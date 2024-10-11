@@ -12,9 +12,21 @@ env:
 jobs:
   build:
 
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
+    - name: Create and mount an fs-verity-enabled filesystem
+      run: |
+        sudo truncate --size 4GiB /verity.fs
+        sudo mkfs.ext4 -O verity /verity.fs
+        sudo mkdir /verity
+        sudo mount -o loop /verity.fs /verity
+        sudo chmod 1777 /verity
+
+        mkdir /verity/worker
+        mkdir -p ~/.var
+        ln -sf /verity/worker ~/.var/tmp
+
     - uses: actions/checkout@v4
     - name: Build
       run: cargo build --verbose
