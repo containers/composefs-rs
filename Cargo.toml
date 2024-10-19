@@ -12,10 +12,10 @@ rand = "0.8.5"
 rustix = { version = "0.38.37", features = ["fs", "mount", "process"] }
 sha2 = "0.10.8"
 tar = "0.4.42"
+tempfile = "3.13.0"
 zstd = "0.13.2"
 
 [dev-dependencies]
-tempfile = "3.13.0"
 
 [profile.dev.package.sha2]
 # this is *really* slow otherwise

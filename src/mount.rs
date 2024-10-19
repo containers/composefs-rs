@@ -23,10 +23,7 @@ use rustix::mount::{
     unmount,
 };
 
-use crate::{
-    fsverity,
-    tmpdir,
-};
+use crate::fsverity;
 
 struct FsHandle {
     pub fd: OwnedFd,
@@ -58,21 +55,21 @@ impl Drop for FsHandle {
 }
 
 struct TmpMount {
-    pub dir: tmpdir::TempDir,
+    pub dir: tempfile::TempDir,
 }
 
 impl TmpMount {
     pub fn mount(fs: BorrowedFd) -> Result<TmpMount> {
-        let tmp = tmpdir::TempDir::new()?;
+        let tmp = tempfile::TempDir::new()?;
         let mnt = fsmount(fs, FsMountFlags::FSMOUNT_CLOEXEC, MountAttrFlags::empty())?;
-        move_mount(mnt.as_fd(), "", rustix::fs::CWD, &tmp.path, MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH)?;
+        move_mount(mnt.as_fd(), "", rustix::fs::CWD, tmp.path(), MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH)?;
         Ok(TmpMount { dir: tmp })
     }
 }
 
 impl Drop for TmpMount {
     fn drop(&mut self) {
-        unmount(&self.dir.path, UnmountFlags::DETACH)
+        unmount(self.dir.path(), UnmountFlags::DETACH)
             .expect("umount(MNT_DETACH) failed");
     }
 }
@@ -92,7 +89,7 @@ pub fn mount_fd<F: AsFd>(image: F, basedir: &Path, mountpoint: &str) -> Result<(
 
         // unfortunately we can't do this via the fd: we need a tmpdir mountpoint
         let tmp = TmpMount::mount(erofs.as_fd())?;  // NB: must live until the "create" operation
-        fsconfig_set_string(overlayfs.as_fd(), "lowerdir+", &tmp.dir.path)?;
+        fsconfig_set_string(overlayfs.as_fd(), "lowerdir+", tmp.dir.path())?;
         fsconfig_set_string(overlayfs.as_fd(), "datadir+", basedir)?;
         fsconfig_create(overlayfs.as_fd())?;
 

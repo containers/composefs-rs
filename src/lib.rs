@@ -6,4 +6,3 @@ pub mod mount;
 pub mod oci;
 pub mod repository;
 pub mod splitstream;
-pub mod tmpdir;
