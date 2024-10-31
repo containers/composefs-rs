@@ -1,4 +1,3 @@
-use std::io::Read;
 use std::path::Path;
 
 use anyhow::{bail, Result};
@@ -6,9 +5,7 @@ use anyhow::{bail, Result};
 use composefs_experiments::{fsverity::Sha256HashValue, repository::Repository};
 
 fn parse_composefs_cmdline() -> Result<Sha256HashValue> {
-    let mut cmdline = vec![];
-    let mut proc_cmdline = std::fs::File::open("/proc/cmdline")?;
-    proc_cmdline.read_to_end(&mut cmdline)?;
+    let cmdline = std::fs::read("/proc/cmdline")?;
     // TODO?: officially we need to understand quoting with double-quotes...
     for part in cmdline.split(|c| c.is_ascii_whitespace()) {
         if let Some(digest) = part.strip_prefix(b"composefs=") {
