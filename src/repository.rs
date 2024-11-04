@@ -438,29 +438,22 @@ impl Repository {
 
     fn walk_symlinkdir(fd: OwnedFd, objects: &mut HashSet<Sha256HashValue>) -> Result<()> {
         for item in Dir::read_from(&fd)? {
-            match item {
-                Err(x) => Err(x)?,
-                Ok(entry) => {
-                    // NB: the underlying filesystem must support returning filetype via direntry
-                    // that's a reasonable assumption, since it must also support fsverity...
-                    match entry.file_type() {
-                        FileType::Directory => {
-                            let filename = entry.file_name();
-                            if filename != c"." && filename != c".." {
-                                let dirfd = openat(&fd, filename, OFlags::RDONLY, Mode::empty())?;
-                                Repository::walk_symlinkdir(dirfd, objects)?;
-                            }
-                        }
-                        FileType::Symlink => {
-                            objects.insert(Repository::read_symlink_hashvalue(
-                                &fd,
-                                entry.file_name(),
-                            )?);
-                        }
-                        _ => {
-                            bail!("Unexpected file type encountered");
-                        }
+            let entry = item?;
+            // NB: the underlying filesystem must support returning filetype via direntry
+            // that's a reasonable assumption, since it must also support fsverity...
+            match entry.file_type() {
+                FileType::Directory => {
+                    let filename = entry.file_name();
+                    if filename != c"." && filename != c".." {
+                        let dirfd = openat(&fd, filename, OFlags::RDONLY, Mode::empty())?;
+                        Repository::walk_symlinkdir(dirfd, objects)?;
                     }
+                }
+                FileType::Symlink => {
+                    objects.insert(Repository::read_symlink_hashvalue(&fd, entry.file_name())?);
+                }
+                _ => {
+                    bail!("Unexpected file type encountered");
                 }
             }
         }
@@ -486,21 +479,17 @@ impl Repository {
         Repository::walk_symlinkdir(refs, &mut objects)?;
 
         for item in Dir::read_from(&category_fd)? {
-            match item {
-                Err(x) => Err(x)?,
-                Ok(entry) => {
-                    let filename = entry.file_name();
-                    if filename != c"refs" && filename != c"." && filename != c".." {
-                        if entry.file_type() != FileType::Symlink {
-                            bail!("category directory contains non-symlink");
-                        }
-                        let mut value = Sha256HashValue::EMPTY;
-                        hex::decode_to_slice(filename.to_bytes(), &mut value)?;
+            let entry = item?;
+            let filename = entry.file_name();
+            if filename != c"refs" && filename != c"." && filename != c".." {
+                if entry.file_type() != FileType::Symlink {
+                    bail!("category directory contains non-symlink");
+                }
+                let mut value = Sha256HashValue::EMPTY;
+                hex::decode_to_slice(filename.to_bytes(), &mut value)?;
 
-                        if !objects.contains(&value) {
-                            println!("rm {}/{:?}", category, filename);
-                        }
-                    }
+                if !objects.contains(&value) {
+                    println!("rm {}/{:?}", category, filename);
                 }
             }
         }
