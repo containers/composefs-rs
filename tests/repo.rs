@@ -24,7 +24,10 @@ fn example_layer() -> Result<Vec<u8>> {
     Ok(builder.into_inner()?)
 }
 
-fn home_var_tmp() -> Result<PathBuf> {
+fn test_global_tmpdir() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("CFS_TEST_TMPDIR") {
+        return Ok(path.into());
+    }
     // We can't use /tmp because that's usually a tmpfs (no fsverity)
     // We also can't use /var/tmp because it's an overlayfs in toolbox (no fsverity)
     // So let's try something in the user's homedir?
@@ -41,7 +44,7 @@ fn test_layer() -> Result<()> {
     context.update(&layer);
     let layer_id: [u8; 32] = context.finalize().into();
 
-    let tmpfile = tempfile::TempDir::with_prefix_in("composefs-test-", home_var_tmp()?)?;
+    let tmpfile = tempfile::TempDir::with_prefix_in("composefs-test-", test_global_tmpdir()?)?;
     let repo = Repository::open_path(tmpfile.path().to_path_buf())?;
     let id = oci::import_layer(&repo, &layer_id, Some("name"), &mut layer.as_slice())?;
 
