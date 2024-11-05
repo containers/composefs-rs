@@ -10,6 +10,7 @@ anyhow = { version = "1.0.89", features = ["backtrace"] }
 async-compression = { version = "0.4.17", features = ["tokio", "gzip", "zstd"] }
 clap = { version = "4.5.19", features = ["derive"] }
 containers-image-proxy = "0.7.0"
+composefs = "0.1.3"
 hex = "0.4.3"
 indicatif = { version = "0.17.8", features = ["tokio"] }
 oci-spec = "0.7.0"
