@@ -462,7 +462,13 @@ impl Repository {
     }
 
     fn openat(&self, name: &str, flags: OFlags) -> ErrnoResult<OwnedFd> {
-        openat(&self.repository, name, flags, Mode::empty())
+        // Unconditionally add CLOEXEC as we always want it.
+        openat(
+            &self.repository,
+            name,
+            flags | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
     }
 
     fn gc_category(&self, category: &str) -> Result<HashSet<Sha256HashValue>> {
