@@ -547,20 +547,16 @@ impl Repository {
                 OFlags::RDONLY | OFlags::DIRECTORY,
             )?;
             for item in Dir::new(dirfd)? {
-                match item {
-                    Err(e) => Err(e)?,
-                    Ok(entry) => {
-                        let filename = entry.file_name();
-                        if filename != c"." && filename != c".." {
-                            let mut value = Sha256HashValue::EMPTY;
-                            value[0] = first_byte;
-                            hex::decode_to_slice(filename.to_bytes(), &mut value[1..])?;
-                            if !objects.contains(&value) {
-                                println!("rm objects/{first_byte:02x}/{filename:?}");
-                            } else {
-                                println!("# objects/{first_byte:02x}/{filename:?} lives");
-                            }
-                        }
+                let entry = item?;
+                let filename = entry.file_name();
+                if filename != c"." && filename != c".." {
+                    let mut value = Sha256HashValue::EMPTY;
+                    value[0] = first_byte;
+                    hex::decode_to_slice(filename.to_bytes(), &mut value[1..])?;
+                    if !objects.contains(&value) {
+                        println!("rm objects/{first_byte:02x}/{filename:?}");
+                    } else {
+                        println!("# objects/{first_byte:02x}/{filename:?} lives");
                     }
                 }
             }
