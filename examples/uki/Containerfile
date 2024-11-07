@@ -22,7 +22,7 @@ RUN <<EOF
     # we should install kernel-modules here, but can't
     # because it'll pull in the entire kernel with it
     # it seems to work fine for now....
-    dnf --setopt keepcache=1 install -y systemd util-linux skopeo composefs strace dosfstools
+    dnf --setopt keepcache=1 install -y systemd util-linux skopeo composefs strace dosfstools selinux-policy-targeted
     systemctl enable systemd-networkd
     passwd -d root
     mkdir /sysroot
@@ -33,7 +33,7 @@ ARG COMPOSEFS_FSVERITY
 RUN <<EOF
     set -eux
     mkdir -p /etc/kernel /etc/dracut.conf.d
-    echo "composefs=${COMPOSEFS_FSVERITY} rw" > /etc/kernel/cmdline
+    echo "composefs=${COMPOSEFS_FSVERITY} rw enforcing=0" > /etc/kernel/cmdline
 
     # systemd-boot-unsigned: ditto
     # btrfs-progs: dracut wants to include this in the initramfs
