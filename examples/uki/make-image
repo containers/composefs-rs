@@ -1,0 +1,19 @@
+#!/bin/sh
+
+set -eux
+
+chown -R 0:0 tmp/sysroot
+chcon -R system_u:object_r:usr_t:s0 tmp/sysroot/composefs
+chcon system_u:object_r:var_t:s0 tmp/sysroot/var
+
+> tmp/image.raw
+SYSTEMD_REPART_MKFS_OPTIONS_EXT4='-O verity' \
+    systemd-repart \
+        --empty=require \
+        --size=auto \
+        --dry-run=no \
+        --no-pager \
+        --offline=yes \
+        --root=tmp \
+        --definitions=repart.d \
+        tmp/image.raw
