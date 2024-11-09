@@ -1,4 +1,4 @@
-use std::{fmt::Write, fs::create_dir_all, path::PathBuf};
+use std::{fmt::Write, fs::create_dir_all, io::Read, path::PathBuf};
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -12,7 +12,7 @@ fn append_data(builder: &mut tar::Builder<Vec<u8>>, name: &str, size: usize) -> 
     header.set_mode(0o700);
     header.set_entry_type(tar::EntryType::Regular);
     header.set_size(size as u64);
-    Ok(builder.append_data(&mut header, name, vec![0u8; size].as_slice())?)
+    Ok(builder.append_data(&mut header, name, std::io::repeat(0u8).take(size as u64))?)
 }
 
 fn example_layer() -> Result<Vec<u8>> {
