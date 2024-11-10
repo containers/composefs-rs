@@ -22,8 +22,17 @@ RUN <<EOF
     # we should install kernel-modules here, but can't
     # because it'll pull in the entire kernel with it
     # it seems to work fine for now....
-    dnf --setopt keepcache=1 install -y systemd util-linux skopeo composefs strace dosfstools
+    dnf --setopt keepcache=1 install -y \
+        composefs \
+        dosfstools \
+        policycoreutils-python-utils \
+        selinux-policy-targeted \
+        skopeo \
+        strace \
+        systemd \
+        util-linux
     systemctl enable systemd-networkd
+    semanage permissive -a systemd_gpt_generator_t  # for volatile-root workaround
     passwd -d root
     mkdir /sysroot
 EOF
