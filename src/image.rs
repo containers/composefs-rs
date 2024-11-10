@@ -74,13 +74,13 @@ impl Directory {
         }
     }
 
-    pub fn recurse<'a>(&'a mut self, name: &OsStr) -> Result<&'a mut Directory> {
-        match self.find_entry(name) {
+    pub fn recurse(&mut self, name: impl AsRef<OsStr>) -> Result<&mut Directory> {
+        match self.find_entry(name.as_ref()) {
             Ok(idx) => match &mut self.entries[idx].inode {
                 Inode::Directory(ref mut subdir) => Ok(subdir),
                 _ => bail!("Parent directory is not a directory"),
             },
-            _ => bail!("Unable to find parent directory {:?}", name),
+            _ => bail!("Unable to find parent directory {:?}", name.as_ref()),
         }
     }
 

@@ -1,7 +1,7 @@
 pub mod image;
 pub mod tar;
 
-use std::{collections::HashMap, ffi::OsStr, io::Read, iter::zip, path::Path};
+use std::{collections::HashMap, io::Read, iter::zip, path::Path};
 
 use anyhow::{bail, ensure, Context, Result};
 use async_compression::tokio::bufread::GzipDecoder;
@@ -326,10 +326,7 @@ pub fn prepare_boot(
         image::process_entry(&mut filesystem, entry)?;
     }
 
-    let boot = filesystem
-        .root
-        .recurse(OsStr::new("composefs-meta"))?
-        .recurse(OsStr::new("boot"))?;
+    let boot = filesystem.root.recurse("composefs-meta")?.recurse("boot")?;
 
     write_to_path(repo, boot, output_dir)
 }
