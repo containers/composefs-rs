@@ -71,7 +71,7 @@ fn write_entry(
         write_empty(writer)?;
     }
 
-    for (key, value) in &stat.xattrs {
+    for (key, value) in &*stat.xattrs.borrow() {
         write!(writer, " ")?;
         write_escaped(writer, key.as_bytes())?;
         write!(writer, "=")?;

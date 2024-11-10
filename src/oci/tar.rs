@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     ffi::{OsStr, OsString},
     fmt,
     io::Read,
@@ -252,7 +253,7 @@ pub fn get_entry<R: Read>(reader: &mut SplitStreamReader<R>) -> Result<Option<Ta
                 st_gid: header.gid()? as u32,
                 st_mode: header.mode()?,
                 st_mtim_sec: header.mtime()? as i64,
-                xattrs,
+                xattrs: RefCell::new(xattrs),
             },
             item,
         }));

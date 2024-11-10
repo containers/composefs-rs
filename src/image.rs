@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     cmp::{Ord, Ordering},
     ffi::{OsStr, OsString},
     io::Read,
@@ -17,7 +18,7 @@ pub struct Stat {
     pub st_uid: u32,
     pub st_gid: u32,
     pub st_mtim_sec: i64,
-    pub xattrs: Vec<(OsString, Vec<u8>)>,
+    pub xattrs: RefCell<Vec<(OsString, Vec<u8>)>>,
 }
 
 #[derive(Debug)]
@@ -174,7 +175,7 @@ impl FileSystem {
                     st_uid: 0,
                     st_gid: 0,
                     st_mtim_sec: 0,
-                    xattrs: vec![],
+                    xattrs: RefCell::new(vec![]),
                 },
                 entries: vec![],
             },
