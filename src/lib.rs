@@ -5,5 +5,6 @@ pub mod image;
 pub mod mount;
 pub mod oci;
 pub mod repository;
+pub mod selabel;
 pub mod splitstream;
 pub mod util;

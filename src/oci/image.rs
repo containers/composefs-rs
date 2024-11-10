@@ -9,6 +9,7 @@ use crate::{
     image::{mkcomposefs, FileSystem, Leaf},
     oci,
     repository::Repository,
+    selabel::selabel,
 };
 
 pub fn process_entry(filesystem: &mut FileSystem, entry: oci::tar::TarEntry) -> Result<()> {
@@ -63,6 +64,8 @@ pub fn compose_filesystem(repo: &Repository, layers: &[String]) -> Result<FileSy
         }
     }
 
+    selabel(&mut filesystem, repo)?;
+
     Ok(filesystem)
 }
 
@@ -93,6 +96,8 @@ pub fn create_image(
             process_entry(&mut filesystem, entry)?;
         }
     }
+
+    selabel(&mut filesystem, repo)?;
 
     let image = mkcomposefs(filesystem)?;
     repo.write_image(name, &image)
