@@ -1,5 +1,6 @@
 use std::{
     cell::RefCell,
+    collections::BTreeMap,
     ffi::{OsStr, OsString},
     fmt,
     io::Read,
@@ -124,7 +125,7 @@ impl fmt::Display for TarEntry {
     }
 }
 
-fn path_from_tar(pax: Option<Vec<u8>>, gnu: Vec<u8>, short: &[u8]) -> PathBuf {
+fn path_from_tar(pax: Option<Box<[u8]>>, gnu: Vec<u8>, short: &[u8]) -> PathBuf {
     // Prepend leading /
     let mut path = vec![b'/'];
     if let Some(name) = pax {
@@ -145,9 +146,9 @@ fn path_from_tar(pax: Option<Vec<u8>>, gnu: Vec<u8>, short: &[u8]) -> PathBuf {
     PathBuf::from(OsString::from_vec(path))
 }
 
-fn symlink_target_from_tar(pax: Option<Vec<u8>>, gnu: Vec<u8>, short: &[u8]) -> OsString {
-    if let Some(name) = pax {
-        OsString::from_vec(name)
+fn symlink_target_from_tar(pax: Option<Box<[u8]>>, gnu: Vec<u8>, short: &[u8]) -> OsString {
+    if let Some(ref name) = pax {
+        OsString::from(OsStr::from_bytes(name))
     } else if !gnu.is_empty() {
         OsString::from_vec(gnu)
     } else {
@@ -158,9 +159,9 @@ fn symlink_target_from_tar(pax: Option<Vec<u8>>, gnu: Vec<u8>, short: &[u8]) -> 
 pub fn get_entry<R: Read>(reader: &mut SplitStreamReader<R>) -> Result<Option<TarEntry>> {
     let mut gnu_longlink: Vec<u8> = vec![];
     let mut gnu_longname: Vec<u8> = vec![];
-    let mut pax_longlink: Option<Vec<u8>> = None;
-    let mut pax_longname: Option<Vec<u8>> = None;
-    let mut xattrs = vec![];
+    let mut pax_longlink: Option<Box<[u8]>> = None;
+    let mut pax_longname: Option<Box<[u8]>> = None;
+    let mut xattrs = BTreeMap::new();
 
     loop {
         let mut buf = [0u8; 512];
@@ -204,14 +205,14 @@ pub fn get_entry<R: Read>(reader: &mut SplitStreamReader<R>) -> Result<Option<Ta
                     for item in PaxExtensions::new(&content) {
                         let extension = item?;
                         let key = extension.key()?;
-                        let value = Vec::from(extension.value_bytes());
+                        let value = Box::from(extension.value_bytes());
 
                         if key == "path" {
                             pax_longname = Some(value);
                         } else if key == "linkpath" {
                             pax_longlink = Some(value);
                         } else if let Some(xattr) = key.strip_prefix("SCHILY.xattr.") {
-                            xattrs.push((OsString::from(xattr), value));
+                            xattrs.insert(Box::from(OsStr::new(xattr)), value);
                         }
                     }
                     continue;

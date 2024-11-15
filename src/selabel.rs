@@ -199,11 +199,13 @@ impl Policy {
 }
 
 fn relabel(stat: &Stat, path: &Path, ifmt: u8, policy: &mut Policy) {
+    let security_selinux = OsStr::new("security.selinux"); // no literal syntax for this yet
+    let mut xattrs = stat.xattrs.borrow_mut();
+
     if let Some(label) = policy.lookup(path.as_os_str(), ifmt) {
-        stat.xattrs.borrow_mut().push((
-            OsString::from("security.selinux"),
-            Vec::from(label.as_bytes()),
-        ))
+        xattrs.insert(Box::from(security_selinux), Box::from(label.as_bytes()));
+    } else {
+        xattrs.remove(security_selinux);
     }
 }
 

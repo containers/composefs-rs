@@ -1,6 +1,7 @@
 use std::{
     cell::RefCell,
     cmp::{Ord, Ordering},
+    collections::BTreeMap,
     ffi::{OsStr, OsString},
     io::Read,
     path::Path,
@@ -18,7 +19,7 @@ pub struct Stat {
     pub st_uid: u32,
     pub st_gid: u32,
     pub st_mtim_sec: i64,
-    pub xattrs: RefCell<Vec<(OsString, Vec<u8>)>>,
+    pub xattrs: RefCell<BTreeMap<Box<OsStr>, Box<[u8]>>>,
 }
 
 #[derive(Debug)]
@@ -175,7 +176,7 @@ impl FileSystem {
                     st_uid: 0,
                     st_gid: 0,
                     st_mtim_sec: 0,
-                    xattrs: RefCell::new(vec![]),
+                    xattrs: RefCell::new(BTreeMap::new()),
                 },
                 entries: vec![],
             },

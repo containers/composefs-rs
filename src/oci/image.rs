@@ -106,7 +106,7 @@ pub fn create_image(
 #[cfg(test)]
 use crate::image::{LeafContent, Stat};
 #[cfg(test)]
-use std::{cell::RefCell, io::BufRead, path::PathBuf};
+use std::{cell::RefCell, collections::BTreeMap, io::BufRead, path::PathBuf};
 
 #[cfg(test)]
 fn file_entry(path: &str) -> oci::tar::TarEntry {
@@ -117,7 +117,7 @@ fn file_entry(path: &str) -> oci::tar::TarEntry {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
-            xattrs: RefCell::new(vec![]),
+            xattrs: RefCell::new(BTreeMap::new()),
         },
         item: oci::tar::TarItem::Leaf(LeafContent::InlineFile(vec![])),
     }
@@ -132,7 +132,7 @@ fn dir_entry(path: &str) -> oci::tar::TarEntry {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
-            xattrs: RefCell::new(vec![]),
+            xattrs: RefCell::new(BTreeMap::new()),
         },
         item: oci::tar::TarItem::Directory,
     }
