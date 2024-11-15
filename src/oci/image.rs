@@ -6,7 +6,7 @@ use oci_spec::image::ImageConfiguration;
 use crate::{
     dumpfile::write_dumpfile,
     fsverity::Sha256HashValue,
-    image::{mkcomposefs, FileSystem, Leaf},
+    image::{mkcomposefs, FileSystem, Inode, Leaf},
     oci,
     repository::Repository,
     selabel::selabel,
@@ -39,10 +39,10 @@ pub fn process_entry(filesystem: &mut FileSystem, entry: oci::tar::TarEntry) -> 
             oci::tar::TarItem::Directory => dir.mkdir(filename, entry.stat),
             oci::tar::TarItem::Leaf(content) => dir.insert(
                 filename,
-                Rc::new(Leaf {
+                Inode::Leaf(Rc::new(Leaf {
                     stat: entry.stat,
                     content,
-                }),
+                })),
             ),
             oci::tar::TarItem::Hardlink(ref target) => {
                 // TODO: would be nice to do this inline, but borrow checker doesn't like it

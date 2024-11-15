@@ -113,11 +113,11 @@ impl Directory {
         }
     }
 
-    pub fn insert(&mut self, name: &OsStr, leaf: Rc<Leaf>) {
+    pub fn insert(&mut self, name: &OsStr, inode: Inode) {
         match self.find_entry(name) {
             Ok(idx) => {
                 // found existing item
-                self.entries[idx].inode = Inode::Leaf(leaf);
+                self.entries[idx].inode = inode;
             }
             Err(idx) => {
                 // need to add new item
@@ -125,7 +125,7 @@ impl Directory {
                     idx,
                     DirEnt {
                         name: OsString::from(name),
-                        inode: Inode::Leaf(leaf),
+                        inode,
                     },
                 );
             }
@@ -211,7 +211,7 @@ impl FileSystem {
     pub fn insert_rc(&mut self, name: &Path, leaf: Rc<Leaf>) -> Result<()> {
         if let Some(filename) = name.file_name() {
             let dir = self.get_parent_dir(name)?;
-            dir.insert(filename, leaf);
+            dir.insert(filename, Inode::Leaf(leaf));
             Ok(())
         } else {
             todo!()
