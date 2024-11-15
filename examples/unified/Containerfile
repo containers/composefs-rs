@@ -1,0 +1,48 @@
+# Need 6.12 kernel from rawhide
+FROM fedora:rawhide AS base
+COPY extra /
+COPY cfsctl /usr/bin
+RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
+    set -eux
+
+    # we should install kernel-modules here, but can't
+    # because it'll pull in the entire kernel with it
+    # it seems to work fine for now....
+    dnf --setopt keepcache=1 install -y \
+        composefs \
+        dosfstools \
+        policycoreutils-python-utils \
+        selinux-policy-targeted \
+        skopeo \
+        strace \
+        systemd \
+        util-linux
+    systemctl enable systemd-networkd
+    semanage permissive -a systemd_gpt_generator_t  # for volatile-root workaround
+    passwd -d root
+    mkdir /sysroot
+EOF
+
+FROM base AS kernel
+RUN --mount=type=bind,from=base,target=/mnt/base <<EOF
+    set -eux
+
+    mkdir -p /tmp/sysroot/composefs
+    COMPOSEFS_FSVERITY="$(cfsctl --repo /tmp/sysroot create-image /mnt/base)"
+
+    mkdir -p /etc/kernel /etc/dracut.conf.d
+    echo "composefs=${COMPOSEFS_FSVERITY} rw" > /etc/kernel/cmdline
+EOF
+RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
+    # systemd-boot-unsigned: ditto
+    # btrfs-progs: dracut wants to include this in the initramfs
+    # ukify: dracut doesn't want to take our cmdline args?
+    dnf --setopt keepcache=1 install -y kernel btrfs-progs systemd-boot-unsigned systemd-ukify
+EOF
+
+# This could (better?) be done from cfsctl...
+FROM base AS bootable
+COPY --from=kernel /boot /composefs-meta/boot
+# RUN rm -rf /composefs-meta
+# RUN commands touch /run unfortunately
+COPY empty /.wh.composefs-meta

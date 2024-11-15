@@ -1,0 +1,35 @@
+#!/bin/sh
+
+set -eux
+
+cd "${0%/*}"
+
+cargo build --release
+
+cp ../../target/release/cfsctl .
+cp ../../target/release/composefs-pivot-sysroot extra/usr/lib/dracut/modules.d/37composefs/
+CFSCTL='./cfsctl --repo tmp/sysroot/composefs'
+
+rm -rf tmp
+mkdir -p tmp/sysroot/composefs tmp/sysroot/var
+
+# mkdir tmp/internal-sysroot  # for debugging
+# podman build -v $(pwd)/tmp/internal-sysroot:/tmp/sysroot:z,U --iidfile=tmp/iid "$@" .
+#
+podman build --iidfile=tmp/iid "$@" .
+
+IMAGE_ID="$(sed s/sha256:// tmp/iid)"
+podman save --format oci-archive -o tmp/final.tar "${IMAGE_ID}"
+${CFSCTL} oci pull oci-archive:tmp/final.tar
+IMAGE_FSVERITY="$(${CFSCTL} oci create-image "${IMAGE_ID}")"
+
+mkdir -p tmp/efi/loader
+echo 'timeout 3' > tmp/efi/loader/loader.conf
+mkdir -p tmp/efi/EFI/BOOT tmp/efi/EFI/systemd
+cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi tmp/efi/EFI/systemd
+cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi tmp/efi/EFI/BOOT/BOOTX64.EFI
+${CFSCTL} oci prepare-boot "${IMAGE_ID}" tmp/efi
+
+fakeroot ./make-image
+qemu-img convert -f raw tmp/image.raw -O qcow2 image.qcow2
+./fix-verity image.qcow2  # https://github.com/tytso/e2fsprogs/issues/201

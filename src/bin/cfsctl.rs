@@ -73,7 +73,9 @@ enum Command {
     /// Perform garbage collection
     GC,
     /// Imports a composefs image (unsafe!)
-    ImportImage { reference: String },
+    ImportImage {
+        reference: String,
+    },
     /// Commands for dealing with OCI layers
     Oci {
         #[clap(subcommand)]
@@ -85,6 +87,12 @@ enum Command {
         name: String,
         /// the mountpoint
         mountpoint: String,
+    },
+    CreateImage {
+        path: PathBuf,
+    },
+    CreateDumpfile {
+        path: PathBuf,
     },
 }
 
@@ -165,6 +173,13 @@ fn main() -> Result<()> {
                 oci::prepare_boot(&repo, name, None, &output)?;
             }
         },
+        Command::CreateImage { ref path } => {
+            let image_id = composefs::fs::create_image(path, Some(&repo))?;
+            println!("{}", hex::encode(image_id));
+        }
+        Command::CreateDumpfile { ref path } => {
+            composefs::fs::create_dumpfile(path)?;
+        }
         Command::Mount { name, mountpoint } => {
             repo.mount(&name, &mountpoint)?;
         }
