@@ -7,7 +7,7 @@ use std::{
     path::PathBuf,
 };
 
-use anyhow::{bail, Result};
+use anyhow::{bail, ensure, Result};
 use rustix::fs::makedev;
 use tar::{EntryType, Header, PaxExtensions};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -17,6 +17,7 @@ use crate::{
     image::{LeafContent, Stat},
     splitstream::{SplitStreamData, SplitStreamReader, SplitStreamWriter},
     util::{read_exactish, read_exactish_async},
+    INLINE_CONTENT_MAX,
 };
 
 fn read_header<R: Read>(reader: &mut R) -> Result<Option<Header>> {
@@ -55,7 +56,7 @@ pub fn split<R: Read>(tar_stream: &mut R, writer: &mut SplitStreamWriter) -> Res
         let mut buffer = vec![0u8; storage_size];
         tar_stream.read_exact(&mut buffer)?;
 
-        if header.entry_type() == EntryType::Regular && storage_size > 0 {
+        if header.entry_type() == EntryType::Regular && actual_size > INLINE_CONTENT_MAX {
             // non-empty regular file: store the data in the object store
             let padding = buffer.split_off(actual_size);
             writer.write_external(&buffer, padding)?;
@@ -85,7 +86,7 @@ pub async fn split_async(
         let mut buffer = vec![0u8; storage_size];
         tar_stream.read_exact(&mut buffer).await?;
 
-        if header.entry_type() == EntryType::Regular && storage_size > 0 {
+        if header.entry_type() == EntryType::Regular && actual_size > INLINE_CONTENT_MAX {
             // non-empty regular file: store the data in the object store
             let padding = buffer.split_off(actual_size);
             writer.write_external(&buffer, padding)?;
@@ -175,6 +176,10 @@ pub fn get_entry<R: Read>(reader: &mut SplitStreamReader<R>) -> Result<Option<Ta
         let item = match reader.read_exact(size as usize, ((size + 511) & !511) as usize)? {
             SplitStreamData::External(id) => match header.entry_type() {
                 EntryType::Regular | EntryType::Continuous => {
+                    ensure!(
+                        size as usize > INLINE_CONTENT_MAX,
+                        "Splitstream incorrectly stored a small ({size} byte) file external"
+                    );
                     TarItem::Leaf(LeafContent::ExternalFile(id, size))
                 }
                 _ => bail!(
@@ -213,6 +218,11 @@ pub fn get_entry<R: Read>(reader: &mut SplitStreamReader<R>) -> Result<Option<Ta
                 }
                 EntryType::Directory => TarItem::Directory,
                 EntryType::Regular | EntryType::Continuous => {
+                    ensure!(
+                        content.len() <= INLINE_CONTENT_MAX,
+                        "Splitstream incorrectly stored a large ({} byte) file inline",
+                        content.len()
+                    );
                     TarItem::Leaf(LeafContent::InlineFile(content))
                 }
                 EntryType::Link => TarItem::Hardlink({
