@@ -24,4 +24,4 @@ jobs:
     - run: cargo build --verbose
     - run: cargo fmt --check
     - run: cargo clippy -- -Dwarnings
-      run: env CFS_TEST_TMPDIR=/run/host/var/tmp cargo test --verbose
+    - run: env CFS_TEST_TMPDIR=/run/host/var/tmp cargo test --verbose
