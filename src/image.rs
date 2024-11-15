@@ -155,6 +155,20 @@ impl Directory {
     pub fn remove_all(&mut self) {
         self.entries.clear();
     }
+
+    pub fn newest_file(&self) -> i64 {
+        let mut newest = self.stat.st_mtim_sec;
+        for DirEnt { inode, .. } in &self.entries {
+            let mtime = match inode {
+                Inode::Leaf(ref leaf) => leaf.stat.st_mtim_sec,
+                Inode::Directory(ref dir) => dir.newest_file(),
+            };
+            if mtime > newest {
+                newest = mtime;
+            }
+        }
+        newest
+    }
 }
 
 pub struct FileSystem {
@@ -172,10 +186,10 @@ impl FileSystem {
         FileSystem {
             root: Directory {
                 stat: Stat {
-                    st_mode: 0o755,
-                    st_uid: 0,
-                    st_gid: 0,
-                    st_mtim_sec: 0,
+                    st_mode: u32::MAX, // assigned later
+                    st_uid: u32::MAX,  // assigned later
+                    st_gid: u32::MAX,  // assigned later
+                    st_mtim_sec: -1,   // assigned later
                     xattrs: RefCell::new(BTreeMap::new()),
                 },
                 entries: vec![],
@@ -244,6 +258,25 @@ impl FileSystem {
             Ok(())
         } else {
             todo!();
+        }
+    }
+
+    pub fn done(&mut self) {
+        // We need to look at the root entry and deal with the "assign later" fields
+        let stat = &mut self.root.stat;
+
+        if stat.st_mode == u32::MAX {
+            stat.st_mode = 0o555;
+        }
+        if stat.st_uid == u32::MAX {
+            stat.st_uid = 0;
+        }
+        if stat.st_gid == u32::MAX {
+            stat.st_gid = 0;
+        }
+        if stat.st_mtim_sec == -1 {
+            // write this in full to avoid annoying the borrow checker
+            self.root.stat.st_mtim_sec = self.root.newest_file();
         }
     }
 }

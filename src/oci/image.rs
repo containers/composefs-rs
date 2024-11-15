@@ -65,6 +65,7 @@ pub fn compose_filesystem(repo: &Repository, layers: &[String]) -> Result<FileSy
     }
 
     selabel(&mut filesystem, repo)?;
+    filesystem.done();
 
     Ok(filesystem)
 }
@@ -98,6 +99,7 @@ pub fn create_image(
     }
 
     selabel(&mut filesystem, repo)?;
+    filesystem.done();
 
     let image = mkcomposefs(filesystem)?;
     repo.write_image(name, &image)
