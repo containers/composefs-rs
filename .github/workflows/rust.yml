@@ -17,7 +17,7 @@ jobs:
       options: "--privileged --pid=host -v /var/tmp:/var/tmp -v /:/run/host"
 
     steps:
-    - run: dnf -y install cargo clippy composefs-devel e2fsprogs
+    - run: dnf -y install cargo clippy composefs-devel e2fsprogs rustfmt
     - name: Enable fs-verity on /
       run: tune2fs -O verity $(findmnt -vno SOURCE /run/host)
     - uses: actions/checkout@v4
