@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/containers/composefs-rs"
 readme = "README.md"
 default-run = "cfsctl"
-exclude = ["/.git*", "/examples/uki/"]
+exclude = ["/.git*", "/examples/"]
 
 [dependencies]
 anyhow = { version = "1.0.89", default-features = false }
