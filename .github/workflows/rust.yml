@@ -10,7 +10,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-fedora:
+  fedora:
     runs-on: ubuntu-24.04
     container:
       image: quay.io/fedora/fedora:41
@@ -25,3 +25,4 @@ jobs:
     - run: cargo fmt --check
     - run: cargo clippy -- -Dwarnings
     - run: env CFS_TEST_TMPDIR=/run/host/var/tmp cargo test --verbose
+    - run: cargo publish --dry-run
