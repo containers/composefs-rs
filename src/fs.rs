@@ -143,8 +143,6 @@ impl<'repo> FilesystemReader<'repo> {
             "xattrs changed during read"
         );
 
-        let names: Vec<u8> = names.into_iter().map(|c| c as u8).collect(); // fml
-
         let mut buffer = [0; 65536];
         for name in names.split_inclusive(|c| *c == 0) {
             let name = CStr::from_bytes_with_nul(name)?;
