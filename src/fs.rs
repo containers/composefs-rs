@@ -138,10 +138,14 @@ impl<'repo> FilesystemReader<'repo> {
         let names_size = listxattr(&filename, &mut [])?;
         let mut names = vec![0; names_size];
         let actual_names_size = listxattr(&filename, &mut names)?;
+
+        // Can be less than the expected size on overlayfs because of
+        // https://github.com/containers/composefs-rs/issues/41
         ensure!(
-            actual_names_size == names.len(),
+            actual_names_size <= names.len(),
             "xattrs changed during read"
         );
+        names.truncate(actual_names_size);
 
         let mut buffer = [0; 65536];
         for name in names.split_inclusive(|c| *c == 0) {
