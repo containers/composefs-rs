@@ -21,7 +21,6 @@ mkdir -p tmp/sysroot/composefs tmp/sysroot/var
 
 ${PODMAN_BUILD} \
     --iidfile=tmp/base.iid \
-    --target=base \
     "$@" \
     .
 

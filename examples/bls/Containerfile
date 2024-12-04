@@ -1,20 +1,5 @@
-# A special form of Containerfile for composefs-enabled UKI images
-# This file must have:
-#
-#  - a stage called 'base' which contains all of the
-#    files of the final image, but not the kernel
-#
-#  - further stages, ultimately resulting in the final container image.  In
-#    this image, the kernel must be present in a whiteout-obscured directory
-#    /composefs-meta/boot/ and otherwise no other changes may be made vs. the
-#    base image.  This is best-accomplished with a multi-stage build.
-#
-#  - during the build stages following 'base', the `COMPOSEFS_FSVERITY` build
-#    arg will be set to the fsverity digest of the container image.  This should
-#    be baked into the UKI.
-
 # Need 6.12 kernel from rawhide
-FROM fedora:rawhide AS base
+FROM fedora:rawhide
 COPY extra /
 COPY cfsctl /usr/bin
 RUN <<EOF
@@ -27,4 +12,4 @@ RUN <<EOF
     mv /boot /composefs-meta
     mkdir /boot
 EOF
-RUN true
+RUN true  # hack to get an extra layer
