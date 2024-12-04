@@ -136,6 +136,10 @@ impl FilesystemReader<'_> {
         let mut xattrs = BTreeMap::new();
 
         let names_size = listxattr(&filename, &mut [])?;
+        // See https://github.com/bytecodealliance/rustix/pull/1061#issuecomment-2518467534
+        // Basically current rustix 0.38 sometimes may expose the element type as a signed
+        // or unsigned variant, depending on the version of linux-raw-sys and rustix feature
+        // flags.
         let mut names = vec![0; names_size];
         let actual_names_size = listxattr(&filename, &mut names)?;
 
@@ -149,6 +153,8 @@ impl FilesystemReader<'_> {
 
         let mut buffer = [0; 65536];
         for name in names.split_inclusive(|c| *c == 0) {
+            // SAFETY: casting i8 to u8 is safe.
+            let name: &[u8] = unsafe { std::mem::transmute(name) };
             let name = CStr::from_bytes_with_nul(name)?;
             let value_size = getxattr(&filename, name, &mut buffer)?;
             let key = Box::from(OsStr::from_bytes(name.to_bytes()));
