@@ -30,6 +30,4 @@ cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi tmp/efi/EFI/systemd
 cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi tmp/efi/EFI/BOOT/BOOTX64.EFI
 ${CFSCTL} oci prepare-boot "${IMAGE_ID}" tmp/efi
 
-fakeroot ./make-image
-qemu-img convert -f raw tmp/image.raw -O qcow2 image.qcow2
-./fix-verity image.qcow2  # https://github.com/tytso/e2fsprogs/issues/201
+../common/make-image image.qcow2

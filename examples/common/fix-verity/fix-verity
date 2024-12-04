@@ -1,0 +1,27 @@
+#!/bin/sh
+
+set -eux
+
+mydir="${0%/*}"
+fix_verity_efi="${mydir}/fix-verity.efi"
+
+# hihi fakeroot
+unset LD_PRELOAD
+
+if [ ! -f ${fix_verity_efi} ]; then
+    if ! podman image exists quay.io/lis/fix-verity; then
+        podman image build -t quay.io/lis/fix-verity "${mydir}"
+    fi
+
+    podman run --rm -i quay.io/lis/fix-verity \
+        cat /fix-verity.efi > "${fix_verity_efi}".tmp
+    mv "${fix_verity_efi}.tmp" "${fix_verity_efi}"
+fi
+
+qemu-system-x86_64 \
+    -nographic \
+    -m 4096 \
+    -enable-kvm \
+    -bios /usr/share/edk2/ovmf/OVMF_CODE.fd \
+    -drive file="$1",format=raw,if=virtio,media=disk \
+    -kernel "${fix_verity_efi}"

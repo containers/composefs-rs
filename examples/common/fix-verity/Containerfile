@@ -1,0 +1,14 @@
+FROM fedora:41
+COPY dracut-hook.sh /
+RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
+    dnf --setopt keepcache=1 install -y \
+        kernel binutils systemd-boot-unsigned btrfs-progs fsverity-utils
+    dracut \
+        --uefi \
+        --no-hostonly \
+        --install 'sync fsverity' \
+        --include /dracut-hook.sh /lib/dracut/hooks/pre-pivot/fix-verity.sh \
+        --kver "$(rpm -q kernel-core --qf '%{VERSION}-%{RELEASE}.%{ARCH}')" \
+        --kernel-cmdline="root=PARTLABEL=root-x86-64 console=ttyS0" \
+        /fix-verity.efi
+EOF

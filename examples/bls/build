@@ -42,18 +42,4 @@ else
 fi
 sed -i 's@ /boot/@ /@' "${BLE}"
 
-> tmp/image.raw
-SYSTEMD_REPART_MKFS_OPTIONS_EXT4='-O verity' \
-    fakeroot \
-        systemd-repart \
-            --empty=require \
-            --size=auto \
-            --dry-run=no \
-            --no-pager \
-            --offline=yes \
-            --root=tmp \
-            --definitions=repart.d \
-            tmp/image.raw
-
-qemu-img convert -f raw tmp/image.raw -O qcow2 image.qcow2
-./fix-verity image.qcow2  # https://github.com/tytso/e2fsprogs/issues/201
+../common/make-image image.qcow2

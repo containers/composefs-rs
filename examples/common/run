@@ -1,0 +1,12 @@
+#!/bin/sh
+
+set -eux
+
+cd "${0%/*}"
+
+qemu-system-x86_64 \
+    -m 4096 \
+    -enable-kvm \
+    -bios /usr/share/edk2/ovmf/OVMF_CODE.fd \
+    -drive file=image.qcow2,if=virtio,cache=unsafe \
+    -nic user,model=virtio-net-pci

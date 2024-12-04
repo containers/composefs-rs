@@ -6,6 +6,8 @@ chown -R 0:0 tmp/sysroot
 chcon -R system_u:object_r:usr_t:s0 tmp/sysroot/composefs
 chcon system_u:object_r:var_t:s0 tmp/sysroot/var
 
+definitions="${0%/*}/repart.d"
+
 > tmp/image.raw
 SYSTEMD_REPART_MKFS_OPTIONS_EXT4='-O verity' \
     systemd-repart \
@@ -15,5 +17,5 @@ SYSTEMD_REPART_MKFS_OPTIONS_EXT4='-O verity' \
         --no-pager \
         --offline=yes \
         --root=tmp \
-        --definitions=repart.d \
+        --definitions="${definitions}" \
         tmp/image.raw

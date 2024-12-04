@@ -1,5 +1,0 @@
-/cfsctl
-/extra/usr/lib/dracut/modules.d/37composefs/composefs-pivot-sysroot
-/fix-verity.efi
-/image.qcow2
-/tmp/
