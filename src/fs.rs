@@ -125,7 +125,7 @@ pub struct FilesystemReader<'repo> {
     root_mtime: i64,
 }
 
-impl<'repo> FilesystemReader<'repo> {
+impl FilesystemReader<'_> {
     fn read_xattrs(&mut self, fd: &OwnedFd) -> Result<BTreeMap<Box<OsStr>, Box<[u8]>>> {
         // flistxattr() and fgetxattr() don't with with O_PATH fds, so go via /proc/self/fd. Note:
         // we want the symlink-following version of this call, which produces the correct behaviour

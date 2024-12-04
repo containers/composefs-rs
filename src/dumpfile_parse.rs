@@ -180,7 +180,7 @@ fn unescape_limited(s: &str, max: usize) -> Result<Cow<[u8]>> {
 
 /// Unescape a byte array according to the composefs dump file escaping format.
 fn unescape(s: &str) -> Result<Cow<[u8]>> {
-    return unescape_limited(s, usize::MAX);
+    unescape_limited(s, usize::MAX)
 }
 
 /// Unescape a string into a Rust `OsStr` which is really just an alias for a byte array,
@@ -492,7 +492,7 @@ impl<'p> Entry<'p> {
     }
 }
 
-impl<'p> Item<'p> {
+impl Item<'_> {
     pub(crate) fn size(&self) -> u64 {
         match self {
             Item::Regular { size, .. } | Item::Directory { size, .. } => *size,
@@ -536,7 +536,7 @@ impl Display for Mtime {
     }
 }
 
-impl<'p> Display for Entry<'p> {
+impl Display for Entry<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         escape(f, self.path.as_os_str().as_bytes(), EscapeMode::Standard)?;
         write!(

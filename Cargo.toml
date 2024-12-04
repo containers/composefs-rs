@@ -2,6 +2,7 @@
 name = "composefs"
 version = "0.2.0"
 edition = "2021"
+rust-version = "1.83.0"
 description = "Rust library for the composefs filesystem"
 keywords = ["composefs"]
 license = "MIT OR Apache-2.0"
