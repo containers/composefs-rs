@@ -4,11 +4,8 @@ set -eux
 
 cd "${0%/*}"
 
+# https://github.com/containers/buildah/issues/5656
 PODMAN_BUILD="podman build --no-cache"
-
-if [ -d ~/.cache/container-build-cache ]; then
-    PODMAN_BUILD="${PODMAN_BUILD} --security-opt=label=disable --volume=${HOME}/.cache/container-build-cache:/var/cache:U"
-fi
 
 cargo build --release
 

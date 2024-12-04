@@ -2,7 +2,7 @@
 FROM fedora:rawhide
 COPY extra /
 COPY cfsctl /usr/bin
-RUN <<EOF
+RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
     set -eux
     dnf --setopt keepcache=1 install -y systemd util-linux skopeo composefs strace dosfstools kernel
     systemctl enable systemd-networkd
