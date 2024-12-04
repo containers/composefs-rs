@@ -20,9 +20,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     fsverity::{
-        digest::FsVerityHasher,
-        ioctl::{fs_ioc_enable_verity, fs_ioc_measure_verity},
-        FsVerityHashValue, Sha256HashValue,
+        self, digest::FsVerityHasher, ioctl::fs_ioc_enable_verity, FsVerityHashValue,
+        Sha256HashValue,
     },
     mount::{mount_fd, pivot_sysroot},
     splitstream::{DigestMap, SplitStreamReader, SplitStreamWriter},
@@ -95,11 +94,11 @@ impl Repository {
         let ro_fd = open(proc_self_fd(&fd), OFlags::RDONLY, Mode::empty())?;
         drop(fd);
 
-        fs_ioc_enable_verity::<&OwnedFd, Sha256HashValue>(&ro_fd)?;
+        fs_ioc_enable_verity::<&OwnedFd, Sha256HashValue>(&ro_fd)
+            .context("Re-validating verity digest")?;
 
         // double-check
-        let measured_digest: Sha256HashValue = fs_ioc_measure_verity(&ro_fd)?;
-        assert!(measured_digest == digest);
+        fsverity::ensure_verity(&ro_fd, &digest)?;
 
         if let Err(err) = linkat(
             CWD,
@@ -123,12 +122,8 @@ impl Repository {
         expected_verity: &Sha256HashValue,
     ) -> Result<OwnedFd> {
         let fd = self.openat(filename, OFlags::RDONLY)?;
-        let measured_verity: Sha256HashValue = fs_ioc_measure_verity(&fd)?;
-        if measured_verity != *expected_verity {
-            bail!("bad verity!")
-        } else {
-            Ok(fd)
-        }
+        fsverity::ensure_verity(&fd, expected_verity)?;
+        Ok(fd)
     }
 
     /// Creates a SplitStreamWriter for writing a split stream.
@@ -194,7 +189,7 @@ impl Repository {
     pub fn check_stream(&self, sha256: &Sha256HashValue) -> Result<Option<Sha256HashValue>> {
         match self.openat(&format!("streams/{}", hex::encode(sha256)), OFlags::RDONLY) {
             Ok(stream) => {
-                let measured_verity: Sha256HashValue = fs_ioc_measure_verity(&stream)?;
+                let measured_verity: Sha256HashValue = fsverity::measure_verity_digest(&stream)?;
                 let mut context = Sha256::new();
                 let mut split_stream = SplitStreamReader::new(File::from(stream))?;
 

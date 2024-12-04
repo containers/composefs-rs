@@ -14,7 +14,7 @@ use rustix::{
     },
 };
 
-use crate::fsverity;
+use crate::{fsverity, util};
 
 struct FsHandle {
     pub fd: OwnedFd,
@@ -192,11 +192,8 @@ impl<'a> MountOptions<'a> {
         let image = std::fs::File::open(self.image)?;
 
         if let Some(expected) = self.digest {
-            let measured: fsverity::Sha256HashValue =
-                fsverity::ioctl::fs_ioc_measure_verity(&image)?;
-            if expected != hex::encode(measured) {
-                panic!("expected {:?} measured {:?}", expected, measured);
-            }
+            let expected = util::parse_sha256(expected)?;
+            fsverity::ensure_verity(&image, &expected)?;
         }
 
         mount_fd(image, self.basedir, mountpoint)
