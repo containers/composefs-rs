@@ -1,0 +1,28 @@
+FROM ubuntu:devel
+COPY extra /
+COPY cfsctl /usr/bin
+
+RUN <<EOF
+    set -eux
+    touch /etc/machine-id
+    touch /etc/fstab
+    apt update
+    DEBIAN_FRONTEND=noninteractive apt install -y \
+       linux-image-generic systemd udev dosfstools \
+      dracut btrfs-progs strace kmod linux-base \
+      libelf1t64 systemd udev podman skopeo btrfs-progs netctl
+    dracut \
+     -a "systemd-initrd composefs bash" \
+     -d "erofs overlay" \
+     -I "/usr/bin/strace /usr/lib/systemd/systemd-sysroot-fstab-check" \
+     --kver $(ls /usr/lib/modules)   --force
+    systemctl enable systemd-networkd systemd-resolved
+    passwd -d root
+    kernel-install add $(cd /usr/lib/modules && echo *) /boot/vmlinuz-$(cd /usr/lib/modules && echo *)
+    apt clean 
+    mkdir /sysroot
+    mkdir /composefs-meta
+    mv /boot /composefs-meta
+    mkdir /boot
+EOF
+RUN true
