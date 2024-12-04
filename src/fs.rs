@@ -1,5 +1,6 @@
 use std::{
     cell::RefCell,
+    cmp::max,
     collections::{BTreeMap, HashMap},
     ffi::OsString,
     ffi::{CStr, OsStr},
@@ -9,7 +10,7 @@ use std::{
     rc::Rc,
 };
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{ensure, Result};
 use rustix::{
     fd::{AsFd, OwnedFd},
     fs::{
@@ -119,14 +120,13 @@ pub fn write_to_path(repo: &Repository, dir: &Directory, output_dir: &Path) -> R
 }
 
 pub struct FilesystemReader<'repo> {
-    st_dev: u64,
     repo: Option<&'repo Repository>,
-    inodes: HashMap<u64, Rc<Leaf>>,
-    root_mtime: i64,
+    inodes: HashMap<(u64, u64), Rc<Leaf>>,
+    root_mtime: Option<i64>,
 }
 
 impl FilesystemReader<'_> {
-    fn read_xattrs(&mut self, fd: &OwnedFd) -> Result<BTreeMap<Box<OsStr>, Box<[u8]>>> {
+    fn read_xattrs(fd: &OwnedFd) -> Result<BTreeMap<Box<OsStr>, Box<[u8]>>> {
         // flistxattr() and fgetxattr() don't with with O_PATH fds, so go via /proc/self/fd. Note:
         // we want the symlink-following version of this call, which produces the correct behaviour
         // even when trying to read xattrs from symlinks themselves.  See
@@ -159,7 +159,7 @@ impl FilesystemReader<'_> {
         Ok(xattrs)
     }
 
-    fn stat(&mut self, fd: &OwnedFd, ifmt: FileType) -> Result<(rustix::fs::Stat, Stat)> {
+    fn stat(fd: &OwnedFd, ifmt: FileType) -> Result<(rustix::fs::Stat, Stat)> {
         let buf = fstat(fd)?;
 
         ensure!(
@@ -168,31 +168,14 @@ impl FilesystemReader<'_> {
             between readdir() and fstat()"
         );
 
-        let mtime = buf.st_mtime as i64;
-
-        if buf.st_dev != self.st_dev {
-            if self.st_dev == u64::MAX {
-                self.st_dev = buf.st_dev;
-            } else {
-                bail!("Attempting to cross devices while importing filesystem");
-            }
-        } else {
-            // The root mtime is equal to the most recent mtime of any inode *except* the root
-            // directory.  Because self.st_dev is unset at first, we know we're in this branch only
-            // if this is the second (or later) inode we process (ie: not the root directory).
-            if mtime > self.root_mtime {
-                self.root_mtime = mtime;
-            }
-        }
-
         Ok((
             buf,
             Stat {
                 st_mode: buf.st_mode & 0o7777,
                 st_uid: buf.st_uid,
                 st_gid: buf.st_gid,
-                st_mtim_sec: mtime,
-                xattrs: RefCell::new(self.read_xattrs(fd)?),
+                st_mtim_sec: buf.st_mtime as i64,
+                xattrs: RefCell::new(FilesystemReader::read_xattrs(fd)?),
             },
         ))
     }
@@ -240,15 +223,16 @@ impl FilesystemReader<'_> {
             Mode::empty(),
         )?;
 
-        let (buf, stat) = self.stat(&fd, ifmt)?;
+        let (buf, stat) = FilesystemReader::stat(&fd, ifmt)?;
 
-        if let Some(leafref) = self.inodes.get(&buf.st_ino) {
+        if let Some(leafref) = self.inodes.get(&(buf.st_dev, buf.st_ino)) {
             Ok(Rc::clone(leafref))
         } else {
             let content = self.read_leaf_content(fd, buf)?;
             let leaf = Rc::new(Leaf { stat, content });
             if buf.st_nlink > 1 {
-                self.inodes.insert(buf.st_ino, Rc::clone(&leaf));
+                self.inodes
+                    .insert((buf.st_dev, buf.st_ino), Rc::clone(&leaf));
             }
             Ok(leaf)
         }
@@ -262,7 +246,7 @@ impl FilesystemReader<'_> {
             Mode::empty(),
         )?;
 
-        let (_, stat) = self.stat(&fd, FileType::Directory)?;
+        let (_, stat) = FilesystemReader::stat(&fd, FileType::Directory)?;
         let mut directory = Directory {
             stat,
             entries: vec![],
@@ -277,6 +261,7 @@ impl FilesystemReader<'_> {
             }
 
             let inode = self.read_inode(&fd, name, entry.file_type())?;
+            self.root_mtime = max(self.root_mtime, Some(inode.stat().st_mtim_sec));
             directory.insert(name, inode);
         }
 
@@ -285,11 +270,11 @@ impl FilesystemReader<'_> {
 
     fn read_inode(&mut self, dirfd: &OwnedFd, name: &OsStr, ifmt: FileType) -> Result<Inode> {
         if ifmt == FileType::Directory {
-            Ok(Inode::Directory(Box::new(
-                self.read_directory(dirfd, name)?,
-            )))
+            let dir = self.read_directory(dirfd, name)?;
+            Ok(Inode::Directory(Box::new(dir)))
         } else {
-            Ok(Inode::Leaf(self.read_leaf(dirfd, name, ifmt)?))
+            let leaf = self.read_leaf(dirfd, name, ifmt)?;
+            Ok(Inode::Leaf(leaf))
         }
     }
 }
@@ -298,13 +283,14 @@ pub fn read_from_path(path: &Path, repo: Option<&Repository>) -> Result<FileSyst
     let mut reader = FilesystemReader {
         repo,
         inodes: HashMap::new(),
-        st_dev: u64::MAX,
-        root_mtime: 0,
+        root_mtime: None,
     };
     let mut fs = FileSystem {
         root: reader.read_directory(CWD, path.as_os_str())?,
     };
-    fs.root.stat.st_mtim_sec = reader.root_mtime;
+
+    // A filesystem with no files ends up in the 1970s...
+    fs.root.stat.st_mtim_sec = reader.root_mtime.unwrap_or(0);
 
     // We can only relabel if we have the repo because we need to read the config and policy files
     if let Some(repo) = repo {

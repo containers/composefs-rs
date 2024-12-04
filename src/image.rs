@@ -57,6 +57,15 @@ pub struct DirEnt {
     pub inode: Inode,
 }
 
+impl Inode {
+    pub fn stat(&self) -> &Stat {
+        match self {
+            Inode::Directory(dir) => &dir.stat,
+            Inode::Leaf(leaf) => &leaf.stat,
+        }
+    }
+}
+
 impl Directory {
     pub fn find_entry(&self, name: &OsStr) -> Result<usize, usize> {
         // OCI layer tarballs are typically sorted, with the entries for a particular directory
