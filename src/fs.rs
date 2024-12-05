@@ -19,6 +19,7 @@ use rustix::{
     },
     io::{read_uninit, write, Errno},
 };
+use zerocopy::IntoBytes;
 
 use crate::{
     fsverity::{digest::FsVerityHasher, Sha256HashValue},
@@ -153,8 +154,7 @@ impl FilesystemReader<'_> {
 
         let mut buffer = [0; 65536];
         for name in names.split_inclusive(|c| *c == 0) {
-            // SAFETY: casting i8 to u8 is safe.
-            let name: &[u8] = unsafe { std::mem::transmute(name) };
+            let name: &[u8] = name.as_bytes();
             let name = CStr::from_bytes_with_nul(name)?;
             let value_size = getxattr(&filename, name, &mut buffer)?;
             let key = Box::from(OsStr::from_bytes(name.to_bytes()));

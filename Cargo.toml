@@ -26,6 +26,7 @@ tar = { version = "0.4.42", default-features = false }
 tempfile = "3.13.0"
 thiserror = "2.0.4"
 tokio = "1.41.0"
+zerocopy = "0.8.13"
 zstd = "0.13.2"
 
 [dev-dependencies]
