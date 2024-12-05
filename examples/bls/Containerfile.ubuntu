@@ -1,0 +1,82 @@
+# This is an experimental example
+#
+## Run built image directly
+##  cfsctl oci pull docker://docker.io/shawn111/cfs-images:ubuntu
+##  cfsctl oci prepare-boot [image id]
+
+
+## composefs part
+##
+##  build composefs related binaries, like mkcomposefs
+##  https://github.com/containers/composefs-rs/pull/45#pullrequestreview-2479501125
+##
+##  FIXME: This part could replace by a composefs deb package.
+##
+
+FROM ubuntu:devel AS composefs
+RUN apt update
+
+RUN DEBIAN_FRONTEND=noninteractive apt install --no-install-recommends -y git autoconf m4 libglib2.0-dev libtool bison \
+                   liblzma-dev e2fslibs-dev libgpgme-dev libsystemd-dev \
+                   make libfuse3-dev \
+                   gcc meson libssl-dev \
+                   ca-certificates
+RUN git clone https://github.com/containers/composefs.git /cfs
+WORKDIR /cfs
+RUN meson setup target --prefix=/cfs/target/usr --default-library=shared -Dfuse=enabled
+RUN meson compile -C target
+RUN meson install -C target
+
+
+## kernel part (kernel/initrd/bls)
+##
+##   fetch v6.12 kernel (curl command could be removed after 6.12 kernel in repos)
+##    - mainline ppa, only provide packages not repo
+##
+FROM ubuntu:devel AS kernel
+COPY extra /
+RUN apt update
+RUN apt install -y kmod linux-base libelf1t64
+RUN apt install -y curl
+
+RUN curl -Lf --remote-name-all https://kernel.ubuntu.com/mainline/v6.12/amd64/linux-headers-6.12.0-061200-generic_6.12.0-061200.202411220723_amd64.deb \
+    https://kernel.ubuntu.com/mainline/v6.12/amd64/linux-headers-6.12.0-061200_6.12.0-061200.202411220723_all.deb \
+    https://kernel.ubuntu.com/mainline/v6.12/amd64/linux-image-unsigned-6.12.0-061200-generic_6.12.0-061200.202411220723_amd64.deb \
+    https://kernel.ubuntu.com/mainline/v6.12/amd64/linux-modules-6.12.0-061200-generic_6.12.0-061200.202411220723_amd64.deb  && \
+    dpkg -i *.deb
+
+# install dracut related packages to build initrd
+RUN DEBIAN_FRONTEND=noninteractive apt install -y systemd udev dosfstools dracut btrfs-progs strace
+RUN dracut \
+     -a "systemd-initrd composefs bash" \
+     -d "erofs overlay" \
+     -I "/usr/bin/strace" \
+     --kver $(ls /usr/lib/modules) \
+     --no-hostonly \
+     /usr/lib/modules/$(cd /usr/lib/modules && echo *)/initramfs.img  --force
+
+# generate bls configation files
+RUN echo "console=ttyS0,115200 console=tty0" >> /etc/kernel/cmdline
+RUN kernel-install add $(ls /usr/lib/modules) /boot/vmlinuz /usr/lib/modules/$(cd /usr/lib/modules && echo *)/initramfs.img
+RUN ln -s /boot /boot/boot
+
+FROM ubuntu:devel AS base
+COPY extra /
+COPY --from=kernel /usr/lib/modules /usr/lib/modules
+COPY --from=kernel /boot /boot
+COPY --from=composefs /cfs/target/usr /usr
+COPY cfsctl /usr/bin
+RUN <<EOF
+    set -eux
+    touch /etc/machine-id
+    apt update
+    DEBIAN_FRONTEND=noninteractive apt install -y systemd udev podman skopeo dosfstools btrfs-progs netctl
+    systemctl enable systemd-networkd systemd-resolved
+    passwd -d root
+
+    mkdir /sysroot
+    mkdir /composefs-meta
+    mv /boot /composefs-meta
+    mkdir /boot
+EOF
+RUN true
