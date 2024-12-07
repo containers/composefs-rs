@@ -19,6 +19,7 @@ pub enum MeasureVerityError {
 
 // See /usr/include/linux/fsverity.h
 #[repr(C)]
+#[derive(Debug)]
 pub struct FsVerityEnableArg {
     version: u32,
     hash_algorithm: u32,
@@ -60,6 +61,7 @@ pub fn fs_ioc_enable_verity<F: AsFd, H: FsVerityHashValue>(fd: F) -> std::io::Re
 
 /// Core definition of a fsverity digest.
 #[repr(C)]
+#[derive(Debug)]
 pub struct FsVerityDigest<F> {
     digest_algorithm: u16,
     digest_size: u16,
