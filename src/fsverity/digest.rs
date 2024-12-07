@@ -157,7 +157,7 @@ mod tests {
     #[test]
     fn test_digest() -> Result<()> {
         let digest = FsVerityHasher::hash(b"hello world");
-        assert_eq!(
+        similar_asserts::assert_eq!(
             digest,
             [
                 30, 46, 170, 66, 2, 215, 80, 164, 17, 116, 238, 69, 73, 112, 185, 44, 27, 194, 249,

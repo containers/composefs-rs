@@ -30,6 +30,7 @@ zerocopy = "0.8.13"
 zstd = "0.13.2"
 
 [dev-dependencies]
+similar-asserts = "1.6.0"
 
 [profile.dev.package.sha2]
 # this is *really* slow otherwise
