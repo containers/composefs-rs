@@ -1,3 +1,5 @@
+#![deny(missing_debug_implementations)]
+
 pub mod dumpfile;
 pub mod dumpfile_parse;
 pub mod fs;

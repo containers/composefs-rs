@@ -163,6 +163,7 @@ pub fn pivot_sysroot(image: impl AsFd, basedir: &Path, sysroot: &Path) -> Result
     }
 }
 
+#[derive(Debug)]
 pub struct MountOptions<'a> {
     image: &'a str,
     basedir: &'a Path,
