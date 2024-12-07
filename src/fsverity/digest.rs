@@ -6,6 +6,7 @@ use super::Sha256HashValue;
 
 // TODO: support Sha512
 
+#[derive(Debug)]
 struct FsVerityLayer {
     context: Sha256,
     remaining: usize,
@@ -31,6 +32,7 @@ impl FsVerityLayer {
     }
 }
 
+#[derive(Debug)]
 pub struct FsVerityHasher {
     layers: Vec<FsVerityLayer>,
     value: Option<Sha256HashValue>,

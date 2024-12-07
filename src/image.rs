@@ -180,6 +180,7 @@ impl Directory {
     }
 }
 
+#[derive(Debug)]
 pub struct FileSystem {
     pub root: Directory,
 }

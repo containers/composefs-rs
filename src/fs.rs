@@ -120,6 +120,7 @@ pub fn write_to_path(repo: &Repository, dir: &Directory, output_dir: &Path) -> R
     write_directory_contents(dir, &fd, repo)
 }
 
+#[derive(Debug)]
 pub struct FilesystemReader<'repo> {
     repo: Option<&'repo Repository>,
     inodes: HashMap<(u64, u64), Rc<Leaf>>,

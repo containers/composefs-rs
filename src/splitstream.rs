@@ -15,11 +15,13 @@ use crate::{
     util::read_exactish,
 };
 
+#[derive(Debug)]
 pub struct DigestMapEntry {
     pub body: Sha256HashValue,
     pub verity: Sha256HashValue,
 }
 
+#[derive(Debug)]
 pub struct DigestMap {
     pub map: Vec<DigestMapEntry>,
 }
@@ -61,6 +63,17 @@ pub struct SplitStreamWriter<'a> {
     inline_content: Vec<u8>,
     writer: Encoder<'a, Vec<u8>>,
     pub sha256: Option<(Sha256, Sha256HashValue)>,
+}
+
+impl std::fmt::Debug for SplitStreamWriter<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // writer doesn't impl Debug
+        f.debug_struct("SplitStreamWriter")
+            .field("repo", &self.repo)
+            .field("inline_content", &self.inline_content)
+            .field("sha256", &self.sha256)
+            .finish()
+    }
 }
 
 impl SplitStreamWriter<'_> {
@@ -153,6 +166,7 @@ impl SplitStreamWriter<'_> {
     }
 }
 
+#[derive(Debug)]
 pub enum SplitStreamData {
     Inline(Vec<u8>),
     External(Sha256HashValue),
@@ -163,6 +177,16 @@ pub struct SplitStreamReader<R: Read> {
     decoder: Decoder<'static, BufReader<R>>,
     pub refs: DigestMap,
     inline_bytes: usize,
+}
+
+impl<R: Read> std::fmt::Debug for SplitStreamReader<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // decoder doesn't impl Debug
+        f.debug_struct("SplitStreamReader")
+            .field("refs", &self.refs)
+            .field("inline_bytes", &self.inline_bytes)
+            .finish()
+    }
 }
 
 fn read_u64_le<R: Read>(reader: &mut R) -> Result<Option<usize>> {

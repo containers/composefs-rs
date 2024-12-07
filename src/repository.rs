@@ -28,6 +28,7 @@ use crate::{
     util::{parse_sha256, proc_self_fd},
 };
 
+#[derive(Debug)]
 pub struct Repository {
     repository: OwnedFd,
     path: PathBuf,
