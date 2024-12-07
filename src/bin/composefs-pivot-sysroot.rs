@@ -33,7 +33,7 @@ fn test_parse() {
     }
     let digest = "8b7df143d91c716ecfa5fc1730022f6b421b05cedee8fd52b1fc65a96030ad52";
     let digest_bytes = hex::decode(digest).unwrap();
-    assert_eq!(
+    similar_asserts::assert_eq!(
         parse_composefs_cmdline(format!("composefs={digest}").as_bytes())
             .unwrap()
             .as_slice(),
