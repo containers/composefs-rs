@@ -53,7 +53,7 @@ fn test_layer() -> Result<()> {
     while let Some(entry) = oci::tar::get_entry(&mut split_stream)? {
         writeln!(dump, "{}", entry)?;
     }
-    assert_eq!(dump, "\
+    similar_asserts::assert_eq!(dump, "\
 /file0 0 100700 1 0 0 0 0.0 - - -
 /file4095 4095 100700 1 0 0 0 0.0 53/72beb83c78537c8970c8361e3254119fafdf1763854ecd57d3f0fe2da7c719 - 5372beb83c78537c8970c8361e3254119fafdf1763854ecd57d3f0fe2da7c719
 /file4096 4096 100700 1 0 0 0 0.0 ba/bc284ee4ffe7f449377fbf6692715b43aec7bc39c094a95878904d34bac97e - babc284ee4ffe7f449377fbf6692715b43aec7bc39c094a95878904d34bac97e

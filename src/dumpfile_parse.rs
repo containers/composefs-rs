@@ -784,15 +784,15 @@ mod tests {
     #[test]
     fn test_xattr() {
         let v = Xattr::parse("foo=bar").unwrap();
-        assert_eq!(v.key.as_bytes(), b"foo");
-        assert_eq!(&*v.value, b"bar");
+        similar_asserts::assert_eq!(v.key.as_bytes(), b"foo");
+        similar_asserts::assert_eq!(&*v.value, b"bar");
         // Invalid embedded NUL in keys
         assert!(Xattr::parse("foo\0bar=baz").is_err());
         assert!(Xattr::parse("foo\x00bar=baz").is_err());
         // But embedded NUL in values is OK
         let v = Xattr::parse("security.selinux=bar\x00").unwrap();
-        assert_eq!(v.key.as_bytes(), b"security.selinux");
-        assert_eq!(&*v.value, b"bar\0");
+        similar_asserts::assert_eq!(v.key.as_bytes(), b"security.selinux");
+        similar_asserts::assert_eq!(&*v.value, b"bar\0");
     }
 
     #[test]
@@ -829,9 +829,9 @@ mod tests {
             if line != serialized {
                 dbg!(&line, &e, &serialized);
             }
-            assert_eq!(line, serialized);
+            similar_asserts::assert_eq!(line, serialized);
             let e2 = Entry::parse(&serialized).unwrap();
-            assert_eq!(e, e2);
+            similar_asserts::assert_eq!(e, e2);
         }
     }
 
@@ -875,7 +875,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert_eq!(SPECIAL_DUMP, &entries);
+        similar_asserts::assert_eq!(SPECIAL_DUMP, &entries);
         Ok(())
     }
 

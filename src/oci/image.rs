@@ -149,7 +149,7 @@ fn assert_files(fs: &FileSystem, expected: &[&str]) -> Result<()> {
         .map(|line| line.unwrap().split_once(' ').unwrap().0.into())
         .collect();
 
-    assert_eq!(actual, expected);
+    similar_asserts::assert_eq!(actual, expected);
     Ok(())
 }
 
