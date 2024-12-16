@@ -1,0 +1,51 @@
+---
+source: tests/mkfs.rs
+expression: debug_fs(fs)
+snapshot_kind: text
+---
+00000000 ComposefsHeader
+      +0     magic: U32(3497550490)
+      +4     version: U32(1)
+      +c     composefs_version: U32(2)
+
+00000020 Padding
+    +3e0     # 992 nul bytes
+
+00000400 Superblock
+      +0     magic: U32(3774210530)
+      +8     feature_compat: U32(6)
+      +c     blkszbits: 12
+      +e     root_nid: U16(36)
+     +10     inos: U64(1)
+     +24     blocks: U32(1)
+
+# Filename "/"
+# nid #36
+00000480 ExtendedInodeHeader
+      +0     format: 5 = Extended | Ok(FlatInline)
+      +4     mode: 0040555 (directory)
+      +8     size: U64(27)
+     +14     ino: U32(36)
+     +20     mtime: U64(18446744073709551615)
+     +2c     nlink: U32(2)
+     +40 --- inline directory entries ---
+      +0     inode_offset: U64(36)
+      +8     name_offset: U16(24)
+      +a     file_type: Directory
+     +18     # name: "."
+
+      +c     inode_offset: U64(36)
+     +14     name_offset: U16(25)
+     +16     file_type: Directory
+     +19     # name: ".."
+
+000004db Padding
+    +b25     # 2853 nul bytes
+
+
+Space statistics (total size 4096B):
+  extended inode = 91B, 2.22%
+  header = 32B, 0.78%
+  superblock = 128B, 3.12%
+  padding extended inode -> eof = 2853B, 69.65%
+  padding header -> superblock = 992B, 24.22%

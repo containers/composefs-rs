@@ -97,6 +97,8 @@ enum Command {
 }
 
 fn main() -> Result<()> {
+    env_logger::init();
+
     let args = App::parse();
 
     let repo = (if let Some(path) = args.repo {
