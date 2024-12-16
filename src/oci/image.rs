@@ -5,8 +5,9 @@ use oci_spec::image::ImageConfiguration;
 
 use crate::{
     dumpfile::write_dumpfile,
+    erofs::writer::mkfs_erofs,
     fsverity::Sha256HashValue,
-    image::{mkcomposefs, FileSystem, Inode, Leaf},
+    image::{FileSystem, Inode, Leaf},
     oci,
     repository::Repository,
     selabel::selabel,
@@ -101,8 +102,8 @@ pub fn create_image(
     selabel(&mut filesystem, repo)?;
     filesystem.done();
 
-    let image = mkcomposefs(filesystem)?;
-    repo.write_image(name, &image)
+    let erofs = mkfs_erofs(&filesystem);
+    repo.write_image(name, &erofs)
 }
 
 #[cfg(test)]

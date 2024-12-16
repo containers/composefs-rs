@@ -2,6 +2,7 @@
 
 pub mod dumpfile;
 pub mod dumpfile_parse;
+pub mod erofs;
 pub mod fs;
 pub mod fsverity;
 pub mod image;
