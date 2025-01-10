@@ -864,6 +864,7 @@ mod tests {
         }
     }
 
+    #[test_with::executable(mkcomposefs)]
     #[test]
     fn test_load_cfs() -> Result<()> {
         let mut tmpf = tempfile::tempfile()?;
@@ -879,6 +880,7 @@ mod tests {
         Ok(())
     }
 
+    #[test_with::executable(mkcomposefs)]
     #[test]
     fn test_load_cfs_filtered() -> Result<()> {
         const FILTERED: &str =
