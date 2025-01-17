@@ -11,3 +11,4 @@ a verified operating system image.
    In this case we simply hack the bootloader entry to refer to the correct composefs hash at install type.
  - `unified`: similar to the `uki` example, but avoiding the intermediate `cfsctl` step by running `cfsctl` inside a build stage from the `Containerfile` itself.
    This involves bind-mounting the earlier build stage of the base image so that we can measure it from inside the stage that builds the UKI.
+ - `unified-secureboot`: based on the `unified` example, adding signing for Secure Boot.
