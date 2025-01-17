@@ -1,0 +1,56 @@
+#!/bin/bash
+
+set -eux
+
+cd "${0%/*}"
+
+cargo build --release
+
+cp ../../target/release/cfsctl .
+cp ../../target/release/composefs-pivot-sysroot extra/usr/lib/dracut/modules.d/37composefs/
+CFSCTL='./cfsctl --repo tmp/sysroot/composefs'
+
+rm -rf tmp
+mkdir -p tmp/sysroot/composefs tmp/sysroot/var
+
+# See: https://wiki.archlinux.org/title/Unified_Extensible_Firmware_Interface/Secure_Boot
+# Alternative to generate keys for testing: `sbctl create-keys`
+if [[ ! -d "secureboot" ]]; then
+    echo "Generating test Secure Boot keys"
+    mkdir secureboot
+    pushd secureboot > /dev/null
+    uuidgen --random > GUID.txt
+    openssl req -newkey rsa:4096 -nodes -keyout PK.key -new -x509 -sha256 -days 3650 -subj "/CN=Test Platform Key/" -out PK.crt
+    openssl x509 -outform DER -in PK.crt -out PK.cer
+    openssl req -newkey rsa:4096 -nodes -keyout KEK.key -new -x509 -sha256 -days 3650 -subj "/CN=Test Key Exchange Key/" -out KEK.crt
+    openssl x509 -outform DER -in KEK.crt -out KEK.cer
+    openssl req -newkey rsa:4096 -nodes -keyout db.key -new -x509 -sha256 -days 3650 -subj "/CN=Test Signature Database key/" -out db.crt
+    openssl x509 -outform DER -in db.crt -out db.cer
+    popd > /dev/null
+fi
+
+# For debugging, add --no-cache to podman command
+mkdir tmp/internal-sysroot
+podman build \
+    --iidfile=tmp/iid \
+    -v $(pwd)/tmp/internal-sysroot:/tmp/sysroot:z,U \
+    --secret=id=key,src=secureboot/db.key \
+    --secret=id=cert,src=secureboot/db.crt \
+    "$@" .
+
+IMAGE_ID="$(sed s/sha256:// tmp/iid)"
+podman save --format oci-archive -o tmp/final.tar "${IMAGE_ID}"
+${CFSCTL} oci pull oci-archive:tmp/final.tar
+IMAGE_FSVERITY="$(${CFSCTL} oci create-image "${IMAGE_ID}")"
+fsck.erofs "tmp/sysroot/composefs/images/${IMAGE_FSVERITY}"
+
+mkdir -p tmp/efi/loader
+echo 'timeout 3' > tmp/efi/loader/loader.conf
+mkdir -p tmp/efi/EFI/BOOT tmp/efi/EFI/systemd
+sbsign --key secureboot/db.key --cert secureboot/db.crt \
+    /usr/lib/systemd/boot/efi/systemd-bootx64.efi \
+    --output tmp/efi/EFI/systemd/systemd-bootx64.efi
+cp tmp/efi/EFI/{systemd/systemd-bootx64.efi,BOOT/BOOTX64.EFI}
+${CFSCTL} oci prepare-boot "${IMAGE_ID}" tmp/efi
+
+../common/make-image image.qcow2
