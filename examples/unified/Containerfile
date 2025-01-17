@@ -33,11 +33,13 @@ RUN --mount=type=bind,from=base,target=/mnt/base <<EOF
     mkdir -p /etc/kernel /etc/dracut.conf.d
     echo "composefs=${COMPOSEFS_FSVERITY} rw" > /etc/kernel/cmdline
 EOF
-RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
+RUN --mount=type=cache,target=/var/cache/libdnf5 \
+    --mount=type=secret,id=key \
+    --mount=type=secret,id=cert <<EOF
     # systemd-boot-unsigned: ditto
     # btrfs-progs: dracut wants to include this in the initramfs
     # ukify: dracut doesn't want to take our cmdline args?
-    dnf --setopt keepcache=1 install -y kernel btrfs-progs systemd-boot-unsigned systemd-ukify
+    dnf --setopt keepcache=1 install -y kernel btrfs-progs systemd-boot-unsigned systemd-ukify sbsigntools
 EOF
 
 # This could (better?) be done from cfsctl...
