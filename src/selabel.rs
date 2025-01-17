@@ -245,7 +245,7 @@ fn parse_config(file: impl Read) -> Result<Option<String>> {
     for line in BufReader::new(file).lines() {
         if let Some((key, value)) = line?.split_once('=') {
             // this might be a comment, but then key will start with '#'
-            if key.trim().to_ascii_uppercase() == "SELINUXTYPE" {
+            if key.trim().eq_ignore_ascii_case("SELINUXTYPE") {
                 return Ok(Some(value.trim().to_string()));
             }
         }
