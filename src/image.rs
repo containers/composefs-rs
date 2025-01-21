@@ -3,15 +3,13 @@ use std::{
     cmp::{Ord, Ordering},
     collections::BTreeMap,
     ffi::{OsStr, OsString},
-    io::Read,
     path::Path,
-    process::{Command, Stdio},
     rc::Rc,
 };
 
 use anyhow::{bail, Context, Result};
 
-use crate::{dumpfile::write_dumpfile, fsverity::Sha256HashValue};
+use crate::fsverity::Sha256HashValue;
 
 #[derive(Debug)]
 pub struct Stat {
@@ -289,27 +287,4 @@ impl FileSystem {
             self.root.stat.st_mtim_sec = self.root.newest_file();
         }
     }
-}
-
-pub fn mkcomposefs(filesystem: FileSystem) -> Result<Vec<u8>> {
-    let mut mkcomposefs = Command::new("mkcomposefs")
-        .args(["--from-file", "-", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
-
-    let mut stdin = mkcomposefs.stdin.take().unwrap();
-    write_dumpfile(&mut stdin, &filesystem)?;
-    drop(stdin);
-
-    let mut stdout = mkcomposefs.stdout.take().unwrap();
-    let mut image = vec![];
-    stdout.read_to_end(&mut image)?;
-    drop(stdout);
-
-    if !mkcomposefs.wait()?.success() {
-        bail!("mkcomposefs failed");
-    };
-
-    Ok(image)
 }

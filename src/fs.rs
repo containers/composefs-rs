@@ -314,7 +314,7 @@ pub fn read_from_path(path: &Path, repo: Option<&Repository>) -> Result<FileSyst
 
 pub fn create_image(path: &Path, repo: Option<&Repository>) -> Result<Sha256HashValue> {
     let fs = read_from_path(path, repo)?;
-    let image = super::image::mkcomposefs(fs)?;
+    let image = crate::mkfs::mkfs(&fs)?;
     if let Some(repo) = repo {
         Ok(repo.write_image(None, &image)?)
     } else {
