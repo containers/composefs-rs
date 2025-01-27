@@ -25,6 +25,7 @@ BASE_ID="$(sed s/sha256:// tmp/base.iid)"
 podman save --format oci-archive -o tmp/base.tar "${BASE_ID}"
 ${CFSCTL} oci pull oci-archive:tmp/base.tar
 BASE_IMAGE_FSVERITY="$(${CFSCTL} oci create-image "${BASE_ID}")"
+fsck.erofs "tmp/sysroot/composefs/images/${BASE_IMAGE_FSVERITY}"
 
 mkdir -p tmp/efi/loader
 echo 'timeout 3' > tmp/efi/loader/loader.conf

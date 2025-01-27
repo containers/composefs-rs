@@ -22,6 +22,7 @@ IMAGE_ID="$(sed s/sha256:// tmp/iid)"
 podman save --format oci-archive -o tmp/final.tar "${IMAGE_ID}"
 ${CFSCTL} oci pull oci-archive:tmp/final.tar
 IMAGE_FSVERITY="$(${CFSCTL} oci create-image "${IMAGE_ID}")"
+fsck.erofs "tmp/sysroot/composefs/images/${IMAGE_FSVERITY}"
 
 mkdir -p tmp/efi/loader
 echo 'timeout 3' > tmp/efi/loader/loader.conf

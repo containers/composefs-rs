@@ -27,7 +27,7 @@ jobs:
       run: sudo tune2fs -O verity $(findmnt -vno SOURCE /)
 
     - name: Install dependencies
-      run: sudo apt-get install -y meson mtools qemu-system systemd-boot-efi
+      run: sudo apt-get install -y meson mtools qemu-system systemd-boot-efi erofs-utils
 
     - name: Get a newer podman for heredoc support (from debian testing)
       run: |

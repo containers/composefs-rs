@@ -39,6 +39,7 @@ FINAL_ID="$(sed s/sha256:// tmp/final.iid)"
 podman save --format oci-archive -o tmp/final.tar "${FINAL_ID}"
 ${CFSCTL} oci pull oci-archive:tmp/final.tar
 FINAL_IMAGE_FSVERITY="$(${CFSCTL} oci create-image "${FINAL_ID}")"
+fsck.erofs "tmp/sysroot/composefs/images/${FINAL_IMAGE_FSVERITY}"
 
 ## IMPORTANT: the filesystems of the base and final images are identical
 test "${BASE_IMAGE_FSVERITY}" = "${FINAL_IMAGE_FSVERITY}"
