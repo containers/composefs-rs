@@ -237,15 +237,16 @@ impl FilesystemReader<'_> {
 
         let (buf, stat) = FilesystemReader::stat(&fd, ifmt)?;
 
-        if let Some(leafref) = self.inodes.get(&(buf.st_dev, buf.st_ino)) {
+        // NB: We could check `st_nlink > 1` to find out if we should track a file as a potential
+        // hardlink or not, but some filesystems (like fuse-overlayfs) can report this incorrectly.
+        // Track all files.  https://github.com/containers/fuse-overlayfs/issues/435
+        let key = (buf.st_dev, buf.st_ino);
+        if let Some(leafref) = self.inodes.get(&key) {
             Ok(Rc::clone(leafref))
         } else {
             let content = self.read_leaf_content(fd, buf)?;
             let leaf = Rc::new(Leaf { stat, content });
-            if buf.st_nlink > 1 {
-                self.inodes
-                    .insert((buf.st_dev, buf.st_ino), Rc::clone(&leaf));
-            }
+            self.inodes.insert(key, Rc::clone(&leaf));
             Ok(leaf)
         }
     }
