@@ -28,6 +28,6 @@ EOF
 # This could (better?) be done from cfsctl...
 FROM base AS bootable
 COPY --from=kernel /boot /composefs-meta/boot
-# RUN rm -rf /composefs-meta
-# RUN commands touch /run unfortunately
-COPY empty /.wh.composefs-meta
+# https://github.com/containers/buildah/issues/5950
+RUN --mount=type=tmpfs,target=/run \
+    rm -rf /composefs-meta
