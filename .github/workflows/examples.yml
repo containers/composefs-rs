@@ -39,16 +39,6 @@ jobs:
         podman --version
         skopeo --version
 
-    - name: Install composefs
-      run: |
-        set -eux
-        git clone --depth=1 https://github.com/containers/composefs
-        cd composefs
-        meson setup build
-        ninja -C build
-        sudo ninja -C build install
-        sudo ldconfig
-
     - uses: actions/checkout@v4
 
     - name: Disable fix-verity hack (requires KVM)
