@@ -14,8 +14,6 @@ use rustix::{
     },
 };
 
-use crate::{fsverity, util};
-
 struct FsHandle {
     pub fd: OwnedFd,
 }
@@ -160,43 +158,5 @@ pub fn pivot_sysroot(image: impl AsFd, basedir: &Path, sysroot: &Path) -> Result
     }) {
         Ok(()) | Err(Errno::NOENT) => Ok(()),
         Err(err) => Err(err)?,
-    }
-}
-
-#[derive(Debug)]
-pub struct MountOptions<'a> {
-    image: &'a str,
-    basedir: &'a Path,
-    digest: Option<&'a str>,
-    verity: bool,
-}
-
-impl<'a> MountOptions<'a> {
-    pub fn new(image: &'a str, basedir: &'a Path) -> MountOptions<'a> {
-        MountOptions {
-            image,
-            basedir,
-            digest: None,
-            verity: false,
-        }
-    }
-
-    pub fn set_require_verity(&mut self) {
-        self.verity = true;
-    }
-
-    pub fn set_digest(&mut self, digest: &'a str) {
-        self.digest = Some(digest);
-    }
-
-    pub fn mount(self, mountpoint: &str) -> Result<()> {
-        let image = std::fs::File::open(self.image)?;
-
-        if let Some(expected) = self.digest {
-            let expected = util::parse_sha256(expected)?;
-            fsverity::ensure_verity(&image, &expected)?;
-        }
-
-        mount_fd(image, self.basedir, mountpoint)
     }
 }
