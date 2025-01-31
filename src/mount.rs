@@ -74,12 +74,13 @@ fn proc_self_fd<A: AsFd>(fd: A) -> String {
     format!("/proc/self/fd/{}", fd.as_fd().as_raw_fd())
 }
 
-pub fn composefs_fsmount(image: impl AsFd, basedir: &Path) -> Result<OwnedFd> {
+pub fn composefs_fsmount(image: impl AsFd, name: &str, basedir: &Path) -> Result<OwnedFd> {
     let erofs = FsHandle::open("erofs")?;
     fsconfig_set_string(erofs.as_fd(), "source", proc_self_fd(&image))?;
     fsconfig_create(erofs.as_fd())?;
 
     let overlayfs = FsHandle::open("overlay")?;
+    fsconfig_set_string(overlayfs.as_fd(), "source", format!("composefs:{name}"))?;
     fsconfig_set_string(overlayfs.as_fd(), "metacopy", "on")?;
     fsconfig_set_string(overlayfs.as_fd(), "redirect_dir", "on")?;
     fsconfig_set_string(overlayfs.as_fd(), "verity", "require")?;
@@ -97,8 +98,8 @@ pub fn composefs_fsmount(image: impl AsFd, basedir: &Path) -> Result<OwnedFd> {
     )?)
 }
 
-pub fn mount_fd<F: AsFd>(image: F, basedir: &Path, mountpoint: &str) -> Result<()> {
-    let mnt = composefs_fsmount(image, basedir)?;
+pub fn mount_fd<F: AsFd>(image: F, name: &str, basedir: &Path, mountpoint: &str) -> Result<()> {
+    let mnt = composefs_fsmount(image, name, basedir)?;
 
     move_mount(
         mnt.as_fd(),
@@ -111,7 +112,7 @@ pub fn mount_fd<F: AsFd>(image: F, basedir: &Path, mountpoint: &str) -> Result<(
     Ok(())
 }
 
-pub fn pivot_sysroot(image: impl AsFd, basedir: &Path, sysroot: &Path) -> Result<()> {
+pub fn pivot_sysroot(image: impl AsFd, name: &str, basedir: &Path, sysroot: &Path) -> Result<()> {
     // https://github.com/systemd/systemd/issues/35017
     let rootdev = stat("/dev/gpt-auto-root")?;
     let target = format!(
@@ -121,7 +122,7 @@ pub fn pivot_sysroot(image: impl AsFd, basedir: &Path, sysroot: &Path) -> Result
     );
     symlink(target, "/run/systemd/volatile-root")?;
 
-    let mnt = composefs_fsmount(image, basedir)?;
+    let mnt = composefs_fsmount(image, name, basedir)?;
 
     // try to move /sysroot to /sysroot/sysroot if it exists
     let prev = open_tree(CWD, sysroot, OpenTreeFlags::OPEN_TREE_CLONE)?;
