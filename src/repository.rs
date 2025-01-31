@@ -358,25 +358,27 @@ impl Repository {
         self.write_image(Some(name), &data)
     }
 
+    pub fn open_image(&self, name: &str) -> Result<OwnedFd> {
+        let image = self.openat(&format!("images/{}", name), OFlags::RDONLY)?;
+
+        if !name.contains("/") {
+            // A name with no slashes in it is taken to be a sha256 fs-verity digest
+            fsverity::ensure_verity(&image, &parse_sha256(name)?)?;
+        }
+
+        Ok(image)
+    }
+
     pub fn mount(&self, name: &str, mountpoint: &str) -> Result<()> {
-        let filename = format!("images/{}", name);
-
-        let image = if name.contains("/") {
-            // no fsverity checking on this path
-            Ok(self.openat(&filename, OFlags::RDONLY)?)
-        } else {
-            self.open_with_verity(&filename, &parse_sha256(name)?)
-        }?;
-
+        let image = self.open_image(name)?;
         let object_path = self.path.join("objects");
-        mount_fd(image, &object_path, mountpoint)
+        mount_fd(image, name, &object_path, mountpoint)
     }
 
     pub fn pivot_sysroot(&self, name: &str, mountpoint: &Path) -> Result<()> {
-        let filename = format!("images/{}", name);
+        let image = self.open_image(name)?;
         let object_path = self.path.join("objects");
-        let image = self.open_with_verity(&filename, &parse_sha256(name)?)?;
-        pivot_sysroot(image, &object_path, mountpoint)
+        pivot_sysroot(image, name, &object_path, mountpoint)
     }
 
     pub fn symlink(&self, name: impl AsRef<Path>, target: impl AsRef<Path>) -> ErrnoResult<()> {
