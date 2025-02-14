@@ -17,6 +17,15 @@ pub enum MeasureVerityError {
     InvalidDigestSize { expected: u16 },
 }
 
+/// Enabling fsverity failed.
+#[derive(Error, Debug, PartialEq)]
+pub enum EnableVerifyError {
+    #[error("Filesystem does not support fs-verity")]
+    FilesystemNotSupported,
+    #[error("{0}")]
+    Errno(#[from] rustix::io::Errno),
+}
+
 // See /usr/include/linux/fsverity.h
 #[repr(C)]
 #[derive(Debug)]
@@ -38,9 +47,9 @@ type FsIocEnableVerity = ioctl::WriteOpcode<b'f', 133, FsVerityEnableArg>;
 /// Enable fsverity on the target file. This is a thin safe wrapper for the underlying base `ioctl`
 /// and hence all constraints apply such as requiring the file descriptor to already be `O_RDONLY`
 /// etc.
-pub fn fs_ioc_enable_verity<F: AsFd, H: FsVerityHashValue>(fd: F) -> std::io::Result<()> {
+pub fn fs_ioc_enable_verity<F: AsFd, H: FsVerityHashValue>(fd: F) -> Result<(), EnableVerifyError> {
     unsafe {
-        ioctl::ioctl(
+        match ioctl::ioctl(
             fd,
             ioctl::Setter::<FsIocEnableVerity, FsVerityEnableArg>::new(FsVerityEnableArg {
                 version: 1,
@@ -53,7 +62,13 @@ pub fn fs_ioc_enable_verity<F: AsFd, H: FsVerityHashValue>(fd: F) -> std::io::Re
                 sig_ptr: 0,
                 __reserved2: [0; 11],
             }),
-        )?;
+        ) {
+            Err(rustix::io::Errno::NOTTY) | Err(rustix::io::Errno::OPNOTSUPP) => {
+                return Err(EnableVerifyError::FilesystemNotSupported)
+            }
+            Err(e) => return Err(e.into()),
+            Ok(_) => (),
+        }
     }
 
     Ok(())
@@ -118,6 +133,10 @@ pub fn fs_ioc_measure_verity<F: AsFd, H: FsVerityHashValue>(
 mod tests {
     use super::*;
     use crate::fsverity::Sha256HashValue;
+    use rustix::fd::FromRawFd;
+    use std::mem::ManuallyDrop;
+    use std::os::fd::OwnedFd;
+    use tempfile::tempfile_in;
 
     #[test]
     fn test_measure_verity_opt() -> anyhow::Result<()> {
@@ -127,5 +146,28 @@ mod tests {
             None
         );
         Ok(())
+    }
+
+    #[test_with::path(/dev/shm)]
+    #[test]
+    fn test_fs_ioc_enable_verity_wrong_fs() {
+        let file = tempfile_in("/dev/shm").unwrap();
+        let fd = OwnedFd::try_from(file).unwrap();
+        let res = fs_ioc_enable_verity::<&OwnedFd, Sha256HashValue>(&fd);
+        let err = res.err().unwrap();
+        assert_eq!(err, EnableVerifyError::FilesystemNotSupported);
+        assert_eq!(err.to_string(), "Filesystem does not support fs-verity",);
+    }
+
+    #[test]
+    fn test_fs_ioc_enable_verity_bad_fd() {
+        let fd = ManuallyDrop::new(unsafe { OwnedFd::from_raw_fd(123456) });
+        let res = fs_ioc_enable_verity::<&OwnedFd, Sha256HashValue>(&fd);
+        let err = res.err().unwrap();
+        assert_eq!(
+            err,
+            EnableVerifyError::Errno(rustix::io::Errno::from_raw_os_error(9))
+        );
+        assert_eq!(err.to_string(), "Bad file descriptor (os error 9)",);
     }
 }
