@@ -35,7 +35,7 @@ zstd = "0.13.2"
 [dev-dependencies]
 insta = "1.42.0"
 similar-asserts = "1.6.0"
-test-with = { version = "0.14", default-features = false, features = ["executable"] }
+test-with = { version = "0.14", default-features = false, features = ["executable", "runtime"] }
 
 [profile.dev.package.sha2]
 # this is *really* slow otherwise
