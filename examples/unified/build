@@ -13,10 +13,12 @@ CFSCTL='./cfsctl --repo tmp/sysroot/composefs'
 rm -rf tmp
 mkdir -p tmp/sysroot/composefs tmp/sysroot/var
 
-# mkdir tmp/internal-sysroot  # for debugging
-# podman build -v $(pwd)/tmp/internal-sysroot:/tmp/sysroot:z,U --iidfile=tmp/iid "$@" .
-#
-podman build --iidfile=tmp/iid "$@" .
+# For debugging, add --no-cache to podman command
+mkdir tmp/internal-sysroot
+podman build \
+    --iidfile=tmp/iid \
+    -v $(pwd)/tmp/internal-sysroot:/tmp/sysroot:z,U \
+    "$@" .
 
 IMAGE_ID="$(sed s/sha256:// tmp/iid)"
 podman save --format oci-archive -o tmp/final.tar "${IMAGE_ID}"
