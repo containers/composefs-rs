@@ -22,7 +22,7 @@ RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
     # we should install kernel-modules here, but can't
     # because it'll pull in the entire kernel with it
     # it seems to work fine for now....
-    dnf --setopt keepcache=1 install -y \
+    dnf --setopt keepcache=1 install --allowerasing -y \
         composefs \
         dosfstools \
         policycoreutils-python-utils \
