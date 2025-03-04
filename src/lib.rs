@@ -1,4 +1,5 @@
 #![deny(missing_debug_implementations)]
+#![allow(clippy::needless_return)]
 
 pub mod dumpfile;
 pub mod dumpfile_parse;
@@ -11,6 +12,7 @@ pub mod oci;
 pub mod repository;
 pub mod selabel;
 pub mod splitstream;
+pub mod trace;
 pub mod util;
 
 /// All files that contain 64 or fewer bytes (size <= INLINE_CONTENT_MAX) should be stored inline

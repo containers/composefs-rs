@@ -11,13 +11,15 @@ use anyhow::{bail, Context, Result};
 
 use crate::fsverity::Sha256HashValue;
 
+pub type StatXattrs = BTreeMap<Box<OsStr>, Box<[u8]>>;
+
 #[derive(Debug)]
 pub struct Stat {
     pub st_mode: u32,
     pub st_uid: u32,
     pub st_gid: u32,
     pub st_mtim_sec: i64,
-    pub xattrs: RefCell<BTreeMap<Box<OsStr>, Box<[u8]>>>,
+    pub xattrs: RefCell<StatXattrs>,
 }
 
 #[derive(Debug)]

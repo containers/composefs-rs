@@ -3,7 +3,10 @@
  * See doc/splitstream.md
  */
 
-use std::io::{BufReader, Read, Write};
+use std::{
+    fmt::Debug,
+    io::{BufReader, Read, Write},
+};
 
 use anyhow::{bail, Result};
 use sha2::{Digest, Sha256};
@@ -15,10 +18,20 @@ use crate::{
     util::read_exactish,
 };
 
-#[derive(Debug)]
 pub struct DigestMapEntry {
     pub body: Sha256HashValue,
     pub verity: Sha256HashValue,
+}
+
+impl Debug for DigestMapEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "< Body: {}, Verity: {} >",
+            hex::encode(self.body),
+            hex::encode(self.verity)
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -149,7 +162,9 @@ impl SplitStreamWriter<'_> {
             sha256.update(data);
             sha256.update(&padding);
         }
+
         let id = self.repo.ensure_object(data)?;
+
         self.write_reference(id, padding)
     }
 
@@ -176,7 +191,13 @@ pub enum SplitStreamData {
 pub struct SplitStreamReader<R: Read> {
     decoder: Decoder<'static, BufReader<R>>,
     pub refs: DigestMap,
+    /// Is non zero if we're in the process of reading internal chunks
+    /// Once we find an internal chunk, `inline_bytes` is set to the size
+    /// of the internal chunk
     inline_bytes: usize,
+    /// If this is not None, then there is some padding in the next internal
+    /// chunk that needs to be skipped
+    skip_padding: Option<usize>,
 }
 
 impl<R: Read> std::fmt::Debug for SplitStreamReader<R> {
@@ -215,6 +236,8 @@ enum ChunkType {
 }
 
 impl<R: Read> SplitStreamReader<R> {
+    /// Creates a new zstd decoder using `reader`
+    /// Reads the number of map_entries in the file, puts them in a vec
     pub fn new(reader: R) -> Result<SplitStreamReader<R>> {
         let mut decoder = Decoder::new(reader)?;
 
@@ -240,6 +263,7 @@ impl<R: Read> SplitStreamReader<R> {
             decoder,
             refs,
             inline_bytes: 0,
+            skip_padding: None,
         })
     }
 
@@ -249,22 +273,32 @@ impl<R: Read> SplitStreamReader<R> {
         ext_ok: bool,
         expected_bytes: usize,
     ) -> Result<ChunkType> {
+        // Only try to read if there are no inline bytes left to read
+        // Else we're still in the process of reading inline bytes
         if self.inline_bytes == 0 {
             match read_u64_le(&mut self.decoder)? {
                 None => {
                     if !eof_ok {
                         bail!("Unexpected EOF when parsing splitstream");
                     }
+
                     return Ok(ChunkType::Eof);
                 }
+
                 Some(0) => {
-                    if !ext_ok {
-                        bail!("Unexpected external reference when parsing splitstream");
-                    }
                     let mut id = Sha256HashValue::EMPTY;
                     self.decoder.read_exact(&mut id)?;
+
+                    if !ext_ok {
+                        bail!(
+                            "Unexpected external reference {} when parsing splitstream",
+                            hex::encode(id)
+                        );
+                    }
+
                     return Ok(ChunkType::External(id));
                 }
+
                 Some(size) => {
                     self.inline_bytes = size;
                 }
@@ -290,7 +324,7 @@ impl<R: Read> SplitStreamReader<R> {
         }
     }
 
-    fn discard_padding(&mut self, size: usize) -> Result<()> {
+    pub fn discard_padding(&mut self, size: usize) -> Result<()> {
         let mut buf = [0u8; 512];
         assert!(size <= 512);
         self.ensure_chunk(false, false, size)?;
@@ -374,20 +408,46 @@ impl<R: Read> SplitStreamReader<R> {
             None => bail!("Reference is not found in splitstream"),
         }
     }
+
+    pub fn set_padding_to_skip(&mut self, padding: usize) {
+        self.skip_padding = Some(padding);
+    }
+
+    pub fn get_tar_archive(&mut self) -> tar::Archive<&mut SplitStreamReader<R>> {
+        return tar::Archive::new(self);
+    }
 }
 
 impl<F: Read> Read for SplitStreamReader<F> {
     fn read(&mut self, data: &mut [u8]) -> std::io::Result<usize> {
-        match self.ensure_chunk(true, false, 1) {
+        // if we're extracting tar, we are okay with an external chunk
+        let ret = match self.ensure_chunk(true, true, 1) {
             Ok(ChunkType::Eof) => Ok(0),
+
             Ok(ChunkType::Inline) => {
+                if let Some(padding) = self.skip_padding {
+                    if let Err(e) = self.discard_padding(padding) {
+                        return Err(std::io::Error::new(std::io::ErrorKind::Other, e));
+                    };
+
+                    self.skip_padding = None;
+                }
+
                 let n_bytes = std::cmp::min(data.len(), self.inline_bytes);
                 self.decoder.read_exact(&mut data[0..n_bytes])?;
                 self.inline_bytes -= n_bytes;
+
                 Ok(n_bytes)
             }
-            Ok(ChunkType::External(..)) => unreachable!(),
+
+            Ok(ChunkType::External(id)) => {
+                data[..id.len()].copy_from_slice(&id);
+                Ok(id.len())
+            }
+
             Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
-        }
+        };
+
+        return ret;
     }
 }
