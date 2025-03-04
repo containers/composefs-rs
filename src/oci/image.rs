@@ -17,10 +17,11 @@ pub fn process_entry(filesystem: &mut FileSystem, entry: oci::tar::TarEntry) -> 
     let mut components = entry.path.components();
 
     let Some(Component::Normal(filename)) = components.next_back() else {
-        bail!("Empty filename")
+        bail!("Empty filename. Processing entry: {entry:#?}")
     };
 
     let mut dir = &mut filesystem.root;
+
     for component in components {
         if let Component::Normal(name) = component {
             dir = dir.recurse(name)?;
@@ -28,6 +29,7 @@ pub fn process_entry(filesystem: &mut FileSystem, entry: oci::tar::TarEntry) -> 
     }
 
     let bytes = filename.as_bytes();
+
     if let Some(whiteout) = bytes.strip_prefix(b".wh.") {
         if whiteout == b".wh.opq" {
             // complete name is '.wh..wh.opq'
@@ -38,6 +40,7 @@ pub fn process_entry(filesystem: &mut FileSystem, entry: oci::tar::TarEntry) -> 
     } else {
         match entry.item {
             oci::tar::TarItem::Directory => dir.mkdir(filename, entry.stat),
+
             oci::tar::TarItem::Leaf(content) => dir.insert(
                 filename,
                 Inode::Leaf(Rc::new(Leaf {
@@ -45,6 +48,7 @@ pub fn process_entry(filesystem: &mut FileSystem, entry: oci::tar::TarEntry) -> 
                     content,
                 })),
             ),
+
             oci::tar::TarItem::Hardlink(ref target) => {
                 // TODO: would be nice to do this inline, but borrow checker doesn't like it
                 filesystem.hardlink(&entry.path, target)?;
@@ -60,6 +64,7 @@ pub fn compose_filesystem(repo: &Repository, layers: &[String]) -> Result<FileSy
 
     for layer in layers {
         let mut split_stream = repo.open_stream(layer, None)?;
+
         while let Some(entry) = oci::tar::get_entry(&mut split_stream)? {
             process_entry(&mut filesystem, entry)?;
         }
@@ -94,6 +99,7 @@ pub fn create_image(
         let layer_verity = config_stream.lookup(&layer_sha256)?;
 
         let mut layer_stream = repo.open_stream(&hex::encode(layer_sha256), Some(layer_verity))?;
+
         while let Some(entry) = oci::tar::get_entry(&mut layer_stream)? {
             process_entry(&mut filesystem, entry)?;
         }

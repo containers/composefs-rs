@@ -291,6 +291,8 @@ impl Repository {
         Ok(object_id)
     }
 
+    /// Opens "composefs/sysroot/<name>"
+    /// If `verity` is `Some`, validates verity of the file
     pub fn open_stream(
         &self,
         name: &str,
