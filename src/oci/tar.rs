@@ -4,22 +4,36 @@ use std::{
     ffi::{OsStr, OsString},
     fmt,
     io::Read,
-    os::unix::prelude::{OsStrExt, OsStringExt},
     path::PathBuf,
 };
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{bail, Result};
 use rustix::fs::makedev;
-use tar::{EntryType, Header, PaxExtensions};
+use tar::{Entry, EntryType, Header};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::{
     dumpfile,
-    image::{LeafContent, Stat},
-    splitstream::{SplitStreamData, SplitStreamReader, SplitStreamWriter},
+    fsverity::{FsVerityHashValue, Sha256HashValue},
+    image::{LeafContent, Stat, StatXattrs},
+    splitstream::{SplitStreamReader, SplitStreamWriter},
     util::{read_exactish, read_exactish_async},
     INLINE_CONTENT_MAX,
 };
+
+// Constants related to tar archives
+const TAR_BLOCK_SIZE: usize = 512;
+const PAX_SCHILYXATTR: &str = "SCHILY.xattr.";
+
+fn stat_from_tar_header(header: &tar::Header) -> Result<Stat> {
+    Ok(Stat {
+        st_uid: header.uid()? as u32,
+        st_gid: header.gid()? as u32,
+        st_mode: header.mode()?,
+        st_mtim_sec: header.mtime()? as i64,
+        xattrs: RefCell::new(BTreeMap::new()),
+    })
+}
 
 fn read_header<R: Read>(reader: &mut R) -> Result<Option<Header>> {
     let mut header = Header::new_gnu();
@@ -99,10 +113,13 @@ pub async fn split_async(
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub enum TarItem {
+    #[default]
     Directory,
     Leaf(LeafContent),
+    /// Contains the target of the link
+    /// The actual link path should be in TarEntry.path
     Hardlink(OsString),
 }
 
@@ -125,148 +142,204 @@ impl fmt::Display for TarEntry {
     }
 }
 
-fn path_from_tar(pax: Option<Box<[u8]>>, gnu: Vec<u8>, short: &[u8]) -> PathBuf {
-    // Prepend leading /
-    let mut path = vec![b'/'];
-    if let Some(name) = pax {
-        path.extend(name);
-    } else if !gnu.is_empty() {
-        path.extend(gnu);
-    } else {
-        path.extend(short);
-    }
+fn update_xattrs<R: Read>(
+    entry: &mut Entry<'_, &mut SplitStreamReader<R>>,
+    xattrs: &mut StatXattrs,
+) -> Result<(), anyhow::Error> {
+    if let Ok(Some(ext)) = entry.pax_extensions() {
+        for e in ext {
+            let e = e?;
+            let key = e.key()?;
 
-    // Drop trailing '/' characters in case of directories.
-    // https://github.com/rust-lang/rust/issues/122741
-    // path.pop_if(|x| x == &b'/');
-    if path.last() == Some(&b'/') {
-        path.pop(); // this is Vec<u8>, so that's a single char.
-    }
+            if let Some(xattr) = key.strip_prefix(PAX_SCHILYXATTR) {
+                let value = Box::from(e.value_bytes());
+                xattrs.insert(Box::from(OsStr::new(xattr)), value);
+            }
+        }
+    };
 
-    PathBuf::from(OsString::from_vec(path))
+    Ok(())
 }
 
-fn symlink_target_from_tar(pax: Option<Box<[u8]>>, gnu: Vec<u8>, short: &[u8]) -> OsString {
-    if let Some(ref name) = pax {
-        OsString::from(OsStr::from_bytes(name))
-    } else if !gnu.is_empty() {
-        OsString::from_vec(gnu)
-    } else {
-        OsString::from(OsStr::from_bytes(short))
-    }
+fn parse_external_entry<R: Read>(
+    entry: &mut Entry<'_, &mut SplitStreamReader<R>>,
+) -> Result<(TarEntry, usize), anyhow::Error> {
+    let header = entry.header();
+    let entry_size = header.entry_size()? as usize;
+
+    let stat = stat_from_tar_header(header)?;
+
+    let stored_size = (entry_size + 511) & !511;
+
+    let padding = stored_size.saturating_sub(entry_size);
+
+    let mut id = Sha256HashValue::EMPTY;
+    entry.read_exact(&mut id)?;
+
+    let (path, item) = match entry.header().entry_type() {
+        EntryType::Regular | EntryType::Continuous => (
+            PathBuf::from("/").join(entry.path()?),
+            TarItem::Leaf(LeafContent::ExternalFile(id, entry_size as u64)),
+        ),
+
+        _ => bail!(
+            "Unsupported external-chunked entry {:?} {}",
+            entry.header(),
+            hex::encode(id)
+        ),
+    };
+
+    return Ok((TarEntry { path, item, stat }, padding));
 }
 
-pub fn get_entry<R: Read>(reader: &mut SplitStreamReader<R>) -> Result<Option<TarEntry>> {
-    let mut gnu_longlink: Vec<u8> = vec![];
-    let mut gnu_longname: Vec<u8> = vec![];
-    let mut pax_longlink: Option<Box<[u8]>> = None;
-    let mut pax_longname: Option<Box<[u8]>> = None;
-    let mut xattrs = BTreeMap::new();
+fn parse_internal_entry<R: Read>(
+    entry: &mut Entry<'_, &mut SplitStreamReader<R>>,
+) -> Result<(TarEntry, usize), anyhow::Error> {
+    let mut bytes_read = 0;
 
-    loop {
-        let mut buf = [0u8; 512];
-        if !reader.read_inline_exact(&mut buf)? || buf == [0u8; 512] {
-            return Ok(None);
+    let header = entry.header();
+    let entry_size = header.entry_size()? as usize;
+
+    let stat = stat_from_tar_header(header)?;
+
+    let (path, item) = match header.entry_type() {
+        EntryType::Regular | EntryType::Continuous => {
+            // tar will always only read however long the content length is
+            // in the header. It doesn't take into account the length of buffer
+            // so there's no point in trying to read more
+            let mut content = vec![0; entry_size];
+
+            bytes_read = entry.read(&mut content)?;
+
+            // entry.path() contains untruncated path, while entry.header.path contains
+            // path truncated to 100 bytes
+            (
+                PathBuf::from("/").join(entry.path()?),
+                TarItem::Leaf(LeafContent::InlineFile(content)),
+            )
         }
 
-        let header = tar::Header::from_byte_slice(&buf);
-        assert!(header.as_ustar().is_some());
+        EntryType::Link | EntryType::Symlink => {
+            let is_hard_link = header.entry_type() == EntryType::Link;
 
-        let size = header.entry_size()?;
-
-        let item = match reader.read_exact(size as usize, ((size + 511) & !511) as usize)? {
-            SplitStreamData::External(id) => match header.entry_type() {
-                EntryType::Regular | EntryType::Continuous => {
-                    ensure!(
-                        size as usize > INLINE_CONTENT_MAX,
-                        "Splitstream incorrectly stored a small ({size} byte) file external"
-                    );
-                    TarItem::Leaf(LeafContent::ExternalFile(id, size))
-                }
-                _ => bail!(
-                    "Unsupported external-chunked entry {:?} {}",
-                    header,
-                    hex::encode(id)
-                ),
-            },
-            SplitStreamData::Inline(content) => match header.entry_type() {
-                EntryType::GNULongLink => {
-                    gnu_longlink.extend(content);
-                    continue;
-                }
-                EntryType::GNULongName => {
-                    gnu_longname.extend(content);
-                    continue;
-                }
-                EntryType::XGlobalHeader => {
-                    todo!();
-                }
-                EntryType::XHeader => {
-                    for item in PaxExtensions::new(&content) {
-                        let extension = item?;
-                        let key = extension.key()?;
-                        let value = Box::from(extension.value_bytes());
-
-                        if key == "path" {
-                            pax_longname = Some(value);
-                        } else if key == "linkpath" {
-                            pax_longlink = Some(value);
-                        } else if let Some(xattr) = key.strip_prefix("SCHILY.xattr.") {
-                            xattrs.insert(Box::from(OsStr::new(xattr)), value);
-                        }
+            // only get absolute path for hard links, for symlinks we want relative paths
+            let link_name = match entry.link_name()? {
+                Some(l) => {
+                    if is_hard_link {
+                        PathBuf::from("/").join(l)
+                    } else {
+                        PathBuf::from(l)
                     }
-                    continue;
                 }
-                EntryType::Directory => TarItem::Directory,
-                EntryType::Regular | EntryType::Continuous => {
-                    ensure!(
-                        content.len() <= INLINE_CONTENT_MAX,
-                        "Splitstream incorrectly stored a large ({} byte) file inline",
-                        content.len()
-                    );
-                    TarItem::Leaf(LeafContent::InlineFile(content))
-                }
-                EntryType::Link => TarItem::Hardlink({
-                    let Some(link_name) = header.link_name_bytes() else {
-                        bail!("link without a name?")
-                    };
-                    OsString::from(path_from_tar(pax_longlink, gnu_longlink, &link_name))
-                }),
-                EntryType::Symlink => TarItem::Leaf(LeafContent::Symlink({
-                    let Some(link_name) = header.link_name_bytes() else {
-                        bail!("symlink without a name?")
-                    };
-                    symlink_target_from_tar(pax_longlink, gnu_longlink, &link_name)
-                })),
-                EntryType::Block => TarItem::Leaf(LeafContent::BlockDevice(
-                    match (header.device_major()?, header.device_minor()?) {
-                        (Some(major), Some(minor)) => makedev(major, minor),
-                        _ => bail!("Device entry without device numbers?"),
-                    },
-                )),
-                EntryType::Char => TarItem::Leaf(LeafContent::CharacterDevice(
-                    match (header.device_major()?, header.device_minor()?) {
-                        (Some(major), Some(minor)) => makedev(major, minor),
-                        _ => bail!("Device entry without device numbers?"),
-                    },
-                )),
-                EntryType::Fifo => TarItem::Leaf(LeafContent::Fifo),
-                _ => {
-                    todo!("Unsupported entry {:?}", header);
-                }
-            },
+
+                None => bail!("Hard link without a path?"),
+            };
+
+            let tar_item = if is_hard_link {
+                TarItem::Hardlink(link_name.into())
+            } else {
+                TarItem::Leaf(LeafContent::Symlink(link_name.into()))
+            };
+
+            (PathBuf::from("/").join(entry.path()?), tar_item)
+        }
+
+        EntryType::Fifo => (
+            PathBuf::from("/").join(entry.path()?),
+            TarItem::Leaf(LeafContent::Fifo),
+        ),
+
+        EntryType::Char | EntryType::Block => {
+            let (maj, min) = match (header.device_major()?, header.device_minor()?) {
+                (Some(major), Some(minor)) => (major, minor),
+
+                _ => bail!("Device entry without device numbers?"),
+            };
+
+            let tar_item = if header.entry_type() == EntryType::Char {
+                TarItem::Leaf(LeafContent::CharacterDevice(makedev(maj, min)))
+            } else {
+                TarItem::Leaf(LeafContent::BlockDevice(makedev(maj, min)))
+            };
+
+            (PathBuf::from("/").join(entry.path()?), tar_item)
+        }
+
+        EntryType::Directory => (PathBuf::from("/").join(entry.path()?), TarItem::Directory),
+
+        // The iterator never returns these types
+        EntryType::GNULongName
+        | EntryType::GNULongLink
+        | EntryType::XHeader
+        | EntryType::XGlobalHeader => {
+            unreachable!(
+                "tar iterator shouldn't have returned entry type: {:#?}",
+                header.entry_type()
+            )
+        }
+
+        EntryType::GNUSparse => {
+            unreachable!("OCI tar entries should not contain GNUSparse entries")
+        }
+
+        _ => todo!(),
+    };
+
+    return Ok((TarEntry { path, item, stat }, bytes_read));
+}
+
+pub fn get_entry<R: Read>(
+    splitstream_reader: &mut SplitStreamReader<R>,
+) -> Result<Option<TarEntry>> {
+    // We need to keep creating a new archive so that it reads a header for us
+    // The tar crate internally keeps track of the previous header and tries to
+    // skip the content length found in the previous header.
+    // This is a problem for external entries, as if an external entry has 10240 bytes
+    // but we only store 32 bytes + some padding; on next iteration of an entry, the tar
+    // crate will try to skip the next (10240 + 511) & !511 bytes
+    let mut archive = splitstream_reader.get_tar_archive();
+
+    let mut entries = match archive.entries() {
+        Ok(e) => e,
+        Err(_) => todo!(),
+    };
+
+    if let Some(entry) = entries.next() {
+        let mut entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                bail!("Error while reading entry: {e:?}");
+            }
         };
 
-        return Ok(Some(TarEntry {
-            path: path_from_tar(pax_longname, gnu_longname, &header.path_bytes()),
-            stat: Stat {
-                st_uid: header.uid()? as u32,
-                st_gid: header.gid()? as u32,
-                st_mode: header.mode()?,
-                st_mtim_sec: header.mtime()? as i64,
-                xattrs: RefCell::new(xattrs),
-            },
-            item,
-        }));
+        let entry_size = entry.size() as usize;
+
+        // An external ref, i.e. a SHA256 hash
+        let tar_entry = if entry_size > INLINE_CONTENT_MAX {
+            let (tar_entry, padding) = parse_external_entry(&mut entry)?;
+
+            update_xattrs(&mut entry, &mut tar_entry.stat.xattrs.borrow_mut())?;
+
+            // TODO: This is really ugly way to handle things. Need to find a better alt
+            // In the next inline chunk read, we'll need to skip this padding
+            // which is actually the padding for the external chunk
+            splitstream_reader.set_padding_to_skip(padding);
+
+            tar_entry
+        } else {
+            let (tar_entry, bytes_read) = parse_internal_entry(&mut entry)?;
+
+            update_xattrs(&mut entry, &mut tar_entry.stat.xattrs.borrow_mut())?;
+
+            if bytes_read & 511 != 0 {
+                splitstream_reader.discard_padding(TAR_BLOCK_SIZE - bytes_read)?;
+            }
+
+            tar_entry
+        };
+
+        return Ok(Some(tar_entry));
     }
+
+    Ok(None)
 }
