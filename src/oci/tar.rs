@@ -4,20 +4,19 @@ use std::{
     ffi::{OsStr, OsString},
     fmt,
     io::Read,
-    os::unix::prelude::{OsStrExt, OsStringExt},
     path::PathBuf,
 };
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{bail, Result};
 use rustix::fs::makedev;
-use tar::{Entry, EntryType, Header, PaxExtensions};
+use tar::{Entry, EntryType, Header};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::{
-    dumpfile, etrace,
+    dumpfile,
     fsverity::{FsVerityHashValue, Sha256HashValue},
     image::{LeafContent, Stat, StatXattrs},
-    splitstream::{SplitStreamData, SplitStreamReader, SplitStreamWriter},
+    splitstream::{SplitStreamReader, SplitStreamWriter},
     util::{read_exactish, read_exactish_async},
     INLINE_CONTENT_MAX,
 };
@@ -140,37 +139,6 @@ impl fmt::Display for TarEntry {
                 dumpfile::write_leaf(fmt, &self.path, &self.stat, content, 1)
             }
         }
-    }
-}
-
-fn path_from_tar(pax: Option<Box<[u8]>>, gnu: Vec<u8>, short: &[u8]) -> PathBuf {
-    // Prepend leading /
-    let mut path = vec![b'/'];
-    if let Some(name) = pax {
-        path.extend(name);
-    } else if !gnu.is_empty() {
-        path.extend(gnu);
-    } else {
-        path.extend(short);
-    }
-
-    // Drop trailing '/' characters in case of directories.
-    // https://github.com/rust-lang/rust/issues/122741
-    // path.pop_if(|x| x == &b'/');
-    if path.last() == Some(&b'/') {
-        path.pop(); // this is Vec<u8>, so that's a single char.
-    }
-
-    PathBuf::from(OsString::from_vec(path))
-}
-
-fn symlink_target_from_tar(pax: Option<Box<[u8]>>, gnu: Vec<u8>, short: &[u8]) -> OsString {
-    if let Some(ref name) = pax {
-        OsString::from(OsStr::from_bytes(name))
-    } else if !gnu.is_empty() {
-        OsString::from_vec(gnu)
-    } else {
-        OsString::from(OsStr::from_bytes(short))
     }
 }
 
@@ -376,136 +344,4 @@ pub fn get_entry<R: Read>(
     }
 
     Ok(None)
-}
-
-pub fn get_entry_old<R: Read>(reader: &mut SplitStreamReader<R>) -> Result<Option<TarEntry>> {
-    let mut gnu_longlink: Vec<u8> = vec![];
-    let mut gnu_longname: Vec<u8> = vec![];
-    let mut pax_longlink: Option<Box<[u8]>> = None;
-    let mut pax_longname: Option<Box<[u8]>> = None;
-    let mut xattrs = BTreeMap::new();
-
-    loop {
-        let mut buf = [0u8; 512];
-        if !reader.read_inline_exact(&mut buf)? || buf == [0u8; 512] {
-            return Ok(None);
-        }
-
-        let header = tar::Header::from_byte_slice(&buf);
-        assert!(header.as_ustar().is_some());
-
-        let size = header.entry_size()?;
-
-        let item = match reader.read_exact(size as usize, ((size + 511) & !511) as usize)? {
-            SplitStreamData::External(id) => match header.entry_type() {
-                EntryType::Regular | EntryType::Continuous => {
-                    ensure!(
-                        size as usize > INLINE_CONTENT_MAX,
-                        "Splitstream incorrectly stored a small ({size} byte) file external"
-                    );
-                    TarItem::Leaf(LeafContent::ExternalFile(id, size))
-                }
-                _ => bail!(
-                    "Unsupported external-chunked entry {:?} {}",
-                    header,
-                    hex::encode(id)
-                ),
-            },
-
-            SplitStreamData::Inline(content) => match header.entry_type() {
-                EntryType::GNULongLink => {
-                    gnu_longlink.extend(content);
-                    continue;
-                }
-
-                EntryType::GNULongName => {
-                    gnu_longname.extend(content);
-                    continue;
-                }
-
-                EntryType::XGlobalHeader => {
-                    todo!();
-                }
-
-                EntryType::XHeader => {
-                    for item in PaxExtensions::new(&content) {
-                        let extension = item?;
-
-                        let key = extension.key()?;
-                        let value = Box::from(extension.value_bytes());
-
-                        if key == "path" {
-                            pax_longname = Some(value);
-                        } else if key == "linkpath" {
-                            pax_longlink = Some(value);
-                        } else if let Some(xattr) = key.strip_prefix("SCHILY.xattr.") {
-                            xattrs.insert(Box::from(OsStr::new(xattr)), value);
-                        }
-                    }
-                    continue;
-                }
-
-                EntryType::Directory => TarItem::Directory,
-
-                EntryType::Regular | EntryType::Continuous => {
-                    ensure!(
-                        content.len() <= INLINE_CONTENT_MAX,
-                        "Splitstream incorrectly stored a large ({} byte) file inline",
-                        content.len()
-                    );
-
-                    TarItem::Leaf(LeafContent::InlineFile(content))
-                }
-
-                EntryType::Link => TarItem::Hardlink({
-                    let Some(link_name) = header.link_name_bytes() else {
-                        bail!("link without a name?")
-                    };
-                    OsString::from(path_from_tar(pax_longlink, gnu_longlink, &link_name))
-                }),
-
-                EntryType::Symlink => TarItem::Leaf(LeafContent::Symlink({
-                    let Some(link_name) = header.link_name_bytes() else {
-                        bail!("symlink without a name?")
-                    };
-
-                    let lname = symlink_target_from_tar(pax_longlink, gnu_longlink, &link_name);
-                    etrace!("lname = {:#?}", lname);
-
-                    lname
-                })),
-
-                EntryType::Block => TarItem::Leaf(LeafContent::BlockDevice(
-                    match (header.device_major()?, header.device_minor()?) {
-                        (Some(major), Some(minor)) => makedev(major, minor),
-                        _ => bail!("Device entry without device numbers?"),
-                    },
-                )),
-
-                EntryType::Char => TarItem::Leaf(LeafContent::CharacterDevice(
-                    match (header.device_major()?, header.device_minor()?) {
-                        (Some(major), Some(minor)) => makedev(major, minor),
-                        _ => bail!("Device entry without device numbers?"),
-                    },
-                )),
-
-                EntryType::Fifo => TarItem::Leaf(LeafContent::Fifo),
-                _ => {
-                    todo!("Unsupported entry {:?}", header);
-                }
-            },
-        };
-
-        return Ok(Some(TarEntry {
-            path: path_from_tar(pax_longname, gnu_longname, &header.path_bytes()),
-            stat: Stat {
-                st_uid: header.uid()? as u32,
-                st_gid: header.gid()? as u32,
-                st_mode: header.mode()?,
-                st_mtim_sec: header.mtime()? as i64,
-                xattrs: RefCell::new(xattrs),
-            },
-            item,
-        }));
-    }
 }
