@@ -5,7 +5,6 @@ use std::{
     io::{ErrorKind, Read, Write},
     os::fd::OwnedFd,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 use anyhow::{bail, ensure, Context, Result};
@@ -501,6 +500,21 @@ impl Repository {
         Ok(objects)
     }
 
+    pub fn objects_for_image(&self, name: &str) -> Result<HashSet<Sha256HashValue>> {
+        let filename = format!("images/{}", name);
+
+        let image = if name.contains("/") {
+            // no fsverity checking on this path
+            Ok(self.openat(&filename, OFlags::RDONLY)?)
+        } else {
+            self.open_with_verity(&filename, &parse_sha256(name)?)
+        }?;
+
+        let mut data = vec![];
+        std::fs::File::from(image).read_to_end(&mut data)?;
+        Ok(crate::erofs::reader::collect_objects(&data)?)
+    }
+
     pub fn gc(&self) -> Result<()> {
         flock(&self.repository, FlockOperation::LockExclusive)?;
 
@@ -509,29 +523,7 @@ impl Repository {
         for ref object in self.gc_category("images")? {
             println!("{} lives as an image", hex::encode(object));
             objects.insert(*object);
-
-            // composefs-info mmaps the file, so pipes aren't normally OK but we pass the
-            // underlying file directly, which works.
-            let output = Command::new("composefs-info")
-                .stdin(File::from(self.open_object(object)?))
-                .args(["objects", "/proc/self/fd/0"])
-                .output()?
-                .stdout;
-
-            if output.len() % 66 != 0 {
-                bail!("composefs-info gave invalid output (wrong size)");
-            }
-
-            for line in output.chunks_exact(66) {
-                if line[2] != b'/' || line[65] != b'\n' {
-                    bail!("composefs-info gave invalid output");
-                }
-                let mut value = Sha256HashValue::EMPTY;
-                hex::decode_to_slice(&line[0..2], &mut value[0..1])?;
-                hex::decode_to_slice(&line[3..65], &mut value[1..32])?;
-                println!("    with {}", hex::encode(value));
-                objects.insert(value);
-            }
+            objects.extend(self.objects_for_image(&hex::encode(object))?);
         }
 
         for object in self.gc_category("streams")? {
