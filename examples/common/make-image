@@ -2,7 +2,8 @@
 
 set -eux
 
+output="$1"
 fakeroot "${0%/*}/run-repart" tmp/image.raw
 "${0%/*}/fix-verity/fix-verity" tmp/image.raw
-qemu-img convert -f raw tmp/image.raw -O qcow2 image.qcow2
+qemu-img convert -f raw tmp/image.raw -O qcow2 "${output}"
 rm tmp/image.raw
