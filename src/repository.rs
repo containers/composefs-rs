@@ -546,10 +546,14 @@ impl Repository {
         }
 
         for first_byte in 0x0..=0xff {
-            let dirfd = self.openat(
+            let dirfd = match self.openat(
                 &format!("objects/{first_byte:02x}"),
                 OFlags::RDONLY | OFlags::DIRECTORY,
-            )?;
+            ) {
+                Ok(fd) => fd,
+                Err(Errno::NOENT) => continue,
+                Err(e) => Err(e)?,
+            };
             for item in Dir::new(dirfd)? {
                 let entry = item?;
                 let filename = entry.file_name();
