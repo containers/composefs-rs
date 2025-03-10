@@ -4,8 +4,11 @@ COPY extra /
 COPY cfsctl /usr/bin
 RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
     set -eux
-    dnf --setopt keepcache=1 install --allowerasing -y systemd util-linux skopeo composefs strace dosfstools kernel
+    dnf --setopt keepcache=1 install --allowerasing -y systemd util-linux skopeo composefs strace dosfstools kernel openssh-server
     systemctl enable systemd-networkd
+    /usr/libexec/openssh/sshd-keygen ed25519
+    /usr/libexec/openssh/sshd-keygen rsa
+    /usr/libexec/openssh/sshd-keygen ecdsa
     passwd -d root
     mkdir /sysroot
     mkdir /composefs-meta
