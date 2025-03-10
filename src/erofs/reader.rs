@@ -1,12 +1,15 @@
 use core::mem::size_of;
+use std::collections::{BTreeSet, HashSet};
 use std::ops::Range;
 
+use thiserror::Error;
 use zerocopy::{little_endian::U32, FromBytes, Immutable, KnownLayout};
 
 use super::format::{
     CompactInodeHeader, ComposefsHeader, DataLayout, DirectoryEntryHeader, ExtendedInodeHeader,
     InodeXAttrHeader, ModeField, Superblock, XAttrHeader,
 };
+use crate::fsverity::Sha256HashValue;
 
 pub fn round_up(n: usize, to: usize) -> usize {
     (n + to - 1) & !(to - 1)
@@ -424,6 +427,12 @@ pub struct DirectoryEntry<'a> {
     pub name: &'a [u8],
 }
 
+impl DirectoryEntry<'_> {
+    fn nid(&self) -> u64 {
+        self.header.inode_offset.get()
+    }
+}
+
 #[derive(Debug)]
 pub struct DirectoryEntries<'d> {
     block: &'d DirectoryBlock,
@@ -455,4 +464,105 @@ impl<'d> Iterator for DirectoryEntries<'d> {
             None
         }
     }
+}
+
+#[derive(Error, Debug)]
+pub enum ErofsReaderError {
+    #[error("Hardlinked directories detected")]
+    DirectoryHardlinks,
+    #[error("Maximum directory depth exceeded")]
+    DepthExceeded,
+    #[error("Invalid '.' entry in directory")]
+    InvalidSelfReference,
+    #[error("Invalid '..' entry in directory")]
+    InvalidParentReference,
+    #[error("File type in dirent doesn't match type in inode")]
+    FileTypeMismatch,
+}
+
+type ReadResult<T> = Result<T, ErofsReaderError>;
+
+#[derive(Debug)]
+pub struct ObjectCollector {
+    visited_nids: HashSet<u64>,
+    nids_to_visit: BTreeSet<u64>,
+    objects: HashSet<Sha256HashValue>,
+}
+
+impl ObjectCollector {
+    fn visit_xattr(&mut self, attr: &XAttr) {
+        // TODO: "4" is a bit magic, isn't it?
+        if attr.header.name_index != 4 {
+            return;
+        }
+        if attr.suffix() != b"overlay.metacopy" {
+            return;
+        }
+        let value = attr.value();
+        // TODO: oh look, more magic values...
+        if value.len() == 36 && value[..4] == [0, 36, 0, 1] {
+            // SAFETY: We already checked that the length is 4 + 32
+            self.objects.insert(value[4..].try_into().unwrap());
+        }
+    }
+
+    fn visit_xattrs(&mut self, img: &Image, xattrs: &InodeXAttrs) -> ReadResult<()> {
+        for id in xattrs.shared() {
+            self.visit_xattr(img.shared_xattr(id.get()));
+        }
+        for attr in xattrs.local() {
+            self.visit_xattr(attr);
+        }
+        Ok(())
+    }
+
+    fn visit_directory_block(&mut self, block: &DirectoryBlock) {
+        for entry in block.entries() {
+            if entry.name != b"." && entry.name != b".." {
+                let nid = entry.nid();
+                if !self.visited_nids.contains(&nid) {
+                    self.nids_to_visit.insert(nid);
+                }
+            }
+        }
+    }
+
+    fn visit_nid(&mut self, img: &Image, nid: u64) -> ReadResult<()> {
+        let first_time = self.visited_nids.insert(nid);
+        assert!(first_time); // should not have been added to the "to visit" list otherwise
+
+        let inode = img.inode(nid);
+
+        if let Some(xattrs) = inode.xattrs() {
+            self.visit_xattrs(img, xattrs)?;
+        }
+
+        if inode.mode().is_dir() {
+            for blkid in inode.blocks(img.sb.blkszbits) {
+                self.visit_directory_block(img.directory_block(blkid));
+            }
+
+            let tail = DirectoryBlock::ref_from_bytes(inode.inline()).unwrap();
+            self.visit_directory_block(tail);
+        }
+
+        Ok(())
+    }
+}
+
+pub fn collect_objects(image: &[u8]) -> ReadResult<HashSet<Sha256HashValue>> {
+    let img = Image::open(image);
+    let mut this = ObjectCollector {
+        visited_nids: HashSet::new(),
+        nids_to_visit: BTreeSet::new(),
+        objects: HashSet::new(),
+    };
+
+    // nids_to_visit is initialized with the root directory.  Visiting directory nids will add
+    // more nids to the "to visit" list.  Keep iterating until it's empty.
+    this.nids_to_visit.insert(img.sb.root_nid.get() as u64);
+    while let Some(nid) = this.nids_to_visit.pop_first() {
+        this.visit_nid(&img, nid)?;
+    }
+    Ok(this.objects)
 }

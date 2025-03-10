@@ -94,6 +94,9 @@ enum Command {
     CreateDumpfile {
         path: PathBuf,
     },
+    ImageObjects {
+        name: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -184,6 +187,12 @@ fn main() -> Result<()> {
         }
         Command::Mount { name, mountpoint } => {
             repo.mount(&name, &mountpoint)?;
+        }
+        Command::ImageObjects { name } => {
+            let objects = repo.objects_for_image(&name)?;
+            for object in objects {
+                println!("{}", hex::encode(object));
+            }
         }
         Command::GC => {
             repo.gc()?;
