@@ -1,0 +1,17 @@
+#!/bin/sh
+
+set -eux
+
+cd "${0%/*}/.."
+
+if [ ! -e test/bots ]; then
+    if [ -h ~/.config/cockpit-dev/bots ]; then
+        ln -sfT "$(realpath --relative-to=. ~/.config/cockpit-dev)/bots" test/bots
+    else
+        git clone https://github.com/cockpit-project/bots test/bots
+    fi
+fi
+
+EXAMPLE="$1"
+"${EXAMPLE}/build"
+test/run-tests "${EXAMPLE}/image-efi.qcow2"

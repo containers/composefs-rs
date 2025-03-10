@@ -1,0 +1,59 @@
+#!/usr/bin/python3
+
+import argparse
+import traceback
+import sys
+
+from machine import testvm
+
+def test_basic(m: testvm.Machine):
+    # root filesystem is read-only
+    m.execute('! touch /a')
+
+    # the content of /sysroot is what we expect
+    assert m.execute('ls /sysroot') == 'composefs\nlost+found\nvar\n'
+
+    # make sure /var persists across a reboot
+    m.write('/var/persists', 'hihi')
+    m.reboot()
+    assert m.execute('cat /var/persists') == 'hihi'
+    m.execute('rm /var/persists')
+
+
+def create_machine(image: str, *, verbose: bool, network: bool) -> testvm.VirtMachine:
+    networking = testvm.VirtNetwork(0, image=image).host(restrict=not network)
+    machine = testvm.VirtMachine(verbose=True, image=image, networking=networking)
+    machine.start()
+    machine.wait_boot()
+    return machine
+
+
+def sit(machine: testvm.Machine) -> None:
+    print(machine.diagnose(), file=sys.stderr)
+    print("Press RET to continue...")
+    sys.stdin.readline()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description='Run a test machine')
+    parser.add_argument('-v', '--verbose', action='store_true', help="Display verbose details")
+    parser.add_argument('-s', '--sit', action='store_true', help="Sit and wait after test failure")
+    parser.add_argument('-n', '--network', action='store_true', help="Allow external network access")
+    parser.add_argument('image', help='The image to run')
+    args = parser.parse_args()
+
+    machine = create_machine(args.image, verbose=args.verbose, network=args.network)
+    try:
+        for case in [test_basic]:
+            case(machine)
+    except Exception:
+        if args.sit:
+            traceback.print_exc(file=sys.stderr)
+            sit(machine)
+        raise
+
+    machine.kill()
+
+
+if __name__ == '__main__':
+    main()
