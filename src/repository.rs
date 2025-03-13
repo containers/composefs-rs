@@ -501,15 +501,7 @@ impl Repository {
     }
 
     pub fn objects_for_image(&self, name: &str) -> Result<HashSet<Sha256HashValue>> {
-        let filename = format!("images/{}", name);
-
-        let image = if name.contains("/") {
-            // no fsverity checking on this path
-            Ok(self.openat(&filename, OFlags::RDONLY)?)
-        } else {
-            self.open_with_verity(&filename, &parse_sha256(name)?)
-        }?;
-
+        let image = self.open_image(name)?;
         let mut data = vec![];
         std::fs::File::from(image).read_to_end(&mut data)?;
         Ok(crate::erofs::reader::collect_objects(&data)?)
