@@ -22,7 +22,7 @@ use crate::{
         self, digest::FsVerityHasher, ioctl::fs_ioc_enable_verity, FsVerityHashValue,
         Sha256HashValue,
     },
-    mount::{mount_fd, pivot_sysroot},
+    mount::mount_fd,
     splitstream::{DigestMap, SplitStreamReader, SplitStreamWriter},
     util::{parse_sha256, proc_self_fd},
 };
@@ -40,6 +40,10 @@ impl Drop for Repository {
 }
 
 impl Repository {
+    pub fn object_path(&self) -> PathBuf {
+        self.path.join("objects")
+    }
+
     pub fn open_path(path: PathBuf) -> Result<Repository> {
         // O_PATH isn't enough because flock()
         let repository = open(&path, OFlags::RDONLY, Mode::empty())
@@ -370,14 +374,7 @@ impl Repository {
 
     pub fn mount(&self, name: &str, mountpoint: &str) -> Result<()> {
         let image = self.open_image(name)?;
-        let object_path = self.path.join("objects");
-        mount_fd(image, name, &object_path, mountpoint)
-    }
-
-    pub fn pivot_sysroot(&self, name: &str, mountpoint: &Path) -> Result<()> {
-        let image = self.open_image(name)?;
-        let object_path = self.path.join("objects");
-        pivot_sysroot(image, name, &object_path, mountpoint)
+        mount_fd(image, name, &self.object_path(), mountpoint)
     }
 
     pub fn symlink(&self, name: impl AsRef<Path>, target: impl AsRef<Path>) -> ErrnoResult<()> {

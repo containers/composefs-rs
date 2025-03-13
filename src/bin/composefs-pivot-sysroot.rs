@@ -1,8 +1,14 @@
-use std::path::Path;
+use std::{os::fd::AsFd, path::Path};
 
 use anyhow::{bail, Result};
 
-use composefs::{fsverity::Sha256HashValue, repository::Repository};
+use rustix::{
+    fs::{major, minor, stat, symlink, CWD},
+    io::Errno,
+    mount::{move_mount, open_tree, unmount, MoveMountFlags, OpenTreeFlags, UnmountFlags},
+};
+
+use composefs::{fsverity::Sha256HashValue, mount::composefs_fsmount, repository::Repository};
 
 fn parse_composefs_cmdline(cmdline: &[u8]) -> Result<Sha256HashValue> {
     // TODO?: officially we need to understand quoting with double-quotes...
@@ -16,11 +22,66 @@ fn parse_composefs_cmdline(cmdline: &[u8]) -> Result<Sha256HashValue> {
     bail!("Unable to find composefs= cmdline parameter");
 }
 
+fn pivot_sysroot(image: impl AsFd, name: &str, basedir: &Path, sysroot: &Path) -> Result<()> {
+    // https://github.com/systemd/systemd/issues/35017
+    let rootdev = stat("/dev/gpt-auto-root")?;
+    let target = format!(
+        "/dev/block/{}:{}",
+        major(rootdev.st_rdev),
+        minor(rootdev.st_rdev)
+    );
+    symlink(target, "/run/systemd/volatile-root")?;
+
+    let mnt = composefs_fsmount(image, name, basedir)?;
+
+    // try to move /sysroot to /sysroot/sysroot if it exists
+    let prev = open_tree(CWD, sysroot, OpenTreeFlags::OPEN_TREE_CLONE)?;
+    unmount(sysroot, UnmountFlags::DETACH)?;
+
+    move_mount(
+        mnt.as_fd(),
+        "",
+        rustix::fs::CWD,
+        sysroot,
+        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
+    )?;
+
+    match move_mount(
+        prev.as_fd(),
+        "",
+        mnt.as_fd(),
+        "sysroot",
+        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
+    ) {
+        Ok(()) | Err(Errno::NOENT) => {}
+        Err(err) => Err(err)?,
+    }
+
+    // try to bind-mount (original) /sysroot/var to (new) /sysroot/var, if it exists
+    match open_tree(prev.as_fd(), "var", OpenTreeFlags::OPEN_TREE_CLONE).and_then(|var| {
+        move_mount(
+            var.as_fd(),
+            "",
+            mnt.as_fd(),
+            "var",
+            MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
+        )
+    }) {
+        Ok(()) | Err(Errno::NOENT) => Ok(()),
+        Err(err) => Err(err)?,
+    }
+}
+
 fn main() -> Result<()> {
     let repo = Repository::open_system()?;
     let cmdline = std::fs::read("/proc/cmdline")?;
-    let image = parse_composefs_cmdline(&cmdline)?;
-    repo.pivot_sysroot(&hex::encode(image), Path::new("/sysroot"))?;
+    let image = hex::encode(parse_composefs_cmdline(&cmdline)?);
+    pivot_sysroot(
+        repo.open_image(&image)?,
+        &image,
+        &repo.object_path(),
+        Path::new("/sysroot"),
+    )?;
 
     Ok(())
 }
