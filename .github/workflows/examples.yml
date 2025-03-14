@@ -18,8 +18,7 @@ jobs:
         example:
           - uki
           - bls
-          # https://github.com/containers/composefs-rs/issues/49
-          # - unified
+          - unified
       fail-fast: false
 
     steps:
