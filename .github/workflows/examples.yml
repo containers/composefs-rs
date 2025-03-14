@@ -33,21 +33,35 @@ jobs:
         ls -l /dev/kvm
 
     - name: Install dependencies
-      run: sudo apt-get update && sudo apt-get install -y meson mtools qemu-system systemd-boot-efi erofs-utils
-
-    - name: Get a newer podman for heredoc support (from debian testing)
       run: |
-        set -eux
-        echo 'deb [trusted=yes] https://ftp.debian.org/debian/ testing main' | sudo tee /etc/apt/sources.list.d/testing.list
+        echo 'deb-src http://azure.archive.ubuntu.com/ubuntu noble main' | sudo tee /etc/apt/sources.list.d/debsrc.list
+
+        sudo apt-get update
+        sudo apt-get install -y \
+          erofs-utils \
+          fsverity \
+          mtools \
+          libvirt-daemon \
+          libvirt-daemon-driver-qemu \
+          python3-libvirt \
+          qemu-system \
+          systemd-boot-efi
+        sudo apt-get build-dep systemd e2fsprogs
+
+    - name: Get a newer podman for heredoc support (from plucky)
+      run: |
+        echo 'deb http://azure.archive.ubuntu.com/ubuntu plucky universe main' | sudo tee /etc/apt/sources.list.d/plucky.list
         sudo apt update
-        sudo apt install -y crun/testing podman/testing skopeo/testing
-        crun --version
-        podman --version
-        skopeo --version
+        sudo apt install -y crun/plucky podman/plucky
 
     - uses: actions/checkout@v4
 
-    - name: Disable fix-verity hack (requires KVM)
-      run: printf '#!/bin/sh\n' > examples/common/fix-verity/fix-verity
+    - name: Install patched tools
+      run: |
+        mkdir ~/bin
+        examples/common/install-patched-tools ~/bin
 
-    - run: examples/${{ matrix.example }}/build
+    - name: Run example tests
+      run: |
+        export PATH="${HOME}/bin:${PATH}"
+        examples/test/run ${{ matrix.example }}
