@@ -4,6 +4,8 @@ set -eux
 
 cd "${0%/*}"
 
+../common/check-config
+
 # https://github.com/containers/buildah/issues/5656
 PODMAN_BUILD="podman build --no-cache"
 

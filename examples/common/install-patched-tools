@@ -1,0 +1,23 @@
+#!/bin/sh
+
+set -eux
+
+install_path="$1"
+
+git clone -b repart-verity https://github.com/allisonkarlitskaya/systemd
+(
+	cd systemd
+	meson setup _build
+	ninja -C _build systemd-repart
+	mkdir -p "${install_path}/src/shared"
+	cp _build/systemd-repart "${install_path}"
+	cp _build/src/shared/*.so "${install_path}/src/shared"
+)
+
+git clone -b verity https://github.com/allisonkarlitskaya/e2fsprogs
+(
+	cd e2fsprogs
+	./configure
+	make -j$(nproc)
+	cp misc/mke2fs "${install_path}/mkfs.ext4"
+)
