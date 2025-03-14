@@ -51,4 +51,4 @@ cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi tmp/efi/EFI/systemd
 cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi tmp/efi/EFI/BOOT/BOOTX64.EFI
 ${CFSCTL} oci prepare-boot "${FINAL_ID}" tmp/efi
 
-../common/make-image image.qcow2
+../common/make-image composefs-uki-efi.qcow2
