@@ -26,6 +26,13 @@ jobs:
     - name: Enable fs-verity on /
       run: sudo tune2fs -O verity $(findmnt -vno SOURCE /)
 
+    - name: Setup /dev/kvm
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm --settle
+        test -r /dev/kvm
+
     - name: Install dependencies
       run: sudo apt-get update && sudo apt-get install -y meson mtools qemu-system systemd-boot-efi erofs-utils
 
