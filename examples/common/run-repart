@@ -8,14 +8,27 @@ chcon system_u:object_r:var_t:s0 tmp/sysroot/var
 
 definitions="${0%/*}/repart.d"
 
-> tmp/image.raw
-SYSTEMD_REPART_MKFS_OPTIONS_EXT4='-O verity' \
-    systemd-repart \
-        --empty=require \
-        --size=auto \
-        --dry-run=no \
-        --no-pager \
-        --offline=yes \
-        --root=tmp \
-        --definitions="${definitions}" \
-        tmp/image.raw
+if [ "${FIX_VERITY:-}" = '1' ]; then
+    export SYSTEMD_REPART_MKFS_OPTIONS_EXT4='-O verity'
+    cp -r "${definitions}" tmp/repart.d
+    sed -i 's/:fsverity=copy//' tmp/repart.d/02-sysroot.conf
+    definitions='tmp/repart.d'
+fi
+
+# Setting TMPDIR here has a couple of advantages:
+#  - we already have our own temporary directory
+#  - systemd-repart can copy the files faster when they are in the same partition
+#  - we already know that this partition supports fs-verity (/var/tmp might not)
+TMPDIR="${PWD}/tmp" systemd-repart \
+    --empty=create \
+    --size=auto \
+    --dry-run=no \
+    --no-pager \
+    --offline=yes \
+    --root=tmp \
+    --definitions="${definitions}" \
+    "$1"
+
+if [ "${FIX_VERITY:-}" = '1' ]; then
+    "${0%/*}/fix-verity/fix-verity" "$1"
+fi

@@ -4,6 +4,8 @@ set -eux
 
 cd "${0%/*}"
 
+../common/check-config
+
 # https://github.com/containers/buildah/issues/5656
 PODMAN_BUILD="podman build --no-cache"
 
@@ -51,4 +53,4 @@ cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi tmp/efi/EFI/systemd
 cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi tmp/efi/EFI/BOOT/BOOTX64.EFI
 ${CFSCTL} oci prepare-boot "${FINAL_ID}" tmp/efi
 
-../common/make-image image.qcow2
+../common/make-image composefs-uki-efi.qcow2

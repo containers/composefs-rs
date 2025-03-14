@@ -4,6 +4,8 @@ set -eux
 
 cd "${0%/*}"
 
+../common/check-config
+
 cargo build --release
 
 cp ../../target/release/cfsctl .

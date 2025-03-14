@@ -4,6 +4,8 @@ set -eux
 
 cd "${0%/*}"
 
+../common/check-config
+
 cargo build --release
 
 cp ../../target/release/cfsctl .
@@ -33,4 +35,4 @@ cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi tmp/efi/EFI/systemd
 cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi tmp/efi/EFI/BOOT/BOOTX64.EFI
 ${CFSCTL} oci prepare-boot "${IMAGE_ID}" tmp/efi
 
-../common/make-image image.qcow2
+../common/make-image composefs-unified-efi.qcow2

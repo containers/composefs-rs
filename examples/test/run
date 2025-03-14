@@ -14,4 +14,4 @@ fi
 
 EXAMPLE="$1"
 "${EXAMPLE}/build"
-test/run-tests "${EXAMPLE}/image-efi.qcow2"
+test/run-tests "${EXAMPLE}/composefs-${EXAMPLE}-efi.qcow2"

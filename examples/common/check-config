@@ -1,0 +1,66 @@
+#!/bin/sh
+
+set -eux
+
+# This script ensures that the user's environment is sufficiently capable.
+# That means that at the very least, the current working directory needs to
+# have support for enabling fs-verity, because otherwise cfsctl will fail when
+# importing the image.  We also need the required commands.
+
+fsverity="$(which fsverity)"
+mkfs_ext4="$(which mkfs.ext4)"
+mkfs_vfat="$(which mkfs.vfat)"
+mtools="$(which mtools)"
+skopeo="$(which skopeo)"
+systemd_repart="$(which systemd-repart)"
+
+check_measure() {
+    LC_ALL=C fsverity measure $1 2>&1 | grep 'Inappropriate ioctl\|Operation not'
+}
+
+if check_measure "$0"; then
+    echo "*** Your working directory doesn't seem to support fs-verity"
+    echo "*** Please use btrfs or ext4 with the -O verity flag enabled."
+    exit 1
+fi
+
+# We can build images containing fs-verity files only with a suitably capable
+# version of systemd-repart and mkfs.ext4.  Otherwise, we need to run a fix-up
+# after the fact.  Check for strings only present in the "capable" versions.
+#   - https://github.com/systemd/systemd/pull/35401
+#   - https://github.com/tytso/e2fsprogs/pull/203
+#
+# Note also a bug in systemd that can cause it to silently build broken images
+# if /var/tmp doesn't support fs-verity:
+#   - https://github.com/systemd/systemd/issues/36717
+# so we want to check explicitly that our /var/tmp is capable.
+#
+# See ./install-patched-tools for a script to get the required versions
+#
+# All the tests past this point can be skipped if we're doing after-the-fact
+# verity fixups using the fix-verity script.
+if [ "${FIX_VERITY:-}" = "1" ]; then
+    exit 0
+fi
+
+if ! grep -sq 'fsverity=' "${systemd_repart}"; then
+    echo "*** Your systemd-repart doesn't seem to have fs-verity support"
+    echo "*** See the install-patched-tools script, or set FIX_VERITY=1..."
+    exit 1
+fi
+
+if ! grep -sq 'fs-verity support' "${mkfs_ext4}"; then
+    echo "*** Your mkfs.ext4 doesn't seem to have fs-verity support"
+    echo "*** See the install-patched-tools script, or set FIX_VERITY=1..."
+    exit 1
+fi
+
+check_metadata() {
+    LC_ALL=C fsverity dump_metadata descriptor $1 2>&1 | grep 'Inappropriate ioctl\|Operation not'
+}
+
+if check_metadata "$0"; then
+    echo "*** Your working directory doesn't seem to support FS_IOC_READ_VERITY_METADATA"
+    echo "*** You're probably using btrfs on an older kernel version.  Try FIX_VERITY=1..."
+    exit 1
+fi
