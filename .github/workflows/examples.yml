@@ -16,9 +16,11 @@ jobs:
     strategy:
       matrix:
         example:
-          - uki
-          - bls
-          - unified
+          - { dir: 'uki', file: 'Containerfile' }
+          - { dir: 'uki', file: 'Containerfile.arch' }
+          - { dir: 'bls', file: 'Containerfile' }
+          - { dir: 'bls', file: 'Containerfile.ubuntu' }
+          - { dir: 'unified', file: 'Containerfile' }
       fail-fast: false
 
     steps:
@@ -64,4 +66,4 @@ jobs:
     - name: Run example tests
       run: |
         export PATH="${HOME}/bin:${PATH}"
-        examples/test/run ${{ matrix.example }}
+        examples/test/run ${{ matrix.example.dir }} -f ${{ matrix.example.file }}
