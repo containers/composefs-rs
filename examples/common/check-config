@@ -8,6 +8,7 @@ set -eux
 # importing the image.  We also need the required commands.
 
 fsverity="$(which fsverity)"
+mkfs_erofs="$(which mkfs.erofs)"
 mkfs_ext4="$(which mkfs.ext4)"
 mkfs_vfat="$(which mkfs.vfat)"
 mtools="$(which mtools)"
