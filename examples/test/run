@@ -6,7 +6,7 @@ cd "${0%/*}/.."
 
 if [ ! -e test/bots ]; then
     if [ -h ~/.config/cockpit-dev/bots ]; then
-        ln -sfT "$(realpath --relative-to=. ~/.config/cockpit-dev)/bots" test/bots
+        ln -sfT "$(realpath --relative-to=test ~/.config/cockpit-dev)/bots" test/bots
     else
         git clone https://github.com/cockpit-project/bots test/bots
     fi
