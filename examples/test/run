@@ -13,5 +13,7 @@ if [ ! -e test/bots ]; then
 fi
 
 EXAMPLE="$1"
-"${EXAMPLE}/build"
+shift
+
+"${EXAMPLE}/build" "$@"
 test/run-tests "${EXAMPLE}/composefs-${EXAMPLE}-efi.qcow2"
