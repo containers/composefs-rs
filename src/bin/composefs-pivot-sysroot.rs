@@ -1,4 +1,8 @@
-use std::{os::fd::AsFd, path::Path};
+use std::env;
+use std::{
+    os::fd::AsFd,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{bail, Result};
 
@@ -78,15 +82,14 @@ fn pivot_sysroot(image: impl AsFd, name: &str, basedir: &Path, sysroot: &Path) -
 }
 
 fn main() -> Result<()> {
-    let repo = Repository::open_system()?;
+    let root = match env::args().nth(1) {
+        Some(path) => PathBuf::from(path),
+        None => PathBuf::from("/sysroot"),
+    };
+    let repo = Repository::open_path(root.join("composefs"))?;
     let cmdline = std::fs::read("/proc/cmdline")?;
     let image = hex::encode(parse_composefs_cmdline(&cmdline)?);
-    pivot_sysroot(
-        repo.open_image(&image)?,
-        &image,
-        &repo.object_path(),
-        Path::new("/sysroot"),
-    )?;
+    pivot_sysroot(repo.open_image(&image)?, &image, &repo.object_path(), &root)?;
 
     Ok(())
 }
