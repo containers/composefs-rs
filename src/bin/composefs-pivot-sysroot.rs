@@ -22,7 +22,7 @@ fn parse_composefs_cmdline(cmdline: &[u8]) -> Result<Sha256HashValue> {
     bail!("Unable to find composefs= cmdline parameter");
 }
 
-fn pivot_sysroot(image: impl AsFd, name: &str, basedir: &Path, sysroot: &Path) -> Result<()> {
+fn gpt_workaround() -> Result<()> {
     // https://github.com/systemd/systemd/issues/35017
     let rootdev = stat("/dev/gpt-auto-root")?;
     let target = format!(
@@ -31,6 +31,11 @@ fn pivot_sysroot(image: impl AsFd, name: &str, basedir: &Path, sysroot: &Path) -
         minor(rootdev.st_rdev)
     );
     symlink(target, "/run/systemd/volatile-root")?;
+    Ok(())
+}
+
+fn pivot_sysroot(image: impl AsFd, name: &str, basedir: &Path, sysroot: &Path) -> Result<()> {
+    let _ = gpt_workaround(); // best effort
 
     let mnt = composefs_fsmount(image, name, basedir)?;
 
