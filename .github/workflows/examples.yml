@@ -19,6 +19,7 @@ jobs:
           - { dir: 'uki', file: 'Containerfile' }
           - { dir: 'uki', file: 'Containerfile.arch' }
           - { dir: 'bls', file: 'Containerfile' }
+          - { dir: 'bls', file: 'Containerfile.arch' }
           - { dir: 'bls', file: 'Containerfile.ubuntu' }
           - { dir: 'unified', file: 'Containerfile' }
       fail-fast: false
