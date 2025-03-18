@@ -1,0 +1,15 @@
+#!/usr/bin/ash
+# SPDX-License-Identifier: GPL-2.0-only
+
+run_latehook() {
+    local composefs
+
+    composefs="$(getarg composefs)"
+    if [ -z "$composefs" ]; then
+        return 0
+    fi
+
+    /usr/bin/composefs-pivot-sysroot /new_root
+}
+
+# vim: set ft=sh ts=4 sw=4 et:
