@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+
+build() {
+    add_binary "/usr/lib/dracut/modules.d/37composefs/composefs-pivot-sysroot" "/usr/bin/composefs-pivot-sysroot"
+    add_runscript
+}

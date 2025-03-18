@@ -4,13 +4,14 @@ COPY cfsctl /usr/bin
 RUN <<EOF
     set -eux
     touch /etc/machine-id
-    pacman -Sy --noconfirm skopeo composefs strace dosfstools dracut btrfs-progs
-    curl -O https://pkgbuild.com/~jelle/linux-mainline-6.12rc6-1-x86_64.pkg.tar.zst
-    pacman -U --noconfirm linux-mainline-6.12rc6-1-x86_64.pkg.tar.zst
-    systemctl enable systemd-networkd systemd-resolved
+    echo 'root=/dev/vda2' > /etc/kernel/cmdline
+    pacman -Syu --noconfirm
+    pacman -Sy --noconfirm skopeo composefs strace dosfstools linux mkinitcpio btrfs-progs openssh
+    systemctl enable systemd-networkd systemd-resolved sshd
+    ssh-keygen -A
     passwd -d root
     mkdir /sysroot
-    kernel-install add 6.12.0-rc6-1-mainline /usr/lib/modules/6.12.0-rc6-1-mainline/vmlinuz
+    kernel-install add "$(ls /usr/lib/modules)" /usr/lib/modules/"$(ls /usr/lib/modules)"/vmlinuz
     mkdir /composefs-meta
     mv /boot /composefs-meta
     mkdir /boot
