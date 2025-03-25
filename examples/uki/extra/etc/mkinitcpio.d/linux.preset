@@ -1,0 +1,10 @@
+ALL_kver="/boot/vmlinuz-linux"
+
+MODULES=(ext4 overlay erofs)
+BINARIES=(fsck.ext4 strace)
+HOOKS=(base udev composefs autodetect microcode modconf kms keyboard keymap consolefont block filesystems fsck)
+
+PRESETS=('default')
+
+default_uki="/boot/EFI/Linux/arch-linux.efi"
+default_options="--splash=/usr/share/systemd/bootctl/splash-arch.bmp"
