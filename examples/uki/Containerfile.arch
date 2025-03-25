@@ -4,8 +4,9 @@ COPY cfsctl /usr/bin
 RUN <<EOF
     set -eux
     touch /etc/machine-id
+    mkdir -p boot/EFI/Linux
     pacman -Syu --noconfirm
-    pacman -Sy --noconfirm skopeo composefs strace dosfstools openssh
+    pacman -Sy --noconfirm skopeo composefs strace dosfstools openssh linux
     systemctl enable systemd-networkd systemd-resolved sshd
     ssh-keygen -A
     passwd -d root
@@ -17,10 +18,9 @@ ARG COMPOSEFS_FSVERITY
 RUN <<EOF
     set -eux
     # systemd-boot-unsigned: ditto
-    # btrfs-progs: dracut wants to include this in the initramfs
-    # ukify: dracut doesn't want to take our cmdline args?
-    pacman -Sy --noconfirm linux dracut btrfs-progs systemd-ukify
-    dracut --kver "$(ls /usr/lib/modules)" --uefi --kernel-cmdline="console=ttyS0,115200 composefs=${COMPOSEFS_FSVERITY} rw"
+    echo "root=/dev/vda2 console=ttyS0,115200 composefs=${COMPOSEFS_FSVERITY} rw" > /etc/kernel/cmdline
+    pacman -Sy --noconfirm systemd-ukify
+    mkinitcpio -p linux
 EOF
 
 # This could (better?) be done from cfsctl...

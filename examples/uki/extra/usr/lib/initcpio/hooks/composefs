@@ -1,0 +1,12 @@
+#!/usr/bin/ash
+
+run_latehook() {
+    local composefs
+
+    composefs="$(getarg composefs)"
+    if [ -z "$composefs" ]; then
+        return 0
+    fi
+
+    /usr/bin/composefs-pivot-sysroot /new_root
+}
