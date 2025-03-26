@@ -42,7 +42,7 @@ pub struct FsVerityEnableArg {
 }
 
 // #define FS_IOC_ENABLE_VERITY    _IOW('f', 133, struct fsverity_enable_arg)
-type FsIocEnableVerity = ioctl::WriteOpcode<b'f', 133, FsVerityEnableArg>;
+const FS_IOC_ENABLE_VERITY: u32 = ioctl::opcode::write::<FsVerityEnableArg>(b'f', 133);
 
 /// Enable fsverity on the target file. This is a thin safe wrapper for the underlying base `ioctl`
 /// and hence all constraints apply such as requiring the file descriptor to already be `O_RDONLY`
@@ -51,7 +51,7 @@ pub fn fs_ioc_enable_verity<F: AsFd, H: FsVerityHashValue>(fd: F) -> Result<(), 
     unsafe {
         match ioctl::ioctl(
             fd,
-            ioctl::Setter::<FsIocEnableVerity, FsVerityEnableArg>::new(FsVerityEnableArg {
+            ioctl::Setter::<{ FS_IOC_ENABLE_VERITY }, FsVerityEnableArg>::new(FsVerityEnableArg {
                 version: 1,
                 hash_algorithm: H::ALGORITHM as u32,
                 block_size: 4096,
@@ -84,7 +84,7 @@ pub struct FsVerityDigest<F> {
 }
 
 // #define FS_IOC_MEASURE_VERITY   _IORW('f', 134, struct fsverity_digest)
-type FsIocMeasureVerity = ioctl::ReadWriteOpcode<b'f', 134, FsVerityDigest<()>>;
+const FS_IOC_MEASURE_VERITY: u32 = ioctl::opcode::read_write::<FsVerityDigest<()>>(b'f', 134);
 
 /// Measure the fsverity digest of the provided file descriptor.
 pub fn fs_ioc_measure_verity<F: AsFd, H: FsVerityHashValue>(
@@ -102,7 +102,7 @@ pub fn fs_ioc_measure_verity<F: AsFd, H: FsVerityHashValue>(
     let r = unsafe {
         ioctl::ioctl(
             fd,
-            ioctl::Updater::<FsIocMeasureVerity, FsVerityDigest<H>>::new(&mut digest),
+            ioctl::Updater::<{ FS_IOC_MEASURE_VERITY }, FsVerityDigest<H>>::new(&mut digest),
         )
     };
     match r {

@@ -18,7 +18,7 @@ use rustix::{
         fstat, getxattr, linkat, listxattr, mkdirat, mknodat, openat, readlinkat, symlinkat,
         AtFlags, Dir, FileType, Mode, OFlags, CWD,
     },
-    io::{read_uninit, Errno},
+    io::{read, Errno},
 };
 use zerocopy::IntoBytes;
 
@@ -93,7 +93,7 @@ fn write_leaf(leaf: &Leaf, dirfd: &OwnedFd, name: &OsStr, repo: &Repository) -> 
             let object = repo.open_object(id)?;
             // TODO: make this better.  At least needs to be EINTR-safe.  Could even do reflink in some cases...
             let mut buffer = vec![MaybeUninit::uninit(); size as usize];
-            let (data, _) = read_uninit(object, &mut buffer)?;
+            let (data, _) = read(object, &mut buffer)?;
             set_file_contents(dirfd, name, &leaf.stat, data)?;
         }
         LeafContent::BlockDevice(rdev) => mknodat(dirfd, name, FileType::BlockDevice, mode, rdev)?,
@@ -134,38 +134,24 @@ pub struct FilesystemReader<'repo> {
 
 impl FilesystemReader<'_> {
     fn read_xattrs(fd: &OwnedFd) -> Result<BTreeMap<Box<OsStr>, Box<[u8]>>> {
-        // flistxattr() and fgetxattr() don't with with O_PATH fds, so go via /proc/self/fd. Note:
-        // we want the symlink-following version of this call, which produces the correct behaviour
-        // even when trying to read xattrs from symlinks themselves.  See
+        // flistxattr() and fgetxattr() don't work with with O_PATH fds, so go via /proc/self/fd.
+        // Note: we want the symlink-following version of this call, which produces the correct
+        // behaviour even when trying to read xattrs from symlinks themselves.  See
         // https://gist.github.com/allisonkarlitskaya/7a80f2ebb3314d80f45c653a1ba0e398
         let filename = proc_self_fd(fd);
 
         let mut xattrs = BTreeMap::new();
 
-        let names_size = listxattr(&filename, &mut [])?;
-        // See https://github.com/bytecodealliance/rustix/pull/1061#issuecomment-2518467534
-        // Basically current rustix 0.38 sometimes may expose the element type as a signed
-        // or unsigned variant, depending on the version of linux-raw-sys and rustix feature
-        // flags.
-        let mut names = vec![0; names_size];
-        let actual_names_size = listxattr(&filename, &mut names)?;
+        let mut names = [MaybeUninit::new(0); 65536];
+        let (names, _) = listxattr(&filename, &mut names)?;
 
-        // Can be less than the expected size on overlayfs because of
-        // https://github.com/containers/composefs-rs/issues/41
-        ensure!(
-            actual_names_size <= names.len(),
-            "xattrs changed during read"
-        );
-        names.truncate(actual_names_size);
-
-        let mut buffer = [0; 65536];
         for name in names.split_inclusive(|c| *c == 0) {
+            let mut buffer = [MaybeUninit::new(0); 65536];
             let name: &[u8] = name.as_bytes();
             let name = CStr::from_bytes_with_nul(name)?;
-            let value_size = getxattr(&filename, name, &mut buffer)?;
+            let (value, _) = getxattr(&filename, name, &mut buffer)?;
             let key = Box::from(OsStr::from_bytes(name.to_bytes()));
-            let value = Box::from(&buffer[..value_size]);
-            xattrs.insert(key, value);
+            xattrs.insert(key, Box::from(value));
         }
 
         Ok(xattrs)
@@ -197,7 +183,7 @@ impl FilesystemReader<'_> {
             FileType::Directory | FileType::Unknown => unreachable!(),
             FileType::RegularFile => {
                 let mut buffer = vec![MaybeUninit::uninit(); buf.st_size as usize];
-                let (data, _) = read_uninit(fd, &mut buffer)?;
+                let (data, _) = read(fd, &mut buffer)?;
 
                 if buf.st_size > INLINE_CONTENT_MAX as i64 {
                     let id = if let Some(repo) = self.repo {
