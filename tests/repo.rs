@@ -1,6 +1,7 @@
 use std::{fmt::Write, fs::create_dir_all, io::Read, path::PathBuf};
 
 use anyhow::{Context, Result};
+use rustix::fs::CWD;
 use sha2::{Digest, Sha256};
 
 use composefs::{oci, repository::Repository};
@@ -45,7 +46,7 @@ fn test_layer() -> Result<()> {
     let layer_id: [u8; 32] = context.finalize().into();
 
     let tmpfile = tempfile::TempDir::with_prefix_in("composefs-test-", test_global_tmpdir()?)?;
-    let repo = Repository::open_path(tmpfile.path().to_path_buf())?;
+    let repo = Repository::open_path(CWD, tmpfile.path().to_path_buf())?;
     let id = oci::import_layer(&repo, &layer_id, Some("name"), &mut layer.as_slice())?;
 
     let mut dump = String::new();
