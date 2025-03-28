@@ -13,8 +13,7 @@
 #    arg will be set to the fsverity digest of the container image.  This should
 #    be baked into the UKI.
 
-# Need 6.12 kernel from rawhide
-FROM fedora:rawhide AS base
+FROM fedora:42 AS base
 COPY extra /
 COPY cfsctl /usr/bin
 RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
