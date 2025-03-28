@@ -1,5 +1,4 @@
-# Need 6.12 kernel from rawhide
-FROM fedora:rawhide
+FROM fedora:42
 COPY extra /
 COPY cfsctl /usr/bin
 RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
