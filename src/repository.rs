@@ -3,7 +3,7 @@ use std::{
     ffi::CStr,
     fs::File,
     io::{ErrorKind, Read, Write},
-    os::fd::OwnedFd,
+    os::fd::{AsFd, OwnedFd},
     path::{Path, PathBuf},
 };
 
@@ -43,13 +43,13 @@ impl Repository {
         self.openat("objects", OFlags::PATH)
     }
 
-    pub fn open_path(path: PathBuf) -> Result<Repository> {
+    pub fn open_path(dirfd: impl AsFd, path: impl AsRef<Path>) -> Result<Repository> {
         // O_PATH isn't enough because flock()
-        let repository = open(&path, OFlags::RDONLY, Mode::empty())
-            .with_context(|| format!("Cannot open composefs repository {path:?}"))?;
+        let repository = openat(dirfd, path.as_ref(), OFlags::RDONLY, Mode::empty())
+            .context("Cannot open composefs repository")?;
 
         flock(&repository, FlockOperation::LockShared)
-            .with_context(|| format!("Cannot lock repository {path:?}"))?;
+            .context("Cannot lock composefs repository")?;
 
         Ok(Repository { repository })
     }
@@ -57,11 +57,11 @@ impl Repository {
     pub fn open_user() -> Result<Repository> {
         let home = std::env::var("HOME").with_context(|| "$HOME must be set when in user mode")?;
 
-        Repository::open_path(PathBuf::from(home).join(".var/lib/composefs"))
+        Repository::open_path(CWD, PathBuf::from(home).join(".var/lib/composefs"))
     }
 
     pub fn open_system() -> Result<Repository> {
-        Repository::open_path(PathBuf::from("/sysroot/composefs".to_string()))
+        Repository::open_path(CWD, PathBuf::from("/sysroot/composefs".to_string()))
     }
 
     fn ensure_dir(&self, dir: impl AsRef<Path>) -> ErrnoResult<()> {

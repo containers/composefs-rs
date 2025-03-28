@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use rustix::fs::CWD;
+
 use composefs::{oci, repository::Repository, util::parse_sha256};
 
 /// cfsctl
@@ -105,7 +107,7 @@ fn main() -> Result<()> {
     let args = App::parse();
 
     let repo = (if let Some(path) = args.repo {
-        Repository::open_path(path)
+        Repository::open_path(CWD, path)
     } else if args.system {
         Repository::open_system()
     } else if args.user {

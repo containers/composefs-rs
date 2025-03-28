@@ -86,7 +86,7 @@ fn main() -> Result<()> {
         Some(path) => PathBuf::from(path),
         None => PathBuf::from("/sysroot"),
     };
-    let repo = Repository::open_path(root.join("composefs"))?;
+    let repo = Repository::open_path(CWD, root.join("composefs"))?;
     let cmdline = std::fs::read("/proc/cmdline")?;
     let image = hex::encode(parse_composefs_cmdline(&cmdline)?);
     pivot_sysroot(repo.open_image(&image)?, &image, repo.object_dir()?, &root)?;
