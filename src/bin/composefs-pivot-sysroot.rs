@@ -38,7 +38,7 @@ fn gpt_workaround() -> Result<()> {
     Ok(())
 }
 
-fn pivot_sysroot(image: impl AsFd, name: &str, basedir: &Path, sysroot: &Path) -> Result<()> {
+fn pivot_sysroot(image: impl AsFd, name: &str, basedir: impl AsFd, sysroot: &Path) -> Result<()> {
     let _ = gpt_workaround(); // best effort
 
     let mnt = composefs_fsmount(image, name, basedir)?;
@@ -89,7 +89,7 @@ fn main() -> Result<()> {
     let repo = Repository::open_path(root.join("composefs"))?;
     let cmdline = std::fs::read("/proc/cmdline")?;
     let image = hex::encode(parse_composefs_cmdline(&cmdline)?);
-    pivot_sysroot(repo.open_image(&image)?, &image, &repo.object_path(), &root)?;
+    pivot_sysroot(repo.open_image(&image)?, &image, repo.object_dir()?, &root)?;
 
     Ok(())
 }
