@@ -1,13 +1,15 @@
 use std::{
     fs::canonicalize,
     os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
-    path::Path,
 };
 
 use anyhow::Result;
-use rustix::mount::{
-    fsconfig_create, fsconfig_set_string, fsmount, fsopen, move_mount, unmount, FsMountFlags,
-    FsOpenFlags, MountAttrFlags, MoveMountFlags, UnmountFlags,
+use rustix::{
+    fs::{open, openat, Mode, OFlags},
+    mount::{
+        fsconfig_create, fsconfig_set_fd, fsconfig_set_string, fsmount, fsopen, move_mount,
+        unmount, FsMountFlags, FsOpenFlags, MountAttrFlags, MoveMountFlags, UnmountFlags,
+    },
 };
 
 struct FsHandle {
@@ -42,13 +44,21 @@ impl Drop for FsHandle {
 }
 
 struct TmpMount {
-    pub dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
+    fd: OwnedFd,
 }
 
+// Required before Linux 6.15: it's not possible to use floating mounts with OPEN_TREE_CLONE or
+// overlayfs.  Convert them into a non-floating form by mounting them on a temporary directory and
+// reopening them as an O_PATH fd.
 impl TmpMount {
-    pub fn mount(fs: BorrowedFd) -> Result<TmpMount> {
+    pub fn fsmount(fs_fd: BorrowedFd) -> Result<impl AsFd> {
         let tmp = tempfile::TempDir::new()?;
-        let mnt = fsmount(fs, FsMountFlags::FSMOUNT_CLOEXEC, MountAttrFlags::empty())?;
+        let mnt = fsmount(
+            fs_fd,
+            FsMountFlags::FSMOUNT_CLOEXEC,
+            MountAttrFlags::empty(),
+        )?;
         move_mount(
             mnt.as_fd(),
             "",
@@ -56,7 +66,14 @@ impl TmpMount {
             tmp.path(),
             MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
         )?;
-        Ok(TmpMount { dir: tmp })
+        let fd = open(tmp.path(), OFlags::PATH, Mode::empty())?;
+        Ok(TmpMount { dir: tmp, fd })
+    }
+}
+
+impl AsFd for TmpMount {
+    fn as_fd(&self) -> BorrowedFd {
+        self.fd.as_fd()
     }
 }
 
@@ -66,25 +83,29 @@ impl Drop for TmpMount {
     }
 }
 
+// Required before Linux 6.15: it's not possible to use O_PATH fds
+fn fsconfig_set_opath_fd(fs_fd: BorrowedFd, key: &str, fd: BorrowedFd) -> Result<()> {
+    let fd = openat(fd, ".", OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())?;
+    Ok(fsconfig_set_fd(fs_fd, key, fd.as_fd())?)
+}
+
 fn proc_self_fd<A: AsFd>(fd: A) -> String {
     format!("/proc/self/fd/{}", fd.as_fd().as_raw_fd())
 }
 
-pub fn composefs_fsmount(image: impl AsFd, name: &str, basedir: &Path) -> Result<OwnedFd> {
+pub fn composefs_fsmount(image: impl AsFd, name: &str, basedir: impl AsFd) -> Result<OwnedFd> {
     let erofs = FsHandle::open("erofs")?;
     fsconfig_set_string(erofs.as_fd(), "source", proc_self_fd(&image))?;
     fsconfig_create(erofs.as_fd())?;
+    let erofs_mnt = TmpMount::fsmount(erofs.as_fd())?;
 
     let overlayfs = FsHandle::open("overlay")?;
     fsconfig_set_string(overlayfs.as_fd(), "source", format!("composefs:{name}"))?;
     fsconfig_set_string(overlayfs.as_fd(), "metacopy", "on")?;
     fsconfig_set_string(overlayfs.as_fd(), "redirect_dir", "on")?;
     fsconfig_set_string(overlayfs.as_fd(), "verity", "require")?;
-
-    // unfortunately we can't do this via the fd: we need a tmpdir mountpoint
-    let tmp = TmpMount::mount(erofs.as_fd())?; // NB: must live until the "create" operation
-    fsconfig_set_string(overlayfs.as_fd(), "lowerdir+", tmp.dir.path())?;
-    fsconfig_set_string(overlayfs.as_fd(), "datadir+", basedir)?;
+    fsconfig_set_opath_fd(overlayfs.as_fd(), "lowerdir+", erofs_mnt.as_fd())?;
+    fsconfig_set_opath_fd(overlayfs.as_fd(), "datadir+", basedir.as_fd())?;
     fsconfig_create(overlayfs.as_fd())?;
 
     Ok(fsmount(
@@ -94,7 +115,7 @@ pub fn composefs_fsmount(image: impl AsFd, name: &str, basedir: &Path) -> Result
     )?)
 }
 
-pub fn mount_fd<F: AsFd>(image: F, name: &str, basedir: &Path, mountpoint: &str) -> Result<()> {
+pub fn mount_fd(image: impl AsFd, name: &str, basedir: impl AsFd, mountpoint: &str) -> Result<()> {
     let mnt = composefs_fsmount(image, name, basedir)?;
 
     move_mount(

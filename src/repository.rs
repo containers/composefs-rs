@@ -30,7 +30,6 @@ use crate::{
 #[derive(Debug)]
 pub struct Repository {
     repository: OwnedFd,
-    path: PathBuf,
 }
 
 impl Drop for Repository {
@@ -40,8 +39,8 @@ impl Drop for Repository {
 }
 
 impl Repository {
-    pub fn object_path(&self) -> PathBuf {
-        self.path.join("objects")
+    pub fn object_dir(&self) -> ErrnoResult<OwnedFd> {
+        self.openat("objects", OFlags::PATH)
     }
 
     pub fn open_path(path: PathBuf) -> Result<Repository> {
@@ -52,7 +51,7 @@ impl Repository {
         flock(&repository, FlockOperation::LockShared)
             .with_context(|| format!("Cannot lock repository {path:?}"))?;
 
-        Ok(Repository { repository, path })
+        Ok(Repository { repository })
     }
 
     pub fn open_user() -> Result<Repository> {
@@ -374,7 +373,7 @@ impl Repository {
 
     pub fn mount(&self, name: &str, mountpoint: &str) -> Result<()> {
         let image = self.open_image(name)?;
-        mount_fd(image, name, &self.object_path(), mountpoint)
+        mount_fd(image, name, &self.object_dir()?, mountpoint)
     }
 
     pub fn symlink(&self, name: impl AsRef<Path>, target: impl AsRef<Path>) -> ErrnoResult<()> {
