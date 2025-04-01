@@ -8,7 +8,6 @@ RUN <<EOF
     pacman -Syu --noconfirm
     pacman -Sy --noconfirm skopeo composefs strace dosfstools linux mkinitcpio btrfs-progs openssh
     systemctl enable systemd-networkd systemd-resolved sshd
-    ssh-keygen -A
     passwd -d root
     mkdir /sysroot
     kernel-install add "$(ls /usr/lib/modules)" /usr/lib/modules/"$(ls /usr/lib/modules)"/vmlinuz

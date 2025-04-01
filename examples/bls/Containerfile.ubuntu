@@ -17,7 +17,6 @@ RUN <<EOF
      -I "/usr/lib/systemd/systemd-sysroot-fstab-check" \
      --kver $(ls /usr/lib/modules)   --force
     systemctl enable systemd-networkd systemd-resolved
-    ssh-keygen -A
     passwd -d root
     kernel-install add $(cd /usr/lib/modules && echo *) /boot/vmlinuz-$(cd /usr/lib/modules && echo *)
     apt clean
