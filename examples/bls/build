@@ -2,9 +2,26 @@
 
 set -eux
 
+os="${1:-fedora}"
 cd "${0%/*}"
 
 ../common/check-config
+
+case "${os}" in
+    fedora)
+        containerfile='Containerfile'
+        ;;
+    arch)
+        containerfile='Containerfile.arch'
+        ;;
+    ubuntu)
+        containerfile='Containerfile.ubuntu'
+        ;;
+    *)
+        echo "*** unknown variant ${os}"
+        false
+        ;;
+esac
 
 # https://github.com/containers/buildah/issues/5656
 PODMAN_BUILD="podman build --no-cache"
@@ -20,7 +37,7 @@ mkdir -p tmp/sysroot/composefs tmp/sysroot/var
 
 ${PODMAN_BUILD} \
     --iidfile=tmp/base.iid \
-    "$@" \
+    -f "${containerfile}" \
     .
 
 BASE_ID="$(sed s/sha256:// tmp/base.iid)"
@@ -46,4 +63,4 @@ else
 fi
 sed -i 's@ /boot/@ /@' "${BLE}"
 
-../common/make-image composefs-bls-efi.qcow2
+../common/make-image "${os}-bls-efi.qcow2"

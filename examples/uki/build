@@ -2,9 +2,23 @@
 
 set -eux
 
+os="${1:-fedora}"
 cd "${0%/*}"
 
 ../common/check-config
+
+case "${os}" in
+    fedora)
+        containerfile='Containerfile'
+        ;;
+    arch)
+        containerfile='Containerfile.arch'
+        ;;
+    *)
+        echo "*** unknown variant ${os}"
+        false
+        ;;
+esac
 
 # https://github.com/containers/buildah/issues/5656
 PODMAN_BUILD="podman build --no-cache"
@@ -21,7 +35,7 @@ mkdir -p tmp/sysroot/composefs tmp/sysroot/var
 ${PODMAN_BUILD} \
     --iidfile=tmp/base.iid \
     --target=base \
-    "$@" \
+    -f "${containerfile}" \
     .
 
 BASE_ID="$(sed s/sha256:// tmp/base.iid)"
@@ -34,7 +48,7 @@ ${PODMAN_BUILD} \
     --build-context=base="container-image://${BASE_ID}" \
     --build-arg=COMPOSEFS_FSVERITY="${BASE_IMAGE_FSVERITY}" \
     --label=containers.composefs.fsverity="${BASE_IMAGE_FSVERITY}" \
-    "$@" \
+    -f "${containerfile}" \
     .
 
 FINAL_ID="$(sed s/sha256:// tmp/final.iid)"
@@ -53,4 +67,4 @@ cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi tmp/efi/EFI/systemd
 cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi tmp/efi/EFI/BOOT/BOOTX64.EFI
 ${CFSCTL} oci prepare-boot "${FINAL_ID}" tmp/efi
 
-../common/make-image composefs-uki-efi.qcow2
+../common/make-image "${os}-uki-efi.qcow2"

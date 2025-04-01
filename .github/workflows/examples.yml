@@ -16,12 +16,12 @@ jobs:
     strategy:
       matrix:
         example:
-          - { dir: 'uki', file: 'Containerfile' }
-          - { dir: 'uki', file: 'Containerfile.arch' }
-          - { dir: 'bls', file: 'Containerfile' }
-          - { dir: 'bls', file: 'Containerfile.arch' }
-          - { dir: 'bls', file: 'Containerfile.ubuntu' }
-          - { dir: 'unified', file: 'Containerfile' }
+          - { dir: 'bls', os: 'arch' }
+          - { dir: 'bls', os: 'fedora' }
+          - { dir: 'bls', os: 'ubuntu' }
+          - { dir: 'uki', os: 'arch' }
+          - { dir: 'uki', os: 'fedora' }
+          - { dir: 'unified', os: 'fedora' }
       fail-fast: false
 
     steps:
@@ -67,4 +67,4 @@ jobs:
     - name: Run example tests
       run: |
         export PATH="${HOME}/bin:${PATH}"
-        examples/test/run ${{ matrix.example.dir }} -f ${{ matrix.example.file }}
+        examples/test/run ${{ matrix.example.dir }} ${{ matrix.example.os }}
