@@ -1,6 +1,6 @@
 /*/VARS_CUSTOM.secboot.fd*
 /*/cfsctl
-/*/extra/usr/lib/dracut/modules.d/37composefs/composefs-pivot-sysroot
+/*/extra/usr/lib/dracut/modules.d/37composefs/composefs-setup-root
 /*/*.qcow2
 /*/secureboot
 /*/tmp/

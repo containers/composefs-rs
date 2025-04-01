@@ -11,13 +11,16 @@ def test_basic(m: testvm.Machine):
     m.execute('! touch /a')
 
     # the content of /sysroot is what we expect
-    assert m.execute('ls /sysroot') == 'composefs\nlost+found\nvar\n'
+    assert m.execute('ls /sysroot') == 'composefs\nlost+found\nstate\n'
 
-    # make sure /var persists across a reboot
-    m.write('/var/persists', 'hihi')
+    # make sure /etc and /var persist across a reboot
+    m.write('/etc/persists.conf', 'hihi conf')
+    m.write('/var/persists.db', 'hihi db')
     m.reboot()
-    assert m.execute('cat /var/persists') == 'hihi'
-    m.execute('rm /var/persists')
+    assert m.execute('cat /etc/persists.conf') == 'hihi conf'
+    m.execute('rm /etc/persists.conf')
+    assert m.execute('cat /var/persists.db') == 'hihi db'
+    m.execute('rm /var/persists.db')
 
 
 def create_machine(image: str, *, verbose: bool, network: bool) -> testvm.VirtMachine:

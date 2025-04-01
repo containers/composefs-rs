@@ -10,11 +10,13 @@ depends() {
 
 install() {
     inst \
-        "${moddir}/composefs-pivot-sysroot" /bin/composefs-pivot-sysroot
+        "/usr/bin/strace" /bin/strace
     inst \
-        "${moddir}/composefs-pivot-sysroot.service" \
-        "${systemdsystemunitdir}/composefs-pivot-sysroot.service"
+        "${moddir}/composefs-setup-root" /bin/composefs-setup-root
+    inst \
+        "${moddir}/composefs-setup-root.service" \
+        "${systemdsystemunitdir}/composefs-setup-root.service"
 
     $SYSTEMCTL -q --root "${initdir}" add-wants \
-        'initrd-root-fs.target' 'composefs-pivot-sysroot.service'
+        'initrd-root-fs.target' 'composefs-setup-root.service'
 }

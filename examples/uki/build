@@ -26,11 +26,11 @@ PODMAN_BUILD="podman build --no-cache"
 cargo build --release
 
 cp ../../target/release/cfsctl .
-cp ../../target/release/composefs-pivot-sysroot extra/usr/lib/dracut/modules.d/37composefs/
+cp ../../target/release/composefs-setup-root extra/usr/lib/dracut/modules.d/37composefs/
 CFSCTL='./cfsctl --repo tmp/sysroot/composefs'
 
 rm -rf tmp
-mkdir -p tmp/sysroot/composefs tmp/sysroot/var
+mkdir -p tmp/sysroot/composefs
 
 ${PODMAN_BUILD} \
     --iidfile=tmp/base.iid \
@@ -59,6 +59,10 @@ fsck.erofs "tmp/sysroot/composefs/images/${FINAL_IMAGE_FSVERITY}"
 
 ## IMPORTANT: the filesystems of the base and final images are identical
 test "${BASE_IMAGE_FSVERITY}" = "${FINAL_IMAGE_FSVERITY}"
+
+mkdir -p "tmp/sysroot/state/${BASE_IMAGE_FSVERITY}/etc/work"
+mkdir -p "tmp/sysroot/state/${BASE_IMAGE_FSVERITY}/etc/upper"
+mkdir -p "tmp/sysroot/state/${BASE_IMAGE_FSVERITY}/var"
 
 mkdir -p tmp/efi/loader
 echo 'timeout 3' > tmp/efi/loader/loader.conf

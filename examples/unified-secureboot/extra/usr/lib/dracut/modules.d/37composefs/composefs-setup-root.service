@@ -27,7 +27,7 @@ OnFailureJobMode=isolate
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/composefs-pivot-sysroot
+ExecStart=/usr/bin/composefs-setup-root
 StandardInput=null
 StandardOutput=journal
 StandardError=journal+console
