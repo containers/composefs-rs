@@ -28,11 +28,13 @@ log = "0.4.27"
 oci-spec = "0.7.1"
 regex-automata = { version = "0.4.9", default-features = false }
 rustix = { version = "1.0.3", features = ["fs", "mount", "process"] }
+serde = "1.0.219"
 sha2 = "0.10.8"
 tar = { version = "0.4.44", default-features = false }
 tempfile = "3.19.1"
 thiserror = "2.0.12"
 tokio = "1.44.1"
+toml = "0.8.20"
 xxhash-rust = { version = "0.8.15", features = ["xxh32"] }
 zerocopy = { version = "0.8.24", features = ["derive"] }
 zstd = "0.13.3"
