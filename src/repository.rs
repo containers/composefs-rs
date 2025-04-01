@@ -22,7 +22,7 @@ use crate::{
         self, digest::FsVerityHasher, ioctl::fs_ioc_enable_verity, FsVerityHashValue,
         Sha256HashValue,
     },
-    mount::mount_fd,
+    mount::mount_composefs_at,
     splitstream::{DigestMap, SplitStreamReader, SplitStreamWriter},
     util::{parse_sha256, proc_self_fd},
 };
@@ -376,7 +376,12 @@ impl Repository {
 
     pub fn mount(&self, name: &str, mountpoint: &str) -> Result<()> {
         let image = self.open_image(name)?;
-        mount_fd(image, name, &self.object_dir()?, mountpoint)
+        Ok(mount_composefs_at(
+            image,
+            name,
+            &self.object_dir()?,
+            mountpoint,
+        )?)
     }
 
     pub fn symlink(&self, name: impl AsRef<Path>, target: impl AsRef<Path>) -> ErrnoResult<()> {

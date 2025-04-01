@@ -1,18 +1,26 @@
 use std::{
     fs::canonicalize,
-    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
+    io::Result,
+    os::fd::{AsFd, BorrowedFd, OwnedFd},
+    path::Path,
 };
 
-use anyhow::Result;
 use rustix::{
-    fs::{open, openat, Mode, OFlags},
+    fs::CWD,
     mount::{
-        fsconfig_create, fsconfig_set_fd, fsconfig_set_string, fsmount, fsopen, move_mount,
-        unmount, FsMountFlags, FsOpenFlags, MountAttrFlags, MoveMountFlags, UnmountFlags,
+        fsconfig_create, fsconfig_set_flag, fsconfig_set_string, fsmount, fsopen, move_mount,
+        FsMountFlags, FsOpenFlags, MountAttrFlags, MoveMountFlags,
     },
+    path,
 };
 
-struct FsHandle {
+use crate::{
+    mountcompat::{make_erofs_mountable, overlayfs_set_lower_and_data_fds, prepare_mount},
+    util::proc_self_fd,
+};
+
+#[derive(Debug)]
+pub struct FsHandle {
     pub fd: OwnedFd,
 }
 
@@ -43,69 +51,42 @@ impl Drop for FsHandle {
     }
 }
 
-struct TmpMount {
-    dir: tempfile::TempDir,
-    fd: OwnedFd,
+pub fn mount_at(
+    fs_fd: impl AsFd,
+    dirfd: impl AsFd,
+    path: impl path::Arg,
+) -> rustix::io::Result<()> {
+    move_mount(
+        fs_fd.as_fd(),
+        "",
+        dirfd.as_fd(),
+        path,
+        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
+    )
 }
 
-// Required before Linux 6.15: it's not possible to use floating mounts with OPEN_TREE_CLONE or
-// overlayfs.  Convert them into a non-floating form by mounting them on a temporary directory and
-// reopening them as an O_PATH fd.
-impl TmpMount {
-    pub fn fsmount(fs_fd: BorrowedFd) -> Result<impl AsFd> {
-        let tmp = tempfile::TempDir::new()?;
-        let mnt = fsmount(
-            fs_fd,
-            FsMountFlags::FSMOUNT_CLOEXEC,
-            MountAttrFlags::empty(),
-        )?;
-        move_mount(
-            mnt.as_fd(),
-            "",
-            rustix::fs::CWD,
-            tmp.path(),
-            MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
-        )?;
-        let fd = open(tmp.path(), OFlags::PATH, Mode::empty())?;
-        Ok(TmpMount { dir: tmp, fd })
-    }
-}
-
-impl AsFd for TmpMount {
-    fn as_fd(&self) -> BorrowedFd {
-        self.fd.as_fd()
-    }
-}
-
-impl Drop for TmpMount {
-    fn drop(&mut self) {
-        unmount(self.dir.path(), UnmountFlags::DETACH).expect("umount(MNT_DETACH) failed");
-    }
-}
-
-// Required before Linux 6.15: it's not possible to use O_PATH fds
-fn fsconfig_set_opath_fd(fs_fd: BorrowedFd, key: &str, fd: BorrowedFd) -> Result<()> {
-    let fd = openat(fd, ".", OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())?;
-    Ok(fsconfig_set_fd(fs_fd, key, fd.as_fd())?)
-}
-
-fn proc_self_fd<A: AsFd>(fd: A) -> String {
-    format!("/proc/self/fd/{}", fd.as_fd().as_raw_fd())
-}
-
-pub fn composefs_fsmount(image: impl AsFd, name: &str, basedir: impl AsFd) -> Result<OwnedFd> {
+pub fn erofs_mount(image: OwnedFd) -> Result<OwnedFd> {
+    let image = make_erofs_mountable(image)?;
     let erofs = FsHandle::open("erofs")?;
+    fsconfig_set_flag(erofs.as_fd(), "ro")?;
     fsconfig_set_string(erofs.as_fd(), "source", proc_self_fd(&image))?;
     fsconfig_create(erofs.as_fd())?;
-    let erofs_mnt = TmpMount::fsmount(erofs.as_fd())?;
+    Ok(fsmount(
+        erofs.as_fd(),
+        FsMountFlags::FSMOUNT_CLOEXEC,
+        MountAttrFlags::empty(),
+    )?)
+}
+
+pub fn composefs_fsmount(image: OwnedFd, name: &str, basedir: impl AsFd) -> Result<OwnedFd> {
+    let erofs_mnt = prepare_mount(erofs_mount(image)?)?;
 
     let overlayfs = FsHandle::open("overlay")?;
     fsconfig_set_string(overlayfs.as_fd(), "source", format!("composefs:{name}"))?;
     fsconfig_set_string(overlayfs.as_fd(), "metacopy", "on")?;
     fsconfig_set_string(overlayfs.as_fd(), "redirect_dir", "on")?;
     fsconfig_set_string(overlayfs.as_fd(), "verity", "require")?;
-    fsconfig_set_opath_fd(overlayfs.as_fd(), "lowerdir+", erofs_mnt.as_fd())?;
-    fsconfig_set_opath_fd(overlayfs.as_fd(), "datadir+", basedir.as_fd())?;
+    overlayfs_set_lower_and_data_fds(&overlayfs, &erofs_mnt, Some(&basedir))?;
     fsconfig_create(overlayfs.as_fd())?;
 
     Ok(fsmount(
@@ -115,16 +96,12 @@ pub fn composefs_fsmount(image: impl AsFd, name: &str, basedir: impl AsFd) -> Re
     )?)
 }
 
-pub fn mount_fd(image: impl AsFd, name: &str, basedir: impl AsFd, mountpoint: &str) -> Result<()> {
+pub fn mount_composefs_at(
+    image: OwnedFd,
+    name: &str,
+    basedir: impl AsFd,
+    mountpoint: impl AsRef<Path>,
+) -> Result<()> {
     let mnt = composefs_fsmount(image, name, basedir)?;
-
-    move_mount(
-        mnt.as_fd(),
-        "",
-        rustix::fs::CWD,
-        canonicalize(mountpoint)?,
-        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
-    )?;
-
-    Ok(())
+    Ok(mount_at(mnt, CWD, &canonicalize(mountpoint)?)?)
 }

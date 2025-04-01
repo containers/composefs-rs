@@ -7,6 +7,7 @@ pub mod fs;
 pub mod fsverity;
 pub mod image;
 pub mod mount;
+pub mod mountcompat;
 pub mod oci;
 pub mod repository;
 pub mod selabel;
