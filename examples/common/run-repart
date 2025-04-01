@@ -4,7 +4,8 @@ set -eux
 
 chown -R 0:0 tmp/sysroot
 chcon -R system_u:object_r:usr_t:s0 tmp/sysroot/composefs
-chcon system_u:object_r:var_t:s0 tmp/sysroot/var
+chcon system_u:object_r:var_t:s0 tmp/sysroot/state/*/var
+chcon system_u:object_r:etc_t:s0 tmp/sysroot/state/*/etc/*
 
 definitions="${0%/*}/repart.d"
 

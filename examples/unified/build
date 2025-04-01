@@ -15,11 +15,11 @@ fi
 cargo build --release
 
 cp ../../target/release/cfsctl .
-cp ../../target/release/composefs-pivot-sysroot extra/usr/lib/dracut/modules.d/37composefs/
+cp ../../target/release/composefs-setup-root extra/usr/lib/dracut/modules.d/37composefs/
 CFSCTL='./cfsctl --repo tmp/sysroot/composefs'
 
 rm -rf tmp
-mkdir -p tmp/sysroot/composefs tmp/sysroot/var
+mkdir -p tmp/sysroot/composefs
 
 # For debugging, add --no-cache to podman command
 mkdir tmp/internal-sysroot
@@ -33,6 +33,10 @@ podman save --format oci-archive -o tmp/final.tar "${IMAGE_ID}"
 ${CFSCTL} oci pull oci-archive:tmp/final.tar
 IMAGE_FSVERITY="$(${CFSCTL} oci create-image "${IMAGE_ID}")"
 fsck.erofs "tmp/sysroot/composefs/images/${IMAGE_FSVERITY}"
+
+mkdir -p "tmp/sysroot/state/${IMAGE_FSVERITY}/etc/work"
+mkdir -p "tmp/sysroot/state/${IMAGE_FSVERITY}/etc/upper"
+mkdir -p "tmp/sysroot/state/${IMAGE_FSVERITY}/var"
 
 mkdir -p tmp/efi/loader
 echo 'timeout 3' > tmp/efi/loader/loader.conf

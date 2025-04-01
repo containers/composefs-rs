@@ -8,5 +8,5 @@ run_latehook() {
         return 0
     fi
 
-    /usr/bin/composefs-pivot-sysroot /new_root
+    /usr/bin/composefs-setup-root --sysroot /new_root
 }
