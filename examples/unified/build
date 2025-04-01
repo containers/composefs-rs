@@ -2,9 +2,15 @@
 
 set -eux
 
+os="${1:-fedora}"
 cd "${0%/*}"
 
 ../common/check-config
+
+if [ "${os}" != 'fedora' ]; then
+    echo '*** only fedora is supported'
+    false
+fi
 
 cargo build --release
 
@@ -20,7 +26,7 @@ mkdir tmp/internal-sysroot
 podman build \
     --iidfile=tmp/iid \
     -v $(pwd)/tmp/internal-sysroot:/tmp/sysroot:z,U \
-    "$@" .
+    .
 
 IMAGE_ID="$(sed s/sha256:// tmp/iid)"
 podman save --format oci-archive -o tmp/final.tar "${IMAGE_ID}"
@@ -35,4 +41,4 @@ cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi tmp/efi/EFI/systemd
 cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi tmp/efi/EFI/BOOT/BOOTX64.EFI
 ${CFSCTL} oci prepare-boot "${IMAGE_ID}" tmp/efi
 
-../common/make-image composefs-unified-efi.qcow2
+../common/make-image fedora-unified-efi.qcow2
