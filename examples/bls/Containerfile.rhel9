@@ -1,0 +1,19 @@
+# FROM docker.io/redhat/ubi9  missing: dosfstools, kernel
+FROM quay.io/centos/centos:9
+COPY extra /
+COPY cfsctl /usr/bin
+RUN --mount=type=cache,target=/var/cache/dnf <<EOF
+    set -eux
+    mkdir -p /etc/kernel
+    touch /etc/kernel/cmdline
+    echo layout=bls | tee /etc/kernel/install.conf
+    dnf --setopt keepcache=1 install --allowerasing -y \
+        systemd util-linux skopeo composefs strace dosfstools kernel openssh-server passwd NetworkManager
+    systemctl enable tmp.mount
+    passwd -d root
+    mkdir /sysroot
+    mkdir /composefs-meta
+    mv /boot /composefs-meta
+    mkdir /boot
+EOF
+RUN true  # hack to get an extra layer
