@@ -1,6 +1,6 @@
 use std::env;
 use std::{
-    os::fd::AsFd,
+    os::fd::{OwnedFd, AsFd},
     path::{Path, PathBuf},
 };
 
@@ -38,7 +38,7 @@ fn gpt_workaround() -> Result<()> {
     Ok(())
 }
 
-fn pivot_sysroot(image: impl AsFd, name: &str, basedir: impl AsFd, sysroot: &Path) -> Result<()> {
+fn pivot_sysroot(image: OwnedFd, name: &str, basedir: impl AsFd, sysroot: &Path) -> Result<()> {
     let _ = gpt_workaround(); // best effort
 
     let mnt = composefs_fsmount(image, name, basedir)?;
