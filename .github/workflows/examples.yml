@@ -22,6 +22,7 @@ jobs:
           - { dir: 'uki', os: 'arch' }
           - { dir: 'uki', os: 'fedora' }
           - { dir: 'unified', os: 'fedora' }
+          - { dir: 'unified-secureboot', os: 'fedora' }
       fail-fast: false
 
     steps:
