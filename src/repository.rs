@@ -40,7 +40,10 @@ impl Drop for Repository {
 
 impl Repository {
     pub fn object_dir(&self) -> ErrnoResult<OwnedFd> {
-        self.openat("objects", OFlags::PATH)
+        self.openat(
+            "objects",
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        )
     }
 
     pub fn open_path(dirfd: impl AsFd, path: impl AsRef<Path>) -> Result<Repository> {
