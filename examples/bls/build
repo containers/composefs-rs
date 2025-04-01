@@ -16,11 +16,17 @@ case "${os}" in
         containerfile='Containerfile.arch'
         features='--features=pre-6.15'
         ;;
+    rhel9)
+        containerfile='Containerfile.rhel9'
+        features='--features=rhel9'
         ;;
     ubuntu)
         containerfile='Containerfile.ubuntu'
         features='--features=pre-6.15'
         ;;
+    rawhide)
+        containerfile='Containerfile.rawhide'
+        features='--no-default-features'
         ;;
     *)
         echo "*** unknown variant ${os}"
