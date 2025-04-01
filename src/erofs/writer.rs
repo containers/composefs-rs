@@ -332,12 +332,13 @@ impl Inode<'_> {
         if matches!(layout, format::DataLayout::FlatInline) {
             let inode_and_xattr_size = size_of::<format::ExtendedInodeHeader>() + xattr_size;
             let inline_start = output.len() + inode_and_xattr_size;
+            let end_of_metadata = inline_start - 1;
             let inline_end = inline_start + (size as usize % format::BLOCK_SIZE);
-            if inline_start / format::BLOCK_SIZE != inline_end / format::BLOCK_SIZE {
+            if end_of_metadata / format::BLOCK_SIZE != inline_end / format::BLOCK_SIZE {
                 // If we proceed, then we'll violate the rule about crossing block boundaries.
                 // The easiest thing to do is to add padding so that the inline data starts close
                 // to the start of a fresh block boundary, while ensuring inode alignment.
-                let pad = vec![0; 4096 - inline_start % 4096];
+                let pad = vec![0; 4096 - end_of_metadata % 4096];
                 debug!("added pad {}", pad.len());
                 output.write(&pad);
                 output.pad(32);
