@@ -8,7 +8,6 @@ RUN <<EOF
     pacman -Syu --noconfirm
     pacman -Sy --noconfirm skopeo composefs strace dosfstools openssh linux
     systemctl enable systemd-networkd systemd-resolved sshd
-    ssh-keygen -A
     passwd -d root
     mkdir /sysroot
 EOF

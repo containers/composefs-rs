@@ -18,9 +18,6 @@ RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
         systemd \
         util-linux
     systemctl enable systemd-networkd
-    /usr/libexec/openssh/sshd-keygen ed25519
-    /usr/libexec/openssh/sshd-keygen rsa
-    /usr/libexec/openssh/sshd-keygen ecdsa
     semanage permissive -a systemd_gpt_generator_t  # for volatile-root workaround
     passwd -d root
     mkdir /sysroot
