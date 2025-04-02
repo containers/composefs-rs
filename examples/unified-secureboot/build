@@ -41,7 +41,7 @@ fi
 mkdir tmp/internal-sysroot
 podman build \
     --iidfile=tmp/iid \
-    -v $(pwd)/tmp/internal-sysroot:/tmp/sysroot:z,U \
+    -v "${PWD}/tmp/internal-sysroot:/tmp/sysroot:z,U" \
     --secret=id=key,src=secureboot/db.key \
     --secret=id=cert,src=secureboot/db.crt \
     .

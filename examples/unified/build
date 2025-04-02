@@ -25,7 +25,7 @@ mkdir -p tmp/sysroot/composefs
 mkdir tmp/internal-sysroot
 podman build \
     --iidfile=tmp/iid \
-    -v $(pwd)/tmp/internal-sysroot:/tmp/sysroot:z,U \
+    -v "${PWD}/tmp/internal-sysroot:/tmp/sysroot:z,U" \
     .
 
 IMAGE_ID="$(sed s/sha256:// tmp/iid)"
