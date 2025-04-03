@@ -4,10 +4,10 @@ pub mod tar;
 use std::{collections::HashMap, io::Read, iter::zip, path::Path};
 
 use anyhow::{bail, ensure, Context, Result};
-use async_compression::tokio::bufread::GzipDecoder;
+use async_compression::tokio::bufread::{GzipDecoder, ZstdDecoder};
 use containers_image_proxy::{ImageProxy, ImageProxyConfig, OpenedImage};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use oci_spec::image::{Descriptor, ImageConfiguration, ImageManifest};
+use oci_spec::image::{Descriptor, ImageConfiguration, ImageManifest, MediaType};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -101,9 +101,20 @@ impl<'repo> ImageOp<'repo> {
             let progress = bar.wrap_async_read(blob_reader);
             self.progress
                 .println(format!("Fetching layer {}", hex::encode(layer_sha256)))?;
-            let decoder = GzipDecoder::new(progress);
+
             let mut splitstream = self.repo.create_stream(Some(*layer_sha256), None);
-            split_async(decoder, &mut splitstream).await?;
+            match descriptor.media_type() {
+                MediaType::ImageLayer => {
+                    split_async(progress, &mut splitstream).await?;
+                }
+                MediaType::ImageLayerGzip => {
+                    split_async(GzipDecoder::new(progress), &mut splitstream).await?;
+                }
+                MediaType::ImageLayerZstd => {
+                    split_async(ZstdDecoder::new(progress), &mut splitstream).await?;
+                }
+                other => bail!("Unsupported layer media type {:?}", other),
+            };
             let layer_id = self.repo.write_stream(splitstream, None)?;
             driver.await?;
             Ok(layer_id)
