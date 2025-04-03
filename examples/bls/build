@@ -34,9 +34,6 @@ case "${os}" in
         ;;
 esac
 
-# https://github.com/containers/buildah/issues/5656
-PODMAN_BUILD="podman build --no-cache"
-
 cargo build --release "${features}"
 
 cp ../../target/release/cfsctl .
@@ -46,7 +43,7 @@ CFSCTL='./cfsctl --repo tmp/sysroot/composefs'
 rm -rf tmp
 mkdir -p tmp/sysroot/composefs
 
-${PODMAN_BUILD} \
+podman build \
     --iidfile=tmp/base.iid \
     -f "${containerfile}" \
     .
