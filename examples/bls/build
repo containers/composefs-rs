@@ -49,8 +49,7 @@ podman build \
     .
 
 BASE_ID="$(sed s/sha256:// tmp/base.iid)"
-podman save --format oci-archive -o tmp/base.tar "${BASE_ID}"
-${CFSCTL} oci pull oci-archive:tmp/base.tar
+${CFSCTL} oci pull containers-storage:${BASE_ID}
 BASE_IMAGE_FSVERITY="$(${CFSCTL} oci create-image "${BASE_ID}")"
 fsck.erofs "tmp/sysroot/composefs/images/${BASE_IMAGE_FSVERITY}"
 
