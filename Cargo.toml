@@ -18,7 +18,7 @@ rhel9 = ['pre-6.15']
 
 [dependencies]
 anyhow = { version = "1.0.97", default-features = false }
-async-compression = { version = "0.4.22", default-features = false, features = ["tokio", "gzip"] }
+async-compression = { version = "0.4.22", default-features = false, features = ["tokio", "zstd", "gzip"] }
 clap = { version = "4.5.32", default-features = false, features = ["std", "help", "usage", "derive"] }
 containers-image-proxy = "0.7.0"
 env_logger = "0.11.7"
