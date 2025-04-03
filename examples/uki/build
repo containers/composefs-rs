@@ -41,8 +41,7 @@ ${PODMAN_BUILD} \
     .
 
 BASE_ID="$(sed s/sha256:// tmp/base.iid)"
-podman save --format oci-archive -o tmp/base.tar "${BASE_ID}"
-${CFSCTL} oci pull oci-archive:tmp/base.tar
+${CFSCTL} oci pull containers-storage:"${BASE_ID}"
 BASE_IMAGE_FSVERITY="$(${CFSCTL} oci create-image "${BASE_ID}")"
 
 ${PODMAN_BUILD} \
@@ -54,8 +53,7 @@ ${PODMAN_BUILD} \
     .
 
 FINAL_ID="$(sed s/sha256:// tmp/final.iid)"
-podman save --format oci-archive -o tmp/final.tar "${FINAL_ID}"
-${CFSCTL} oci pull oci-archive:tmp/final.tar
+${CFSCTL} oci pull containers-storage:"${FINAL_ID}"
 FINAL_IMAGE_FSVERITY="$(${CFSCTL} oci create-image "${FINAL_ID}")"
 fsck.erofs "tmp/sysroot/composefs/images/${FINAL_IMAGE_FSVERITY}"
 
