@@ -1,3 +1,5 @@
+use std::process::Command;
+
 pub mod image;
 pub mod tar;
 
@@ -63,7 +65,17 @@ type ContentAndVerity = (Sha256HashValue, Sha256HashValue);
 
 impl<'repo> ImageOp<'repo> {
     async fn new(repo: &'repo Repository, imgref: &str) -> Result<Self> {
+        // See https://github.com/containers/skopeo/issues/2563
+        let skopeo_cmd = if imgref.starts_with("containers-storage:") {
+            let mut cmd = Command::new("podman");
+            cmd.args(["unshare", "skopeo"]);
+            Some(cmd)
+        } else {
+            None
+        };
+
         let config = ImageProxyConfig {
+            skopeo_cmd,
             // auth_anonymous: true, debug: true, insecure_skip_tls_verification: Some(true),
             ..ImageProxyConfig::default()
         };
