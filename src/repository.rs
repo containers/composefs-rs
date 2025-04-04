@@ -47,9 +47,11 @@ impl Repository {
     }
 
     pub fn open_path(dirfd: impl AsFd, path: impl AsRef<Path>) -> Result<Repository> {
+        let path = path.as_ref();
+
         // O_PATH isn't enough because flock()
-        let repository = openat(dirfd, path.as_ref(), OFlags::RDONLY, Mode::empty())
-            .context("Cannot open composefs repository")?;
+        let repository = openat(dirfd, path, OFlags::RDONLY, Mode::empty())
+            .with_context(|| format!("Cannot open composefs repository at {}", path.display()))?;
 
         flock(&repository, FlockOperation::LockShared)
             .context("Cannot lock composefs repository")?;
