@@ -265,14 +265,14 @@ impl<'a> Directory<'a> {
 impl Leaf<'_> {
     fn inode_meta(&self) -> (format::DataLayout, u32, u64, usize) {
         let (layout, u, size) = match &self.content {
-            image::LeafContent::InlineFile(data) => {
+            image::LeafContent::Regular(image::RegularFile::Inline(data)) => {
                 if data.is_empty() {
                     (format::DataLayout::FlatPlain, 0, data.len() as u64)
                 } else {
                     (format::DataLayout::FlatInline, 0, data.len() as u64)
                 }
             }
-            image::LeafContent::ExternalFile(.., size) => {
+            image::LeafContent::Regular(image::RegularFile::External(.., size)) => {
                 (format::DataLayout::ChunkBased, 31, *size)
             }
             image::LeafContent::CharacterDevice(rdev) | image::LeafContent::BlockDevice(rdev) => {
@@ -290,8 +290,8 @@ impl Leaf<'_> {
 
     fn write_inline(&self, output: &mut impl Output) {
         output.write(match self.content {
-            image::LeafContent::InlineFile(data) => data,
-            image::LeafContent::ExternalFile(..) => b"\xff\xff\xff\xff", // null chunk
+            image::LeafContent::Regular(image::RegularFile::Inline(data)) => data,
+            image::LeafContent::Regular(image::RegularFile::External(..)) => b"\xff\xff\xff\xff", // null chunk
             image::LeafContent::Symlink(target) => target.as_bytes(),
             _ => &[],
         });
@@ -303,9 +303,7 @@ impl Inode<'_> {
         match &self.content {
             InodeContent::Directory(..) => format::FileType::Directory,
             InodeContent::Leaf(leaf) => match &leaf.content {
-                image::LeafContent::ExternalFile(..) | image::LeafContent::InlineFile(..) => {
-                    format::FileType::RegularFile
-                }
+                image::LeafContent::Regular(..) => format::FileType::RegularFile,
                 image::LeafContent::CharacterDevice(..) => format::FileType::CharacterDevice,
                 image::LeafContent::BlockDevice(..) => format::FileType::BlockDevice,
                 image::LeafContent::Fifo => format::FileType::Fifo,
@@ -407,7 +405,7 @@ impl<'a> InodeCollector<'a> {
 
         // We need to record extra xattrs for some files.  These come first.
         if let InodeContent::Leaf(Leaf {
-            content: image::LeafContent::ExternalFile(id, ..),
+            content: image::LeafContent::Regular(image::RegularFile::External(id, ..)),
             ..
         }) = content
         {

@@ -11,7 +11,7 @@ use anyhow::{bail, ensure, Context, Result};
 use regex_automata::{hybrid::dfa, util::syntax, Anchored, Input};
 
 use crate::{
-    image::{DirEnt, Directory, FileSystem, Inode, Leaf, LeafContent, Stat},
+    image::{DirEnt, Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
     repository::Repository,
 };
 
@@ -116,8 +116,8 @@ pub fn openat<'a>(
 
     match &dir.entries[idx].inode {
         Inode::Leaf(leaf) => match &leaf.content {
-            LeafContent::InlineFile(data) => Ok(Some(Box::new(data.as_slice()))),
-            LeafContent::ExternalFile(id, ..) => {
+            LeafContent::Regular(RegularFile::Inline(data)) => Ok(Some(Box::new(data.as_slice()))),
+            LeafContent::Regular(RegularFile::External(id, ..)) => {
                 Ok(Some(Box::new(File::from(repo.open_object(id)?))))
             }
             _ => bail!("Invalid file type"),
@@ -211,7 +211,7 @@ fn relabel(stat: &Stat, path: &Path, ifmt: u8, policy: &mut Policy) {
 
 fn relabel_leaf(leaf: &Leaf, path: &Path, policy: &mut Policy) {
     let ifmt = match leaf.content {
-        LeafContent::InlineFile(..) | LeafContent::ExternalFile(..) => b'-',
+        LeafContent::Regular(..) => b'-',
         LeafContent::Fifo => b'p', // NB: 'pipe', not 'fifo'
         LeafContent::Socket => b's',
         LeafContent::Symlink(..) => b'l',

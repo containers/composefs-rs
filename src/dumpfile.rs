@@ -13,7 +13,7 @@ use rustix::fs::FileType;
 
 use crate::{
     fsverity::Sha256HashValue,
-    image::{DirEnt, Directory, FileSystem, Inode, Leaf, LeafContent, Stat},
+    image::{DirEnt, Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
 };
 
 fn write_empty(writer: &mut impl fmt::Write) -> fmt::Result {
@@ -109,7 +109,7 @@ pub fn write_leaf(
     nlink: usize,
 ) -> fmt::Result {
     match content {
-        LeafContent::InlineFile(ref data) => write_entry(
+        LeafContent::Regular(RegularFile::Inline(ref data)) => write_entry(
             writer,
             path,
             stat,
@@ -121,7 +121,7 @@ pub fn write_leaf(
             data,
             None,
         ),
-        LeafContent::ExternalFile(id, size) => write_entry(
+        LeafContent::Regular(RegularFile::External(id, size)) => write_entry(
             writer,
             path,
             stat,

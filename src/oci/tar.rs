@@ -15,7 +15,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::{
     dumpfile,
-    image::{LeafContent, Stat},
+    image::{LeafContent, RegularFile, Stat},
     splitstream::{SplitStreamData, SplitStreamReader, SplitStreamWriter},
     util::{read_exactish, read_exactish_async},
     INLINE_CONTENT_MAX,
@@ -181,7 +181,7 @@ pub fn get_entry<R: Read>(reader: &mut SplitStreamReader<R>) -> Result<Option<Ta
                         size as usize > INLINE_CONTENT_MAX,
                         "Splitstream incorrectly stored a small ({size} byte) file external"
                     );
-                    TarItem::Leaf(LeafContent::ExternalFile(id, size))
+                    TarItem::Leaf(LeafContent::Regular(RegularFile::External(id, size)))
                 }
                 _ => bail!(
                     "Unsupported external-chunked entry {:?} {}",
@@ -224,7 +224,7 @@ pub fn get_entry<R: Read>(reader: &mut SplitStreamReader<R>) -> Result<Option<Ta
                         "Splitstream incorrectly stored a large ({} byte) file inline",
                         content.len()
                     );
-                    TarItem::Leaf(LeafContent::InlineFile(content))
+                    TarItem::Leaf(LeafContent::Regular(RegularFile::Inline(content)))
                 }
                 EntryType::Link => TarItem::Hardlink({
                     let Some(link_name) = header.link_name_bytes() else {

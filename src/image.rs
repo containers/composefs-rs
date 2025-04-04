@@ -21,9 +21,14 @@ pub struct Stat {
 }
 
 #[derive(Debug)]
+pub enum RegularFile {
+    Inline(Vec<u8>),
+    External(Sha256HashValue, u64),
+}
+
+#[derive(Debug)]
 pub enum LeafContent {
-    InlineFile(Vec<u8>),
-    ExternalFile(Sha256HashValue, u64),
+    Regular(RegularFile),
     BlockDevice(u64),
     CharacterDevice(u64),
     Fifo,
