@@ -13,6 +13,7 @@ use std::{
 
 use anyhow::{ensure, Result};
 use rustix::{
+    buffer::spare_capacity,
     fd::{AsFd, OwnedFd},
     fs::{
         fstat, getxattr, linkat, listxattr, mkdirat, mknodat, openat, readlinkat, symlinkat,
@@ -184,18 +185,19 @@ impl FilesystemReader<'_> {
         let content = match FileType::from_raw_mode(buf.st_mode) {
             FileType::Directory | FileType::Unknown => unreachable!(),
             FileType::RegularFile => {
-                let mut buffer = vec![MaybeUninit::uninit(); buf.st_size as usize];
-                let (data, _) = read(fd, &mut buffer)?;
+                let mut buffer = Vec::with_capacity(buf.st_size as usize);
+                read(fd, spare_capacity(&mut buffer))?;
+                let buffer = Box::from(buffer);
 
                 if buf.st_size > INLINE_CONTENT_MAX as i64 {
                     let id = if let Some(repo) = self.repo {
-                        repo.ensure_object(data)?
+                        repo.ensure_object(&buffer)?
                     } else {
-                        FsVerityHasher::hash(data)
+                        FsVerityHasher::hash(&buffer)
                     };
                     LeafContent::Regular(RegularFile::External(id, buf.st_size as u64))
                 } else {
-                    LeafContent::Regular(RegularFile::Inline(Vec::from(data)))
+                    LeafContent::Regular(RegularFile::Inline(buffer))
                 }
             }
             FileType::Symlink => {

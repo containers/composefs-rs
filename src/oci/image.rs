@@ -122,7 +122,7 @@ fn file_entry(path: &str) -> oci::tar::TarEntry {
             st_mtim_sec: 0,
             xattrs: RefCell::new(BTreeMap::new()),
         },
-        item: oci::tar::TarItem::Leaf(LeafContent::Regular(RegularFile::Inline(vec![]))),
+        item: oci::tar::TarItem::Leaf(LeafContent::Regular(RegularFile::Inline([].into()))),
     }
 }
 
