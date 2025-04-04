@@ -13,7 +13,7 @@ use tempfile::NamedTempFile;
 use composefs::{
     dumpfile::write_dumpfile,
     erofs::{debug::debug_img, writer::mkfs_erofs},
-    image::{Directory, FileSystem, Inode, Leaf, LeafContent, Stat},
+    image::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
 };
 
 fn debug_fs(mut fs: FileSystem) -> String {
@@ -54,12 +54,12 @@ fn simple(fs: &mut FileSystem) {
     add_leaf(
         &mut fs.root,
         "regular-inline",
-        LeafContent::InlineFile(b"hihi".to_vec()),
+        LeafContent::Regular(RegularFile::Inline(b"hihi".to_vec())),
     );
     add_leaf(
         &mut fs.root,
         "regular-external",
-        LeafContent::ExternalFile([0x5a; 32], 1234),
+        LeafContent::Regular(RegularFile::External([0x5a; 32], 1234)),
     );
     add_leaf(&mut fs.root, "chrdev", LeafContent::CharacterDevice(123));
     add_leaf(&mut fs.root, "blkdev", LeafContent::BlockDevice(123));

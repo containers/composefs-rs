@@ -24,7 +24,7 @@ use zerocopy::IntoBytes;
 
 use crate::{
     fsverity::{digest::FsVerityHasher, Sha256HashValue},
-    image::{DirEnt, Directory, FileSystem, Inode, Leaf, LeafContent, Stat},
+    image::{DirEnt, Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
     repository::Repository,
     selabel::selabel,
     util::proc_self_fd,
@@ -88,8 +88,10 @@ fn write_leaf(leaf: &Leaf, dirfd: &OwnedFd, name: &OsStr, repo: &Repository) -> 
     let mode = leaf.stat.st_mode.into();
 
     match leaf.content {
-        LeafContent::InlineFile(ref data) => set_file_contents(dirfd, name, &leaf.stat, data)?,
-        LeafContent::ExternalFile(ref id, size) => {
+        LeafContent::Regular(RegularFile::Inline(ref data)) => {
+            set_file_contents(dirfd, name, &leaf.stat, data)?
+        }
+        LeafContent::Regular(RegularFile::External(ref id, size)) => {
             let object = repo.open_object(id)?;
             // TODO: make this better.  At least needs to be EINTR-safe.  Could even do reflink in some cases...
             let mut buffer = vec![MaybeUninit::uninit(); size as usize];
@@ -191,9 +193,9 @@ impl FilesystemReader<'_> {
                     } else {
                         FsVerityHasher::hash(data)
                     };
-                    LeafContent::ExternalFile(id, buf.st_size as u64)
+                    LeafContent::Regular(RegularFile::External(id, buf.st_size as u64))
                 } else {
-                    LeafContent::InlineFile(Vec::from(data))
+                    LeafContent::Regular(RegularFile::Inline(Vec::from(data)))
                 }
             }
             FileType::Symlink => {
