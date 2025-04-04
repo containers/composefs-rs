@@ -116,7 +116,7 @@ pub fn openat<'a>(
 
     match &dir.entries[idx].inode {
         Inode::Leaf(leaf) => match &leaf.content {
-            LeafContent::Regular(RegularFile::Inline(data)) => Ok(Some(Box::new(data.as_slice()))),
+            LeafContent::Regular(RegularFile::Inline(data)) => Ok(Some(Box::new(&**data))),
             LeafContent::Regular(RegularFile::External(id, ..)) => {
                 Ok(Some(Box::new(File::from(repo.open_object(id)?))))
             }

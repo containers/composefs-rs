@@ -54,7 +54,7 @@ fn simple(fs: &mut FileSystem) {
     add_leaf(
         &mut fs.root,
         "regular-inline",
-        LeafContent::Regular(RegularFile::Inline(b"hihi".to_vec())),
+        LeafContent::Regular(RegularFile::Inline((*b"hihi").into())),
     );
     add_leaf(
         &mut fs.root,

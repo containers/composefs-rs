@@ -22,7 +22,7 @@ pub struct Stat {
 
 #[derive(Debug)]
 pub enum RegularFile {
-    Inline(Vec<u8>),
+    Inline(Box<[u8]>),
     External(Sha256HashValue, u64),
 }
 

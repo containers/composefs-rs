@@ -168,7 +168,7 @@ impl SplitStreamWriter<'_> {
 
 #[derive(Debug)]
 pub enum SplitStreamData {
-    Inline(Vec<u8>),
+    Inline(Box<[u8]>),
     External(Sha256HashValue),
 }
 
@@ -315,7 +315,7 @@ impl<R: Read> SplitStreamReader<R> {
             read_into_vec(&mut self.decoder, &mut content, stored_size)?;
             content.truncate(actual_size);
             self.inline_bytes -= stored_size;
-            Ok(SplitStreamData::Inline(content))
+            Ok(SplitStreamData::Inline(content.into()))
         }
     }
 
