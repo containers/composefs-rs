@@ -11,6 +11,7 @@ use containers_image_proxy::{ImageProxy, ImageProxyConfig, OpenedImage};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use oci_spec::image::{Descriptor, ImageConfiguration, ImageManifest, MediaType};
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt;
 
 use crate::{
     fs::write_to_path,
@@ -106,6 +107,10 @@ impl<'repo> ImageOp<'repo> {
         } else {
             // Otherwise, we need to fetch it...
             let (blob_reader, driver) = self.proxy.get_descriptor(&self.img, descriptor).await?;
+
+            // See https://github.com/containers/containers-image-proxy-rs/issues/71
+            let blob_reader = blob_reader.take(descriptor.size());
+
             let bar = self.progress.add(ProgressBar::new(descriptor.size()));
             bar.set_style(ProgressStyle::with_template("[eta {eta}] {bar:40.cyan/blue} {decimal_bytes:>7}/{decimal_total_bytes:7} {msg}")
                 .unwrap()
