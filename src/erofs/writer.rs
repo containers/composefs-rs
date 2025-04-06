@@ -251,9 +251,9 @@ impl<'a> Directory<'a> {
     }
 
     fn inode_meta(&self, block_offset: usize) -> (format::DataLayout, u32, u64, usize) {
-        let (layout, u) = if self.inline.len() == 0 {
+        let (layout, u) = if self.inline.is_empty() {
             (format::DataLayout::FlatPlain, block_offset as u32 / 4096)
-        } else if self.blocks.len() > 0 {
+        } else if !self.blocks.is_empty() {
             (format::DataLayout::FlatInline, block_offset as u32 / 4096)
         } else {
             (format::DataLayout::FlatInline, 0)

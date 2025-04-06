@@ -152,7 +152,7 @@ mod tests {
     #[test]
     fn test_fs_ioc_enable_verity_wrong_fs() {
         let file = tempfile_in("/dev/shm").unwrap();
-        let fd = OwnedFd::try_from(file).unwrap();
+        let fd = OwnedFd::from(file);
         let res = fs_ioc_enable_verity::<&OwnedFd, Sha256HashValue>(&fd);
         let err = res.err().unwrap();
         assert_eq!(err, EnableVerifyError::FilesystemNotSupported);

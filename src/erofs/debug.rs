@@ -250,7 +250,7 @@ fn hexdump(f: &mut impl fmt::Write, data: &[u8], rel: usize) -> fmt::Result {
     };
     let end = start + data.len();
     let start_row = start / 16;
-    let end_row = (end + 15) / 16;
+    let end_row = end.div_ceil(16);
 
     for row in start_row..end_row {
         let row_start = row * 16;

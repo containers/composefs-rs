@@ -891,8 +891,9 @@ mod tests {
         mkcomposefs(SPECIAL_DUMP, &mut tmpf).unwrap();
         let mut entries = String::new();
         tmpf.seek(std::io::SeekFrom::Start(0))?;
-        let mut filter = DumpConfig::default();
-        filter.filters = Some(&["blockdev", "inline"]);
+        let filter = DumpConfig {
+            filters: Some(&["blockdev", "inline"]),
+        };
         dump(tmpf, filter, |e| {
             writeln!(entries, "{e}")?;
             Ok(())
