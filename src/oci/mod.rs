@@ -363,7 +363,9 @@ pub fn prepare_boot(
         image::process_entry(&mut filesystem, entry)?;
     }
 
-    let boot = filesystem.root.recurse("composefs-meta")?.recurse("boot")?;
+    let boot = filesystem
+        .root
+        .get_directory("composefs-meta/boot".as_ref())?;
 
     write_to_path(repo, boot, output_dir)
 }
