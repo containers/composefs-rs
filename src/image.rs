@@ -1,6 +1,6 @@
 use std::{cell::RefCell, collections::BTreeMap, ffi::OsStr, path::Path, rc::Rc};
 
-use anyhow::{bail, Context, Result};
+use thiserror::Error;
 
 use crate::fsverity::Sha256HashValue;
 
@@ -47,6 +47,18 @@ pub enum Inode {
     Leaf(Rc<Leaf>),
 }
 
+#[derive(Error, Debug)]
+pub enum ImageError {
+    #[error("Directory entry {0:?} does not exist")]
+    NotFound(Box<OsStr>),
+    #[error("Directory entry {0:?} is not a subdirectory")]
+    NotADirectory(Box<OsStr>),
+    #[error("Directory entry {0:?} is a directory")]
+    IsADirectory(Box<OsStr>),
+    #[error("Directory entry {0:?} is not a regular file")]
+    IsNotRegular(Box<OsStr>),
+}
+
 impl Inode {
     pub fn stat(&self) -> &Stat {
         match self {
@@ -64,11 +76,11 @@ impl Directory {
         }
     }
 
-    pub fn recurse(&mut self, name: impl AsRef<OsStr>) -> Result<&mut Directory> {
+    pub fn recurse(&mut self, name: impl AsRef<OsStr>) -> Result<&mut Directory, ImageError> {
         match self.entries.get_mut(name.as_ref()) {
             Some(Inode::Directory(subdir)) => Ok(subdir),
-            Some(_) => bail!("Parent directory is not a directory"),
-            None => bail!("Unable to find parent directory {:?}", name.as_ref()),
+            Some(_) => Err(ImageError::NotADirectory(name.as_ref().into())),
+            None => Err(ImageError::NotFound(name.as_ref().into())),
         }
     }
 
@@ -90,11 +102,11 @@ impl Directory {
         self.entries.insert(name.into(), inode);
     }
 
-    pub fn get_for_link(&self, name: &OsStr) -> Result<Rc<Leaf>> {
+    pub fn get_for_link(&self, name: &OsStr) -> Result<Rc<Leaf>, ImageError> {
         match self.entries.get(name) {
             Some(Inode::Leaf(leaf)) => Ok(Rc::clone(leaf)),
-            Some(Inode::Directory(..)) => bail!("Cannot hardlink to directory"),
-            None => bail!("Attempt to hardlink to non-existent file"),
+            Some(Inode::Directory(..)) => Err(ImageError::IsADirectory(name.into())),
+            None => Err(ImageError::NotFound(name.into())),
         }
     }
 
@@ -145,7 +157,7 @@ impl FileSystem {
         }
     }
 
-    fn get_parent_dir<'a>(&'a mut self, name: &Path) -> Result<&'a mut Directory> {
+    fn get_parent_dir<'a>(&'a mut self, name: &Path) -> Result<&'a mut Directory, ImageError> {
         let mut dir = &mut self.root;
 
         if let Some(parent) = name.parent() {
@@ -154,16 +166,14 @@ impl FileSystem {
                     // Path.parent() is really weird...
                     continue;
                 }
-                dir = dir
-                    .recurse(segment)
-                    .with_context(|| format!("Trying to insert item {:?}", name))?;
+                dir = dir.recurse(segment)?;
             }
         }
 
         Ok(dir)
     }
 
-    pub fn mkdir(&mut self, name: &Path, stat: Stat) -> Result<()> {
+    pub fn mkdir(&mut self, name: &Path, stat: Stat) -> Result<(), ImageError> {
         if let Some(filename) = name.file_name() {
             let dir = self.get_parent_dir(name)?;
             dir.mkdir(filename, stat);
@@ -171,7 +181,7 @@ impl FileSystem {
         Ok(())
     }
 
-    pub fn insert_rc(&mut self, name: &Path, leaf: Rc<Leaf>) -> Result<()> {
+    pub fn insert_rc(&mut self, name: &Path, leaf: Rc<Leaf>) -> Result<(), ImageError> {
         if let Some(filename) = name.file_name() {
             let dir = self.get_parent_dir(name)?;
             dir.insert(filename, Inode::Leaf(leaf));
@@ -181,11 +191,11 @@ impl FileSystem {
         }
     }
 
-    pub fn insert(&mut self, name: &Path, leaf: Leaf) -> Result<()> {
+    pub fn insert(&mut self, name: &Path, leaf: Leaf) -> Result<(), ImageError> {
         self.insert_rc(name, Rc::new(leaf))
     }
 
-    fn get_for_link(&mut self, name: &Path) -> Result<Rc<Leaf>> {
+    fn get_for_link(&mut self, name: &Path) -> Result<Rc<Leaf>, ImageError> {
         if let Some(filename) = name.file_name() {
             let dir = self.get_parent_dir(name)?;
             dir.get_for_link(filename)
@@ -194,12 +204,12 @@ impl FileSystem {
         }
     }
 
-    pub fn hardlink(&mut self, name: &Path, target: &OsStr) -> Result<()> {
+    pub fn hardlink(&mut self, name: &Path, target: &OsStr) -> Result<(), ImageError> {
         let rc = self.get_for_link(Path::new(target))?;
         self.insert_rc(name, rc)
     }
 
-    pub fn remove(&mut self, name: &Path) -> Result<()> {
+    pub fn remove(&mut self, name: &Path) -> Result<(), ImageError> {
         if let Some(filename) = name.file_name() {
             let dir = self.get_parent_dir(name)?;
             dir.remove(filename);
