@@ -18,8 +18,12 @@ use crate::{
     fsverity::Sha256HashValue,
     oci::tar::{get_entry, split_async},
     repository::Repository,
-    splitstream::DigestMap,
+    splitstream::{
+        handle_external_object, DigestMap, EnsureObjectMessages, ResultChannelReceiver,
+        ResultChannelSender, WriterMessages,
+    },
     util::parse_sha256,
+    zstd_encoder,
 };
 
 pub fn import_layer(
@@ -83,6 +87,7 @@ impl<'repo> ImageOp<'repo> {
         let proxy = containers_image_proxy::ImageProxy::new_with_config(config).await?;
         let img = proxy.open_image(imgref).await.context("Opening image")?;
         let progress = MultiProgress::new();
+
         Ok(ImageOp {
             repo,
             proxy,
@@ -95,47 +100,49 @@ impl<'repo> ImageOp<'repo> {
         &self,
         layer_sha256: &Sha256HashValue,
         descriptor: &Descriptor,
-    ) -> Result<Sha256HashValue> {
+        layer_num: usize,
+        object_sender: crossbeam::channel::Sender<EnsureObjectMessages>,
+    ) -> Result<()> {
         // We need to use the per_manifest descriptor to download the compressed layer but it gets
         // stored in the repository via the per_config descriptor.  Our return value is the
         // fsverity digest for the corresponding splitstream.
 
-        if let Some(layer_id) = self.repo.check_stream(layer_sha256)? {
-            self.progress
-                .println(format!("Already have layer {}", hex::encode(layer_sha256)))?;
-            Ok(layer_id)
-        } else {
-            // Otherwise, we need to fetch it...
-            let (blob_reader, driver) = self.proxy.get_descriptor(&self.img, descriptor).await?;
+        // Otherwise, we need to fetch it...
+        let (blob_reader, driver) = self.proxy.get_descriptor(&self.img, descriptor).await?;
 
-            // See https://github.com/containers/containers-image-proxy-rs/issues/71
-            let blob_reader = blob_reader.take(descriptor.size());
+        // See https://github.com/containers/containers-image-proxy-rs/issues/71
+        let blob_reader = blob_reader.take(descriptor.size());
 
-            let bar = self.progress.add(ProgressBar::new(descriptor.size()));
-            bar.set_style(ProgressStyle::with_template("[eta {eta}] {bar:40.cyan/blue} {decimal_bytes:>7}/{decimal_total_bytes:7} {msg}")
-                .unwrap()
-                .progress_chars("##-"));
-            let progress = bar.wrap_async_read(blob_reader);
-            self.progress
-                .println(format!("Fetching layer {}", hex::encode(layer_sha256)))?;
+        let bar = self.progress.add(ProgressBar::new(descriptor.size()));
+        bar.set_style(
+            ProgressStyle::with_template(
+                "[eta {eta}] {bar:40.cyan/blue} {decimal_bytes:>7}/{decimal_total_bytes:7} {msg}",
+            )
+            .unwrap()
+            .progress_chars("##-"),
+        );
+        let progress = bar.wrap_async_read(blob_reader);
+        self.progress
+            .println(format!("Fetching layer {}", hex::encode(layer_sha256)))?;
 
-            let mut splitstream = self.repo.create_stream(Some(*layer_sha256), None);
-            match descriptor.media_type() {
-                MediaType::ImageLayer => {
-                    split_async(progress, &mut splitstream).await?;
-                }
-                MediaType::ImageLayerGzip => {
-                    split_async(GzipDecoder::new(progress), &mut splitstream).await?;
-                }
-                MediaType::ImageLayerZstd => {
-                    split_async(ZstdDecoder::new(progress), &mut splitstream).await?;
-                }
-                other => bail!("Unsupported layer media type {:?}", other),
-            };
-            let layer_id = self.repo.write_stream(splitstream, None)?;
-            driver.await?;
-            Ok(layer_id)
-        }
+        let mut splitstream =
+            self.repo
+                .create_stream(Some(*layer_sha256), None, Some(object_sender));
+        match descriptor.media_type() {
+            MediaType::ImageLayer => {
+                split_async(progress, &mut splitstream, layer_num).await?;
+            }
+            MediaType::ImageLayerGzip => {
+                split_async(GzipDecoder::new(progress), &mut splitstream, layer_num).await?;
+            }
+            MediaType::ImageLayerZstd => {
+                split_async(ZstdDecoder::new(progress), &mut splitstream, layer_num).await?;
+            }
+            other => bail!("Unsupported layer media type {:?}", other),
+        };
+        driver.await?;
+
+        Ok(())
     }
 
     pub async fn ensure_config(
@@ -154,7 +161,6 @@ impl<'repo> ImageOp<'repo> {
         } else {
             // We need to add the config to the repo.  We need to parse the config and make sure we
             // have all of the layers first.
-            //
             self.progress
                 .println(format!("Fetching config {}", hex::encode(config_sha256)))?;
 
@@ -169,24 +175,155 @@ impl<'repo> ImageOp<'repo> {
             let raw_config = config?;
             let config = ImageConfiguration::from_reader(&raw_config[..])?;
 
+            let (done_chan_sender, done_chan_recver, object_sender) = self.spawn_threads(&config);
+
             let mut config_maps = DigestMap::new();
-            for (mld, cld) in zip(manifest_layers, config.rootfs().diff_ids()) {
+
+            for (idx, (mld, cld)) in zip(manifest_layers, config.rootfs().diff_ids()).enumerate() {
                 let layer_sha256 = sha256_from_digest(cld)?;
-                let layer_id = self
-                    .ensure_layer(&layer_sha256, mld)
-                    .await
-                    .with_context(|| format!("Failed to fetch layer {cld} via {mld:?}"))?;
+
+                if let Some(layer_id) = self.repo.check_stream(&layer_sha256)? {
+                    self.progress
+                        .println(format!("Already have layer {}", hex::encode(layer_sha256)))?;
+
+                    config_maps.insert(&layer_sha256, &layer_id);
+                } else {
+                    self.ensure_layer(&layer_sha256, mld, idx, object_sender.clone())
+                        .await
+                        .with_context(|| format!("Failed to fetch layer {cld} via {mld:?}"))?;
+                }
+            }
+
+            drop(done_chan_sender);
+
+            while let Ok(res) = done_chan_recver.recv() {
+                let (layer_sha256, layer_id) = res?;
                 config_maps.insert(&layer_sha256, &layer_id);
             }
 
-            let mut splitstream = self
-                .repo
-                .create_stream(Some(config_sha256), Some(config_maps));
+            let mut splitstream =
+                self.repo
+                    .create_stream(Some(config_sha256), Some(config_maps), None);
             splitstream.write_inline(&raw_config);
             let config_id = self.repo.write_stream(splitstream, None)?;
 
             Ok((config_sha256, config_id))
         }
+    }
+
+    fn spawn_threads(
+        &self,
+        config: &ImageConfiguration,
+    ) -> (
+        ResultChannelSender,
+        ResultChannelReceiver,
+        crossbeam::channel::Sender<EnsureObjectMessages>,
+    ) {
+        use crossbeam::channel::{unbounded, Receiver, Sender};
+
+        let encoder_threads = 2;
+        let external_object_writer_threads = 4;
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(encoder_threads + external_object_writer_threads)
+            .build()
+            .unwrap();
+
+        // We need this as writers have internal state that can't be shared between threads
+        //
+        // We'll actually need as many writers (not writer threads, but writer instances) as there are layers.
+        let zstd_writer_channels: Vec<(Sender<WriterMessages>, Receiver<WriterMessages>)> =
+            (0..encoder_threads).map(|_| unbounded()).collect();
+
+        let (object_sender, object_receiver) = unbounded::<EnsureObjectMessages>();
+
+        // (layer_sha256, layer_id)
+        let (done_chan_sender, done_chan_recver) =
+            std::sync::mpsc::channel::<Result<(Sha256HashValue, Sha256HashValue)>>();
+
+        let chunk_len = (config.rootfs().diff_ids().len() + encoder_threads - 1) / encoder_threads;
+
+        // Divide the layers into chunks of some specific size so each worker
+        // thread can work on multiple deterministic layers
+        let mut chunks: Vec<Vec<Sha256HashValue>> = config
+            .rootfs()
+            .diff_ids()
+            .iter()
+            .map(|x| sha256_from_digest(x).unwrap())
+            .collect::<Vec<Sha256HashValue>>()
+            .chunks(chunk_len)
+            .map(|x| x.to_vec())
+            .collect();
+
+        // Mapping from layer_id -> index in writer_channels
+        // This is to make sure that all messages relating to a particular layer
+        // always reach the same writer
+        let layers_to_chunks = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, chunk)| std::iter::repeat(i).take(chunk.len()).collect::<Vec<_>>())
+            .flatten()
+            .collect::<Vec<_>>();
+
+        let _ = (0..encoder_threads)
+            .map(|i| {
+                let repository = self.repo.try_clone().unwrap();
+                let object_sender = object_sender.clone();
+                let done_chan_sender = done_chan_sender.clone();
+                let chunk = std::mem::take(&mut chunks[i]);
+                let receiver = zstd_writer_channels[i].1.clone();
+
+                pool.spawn({
+                    move || {
+                        let start = i * (chunk_len);
+                        let end = start + chunk_len;
+
+                        let enc = zstd_encoder::MultipleZstdWriters::new(
+                            chunk,
+                            repository,
+                            object_sender,
+                            done_chan_sender,
+                        );
+
+                        if let Err(e) = enc.recv_data(receiver, start, end) {
+                            eprintln!("zstd_encoder returned with error: {}", e.to_string());
+                            return;
+                        }
+                    }
+                });
+            })
+            .collect::<Vec<()>>();
+
+        let _ = (0..external_object_writer_threads)
+            .map(|_| {
+                pool.spawn({
+                    let repository = self.repo.try_clone().unwrap();
+                    let zstd_writer_channels = zstd_writer_channels
+                        .iter()
+                        .map(|(s, _)| s.clone())
+                        .collect::<Vec<_>>();
+                    let layers_to_chunks = layers_to_chunks.clone();
+                    let external_object_receiver = object_receiver.clone();
+
+                    move || {
+                        if let Err(e) = handle_external_object(
+                            repository,
+                            external_object_receiver,
+                            zstd_writer_channels,
+                            layers_to_chunks,
+                        ) {
+                            eprintln!(
+                                "handle_external_object returned with error: {}",
+                                e.to_string()
+                            );
+                            return;
+                        }
+                    }
+                });
+            })
+            .collect::<Vec<_>>();
+
+        return (done_chan_sender, done_chan_recver, object_sender);
     }
 
     pub async fn pull(&self) -> Result<(Sha256HashValue, Sha256HashValue)> {
@@ -201,6 +338,7 @@ impl<'repo> ImageOp<'repo> {
         let manifest = ImageManifest::from_reader(raw_manifest.as_slice())?;
         let config_descriptor = manifest.config();
         let layers = manifest.layers();
+
         self.ensure_config(layers, config_descriptor)
             .await
             .with_context(|| format!("Failed to pull config {config_descriptor:?}"))
@@ -280,7 +418,7 @@ pub fn write_config(
     let json = config.to_string()?;
     let json_bytes = json.as_bytes();
     let sha256 = hash(json_bytes);
-    let mut stream = repo.create_stream(Some(sha256), Some(refs));
+    let mut stream = repo.create_stream(Some(sha256), Some(refs), None);
     stream.write_inline(json_bytes);
     let id = repo.write_stream(stream, None)?;
     Ok((sha256, id))

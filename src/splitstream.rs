@@ -5,7 +5,9 @@
 
 use std::io::{BufReader, Read, Write};
 
-use anyhow::{bail, Result};
+use crossbeam::channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
+
+use anyhow::{bail, Context, Result};
 use sha2::Sha256;
 use zstd::stream::read::Decoder;
 
@@ -63,6 +65,7 @@ pub struct SplitStreamWriter<'a> {
     repo: &'a Repository,
     pub(crate) inline_content: Vec<u8>,
     writer: ZstdWriter,
+    pub(crate) object_sender: Option<CrossbeamSender<EnsureObjectMessages>>,
 }
 
 impl std::fmt::Debug for SplitStreamWriter<'_> {
@@ -75,16 +78,116 @@ impl std::fmt::Debug for SplitStreamWriter<'_> {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct FinishMessage {
+    pub(crate) data: Vec<u8>,
+    pub(crate) total_msgs: usize,
+    pub(crate) layer_num: usize,
+}
+
+#[derive(Eq, Debug)]
+pub(crate) struct WriterMessagesData {
+    pub(crate) digest: Sha256HashValue,
+    pub(crate) object_data: SplitStreamWriterSenderData,
+}
+
+#[derive(Debug)]
+pub(crate) enum WriterMessages {
+    WriteData(WriterMessagesData),
+    Finish(FinishMessage),
+}
+
+impl PartialEq for WriterMessagesData {
+    fn eq(&self, other: &Self) -> bool {
+        self.object_data.seq_num.eq(&other.object_data.seq_num)
+    }
+}
+
+impl PartialOrd for WriterMessagesData {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.object_data
+            .seq_num
+            .partial_cmp(&other.object_data.seq_num)
+    }
+}
+
+impl Ord for WriterMessagesData {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.object_data.seq_num.cmp(&other.object_data.seq_num)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SplitStreamWriterSenderData {
+    pub(crate) external_data: Vec<u8>,
+    pub(crate) inline_content: Vec<u8>,
+    pub(crate) seq_num: usize,
+    pub(crate) layer_num: usize,
+}
+pub(crate) enum EnsureObjectMessages {
+    Data(SplitStreamWriterSenderData),
+    Finish(FinishMessage),
+}
+
+pub(crate) type ResultChannelSender =
+    std::sync::mpsc::Sender<Result<(Sha256HashValue, Sha256HashValue)>>;
+pub(crate) type ResultChannelReceiver =
+    std::sync::mpsc::Receiver<Result<(Sha256HashValue, Sha256HashValue)>>;
+
+pub(crate) fn handle_external_object(
+    repository: Repository,
+    external_object_receiver: CrossbeamReceiver<EnsureObjectMessages>,
+    zstd_writer_channels: Vec<CrossbeamSender<WriterMessages>>,
+    layers_to_chunks: Vec<usize>,
+) -> Result<()> {
+    while let Ok(data) = external_object_receiver.recv() {
+        match data {
+            EnsureObjectMessages::Data(data) => {
+                let digest = repository.ensure_object(&data.external_data)?;
+                let layer_num = data.layer_num;
+                let writer_chan_sender = &zstd_writer_channels[layers_to_chunks[layer_num]];
+
+                let msg = WriterMessagesData {
+                    digest,
+                    object_data: data,
+                };
+
+                // `send` only fails if all receivers are dropped
+                writer_chan_sender
+                    .send(WriterMessages::WriteData(msg))
+                    .with_context(|| format!("Failed to send message for layer {layer_num}"))?;
+            }
+
+            EnsureObjectMessages::Finish(final_msg) => {
+                let layer_num = final_msg.layer_num;
+                let writer_chan_sender = &zstd_writer_channels[layers_to_chunks[layer_num]];
+
+                writer_chan_sender
+                    .send(WriterMessages::Finish(final_msg))
+                    .with_context(|| {
+                        format!("Failed to send final message for layer {layer_num}")
+                    })?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 impl SplitStreamWriter<'_> {
-    pub fn new(
+    pub(crate) fn new(
         repo: &Repository,
         refs: Option<DigestMap>,
         sha256: Option<Sha256HashValue>,
+        object_sender: Option<CrossbeamSender<EnsureObjectMessages>>,
     ) -> SplitStreamWriter {
+        let inline_content = vec![];
+
         SplitStreamWriter {
             repo,
-            inline_content: vec![],
-            writer: ZstdWriter::new(sha256, refs),
+            inline_content,
+            object_sender,
+            writer: ZstdWriter::new(sha256, refs, repo.try_clone().unwrap()),
         }
     }
 
@@ -102,26 +205,45 @@ impl SplitStreamWriter<'_> {
     /// really, "add inline content to the buffer"
     /// you need to call .flush_inline() later
     pub fn write_inline(&mut self, data: &[u8]) {
-        self.writer.update_sha(data);
         self.inline_content.extend(data);
     }
 
-    pub fn write_external(&mut self, data: &[u8], padding: Vec<u8>) -> Result<()> {
-        let id = self.repo.ensure_object(&data)?;
+    pub fn write_external(
+        &mut self,
+        data: Vec<u8>,
+        padding: Vec<u8>,
+        seq_num: usize,
+        layer_num: usize,
+    ) -> Result<()> {
+        match &self.object_sender {
+            Some(sender) => {
+                let inline_content = std::mem::replace(&mut self.inline_content, padding);
 
-        self.writer.update_sha(data);
-        self.writer.update_sha(&padding);
-        self.writer.flush_inline(&padding)?;
+                if let Err(e) =
+                    sender.send(EnsureObjectMessages::Data(SplitStreamWriterSenderData {
+                        external_data: data,
+                        inline_content,
+                        seq_num,
+                        layer_num,
+                    }))
+                {
+                    println!("Falied to send message. Err: {}", e.to_string());
+                }
+            }
 
-        self.writer.write_fragment(0, &id)?;
+            None => {
+                let id = self.repo.ensure_object(&data)?;
+                self.writer.flush_inline(&padding)?;
+                self.writer.write_fragment(0, &id)?;
+            }
+        };
+
         Ok(())
     }
 
     pub fn done(mut self) -> Result<Sha256HashValue> {
         self.flush_inline(vec![])?;
-
         self.writer.finalize_sha256_builder()?;
-
         self.repo.ensure_object(&self.writer.finish()?)
     }
 }

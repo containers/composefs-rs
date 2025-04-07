@@ -23,7 +23,7 @@ use crate::{
         Sha256HashValue,
     },
     mount::mount_composefs_at,
-    splitstream::{DigestMap, SplitStreamReader, SplitStreamWriter},
+    splitstream::{DigestMap, EnsureObjectMessages, SplitStreamReader, SplitStreamWriter},
     util::{parse_sha256, proc_self_fd},
 };
 
@@ -143,12 +143,13 @@ impl Repository {
     /// Creates a SplitStreamWriter for writing a split stream.
     /// You should write the data to the returned object and then pass it to .store_stream() to
     /// store the result.
-    pub fn create_stream(
+    pub(crate) fn create_stream(
         &self,
         sha256: Option<Sha256HashValue>,
         maps: Option<DigestMap>,
+        object_sender: Option<crossbeam::channel::Sender<EnsureObjectMessages>>,
     ) -> SplitStreamWriter {
-        SplitStreamWriter::new(self, maps, sha256)
+        SplitStreamWriter::new(self, maps, sha256, object_sender)
     }
 
     fn parse_object_path(path: impl AsRef<[u8]>) -> Result<Sha256HashValue> {
@@ -239,6 +240,7 @@ impl Repository {
         let Some((.., ref sha256)) = writer.get_sha_builder() else {
             bail!("Writer doesn't have sha256 enabled");
         };
+
         let stream_path = format!("streams/{}", hex::encode(sha256));
         let object_id = writer.done()?;
         let object_path = Repository::format_object_path(&object_id);
@@ -286,7 +288,7 @@ impl Repository {
         let object_id = match self.has_stream(sha256)? {
             Some(id) => id,
             None => {
-                let mut writer = self.create_stream(Some(*sha256), None);
+                let mut writer = self.create_stream(Some(*sha256), None, None);
                 callback(&mut writer)?;
                 let object_id = writer.done()?;
 
