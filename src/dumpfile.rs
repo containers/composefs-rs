@@ -226,7 +226,7 @@ impl<'a, W: Write> DumpfileWriter<'a, W> {
     fn write_dir(&mut self, path: &mut PathBuf, dir: &Directory) -> Result<()> {
         // nlink is 2 + number of subdirectories
         // this is also true for the root dir since '..' is another self-ref
-        let nlink = dir.entries.values().fold(2, |count, inode| {
+        let nlink = dir.inodes().fold(2, |count, inode| {
             count + {
                 match inode {
                     Inode::Directory(..) => 1,
@@ -239,8 +239,8 @@ impl<'a, W: Write> DumpfileWriter<'a, W> {
             write_directory(fmt, path, &dir.stat, nlink)
         })?;
 
-        for (name, inode) in &dir.entries {
-            path.push(name.as_ref());
+        for (name, inode) in dir.sorted_entries() {
+            path.push(name);
 
             match inode {
                 Inode::Directory(ref dir) => {

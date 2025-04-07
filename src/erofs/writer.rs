@@ -485,7 +485,7 @@ impl<'a> InodeCollector<'a> {
 
         let mut entries = vec![];
 
-        for (name, inode) in &dir.entries {
+        for (name, inode) in dir.sorted_entries() {
             let child = match inode {
                 image::Inode::Directory(dir) => self.collect_dir(dir, me),
                 image::Inode::Leaf(leaf) => self.collect_leaf(leaf),

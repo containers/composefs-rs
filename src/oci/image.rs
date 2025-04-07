@@ -1,55 +1,46 @@
-use std::{ffi::OsStr, os::unix::ffi::OsStrExt, path::Component, rc::Rc};
+use std::{ffi::OsStr, os::unix::ffi::OsStrExt, rc::Rc};
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use oci_spec::image::ImageConfiguration;
 
 use crate::{
     dumpfile::write_dumpfile,
     erofs::writer::mkfs_erofs,
     fsverity::Sha256HashValue,
-    image::{FileSystem, Inode, Leaf},
-    oci,
+    image::{Directory, FileSystem, Inode, Leaf},
+    oci::{
+        self,
+        tar::{TarEntry, TarItem},
+    },
     repository::Repository,
     selabel::selabel,
 };
 
-pub fn process_entry(filesystem: &mut FileSystem, entry: oci::tar::TarEntry) -> Result<()> {
-    let mut components = entry.path.components();
-
-    let Some(Component::Normal(filename)) = components.next_back() else {
-        bail!("Empty filename")
+pub fn process_entry(filesystem: &mut FileSystem, entry: TarEntry) -> Result<()> {
+    let inode = match entry.item {
+        TarItem::Directory => Inode::Directory(Box::from(Directory::new(entry.stat))),
+        TarItem::Leaf(content) => Inode::Leaf(Rc::new(Leaf {
+            stat: entry.stat,
+            content,
+        })),
+        TarItem::Hardlink(target) => {
+            let (dir, filename) = filesystem.root.split(&target)?;
+            Inode::Leaf(dir.ref_leaf(filename)?)
+        }
     };
 
-    let mut dir = &mut filesystem.root;
-    for component in components {
-        if let Component::Normal(name) = component {
-            dir = dir.recurse(name)?;
-        }
-    }
+    let (dir, filename) = filesystem.root.split_mut(entry.path.as_os_str())?;
 
     let bytes = filename.as_bytes();
     if let Some(whiteout) = bytes.strip_prefix(b".wh.") {
         if whiteout == b".wh.opq" {
             // complete name is '.wh..wh.opq'
-            dir.remove_all()
+            dir.clear();
         } else {
-            dir.remove(OsStr::from_bytes(whiteout))
+            dir.remove(OsStr::from_bytes(whiteout));
         }
     } else {
-        match entry.item {
-            oci::tar::TarItem::Directory => dir.mkdir(filename, entry.stat),
-            oci::tar::TarItem::Leaf(content) => dir.insert(
-                filename,
-                Inode::Leaf(Rc::new(Leaf {
-                    stat: entry.stat,
-                    content,
-                })),
-            ),
-            oci::tar::TarItem::Hardlink(ref target) => {
-                // TODO: would be nice to do this inline, but borrow checker doesn't like it
-                filesystem.hardlink(&entry.path, target)?;
-            }
-        }
+        dir.merge(filename, inode);
     }
 
     Ok(())

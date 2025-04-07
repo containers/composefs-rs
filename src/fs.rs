@@ -112,7 +112,7 @@ fn write_leaf(leaf: &Leaf, dirfd: &OwnedFd, name: &OsStr, repo: &Repository) -> 
 }
 
 fn write_directory_contents(dir: &Directory, fd: &OwnedFd, repo: &Repository) -> Result<()> {
-    for (name, inode) in &dir.entries {
+    for (name, inode) in dir.entries() {
         match inode {
             Inode::Directory(ref dir) => write_directory(dir, fd, name, repo),
             Inode::Leaf(ref leaf) => write_leaf(leaf, fd, name, repo),

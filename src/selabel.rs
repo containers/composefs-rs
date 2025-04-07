@@ -11,7 +11,7 @@ use anyhow::{bail, ensure, Context, Result};
 use regex_automata::{hybrid::dfa, util::syntax, Anchored, Input};
 
 use crate::{
-    image::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
+    image::{Directory, FileSystem, ImageError, Inode, Leaf, LeafContent, RegularFile, Stat},
     repository::Repository,
 };
 
@@ -110,19 +110,11 @@ pub fn openat<'a>(
     filename: impl AsRef<OsStr>,
     repo: &Repository,
 ) -> Result<Option<Box<dyn Read + 'a>>> {
-    let Some(inode) = dir.entries.get(filename.as_ref()) else {
-        return Ok(None);
-    };
-
-    match inode {
-        Inode::Leaf(leaf) => match &leaf.content {
-            LeafContent::Regular(RegularFile::Inline(data)) => Ok(Some(Box::new(&**data))),
-            LeafContent::Regular(RegularFile::External(id, ..)) => {
-                Ok(Some(Box::new(File::from(repo.open_object(id)?))))
-            }
-            _ => bail!("Invalid file type"),
-        },
-        Inode::Directory(..) => bail!("Invalid file type (directory)"),
+    match dir.get_file(filename.as_ref()) {
+        Ok(RegularFile::Inline(data)) => Ok(Some(Box::new(&**data))),
+        Ok(RegularFile::External(id, ..)) => Ok(Some(Box::new(File::from(repo.open_object(id)?)))),
+        Err(ImageError::NotFound(..)) => Ok(None),
+        Err(other) => Err(other)?,
     }
 }
 
@@ -231,8 +223,8 @@ fn relabel_inode(inode: &Inode, path: &mut PathBuf, policy: &mut Policy) {
 fn relabel_dir(dir: &Directory, path: &mut PathBuf, policy: &mut Policy) {
     relabel(&dir.stat, path, b'd', policy);
 
-    for (name, inode) in &dir.entries {
-        path.push(name.as_ref());
+    for (name, inode) in dir.sorted_entries() {
+        path.push(name);
         match policy.check_aliased(path.as_os_str()) {
             Some(original) => relabel_inode(inode, &mut PathBuf::from(original), policy),
             None => relabel_inode(inode, path, policy),
@@ -255,23 +247,22 @@ fn parse_config(file: impl Read) -> Result<Option<String>> {
 
 pub fn selabel(fs: &mut FileSystem, repo: &Repository) -> Result<()> {
     // if /etc/selinux/config doesn't exist then it's not an error
-    let Ok(etc) = fs.root.recurse("etc") else {
-        return Ok(());
-    };
-    let Ok(etc_selinux) = etc.recurse("selinux") else {
-        return Ok(());
-    };
+    let etc_selinux = match fs.root.get_directory("etc/selinux".as_ref()) {
+        Err(ImageError::NotFound(..)) => return Ok(()),
+        other => other,
+    }?;
+
     let Some(etc_selinux_config) = openat(etc_selinux, "config", repo)? else {
         return Ok(());
     };
+
     let Some(policy) = parse_config(etc_selinux_config)? else {
         return Ok(());
     };
 
     let dir = etc_selinux
-        .recurse(policy)?
-        .recurse("contexts")?
-        .recurse("files")?;
+        .get_directory(policy.as_ref())?
+        .get_directory("contexts/files".as_ref())?;
 
     let mut policy = Policy::build(dir, repo)?;
     let mut path = PathBuf::from("/");
