@@ -198,13 +198,13 @@ fn read_u64_le<R: Read>(reader: &mut R) -> Result<Option<usize>> {
     }
 }
 
+/// Using the provided [`vec`] as a buffer, read exactly [`size`]
+/// bytes of content from [`reader`] into it. Any existing content
+/// in [`vec`] will be discarded; however its capacity will be reused,
+/// making this function suitable for use in loops.
 fn read_into_vec(reader: &mut impl Read, vec: &mut Vec<u8>, size: usize) -> Result<()> {
-    unsafe {
-        vec.truncate(0);
-        vec.reserve(size);
-        reader.read_exact(std::slice::from_raw_parts_mut(vec.as_mut_ptr(), size))?;
-        vec.set_len(size);
-    }
+    vec.resize(size, 0u8);
+    reader.read_exact(vec.as_mut_slice())?;
     Ok(())
 }
 
@@ -389,5 +389,62 @@ impl<F: Read> Read for SplitStreamReader<F> {
             Ok(ChunkType::External(..)) => unreachable!(),
             Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn test_read_into_vec() -> Result<()> {
+        // Test with an empty reader
+        let mut reader = Cursor::new(vec![]);
+        let mut vec = Vec::new();
+        let result = read_into_vec(&mut reader, &mut vec, 0);
+        assert!(result.is_ok());
+        assert_eq!(vec.len(), 0);
+
+        // Test with a reader that has some data
+        let mut reader = Cursor::new(vec![1, 2, 3, 4, 5]);
+        let mut vec = Vec::new();
+        let result = read_into_vec(&mut reader, &mut vec, 3);
+        assert!(result.is_ok());
+        assert_eq!(vec.len(), 3);
+        assert_eq!(vec, vec![1, 2, 3]);
+
+        // Test reading more than the reader has
+        let mut reader = Cursor::new(vec![1, 2, 3]);
+        let mut vec = Vec::new();
+        let result = read_into_vec(&mut reader, &mut vec, 5);
+        assert!(result.is_err());
+
+        // Test reading exactly what the reader has
+        let mut reader = Cursor::new(vec![1, 2, 3]);
+        let mut vec = Vec::new();
+        let result = read_into_vec(&mut reader, &mut vec, 3);
+        assert!(result.is_ok());
+        assert_eq!(vec.len(), 3);
+        assert_eq!(vec, vec![1, 2, 3]);
+
+        // Test reading into a vector with existing capacity
+        let mut reader = Cursor::new(vec![1, 2, 3, 4, 5]);
+        let mut vec = Vec::with_capacity(10);
+        let result = read_into_vec(&mut reader, &mut vec, 4);
+        assert!(result.is_ok());
+        assert_eq!(vec.len(), 4);
+        assert_eq!(vec, vec![1, 2, 3, 4]);
+        assert_eq!(vec.capacity(), 10);
+
+        // Test reading into a vector with existing data
+        let mut reader = Cursor::new(vec![1, 2, 3]);
+        let mut vec = vec![9, 9, 9];
+        let result = read_into_vec(&mut reader, &mut vec, 2);
+        assert!(result.is_ok());
+        assert_eq!(vec.len(), 2);
+        assert_eq!(vec, vec![1, 2]);
+
+        Ok(())
     }
 }
