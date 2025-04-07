@@ -13,7 +13,7 @@ use rustix::fs::FileType;
 
 use crate::{
     fsverity::Sha256HashValue,
-    image::{DirEnt, Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
+    image::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
 };
 
 fn write_empty(writer: &mut impl fmt::Write) -> fmt::Result {
@@ -226,9 +226,9 @@ impl<'a, W: Write> DumpfileWriter<'a, W> {
     fn write_dir(&mut self, path: &mut PathBuf, dir: &Directory) -> Result<()> {
         // nlink is 2 + number of subdirectories
         // this is also true for the root dir since '..' is another self-ref
-        let nlink = dir.entries.iter().fold(2, |count, ent| {
+        let nlink = dir.entries.values().fold(2, |count, inode| {
             count + {
-                match ent.inode {
+                match inode {
                     Inode::Directory(..) => 1,
                     _ => 0,
                 }
@@ -239,8 +239,8 @@ impl<'a, W: Write> DumpfileWriter<'a, W> {
             write_directory(fmt, path, &dir.stat, nlink)
         })?;
 
-        for DirEnt { name, inode } in dir.entries.iter() {
-            path.push(name);
+        for (name, inode) in &dir.entries {
+            path.push(name.as_ref());
 
             match inode {
                 Inode::Directory(ref dir) => {

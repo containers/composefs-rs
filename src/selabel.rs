@@ -11,7 +11,7 @@ use anyhow::{bail, ensure, Context, Result};
 use regex_automata::{hybrid::dfa, util::syntax, Anchored, Input};
 
 use crate::{
-    image::{DirEnt, Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
+    image::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
     repository::Repository,
 };
 
@@ -110,11 +110,11 @@ pub fn openat<'a>(
     filename: impl AsRef<OsStr>,
     repo: &Repository,
 ) -> Result<Option<Box<dyn Read + 'a>>> {
-    let Ok(idx) = dir.find_entry(filename.as_ref()) else {
+    let Some(inode) = dir.entries.get(filename.as_ref()) else {
         return Ok(None);
     };
 
-    match &dir.entries[idx].inode {
+    match inode {
         Inode::Leaf(leaf) => match &leaf.content {
             LeafContent::Regular(RegularFile::Inline(data)) => Ok(Some(Box::new(&**data))),
             LeafContent::Regular(RegularFile::External(id, ..)) => {
@@ -231,8 +231,8 @@ fn relabel_inode(inode: &Inode, path: &mut PathBuf, policy: &mut Policy) {
 fn relabel_dir(dir: &Directory, path: &mut PathBuf, policy: &mut Policy) {
     relabel(&dir.stat, path, b'd', policy);
 
-    for DirEnt { name, inode } in dir.entries.iter() {
-        path.push(name);
+    for (name, inode) in &dir.entries {
+        path.push(name.as_ref());
         match policy.check_aliased(path.as_os_str()) {
             Some(original) => relabel_inode(inode, &mut PathBuf::from(original), policy),
             None => relabel_inode(inode, path, policy),

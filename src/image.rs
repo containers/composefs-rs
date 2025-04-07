@@ -1,6 +1,5 @@
 use std::{
     cell::RefCell,
-    cmp::{Ord, Ordering},
     collections::BTreeMap,
     ffi::{OsStr, OsString},
     path::Path,
@@ -45,19 +44,13 @@ pub struct Leaf {
 #[derive(Debug)]
 pub struct Directory {
     pub stat: Stat,
-    pub entries: Vec<DirEnt>,
+    pub entries: BTreeMap<Box<OsStr>, Inode>,
 }
 
 #[derive(Debug)]
 pub enum Inode {
     Directory(Box<Directory>),
     Leaf(Rc<Leaf>),
-}
-
-#[derive(Debug)]
-pub struct DirEnt {
-    pub name: OsString,
-    pub inode: Inode,
 }
 
 impl Inode {
@@ -73,99 +66,46 @@ impl Directory {
     pub fn new(stat: Stat) -> Self {
         Self {
             stat,
-            entries: vec![],
-        }
-    }
-
-    pub fn find_entry(&self, name: &OsStr) -> Result<usize, usize> {
-        // OCI layer tarballs are typically sorted, with the entries for a particular directory
-        // written out immediately after that directory was created.  That means that it's very
-        // likely that the thing we're looking for is either the last entry or the insertion point
-        // immediately following it.  Fast-path those cases by essentially unrolling the first
-        // iteration of the binary search.
-        if let Some(last_entry) = self.entries.last() {
-            match name.cmp(&last_entry.name) {
-                Ordering::Equal => Ok(self.entries.len() - 1), // the last item, indeed
-                Ordering::Greater => Err(self.entries.len()),  // need to append
-                Ordering::Less => self.entries.binary_search_by_key(&name, |e| &e.name),
-            }
-        } else {
-            Err(0)
+            entries: BTreeMap::new(),
         }
     }
 
     pub fn recurse(&mut self, name: impl AsRef<OsStr>) -> Result<&mut Directory> {
-        match self.find_entry(name.as_ref()) {
-            Ok(idx) => match &mut self.entries[idx].inode {
-                Inode::Directory(ref mut subdir) => Ok(subdir),
-                _ => bail!("Parent directory is not a directory"),
-            },
-            _ => bail!("Unable to find parent directory {:?}", name.as_ref()),
+        match self.entries.get_mut(name.as_ref()) {
+            Some(Inode::Directory(subdir)) => Ok(subdir),
+            Some(_) => bail!("Parent directory is not a directory"),
+            None => bail!("Unable to find parent directory {:?}", name.as_ref()),
         }
     }
 
     pub fn mkdir(&mut self, name: &OsStr, stat: Stat) {
-        match self.find_entry(name) {
-            Ok(idx) => match self.entries[idx].inode {
-                // Entry already exists, is a dir
-                Inode::Directory(ref mut dir) => {
-                    // update the stat, but don't drop the entries
-                    dir.stat = stat;
-                }
-                // Entry already exists, is not a dir
-                Inode::Leaf(..) => {
-                    todo!("Trying to replace non-dir with dir!");
-                }
-            },
+        match self.entries.get_mut(name) {
+            // Entry already exists, is a dir.  update the stat, but don't drop the entries
+            Some(Inode::Directory(dir)) => dir.stat = stat,
+            // Entry already exists, is not a dir
+            Some(Inode::Leaf(..)) => todo!("Trying to replace non-dir with dir!"),
             // Entry doesn't exist yet
-            Err(idx) => {
-                self.entries.insert(
-                    idx,
-                    DirEnt {
-                        name: OsString::from(name),
-                        inode: Inode::Directory(Box::new(Directory::new(stat))),
-                    },
-                );
+            None => {
+                self.entries
+                    .insert(name.into(), Inode::Directory(Directory::new(stat).into()));
             }
         }
     }
 
     pub fn insert(&mut self, name: &OsStr, inode: Inode) {
-        match self.find_entry(name) {
-            Ok(idx) => {
-                // found existing item
-                self.entries[idx].inode = inode;
-            }
-            Err(idx) => {
-                // need to add new item
-                self.entries.insert(
-                    idx,
-                    DirEnt {
-                        name: OsString::from(name),
-                        inode,
-                    },
-                );
-            }
-        }
+        self.entries.insert(name.into(), inode);
     }
 
     pub fn get_for_link(&self, name: &OsStr) -> Result<Rc<Leaf>> {
-        match self.find_entry(name) {
-            Ok(idx) => match self.entries[idx].inode {
-                Inode::Leaf(ref leaf) => Ok(Rc::clone(leaf)),
-                Inode::Directory(..) => bail!("Cannot hardlink to directory"),
-            },
-            _ => bail!("Attempt to hardlink to non-existent file"),
+        match self.entries.get(name) {
+            Some(Inode::Leaf(leaf)) => Ok(Rc::clone(leaf)),
+            Some(Inode::Directory(..)) => bail!("Cannot hardlink to directory"),
+            None => bail!("Attempt to hardlink to non-existent file"),
         }
     }
 
     pub fn remove(&mut self, name: &OsStr) {
-        match self.find_entry(name) {
-            Ok(idx) => {
-                self.entries.remove(idx);
-            }
-            _ => { /* not an error to remove an already-missing file */ }
-        }
+        self.entries.remove(name);
     }
 
     pub fn remove_all(&mut self) {
@@ -174,7 +114,7 @@ impl Directory {
 
     pub fn newest_file(&self) -> i64 {
         let mut newest = self.stat.st_mtim_sec;
-        for DirEnt { inode, .. } in &self.entries {
+        for inode in self.entries.values() {
             let mtime = match inode {
                 Inode::Leaf(ref leaf) => leaf.stat.st_mtim_sec,
                 Inode::Directory(ref dir) => dir.newest_file(),
