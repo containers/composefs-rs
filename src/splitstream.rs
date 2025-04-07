@@ -6,13 +6,14 @@
 use std::io::{BufReader, Read, Write};
 
 use anyhow::{bail, Result};
-use sha2::{Digest, Sha256};
-use zstd::stream::{read::Decoder, write::Encoder};
+use sha2::Sha256;
+use zstd::stream::read::Decoder;
 
 use crate::{
     fsverity::{FsVerityHashValue, Sha256HashValue},
     repository::Repository,
     util::read_exactish,
+    zstd_encoder::ZstdWriter,
 };
 
 #[derive(Debug)]
@@ -60,9 +61,8 @@ impl DigestMap {
 
 pub struct SplitStreamWriter<'a> {
     repo: &'a Repository,
-    inline_content: Vec<u8>,
-    writer: Encoder<'a, Vec<u8>>,
-    pub sha256: Option<(Sha256, Sha256HashValue)>,
+    pub(crate) inline_content: Vec<u8>,
+    writer: ZstdWriter,
 }
 
 impl std::fmt::Debug for SplitStreamWriter<'_> {
@@ -71,7 +71,6 @@ impl std::fmt::Debug for SplitStreamWriter<'_> {
         f.debug_struct("SplitStreamWriter")
             .field("repo", &self.repo)
             .field("inline_content", &self.inline_content)
-            .field("sha256", &self.sha256)
             .finish()
     }
 }
@@ -82,85 +81,46 @@ impl SplitStreamWriter<'_> {
         refs: Option<DigestMap>,
         sha256: Option<Sha256HashValue>,
     ) -> SplitStreamWriter {
-        // SAFETY: we surely can't get an error writing the header to a Vec<u8>
-        let mut writer = Encoder::new(vec![], 0).unwrap();
-
-        match refs {
-            Some(DigestMap { map }) => {
-                writer.write_all(&(map.len() as u64).to_le_bytes()).unwrap();
-                for ref entry in map {
-                    writer.write_all(&entry.body).unwrap();
-                    writer.write_all(&entry.verity).unwrap();
-                }
-            }
-            None => {
-                writer.write_all(&0u64.to_le_bytes()).unwrap();
-            }
-        }
-
         SplitStreamWriter {
             repo,
             inline_content: vec![],
-            writer,
-            sha256: sha256.map(|x| (Sha256::new(), x)),
+            writer: ZstdWriter::new(sha256, refs),
         }
     }
 
-    fn write_fragment(writer: &mut impl Write, size: usize, data: &[u8]) -> Result<()> {
-        writer.write_all(&(size as u64).to_le_bytes())?;
-        Ok(writer.write_all(data)?)
+    pub fn get_sha_builder(&self) -> &Option<(Sha256, Sha256HashValue)> {
+        &self.writer.sha256_builder
     }
 
     /// flush any buffered inline data, taking new_value as the new value of the buffer
     fn flush_inline(&mut self, new_value: Vec<u8>) -> Result<()> {
-        if !self.inline_content.is_empty() {
-            SplitStreamWriter::write_fragment(
-                &mut self.writer,
-                self.inline_content.len(),
-                &self.inline_content,
-            )?;
-            self.inline_content = new_value;
-        }
+        self.writer.flush_inline(&self.inline_content)?;
+        self.inline_content = new_value;
         Ok(())
     }
 
     /// really, "add inline content to the buffer"
     /// you need to call .flush_inline() later
     pub fn write_inline(&mut self, data: &[u8]) {
-        if let Some((ref mut sha256, ..)) = self.sha256 {
-            sha256.update(data);
-        }
+        self.writer.update_sha(data);
         self.inline_content.extend(data);
     }
 
-    /// write a reference to external data to the stream.  If the external data had padding in the
-    /// stream which is not stored in the object then pass it here as well and it will be stored
-    /// inline after the reference.
-    fn write_reference(&mut self, reference: Sha256HashValue, padding: Vec<u8>) -> Result<()> {
-        // Flush the inline data before we store the external reference.  Any padding from the
-        // external data becomes the start of a new inline block.
-        self.flush_inline(padding)?;
-
-        SplitStreamWriter::write_fragment(&mut self.writer, 0, &reference)
-    }
-
     pub fn write_external(&mut self, data: &[u8], padding: Vec<u8>) -> Result<()> {
-        if let Some((ref mut sha256, ..)) = self.sha256 {
-            sha256.update(data);
-            sha256.update(&padding);
-        }
-        let id = self.repo.ensure_object(data)?;
-        self.write_reference(id, padding)
+        let id = self.repo.ensure_object(&data)?;
+
+        self.writer.update_sha(data);
+        self.writer.update_sha(&padding);
+        self.writer.flush_inline(&padding)?;
+
+        self.writer.write_fragment(0, &id)?;
+        Ok(())
     }
 
     pub fn done(mut self) -> Result<Sha256HashValue> {
         self.flush_inline(vec![])?;
 
-        if let Some((context, expected)) = self.sha256 {
-            if Into::<Sha256HashValue>::into(context.finalize()) != expected {
-                bail!("Content doesn't have expected SHA256 hash value!");
-            }
-        }
+        self.writer.finalize_sha256_builder()?;
 
         self.repo.ensure_object(&self.writer.finish()?)
     }

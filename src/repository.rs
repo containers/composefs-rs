@@ -171,7 +171,7 @@ impl Repository {
         Ok(result)
     }
 
-    fn format_object_path(id: &Sha256HashValue) -> String {
+    pub fn format_object_path(id: &Sha256HashValue) -> String {
         format!("objects/{:02x}/{}", id[0], hex::encode(&id[1..]))
     }
 
@@ -236,7 +236,7 @@ impl Repository {
         writer: SplitStreamWriter,
         reference: Option<&str>,
     ) -> Result<Sha256HashValue> {
-        let Some((.., ref sha256)) = writer.sha256 else {
+        let Some((.., ref sha256)) = writer.get_sha_builder() else {
             bail!("Writer doesn't have sha256 enabled");
         };
         let stream_path = format!("streams/{}", hex::encode(sha256));

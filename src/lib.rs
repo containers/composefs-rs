@@ -13,6 +13,7 @@ pub mod repository;
 pub mod selabel;
 pub mod splitstream;
 pub mod util;
+pub mod zstd_encoder;
 
 /// All files that contain 64 or fewer bytes (size <= INLINE_CONTENT_MAX) should be stored inline
 /// in the erofs image (and also in splitstreams).  All files with 65 or more bytes (size > MAX)
