@@ -98,8 +98,8 @@ impl MultipleZstdWriters {
             assert!(layer_num >= layer_num_start && layer_num <= layer_num_end);
 
             match self.writers[layers_to_writers[layer_num]].handle_received_data(data) {
-                Ok(t) => {
-                    if t {
+                Ok(finished) => {
+                    if finished {
                         finished_writers += 1
                     }
                 }
@@ -295,18 +295,15 @@ impl ZstdWriter {
 
         let sha = self.finalize_sha256_builder()?;
 
-        if let Err(e) = self
-            .get_state()
+        self.get_state()
             .object_sender
             .send(EnsureObjectMessages::Data(SplitStreamWriterSenderData {
                 external_data: finished,
                 inline_content: vec![],
-                seq_num: 0,
+                seq_num: final_message.total_msgs,
                 layer_num: final_message.layer_num,
             }))
-        {
-            println!("Failed to finish writer. Err: {e}");
-        };
+            .with_context(|| format!("Failed to send object finalize message"))?;
 
         Ok(sha)
     }
@@ -324,13 +321,12 @@ impl ZstdWriter {
                     let object_path = Repository::format_object_path(&recv_data.digest);
                     self.repository.ensure_symlink(&stream_path, &object_path)?;
 
-                    if let Err(e) = self
-                        .get_state()
+                    self.get_state()
                         .final_result_sender
                         .send(Ok((final_sha, recv_data.digest)))
-                    {
-                        println!("Failed to send final digest with err: {e:?}");
-                    }
+                        .with_context(|| {
+                            format!("Failed to send result for layer {final_sha:?}")
+                        })?;
 
                     return Ok(true);
                 }

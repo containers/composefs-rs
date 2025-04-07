@@ -8,7 +8,7 @@ use std::{
     path::PathBuf,
 };
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{bail, ensure, Context, Result};
 use rustix::fs::makedev;
 use tar::{EntryType, Header, PaxExtensions};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -104,11 +104,13 @@ pub async fn split_async(
     }
 
     if let Some(sender) = &writer.object_sender {
-        sender.send(EnsureObjectMessages::Finish(FinishMessage {
-            data: std::mem::take(&mut writer.inline_content),
-            total_msgs: seq_num,
-            layer_num,
-        }))?;
+        sender
+            .send(EnsureObjectMessages::Finish(FinishMessage {
+                data: std::mem::take(&mut writer.inline_content),
+                total_msgs: seq_num,
+                layer_num,
+            }))
+            .with_context(|| format!("Failed to send final message for layer {layer_num}"))?;
     }
 
     Ok(())

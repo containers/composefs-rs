@@ -219,16 +219,16 @@ impl SplitStreamWriter<'_> {
             Some(sender) => {
                 let inline_content = std::mem::replace(&mut self.inline_content, padding);
 
-                if let Err(e) =
-                    sender.send(EnsureObjectMessages::Data(SplitStreamWriterSenderData {
+                sender
+                    .send(EnsureObjectMessages::Data(SplitStreamWriterSenderData {
                         external_data: data,
                         inline_content,
                         seq_num,
                         layer_num,
                     }))
-                {
-                    println!("Falied to send message. Err: {}", e.to_string());
-                }
+                    .with_context(|| {
+                        format!("Failed to send message to writer for layer {layer_num}")
+                    })?;
             }
 
             None => {
