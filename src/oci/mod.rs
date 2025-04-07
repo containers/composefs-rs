@@ -157,8 +157,17 @@ impl<'repo> ImageOp<'repo> {
             //
             self.progress
                 .println(format!("Fetching config {}", hex::encode(config_sha256)))?;
-            let raw_config = self.proxy.fetch_config_raw(&self.img).await?;
-            let config = ImageConfiguration::from_reader(raw_config.as_slice())?;
+
+            let (mut config, driver) = self.proxy.get_descriptor(&self.img, descriptor).await?;
+            let config = async move {
+                let mut s = Vec::new();
+                config.read_to_end(&mut s).await?;
+                anyhow::Ok(s)
+            };
+            let (config, driver) = tokio::join!(config, driver);
+            let _: () = driver?;
+            let raw_config = config?;
+            let config = ImageConfiguration::from_reader(&raw_config[..])?;
 
             let mut config_maps = DigestMap::new();
             for (mld, cld) in zip(manifest_layers, config.rootfs().diff_ids()) {
