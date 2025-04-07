@@ -250,10 +250,7 @@ impl FilesystemReader<'_> {
         )?;
 
         let (_, stat) = FilesystemReader::stat(&fd, FileType::Directory)?;
-        let mut directory = Directory {
-            stat,
-            entries: vec![],
-        };
+        let mut directory = Directory::new(stat);
 
         for item in Dir::read_from(&fd)? {
             let entry = item?;
