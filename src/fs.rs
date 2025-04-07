@@ -2,11 +2,11 @@ use std::{
     cell::RefCell,
     cmp::max,
     collections::{BTreeMap, HashMap},
-    ffi::{CStr, OsStr, OsString},
+    ffi::{CStr, OsStr},
     fs::File,
     io::Write,
     mem::MaybeUninit,
-    os::unix::ffi::{OsStrExt, OsStringExt},
+    os::unix::ffi::OsStrExt,
     path::Path,
     rc::Rc,
 };
@@ -88,24 +88,24 @@ fn write_directory(
 fn write_leaf(leaf: &Leaf, dirfd: &OwnedFd, name: &OsStr, repo: &Repository) -> Result<()> {
     let mode = leaf.stat.st_mode.into();
 
-    match leaf.content {
+    match &leaf.content {
         LeafContent::Regular(RegularFile::Inline(ref data)) => {
             set_file_contents(dirfd, name, &leaf.stat, data)?
         }
         LeafContent::Regular(RegularFile::External(ref id, size)) => {
             let object = repo.open_object(id)?;
             // TODO: make this better.  At least needs to be EINTR-safe.  Could even do reflink in some cases...
-            let mut buffer = vec![MaybeUninit::uninit(); size as usize];
+            let mut buffer = vec![MaybeUninit::uninit(); *size as usize];
             let (data, _) = read(object, &mut buffer)?;
             set_file_contents(dirfd, name, &leaf.stat, data)?;
         }
-        LeafContent::BlockDevice(rdev) => mknodat(dirfd, name, FileType::BlockDevice, mode, rdev)?,
+        LeafContent::BlockDevice(rdev) => mknodat(dirfd, name, FileType::BlockDevice, mode, *rdev)?,
         LeafContent::CharacterDevice(rdev) => {
-            mknodat(dirfd, name, FileType::CharacterDevice, mode, rdev)?
+            mknodat(dirfd, name, FileType::CharacterDevice, mode, *rdev)?
         }
         LeafContent::Socket => mknodat(dirfd, name, FileType::Socket, mode, 0)?,
         LeafContent::Fifo => mknodat(dirfd, name, FileType::Fifo, mode, 0)?,
-        LeafContent::Symlink(ref target) => symlinkat(target, dirfd, name)?,
+        LeafContent::Symlink(target) => symlinkat(target.as_ref(), dirfd, name)?,
     }
 
     Ok(())
@@ -202,7 +202,7 @@ impl FilesystemReader<'_> {
             }
             FileType::Symlink => {
                 let target = readlinkat(fd, "", [])?;
-                LeafContent::Symlink(OsString::from_vec(target.into_bytes()))
+                LeafContent::Symlink(OsStr::from_bytes(target.as_bytes()).into())
             }
             FileType::CharacterDevice => LeafContent::CharacterDevice(buf.st_rdev),
             FileType::BlockDevice => LeafContent::BlockDevice(buf.st_rdev),

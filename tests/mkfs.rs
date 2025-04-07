@@ -1,7 +1,7 @@
 use std::{
     cell::RefCell,
     collections::BTreeMap,
-    ffi::{OsStr, OsString},
+    ffi::OsStr,
     io::Write,
     process::{Command, Stdio},
     rc::Rc,
@@ -67,7 +67,7 @@ fn simple(fs: &mut FileSystem) {
     add_leaf(
         &mut fs.root,
         "symlink",
-        LeafContent::Symlink(OsString::from("/target")),
+        LeafContent::Symlink(OsStr::new("/target").into()),
     );
 }
 

@@ -1,10 +1,4 @@
-use std::{
-    cell::RefCell,
-    collections::BTreeMap,
-    ffi::{OsStr, OsString},
-    path::Path,
-    rc::Rc,
-};
+use std::{cell::RefCell, collections::BTreeMap, ffi::OsStr, path::Path, rc::Rc};
 
 use anyhow::{bail, Context, Result};
 
@@ -32,7 +26,7 @@ pub enum LeafContent {
     CharacterDevice(u64),
     Fifo,
     Socket,
-    Symlink(OsString),
+    Symlink(Box<OsStr>),
 }
 
 #[derive(Debug)]

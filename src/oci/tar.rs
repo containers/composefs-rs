@@ -146,13 +146,13 @@ fn path_from_tar(pax: Option<Box<[u8]>>, gnu: Vec<u8>, short: &[u8]) -> PathBuf 
     PathBuf::from(OsString::from_vec(path))
 }
 
-fn symlink_target_from_tar(pax: Option<Box<[u8]>>, gnu: Vec<u8>, short: &[u8]) -> OsString {
-    if let Some(ref name) = pax {
-        OsString::from(OsStr::from_bytes(name))
+fn symlink_target_from_tar(pax: Option<Box<[u8]>>, gnu: Vec<u8>, short: &[u8]) -> Box<OsStr> {
+    if let Some(name) = pax {
+        OsStr::from_bytes(name.as_ref()).into()
     } else if !gnu.is_empty() {
-        OsString::from_vec(gnu)
+        OsStr::from_bytes(&gnu).into()
     } else {
-        OsString::from(OsStr::from_bytes(short))
+        OsStr::from_bytes(short).into()
     }
 }
 
