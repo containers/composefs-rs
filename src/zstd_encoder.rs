@@ -198,6 +198,7 @@ impl ZstdWriter {
         Ok(self.writer.write_all(data)?)
     }
 
+    /// Writes all the data in `inline_content`, updating the internal SHA
     pub(crate) fn flush_inline(&mut self, inline_content: &Vec<u8>) -> Result<()> {
         if inline_content.is_empty() {
             return Ok(());
@@ -212,6 +213,8 @@ impl ZstdWriter {
         Ok(())
     }
 
+    /// Keeps popping from the heap until it reaches the message with the largest seq_num, n,
+    /// given we have every message with seq_num < n
     fn write_message(&mut self) -> Result<()> {
         loop {
             // Gotta keep lifetime of the destructring inside the loop
@@ -234,9 +237,7 @@ impl ZstdWriter {
                 sha256.update(data.0.object_data.external_data);
             }
 
-            if let Err(e) = self.write_fragment(0, &data.0.digest) {
-                println!("write_fragment err while writing external content: {e:?}");
-            }
+            self.write_fragment(0, &data.0.digest)?;
         }
 
         let final_msg = self.get_state_mut().final_message.take();
@@ -281,6 +282,7 @@ impl ZstdWriter {
         return Ok(sha);
     }
 
+    /// Calls `finish` on the internal writer
     pub(crate) fn finish(self) -> io::Result<Vec<u8>> {
         self.writer.finish()
     }
@@ -310,7 +312,8 @@ impl ZstdWriter {
     }
 
     // Cannot `take` ownership of self, as we'll need it later
-    // returns whether finished or not
+    //
+    /// Returns whether we have finished writing all the data or not
     fn handle_received_data(&mut self, data: WriterMessages) -> Result<bool> {
         match data {
             WriterMessages::WriteData(recv_data) => {
@@ -320,11 +323,6 @@ impl ZstdWriter {
 
                     let object_path = Repository::format_object_path(&recv_data.digest);
                     self.repository.ensure_symlink(&stream_path, &object_path)?;
-
-                    // if let Some(name) = reference {
-                    //     let reference_path = format!("streams/refs/{name}");
-                    //     self.symlink(&reference_path, &stream_path)?;
-                    // }
 
                     if let Err(e) = self
                         .get_state()
