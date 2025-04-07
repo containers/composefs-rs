@@ -485,13 +485,13 @@ impl<'a> InodeCollector<'a> {
 
         let mut entries = vec![];
 
-        for entry in &dir.entries {
-            let child = match &entry.inode {
+        for (name, inode) in &dir.entries {
+            let child = match inode {
                 image::Inode::Directory(dir) => self.collect_dir(dir, me),
                 image::Inode::Leaf(leaf) => self.collect_leaf(leaf),
             };
             entries.push(DirEnt {
-                name: entry.name.as_bytes(),
+                name: name.as_bytes(),
                 inode: child,
                 file_type: self.inodes[child].file_type(),
             });

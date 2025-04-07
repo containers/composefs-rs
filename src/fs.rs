@@ -25,7 +25,7 @@ use zerocopy::IntoBytes;
 
 use crate::{
     fsverity::{digest::FsVerityHasher, Sha256HashValue},
-    image::{DirEnt, Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
+    image::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
     repository::Repository,
     selabel::selabel,
     util::proc_self_fd,
@@ -112,7 +112,7 @@ fn write_leaf(leaf: &Leaf, dirfd: &OwnedFd, name: &OsStr, repo: &Repository) -> 
 }
 
 fn write_directory_contents(dir: &Directory, fd: &OwnedFd, repo: &Repository) -> Result<()> {
-    for DirEnt { name, inode } in &dir.entries {
+    for (name, inode) in &dir.entries {
         match inode {
             Inode::Directory(ref dir) => write_directory(dir, fd, name, repo),
             Inode::Leaf(ref leaf) => write_leaf(leaf, fd, name, repo),
