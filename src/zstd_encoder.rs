@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use zstd::Encoder;
 
 use crate::{
-    fsverity::{FsVerityHashValue, Sha256HashValue},
+    fsverity::Sha256HashValue,
     repository::Repository,
     splitstream::{
         DigestMap, EnsureObjectMessages, FinishMessage, ResultChannelSender,
@@ -198,15 +198,19 @@ impl ZstdWriter {
         Ok(self.writer.write_all(data)?)
     }
 
+    pub(crate) fn update_sha(&mut self, data: &[u8]) {
+        if let Some((sha256, ..)) = &mut self.sha256_builder {
+            sha256.update(&data);
+        }
+    }
+
     /// Writes all the data in `inline_content`, updating the internal SHA
     pub(crate) fn flush_inline(&mut self, inline_content: &Vec<u8>) -> Result<()> {
         if inline_content.is_empty() {
             return Ok(());
         }
 
-        if let Some((sha256, ..)) = &mut self.sha256_builder {
-            sha256.update(&inline_content);
-        }
+        self.update_sha(inline_content);
 
         self.write_fragment(inline_content.len(), &inline_content)?;
 
@@ -263,8 +267,6 @@ impl ZstdWriter {
     pub(crate) fn finalize_sha256_builder(&mut self) -> Result<Sha256HashValue> {
         let sha256_builder = std::mem::replace(&mut self.sha256_builder, None);
 
-        let mut sha = Sha256HashValue::EMPTY;
-
         if let Some((context, expected)) = sha256_builder {
             let final_sha = Into::<Sha256HashValue>::into(context.finalize());
 
@@ -276,10 +278,10 @@ impl ZstdWriter {
                 );
             }
 
-            sha = final_sha;
+            return Ok(final_sha);
         }
 
-        return Ok(sha);
+        bail!("SHA not enabled for writer");
     }
 
     /// Calls `finish` on the internal writer

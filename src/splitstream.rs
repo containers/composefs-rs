@@ -232,8 +232,10 @@ impl SplitStreamWriter<'_> {
             }
 
             None => {
+                self.flush_inline(padding)?;
+                self.writer.update_sha(&data);
+
                 let id = self.repo.ensure_object(&data)?;
-                self.writer.flush_inline(&padding)?;
                 self.writer.write_fragment(0, &id)?;
             }
         };
