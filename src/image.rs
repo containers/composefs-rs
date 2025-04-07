@@ -70,6 +70,13 @@ impl Inode {
 }
 
 impl Directory {
+    pub fn new(stat: Stat) -> Self {
+        Self {
+            stat,
+            entries: vec![],
+        }
+    }
+
     pub fn find_entry(&self, name: &OsStr) -> Result<usize, usize> {
         // OCI layer tarballs are typically sorted, with the entries for a particular directory
         // written out immediately after that directory was created.  That means that it's very
@@ -116,10 +123,7 @@ impl Directory {
                     idx,
                     DirEnt {
                         name: OsString::from(name),
-                        inode: Inode::Directory(Box::new(Directory {
-                            stat,
-                            entries: vec![],
-                        })),
+                        inode: Inode::Directory(Box::new(Directory::new(stat))),
                     },
                 );
             }
@@ -196,17 +200,14 @@ impl Default for FileSystem {
 
 impl FileSystem {
     pub fn new() -> Self {
-        FileSystem {
-            root: Directory {
-                stat: Stat {
-                    st_mode: u32::MAX, // assigned later
-                    st_uid: u32::MAX,  // assigned later
-                    st_gid: u32::MAX,  // assigned later
-                    st_mtim_sec: -1,   // assigned later
-                    xattrs: RefCell::new(BTreeMap::new()),
-                },
-                entries: vec![],
-            },
+        Self {
+            root: Directory::new(Stat {
+                st_mode: u32::MAX, // assigned later
+                st_uid: u32::MAX,  // assigned later
+                st_gid: u32::MAX,  // assigned later
+                st_mtim_sec: -1,   // assigned later
+                xattrs: RefCell::new(BTreeMap::new()),
+            }),
         }
     }
 
