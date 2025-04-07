@@ -241,7 +241,7 @@ impl<'repo> ImageOp<'repo> {
         let (done_chan_sender, done_chan_recver) =
             std::sync::mpsc::channel::<Result<(Sha256HashValue, Sha256HashValue)>>();
 
-        let chunk_len = (config.rootfs().diff_ids().len() + encoder_threads - 1) / encoder_threads;
+        let chunk_len = config.rootfs().diff_ids().len().div_ceil(encoder_threads);
 
         // Divide the layers into chunks of some specific size so each worker
         // thread can work on multiple deterministic layers
@@ -261,8 +261,7 @@ impl<'repo> ImageOp<'repo> {
         let layers_to_chunks = chunks
             .iter()
             .enumerate()
-            .map(|(i, chunk)| std::iter::repeat(i).take(chunk.len()).collect::<Vec<_>>())
-            .flatten()
+            .flat_map(|(i, chunk)| std::iter::repeat(i).take(chunk.len()).collect::<Vec<_>>())
             .collect::<Vec<_>>();
 
         let _ = (0..encoder_threads)
@@ -286,8 +285,7 @@ impl<'repo> ImageOp<'repo> {
                         );
 
                         if let Err(e) = enc.recv_data(receiver, start, end) {
-                            eprintln!("zstd_encoder returned with error: {}", e.to_string());
-                            return;
+                            eprintln!("zstd_encoder returned with error: {}", e)
                         }
                     }
                 });
@@ -312,18 +310,14 @@ impl<'repo> ImageOp<'repo> {
                             zstd_writer_channels,
                             layers_to_chunks,
                         ) {
-                            eprintln!(
-                                "handle_external_object returned with error: {}",
-                                e.to_string()
-                            );
-                            return;
+                            eprintln!("handle_external_object returned with error: {}", e);
                         }
                     }
                 });
             })
             .collect::<Vec<_>>();
 
-        return (done_chan_sender, done_chan_recver, object_sender);
+        (done_chan_sender, done_chan_recver, object_sender)
     }
 
     pub async fn pull(&self) -> Result<(Sha256HashValue, Sha256HashValue)> {

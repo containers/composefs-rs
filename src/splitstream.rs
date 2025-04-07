@@ -105,9 +105,7 @@ impl PartialEq for WriterMessagesData {
 
 impl PartialOrd for WriterMessagesData {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.object_data
-            .seq_num
-            .partial_cmp(&other.object_data.seq_num)
+        Some(self.cmp(other))
     }
 }
 

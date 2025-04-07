@@ -161,7 +161,7 @@ impl ZstdWriter {
             panic!("`get_state` called on a single threaded writer")
         };
 
-        return state;
+        state
     }
 
     fn get_state_mut(&mut self) -> &mut MultiThreadedState {
@@ -169,7 +169,7 @@ impl ZstdWriter {
             panic!("`get_state_mut` called on a single threaded writer")
         };
 
-        return state;
+        state
     }
 
     fn instantiate_writer(refs: Option<DigestMap>) -> zstd::Encoder<'static, Vec<u8>> {
@@ -190,7 +190,7 @@ impl ZstdWriter {
             }
         }
 
-        return writer;
+        writer
     }
 
     pub(crate) fn write_fragment(&mut self, size: usize, data: &[u8]) -> Result<()> {
@@ -200,19 +200,19 @@ impl ZstdWriter {
 
     pub(crate) fn update_sha(&mut self, data: &[u8]) {
         if let Some((sha256, ..)) = &mut self.sha256_builder {
-            sha256.update(&data);
+            sha256.update(data);
         }
     }
 
     /// Writes all the data in `inline_content`, updating the internal SHA
-    pub(crate) fn flush_inline(&mut self, inline_content: &Vec<u8>) -> Result<()> {
+    pub(crate) fn flush_inline(&mut self, inline_content: &[u8]) -> Result<()> {
         if inline_content.is_empty() {
             return Ok(());
         }
 
         self.update_sha(inline_content);
 
-        self.write_fragment(inline_content.len(), &inline_content)?;
+        self.write_fragment(inline_content.len(), inline_content)?;
 
         Ok(())
     }
@@ -265,7 +265,7 @@ impl ZstdWriter {
     }
 
     pub(crate) fn finalize_sha256_builder(&mut self) -> Result<Sha256HashValue> {
-        let sha256_builder = std::mem::replace(&mut self.sha256_builder, None);
+        let sha256_builder = self.sha256_builder.take();
 
         if let Some((context, expected)) = sha256_builder {
             let final_sha = Into::<Sha256HashValue>::into(context.finalize());
@@ -305,7 +305,7 @@ impl ZstdWriter {
                 seq_num: final_message.total_msgs,
                 layer_num: final_message.layer_num,
             }))
-            .with_context(|| format!("Failed to send object finalize message"))?;
+            .context("Failed to send object finalize message")?;
 
         Ok(sha)
     }
@@ -374,6 +374,6 @@ impl ZstdWriter {
             }
         }
 
-        return Ok(false);
+        Ok(false)
     }
 }
