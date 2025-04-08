@@ -41,7 +41,6 @@ pub(crate) enum WriterMode {
 
 pub(crate) struct MultipleZstdWriters {
     writers: Vec<ZstdWriter>,
-    final_result_sender: ResultChannelSender,
 }
 
 impl MultipleZstdWriters {
@@ -52,8 +51,6 @@ impl MultipleZstdWriters {
         final_result_sender: ResultChannelSender,
     ) -> Self {
         Self {
-            final_result_sender: final_result_sender.clone(),
-
             writers: sha256
                 .iter()
                 .map(|sha| {
@@ -104,10 +101,9 @@ impl MultipleZstdWriters {
                     }
                 }
 
-                Err(e) => self
-                    .final_result_sender
-                    .send(Err(e))
-                    .context("Failed to send result on channel")?,
+                Err(e) => {
+                    return Err(e);
+                }
             }
 
             if finished_writers == total_writers {
