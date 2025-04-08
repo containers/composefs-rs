@@ -175,11 +175,14 @@ impl<'repo> ImageOp<'repo> {
             let raw_config = config?;
             let config = ImageConfiguration::from_reader(&raw_config[..])?;
 
-            let (done_chan_sender, done_chan_recver, object_sender) = self.spawn_threads(&config);
+            let (done_chan_sender, done_chan_recver, object_sender) =
+                self.spawn_threads(&config)?;
 
             let mut config_maps = DigestMap::new();
 
-            for (idx, (mld, cld)) in zip(manifest_layers, config.rootfs().diff_ids()).enumerate() {
+            let mut idx = 0;
+
+            for (mld, cld) in zip(manifest_layers, config.rootfs().diff_ids()) {
                 let layer_sha256 = sha256_from_digest(cld)?;
 
                 if let Some(layer_id) = self.repo.check_stream(&layer_sha256)? {
@@ -191,6 +194,8 @@ impl<'repo> ImageOp<'repo> {
                     self.ensure_layer(&layer_sha256, mld, idx, object_sender.clone())
                         .await
                         .with_context(|| format!("Failed to fetch layer {cld} via {mld:?}"))?;
+
+                    idx += 1;
                 }
             }
 
@@ -214,15 +219,53 @@ impl<'repo> ImageOp<'repo> {
     fn spawn_threads(
         &self,
         config: &ImageConfiguration,
-    ) -> (
+    ) -> Result<(
         ResultChannelSender,
         ResultChannelReceiver,
         crossbeam::channel::Sender<EnsureObjectMessages>,
-    ) {
+    )> {
         use crossbeam::channel::{unbounded, Receiver, Sender};
 
-        let encoder_threads = 2;
+        let mut encoder_threads = 2;
         let external_object_writer_threads = 4;
+
+        let chunk_len = config.rootfs().diff_ids().len().div_ceil(encoder_threads);
+
+        // Divide the layers into chunks of some specific size so each worker
+        // thread can work on multiple deterministic layers
+        let diff_ids: Vec<Sha256HashValue> = config
+            .rootfs()
+            .diff_ids()
+            .iter()
+            .map(|x| sha256_from_digest(x))
+            .collect::<Result<Vec<Sha256HashValue>, _>>()?;
+
+        let mut unhandled_layers = vec![];
+
+        // This becomes pretty unreadable with a filter,map chain
+        for id in diff_ids {
+            let layer_exists = self.repo.check_stream(&id)?;
+
+            if layer_exists.is_none() {
+                unhandled_layers.push(id);
+            }
+        }
+
+        let mut chunks: Vec<Vec<Sha256HashValue>> = unhandled_layers
+            .chunks(chunk_len)
+            .map(|x| x.to_vec())
+            .collect();
+
+        // Mapping from layer_id -> index in writer_channels
+        // This is to make sure that all messages relating to a particular layer
+        // always reach the same writer
+        let layers_to_chunks = chunks
+            .iter()
+            .enumerate()
+            .flat_map(|(i, chunk)| std::iter::repeat(i).take(chunk.len()).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+
+        encoder_threads = encoder_threads.min(chunks.len());
 
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(encoder_threads + external_object_writer_threads)
@@ -241,83 +284,56 @@ impl<'repo> ImageOp<'repo> {
         let (done_chan_sender, done_chan_recver) =
             std::sync::mpsc::channel::<Result<(Sha256HashValue, Sha256HashValue)>>();
 
-        let chunk_len = config.rootfs().diff_ids().len().div_ceil(encoder_threads);
+        for i in 0..encoder_threads {
+            let repository = self.repo.try_clone().unwrap();
+            let object_sender = object_sender.clone();
+            let done_chan_sender = done_chan_sender.clone();
+            let chunk = std::mem::take(&mut chunks[i]);
+            let receiver = zstd_writer_channels[i].1.clone();
 
-        // Divide the layers into chunks of some specific size so each worker
-        // thread can work on multiple deterministic layers
-        let mut chunks: Vec<Vec<Sha256HashValue>> = config
-            .rootfs()
-            .diff_ids()
-            .iter()
-            .map(|x| sha256_from_digest(x).unwrap())
-            .collect::<Vec<Sha256HashValue>>()
-            .chunks(chunk_len)
-            .map(|x| x.to_vec())
-            .collect();
+            pool.spawn({
+                move || {
+                    let start = i * (chunk_len);
+                    let end = start + chunk_len;
 
-        // Mapping from layer_id -> index in writer_channels
-        // This is to make sure that all messages relating to a particular layer
-        // always reach the same writer
-        let layers_to_chunks = chunks
-            .iter()
-            .enumerate()
-            .flat_map(|(i, chunk)| std::iter::repeat(i).take(chunk.len()).collect::<Vec<_>>())
-            .collect::<Vec<_>>();
+                    let enc = zstd_encoder::MultipleZstdWriters::new(
+                        chunk,
+                        repository,
+                        object_sender,
+                        done_chan_sender,
+                    );
 
-        let _ = (0..encoder_threads)
-            .map(|i| {
+                    if let Err(e) = enc.recv_data(receiver, start, end) {
+                        eprintln!("zstd_encoder returned with error: {}", e)
+                    }
+                }
+            });
+        }
+
+        for _ in 0..external_object_writer_threads {
+            pool.spawn({
                 let repository = self.repo.try_clone().unwrap();
-                let object_sender = object_sender.clone();
-                let done_chan_sender = done_chan_sender.clone();
-                let chunk = std::mem::take(&mut chunks[i]);
-                let receiver = zstd_writer_channels[i].1.clone();
+                let zstd_writer_channels = zstd_writer_channels
+                    .iter()
+                    .map(|(s, _)| s.clone())
+                    .collect::<Vec<_>>();
+                let layers_to_chunks = layers_to_chunks.clone();
+                let external_object_receiver = object_receiver.clone();
 
-                pool.spawn({
-                    move || {
-                        let start = i * (chunk_len);
-                        let end = start + chunk_len;
-
-                        let enc = zstd_encoder::MultipleZstdWriters::new(
-                            chunk,
-                            repository,
-                            object_sender,
-                            done_chan_sender,
-                        );
-
-                        if let Err(e) = enc.recv_data(receiver, start, end) {
-                            eprintln!("zstd_encoder returned with error: {}", e)
-                        }
+                move || {
+                    if let Err(e) = handle_external_object(
+                        repository,
+                        external_object_receiver,
+                        zstd_writer_channels,
+                        layers_to_chunks,
+                    ) {
+                        eprintln!("handle_external_object returned with error: {}", e);
                     }
-                });
-            })
-            .collect::<Vec<()>>();
+                }
+            });
+        }
 
-        let _ = (0..external_object_writer_threads)
-            .map(|_| {
-                pool.spawn({
-                    let repository = self.repo.try_clone().unwrap();
-                    let zstd_writer_channels = zstd_writer_channels
-                        .iter()
-                        .map(|(s, _)| s.clone())
-                        .collect::<Vec<_>>();
-                    let layers_to_chunks = layers_to_chunks.clone();
-                    let external_object_receiver = object_receiver.clone();
-
-                    move || {
-                        if let Err(e) = handle_external_object(
-                            repository,
-                            external_object_receiver,
-                            zstd_writer_channels,
-                            layers_to_chunks,
-                        ) {
-                            eprintln!("handle_external_object returned with error: {}", e);
-                        }
-                    }
-                });
-            })
-            .collect::<Vec<_>>();
-
-        (done_chan_sender, done_chan_recver, object_sender)
+        Ok((done_chan_sender, done_chan_recver, object_sender))
     }
 
     pub async fn pull(&self) -> Result<(Sha256HashValue, Sha256HashValue)> {
