@@ -12,6 +12,7 @@ pub mod oci;
 pub mod repository;
 pub mod selabel;
 pub mod splitstream;
+pub mod uki;
 pub mod util;
 
 /// All files that contain 64 or fewer bytes (size <= INLINE_CONTENT_MAX) should be stored inline
