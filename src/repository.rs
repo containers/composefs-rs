@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     ffi::CStr,
     fs::File,
-    io::{ErrorKind, Read, Write},
+    io::{self, ErrorKind, Read, Write},
     os::fd::{AsFd, OwnedFd},
     path::{Path, PathBuf},
 };
@@ -44,6 +44,12 @@ impl Repository {
             "objects",
             OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
         )
+    }
+
+    pub fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            repository: self.repository.try_clone()?,
+        })
     }
 
     pub fn open_path(dirfd: impl AsFd, path: impl AsRef<Path>) -> Result<Repository> {
