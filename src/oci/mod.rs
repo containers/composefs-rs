@@ -262,7 +262,7 @@ impl<'repo> ImageOp<'repo> {
         let layers_to_chunks = chunks
             .iter()
             .enumerate()
-            .flat_map(|(i, chunk)| std::iter::repeat(i).take(chunk.len()).collect::<Vec<_>>())
+            .flat_map(|(i, chunk)| std::iter::repeat_n(i, chunk.len()).collect::<Vec<_>>())
             .collect::<Vec<_>>();
 
         encoder_threads = encoder_threads.min(chunks.len());
