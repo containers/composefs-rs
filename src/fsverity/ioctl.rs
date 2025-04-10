@@ -19,7 +19,7 @@ pub enum MeasureVerityError {
 
 /// Enabling fsverity failed.
 #[derive(Error, Debug, PartialEq)]
-pub enum EnableVerifyError {
+pub enum EnableVerityError {
     #[error("Filesystem does not support fs-verity")]
     FilesystemNotSupported,
     #[error("{0}")]
@@ -47,7 +47,7 @@ const FS_IOC_ENABLE_VERITY: u32 = ioctl::opcode::write::<FsVerityEnableArg>(b'f'
 /// Enable fsverity on the target file. This is a thin safe wrapper for the underlying base `ioctl`
 /// and hence all constraints apply such as requiring the file descriptor to already be `O_RDONLY`
 /// etc.
-pub fn fs_ioc_enable_verity<F: AsFd, H: FsVerityHashValue>(fd: F) -> Result<(), EnableVerifyError> {
+pub fn fs_ioc_enable_verity<F: AsFd, H: FsVerityHashValue>(fd: F) -> Result<(), EnableVerityError> {
     unsafe {
         match ioctl::ioctl(
             fd,
@@ -64,7 +64,7 @@ pub fn fs_ioc_enable_verity<F: AsFd, H: FsVerityHashValue>(fd: F) -> Result<(), 
             }),
         ) {
             Err(rustix::io::Errno::NOTTY) | Err(rustix::io::Errno::OPNOTSUPP) => {
-                return Err(EnableVerifyError::FilesystemNotSupported)
+                return Err(EnableVerityError::FilesystemNotSupported)
             }
             Err(e) => return Err(e.into()),
             Ok(_) => (),
@@ -155,7 +155,7 @@ mod tests {
         let fd = OwnedFd::from(file);
         let res = fs_ioc_enable_verity::<&OwnedFd, Sha256HashValue>(&fd);
         let err = res.err().unwrap();
-        assert_eq!(err, EnableVerifyError::FilesystemNotSupported);
+        assert_eq!(err, EnableVerityError::FilesystemNotSupported);
         assert_eq!(err.to_string(), "Filesystem does not support fs-verity",);
     }
 
@@ -164,7 +164,7 @@ mod tests {
         let fd = ManuallyDrop::new(unsafe { OwnedFd::from_raw_fd(123456) });
         let res = fs_ioc_enable_verity::<&OwnedFd, Sha256HashValue>(&fd);
         let err = res.err().unwrap();
-        assert_eq!(err, EnableVerifyError::Errno(Errno::from_raw_os_error(9)));
+        assert_eq!(err, EnableVerityError::Errno(Errno::from_raw_os_error(9)));
         assert_eq!(err.to_string(), "Bad file descriptor (os error 9)",);
     }
 }
