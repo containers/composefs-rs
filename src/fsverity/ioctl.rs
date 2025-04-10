@@ -131,21 +131,21 @@ pub fn fs_ioc_measure_verity<F: AsFd, H: FsVerityHashValue>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::fsverity::Sha256HashValue;
+    use std::{mem::ManuallyDrop, os::fd::OwnedFd};
+
     use rustix::fd::FromRawFd;
-    use std::mem::ManuallyDrop;
-    use std::os::fd::OwnedFd;
     use tempfile::tempfile_in;
 
+    use crate::fsverity::Sha256HashValue;
+
+    use super::*;
+
     #[test]
-    fn test_measure_verity_opt() -> anyhow::Result<()> {
-        let tf = tempfile::tempfile()?;
-        assert_eq!(
-            fs_ioc_measure_verity::<_, Sha256HashValue>(&tf).unwrap(),
-            None
-        );
-        Ok(())
+    fn test_measure_verity_opt() {
+        let tf = tempfile::tempfile().unwrap();
+        assert!(fs_ioc_measure_verity::<_, Sha256HashValue>(&tf)
+            .unwrap()
+            .is_none())
     }
 
     #[test_with::path(/dev/shm)]
@@ -164,10 +164,7 @@ mod tests {
         let fd = ManuallyDrop::new(unsafe { OwnedFd::from_raw_fd(123456) });
         let res = fs_ioc_enable_verity::<&OwnedFd, Sha256HashValue>(&fd);
         let err = res.err().unwrap();
-        assert_eq!(
-            err,
-            EnableVerifyError::Errno(rustix::io::Errno::from_raw_os_error(9))
-        );
+        assert_eq!(err, EnableVerifyError::Errno(Errno::from_raw_os_error(9)));
         assert_eq!(err.to_string(), "Bad file descriptor (os error 9)",);
     }
 }

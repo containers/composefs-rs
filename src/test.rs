@@ -1,10 +1,6 @@
-use std::{
-    ffi::OsString,
-    fs::{create_dir_all, File},
-    path::PathBuf,
-};
+use std::{ffi::OsString, fs::create_dir_all, path::PathBuf};
 
-use tempfile::{tempfile_in, TempDir};
+use tempfile::TempDir;
 
 use once_cell::sync::Lazy;
 
