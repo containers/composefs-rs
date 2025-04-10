@@ -52,12 +52,12 @@ fn sha256_from_descriptor(descriptor: &Descriptor) -> Result<Sha256HashValue> {
     let Some(digest) = descriptor.as_digest_sha256() else {
         bail!("Descriptor in oci config is not sha256");
     };
-    parse_sha256(digest)
+    Ok(parse_sha256(digest)?)
 }
 
 fn sha256_from_digest(digest: &str) -> Result<Sha256HashValue> {
     match digest.strip_prefix("sha256:") {
-        Some(rest) => parse_sha256(rest),
+        Some(rest) => Ok(parse_sha256(rest)?),
         None => bail!("Manifest has non-sha256 digest"),
     }
 }

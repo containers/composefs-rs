@@ -43,6 +43,7 @@ zstd = "0.13.3"
 insta = "1.42.2"
 similar-asserts = "1.7.0"
 test-with = { version = "0.14", default-features = false, features = ["executable", "runtime"] }
+tokio-test = "0.4.4"
 
 [profile.dev.package.sha2]
 # this is *really* slow otherwise
