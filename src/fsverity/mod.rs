@@ -66,11 +66,10 @@ pub fn ensure_verity<F: AsFd, H: FsVerityHashValue>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fsverity::Sha256HashValue;
 
     #[test]
-    fn test_verity_missing() -> anyhow::Result<()> {
-        let tf = tempfile::tempfile()?;
+    fn test_verity_missing() {
+        let tf = tempfile::tempfile().unwrap();
         match measure_verity_digest::<_, Sha256HashValue>(&tf) {
             Err(CompareVerityError::VerityMissing) => {}
             o => panic!("Unexpected {o:?}"),
@@ -80,6 +79,5 @@ mod tests {
             Err(CompareVerityError::VerityMissing) => {}
             o => panic!("Unexpected {o:?}"),
         }
-        Ok(())
     }
 }

@@ -152,20 +152,15 @@ impl FsVerityHasher {
 
 #[cfg(test)]
 mod tests {
-    use anyhow::Result;
+    use similar_asserts::assert_eq;
 
     use super::*;
 
     #[test]
-    fn test_digest() -> Result<()> {
-        let digest = FsVerityHasher::hash(b"hello world");
-        similar_asserts::assert_eq!(
-            digest,
-            [
-                30, 46, 170, 66, 2, 215, 80, 164, 17, 116, 238, 69, 73, 112, 185, 44, 27, 194, 249,
-                37, 177, 227, 80, 118, 216, 199, 213, 245, 99, 98, 186, 100
-            ]
+    fn test_digest() {
+        assert_eq!(
+            hex::encode(FsVerityHasher::hash(b"hello world")),
+            "1e2eaa4202d750a41174ee454970b92c1bc2f925b1e35076d8c7d5f56362ba64"
         );
-        Ok(())
     }
 }
