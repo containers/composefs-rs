@@ -24,7 +24,7 @@ use rustix::{
 use zerocopy::IntoBytes;
 
 use crate::{
-    fsverity::{digest::FsVerityHasher, Sha256HashValue},
+    fsverity::{compute_verity, Sha256HashValue},
     image::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
     repository::Repository,
     selabel::selabel,
@@ -193,7 +193,7 @@ impl FilesystemReader<'_> {
                     let id = if let Some(repo) = self.repo {
                         repo.ensure_object(&buffer)?
                     } else {
-                        FsVerityHasher::hash(&buffer)
+                        compute_verity(&buffer)
                     };
                     LeafContent::Regular(RegularFile::External(id, buf.st_size as u64))
                 } else {
@@ -306,7 +306,7 @@ pub fn create_image(path: &Path, repo: Option<&Repository>) -> Result<Sha256Hash
     if let Some(repo) = repo {
         Ok(repo.write_image(None, &image)?)
     } else {
-        Ok(FsVerityHasher::hash(&image))
+        Ok(compute_verity(&image))
     }
 }
 
