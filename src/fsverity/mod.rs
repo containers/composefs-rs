@@ -3,9 +3,15 @@ mod ioctl;
 
 use std::{io::Error, os::fd::AsFd};
 
+use sha2::{digest::FixedOutputReset, digest::Output, Digest, Sha256, Sha512};
 use thiserror::Error;
 
-pub trait FsVerityHashValue: Eq + AsRef<[u8]> {
+pub trait FsVerityHashValue
+where
+    Self: Eq + AsRef<[u8]> + Clone,
+    Self: From<Output<Self::Digest>>,
+{
+    type Digest: Digest + FixedOutputReset + std::fmt::Debug;
     const ALGORITHM: u8;
     const EMPTY: Self;
 }
@@ -13,6 +19,7 @@ pub trait FsVerityHashValue: Eq + AsRef<[u8]> {
 pub type Sha256HashValue = [u8; 32];
 
 impl FsVerityHashValue for Sha256HashValue {
+    type Digest = Sha256;
     const ALGORITHM: u8 = 1;
     const EMPTY: Self = [0; 32];
 }
@@ -20,6 +27,7 @@ impl FsVerityHashValue for Sha256HashValue {
 pub type Sha512HashValue = [u8; 64];
 
 impl FsVerityHashValue for Sha512HashValue {
+    type Digest = Sha512;
     const ALGORITHM: u8 = 2;
     const EMPTY: Self = [0; 64];
 }
@@ -63,16 +71,16 @@ pub enum CompareVerityError {
 /// contains the root hash of a Merkle tree with an arity determined by the chosen block size and
 /// the output size of the chosen hash algorithm.
 ///
-/// The hash algorithm is currently hardcoded to SHA-256 and the blocksize is currently hardcoded
-/// to 4096.  Salt is not supported.
+/// It's possible to choose the hash algorithm (via the generic parameter) but the blocksize is
+/// currently hardcoded to 4096.  Salt is not supported.
 ///
 /// See https://www.kernel.org/doc/html/latest/filesystems/fsverity.html#file-digest-computation
 ///
 /// # Arguments:
 ///
 ///  * `data`: the data to hash
-pub fn compute_verity(data: &[u8]) -> Sha256HashValue {
-    digest::FsVerityHasher::hash(data)
+pub fn compute_verity<H: FsVerityHashValue>(data: &[u8]) -> H {
+    digest::FsVerityHasher::<H, 12>::hash(data)
 }
 
 /// Enable fs-verity on the given file.
