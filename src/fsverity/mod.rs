@@ -1,7 +1,7 @@
 mod digest;
 mod ioctl;
 
-use std::os::fd::AsFd;
+use std::{io::Error, os::fd::AsFd};
 
 use thiserror::Error;
 
@@ -27,8 +27,8 @@ impl FsVerityHashValue for Sha512HashValue {
 /// Measuring fsverity failed.
 #[derive(Error, Debug)] // can't derive PartialEq because of std::io::Error
 pub enum MeasureVerityError {
-    #[error("I/O error")]
-    Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Io(#[from] Error),
     #[error("fs-verity is not enabled on file")]
     VerityMissing,
     #[error("Expected algorithm {expected}, found {found}")]
@@ -38,12 +38,14 @@ pub enum MeasureVerityError {
 }
 
 /// Enabling fsverity failed.
-#[derive(Error, Debug, PartialEq)]
+#[derive(Error, Debug)]
 pub enum EnableVerityError {
+    #[error("{0}")]
+    Io(#[from] Error),
     #[error("Filesystem does not support fs-verity")]
     FilesystemNotSupported,
-    #[error("{0}")]
-    Errno(#[from] rustix::io::Errno),
+    #[error("fs-verity is already enabled on file")]
+    AlreadyEnabled,
 }
 
 /// A verity comparison failed.
