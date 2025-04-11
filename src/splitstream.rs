@@ -5,14 +5,17 @@
 
 use std::io::{BufReader, Read, Write};
 
-use anyhow::{bail, Result};
-use sha2::{Digest, Sha256};
-use zstd::stream::{read::Decoder, write::Encoder};
+use crossbeam::channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
+
+use anyhow::{bail, Context, Result};
+use sha2::Sha256;
+use zstd::stream::read::Decoder;
 
 use crate::{
     fsverity::{FsVerityHashValue, Sha256HashValue},
     repository::Repository,
     util::read_exactish,
+    zstd_encoder::ZstdWriter,
 };
 
 #[derive(Debug)]
@@ -60,9 +63,9 @@ impl DigestMap {
 
 pub struct SplitStreamWriter<'a> {
     repo: &'a Repository,
-    inline_content: Vec<u8>,
-    writer: Encoder<'a, Vec<u8>>,
-    pub sha256: Option<(Sha256, Sha256HashValue)>,
+    pub(crate) inline_content: Vec<u8>,
+    writer: ZstdWriter,
+    pub(crate) object_sender: Option<CrossbeamSender<EnsureObjectMessages>>,
 }
 
 impl std::fmt::Debug for SplitStreamWriter<'_> {
@@ -71,97 +74,176 @@ impl std::fmt::Debug for SplitStreamWriter<'_> {
         f.debug_struct("SplitStreamWriter")
             .field("repo", &self.repo)
             .field("inline_content", &self.inline_content)
-            .field("sha256", &self.sha256)
             .finish()
     }
 }
 
-impl SplitStreamWriter<'_> {
-    pub fn new(
-        repo: &Repository,
-        refs: Option<DigestMap>,
-        sha256: Option<Sha256HashValue>,
-    ) -> SplitStreamWriter {
-        // SAFETY: we surely can't get an error writing the header to a Vec<u8>
-        let mut writer = Encoder::new(vec![], 0).unwrap();
+#[derive(Debug)]
+pub(crate) struct FinishMessage {
+    pub(crate) data: Vec<u8>,
+    pub(crate) total_msgs: usize,
+    pub(crate) layer_num: usize,
+}
 
-        match refs {
-            Some(DigestMap { map }) => {
-                writer.write_all(&(map.len() as u64).to_le_bytes()).unwrap();
-                for ref entry in map {
-                    writer.write_all(&entry.body).unwrap();
-                    writer.write_all(&entry.verity).unwrap();
-                }
-            }
-            None => {
-                writer.write_all(&0u64.to_le_bytes()).unwrap();
-            }
-        }
+#[derive(Eq, Debug)]
+pub(crate) struct WriterMessagesData {
+    pub(crate) digest: Sha256HashValue,
+    pub(crate) object_data: SplitStreamWriterSenderData,
+}
 
-        SplitStreamWriter {
-            repo,
-            inline_content: vec![],
-            writer,
-            sha256: sha256.map(|x| (Sha256::new(), x)),
+#[derive(Debug)]
+pub(crate) enum WriterMessages {
+    WriteData(WriterMessagesData),
+    Finish(FinishMessage),
+}
+
+impl PartialEq for WriterMessagesData {
+    fn eq(&self, other: &Self) -> bool {
+        self.object_data.seq_num.eq(&other.object_data.seq_num)
+    }
+}
+
+impl PartialOrd for WriterMessagesData {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for WriterMessagesData {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.object_data.seq_num.cmp(&other.object_data.seq_num)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SplitStreamWriterSenderData {
+    pub(crate) external_data: Vec<u8>,
+    pub(crate) inline_content: Vec<u8>,
+    pub(crate) seq_num: usize,
+    pub(crate) layer_num: usize,
+}
+pub(crate) enum EnsureObjectMessages {
+    Data(SplitStreamWriterSenderData),
+    Finish(FinishMessage),
+}
+
+pub(crate) type ResultChannelSender =
+    std::sync::mpsc::Sender<Result<(Sha256HashValue, Sha256HashValue)>>;
+pub(crate) type ResultChannelReceiver =
+    std::sync::mpsc::Receiver<Result<(Sha256HashValue, Sha256HashValue)>>;
+
+pub(crate) fn handle_external_object(
+    repository: Repository,
+    external_object_receiver: CrossbeamReceiver<EnsureObjectMessages>,
+    zstd_writer_channels: Vec<CrossbeamSender<WriterMessages>>,
+    layers_to_chunks: Vec<usize>,
+) -> Result<()> {
+    while let Ok(data) = external_object_receiver.recv() {
+        match data {
+            EnsureObjectMessages::Data(data) => {
+                let digest = repository.ensure_object(&data.external_data)?;
+                let layer_num = data.layer_num;
+                let writer_chan_sender = &zstd_writer_channels[layers_to_chunks[layer_num]];
+
+                let msg = WriterMessagesData {
+                    digest,
+                    object_data: data,
+                };
+
+                // `send` only fails if all receivers are dropped
+                writer_chan_sender
+                    .send(WriterMessages::WriteData(msg))
+                    .with_context(|| format!("Failed to send message for layer {layer_num}"))?;
+            }
+
+            EnsureObjectMessages::Finish(final_msg) => {
+                let layer_num = final_msg.layer_num;
+                let writer_chan_sender = &zstd_writer_channels[layers_to_chunks[layer_num]];
+
+                writer_chan_sender
+                    .send(WriterMessages::Finish(final_msg))
+                    .with_context(|| {
+                        format!("Failed to send final message for layer {layer_num}")
+                    })?;
+            }
         }
     }
 
-    fn write_fragment(writer: &mut impl Write, size: usize, data: &[u8]) -> Result<()> {
-        writer.write_all(&(size as u64).to_le_bytes())?;
-        Ok(writer.write_all(data)?)
+    Ok(())
+}
+
+impl SplitStreamWriter<'_> {
+    pub(crate) fn new(
+        repo: &Repository,
+        refs: Option<DigestMap>,
+        sha256: Option<Sha256HashValue>,
+        object_sender: Option<CrossbeamSender<EnsureObjectMessages>>,
+    ) -> SplitStreamWriter {
+        let inline_content = vec![];
+
+        SplitStreamWriter {
+            repo,
+            inline_content,
+            object_sender,
+            writer: ZstdWriter::new(sha256, refs, repo.try_clone().unwrap()),
+        }
+    }
+
+    pub fn get_sha_builder(&self) -> &Option<(Sha256, Sha256HashValue)> {
+        &self.writer.sha256_builder
     }
 
     /// flush any buffered inline data, taking new_value as the new value of the buffer
     fn flush_inline(&mut self, new_value: Vec<u8>) -> Result<()> {
-        if !self.inline_content.is_empty() {
-            SplitStreamWriter::write_fragment(
-                &mut self.writer,
-                self.inline_content.len(),
-                &self.inline_content,
-            )?;
-            self.inline_content = new_value;
-        }
+        self.writer.flush_inline(&self.inline_content)?;
+        self.inline_content = new_value;
         Ok(())
     }
 
     /// really, "add inline content to the buffer"
     /// you need to call .flush_inline() later
     pub fn write_inline(&mut self, data: &[u8]) {
-        if let Some((ref mut sha256, ..)) = self.sha256 {
-            sha256.update(data);
-        }
         self.inline_content.extend(data);
     }
 
-    /// write a reference to external data to the stream.  If the external data had padding in the
-    /// stream which is not stored in the object then pass it here as well and it will be stored
-    /// inline after the reference.
-    fn write_reference(&mut self, reference: Sha256HashValue, padding: Vec<u8>) -> Result<()> {
-        // Flush the inline data before we store the external reference.  Any padding from the
-        // external data becomes the start of a new inline block.
-        self.flush_inline(padding)?;
+    pub fn write_external(
+        &mut self,
+        data: Vec<u8>,
+        padding: Vec<u8>,
+        seq_num: usize,
+        layer_num: usize,
+    ) -> Result<()> {
+        match &self.object_sender {
+            Some(sender) => {
+                let inline_content = std::mem::replace(&mut self.inline_content, padding);
 
-        SplitStreamWriter::write_fragment(&mut self.writer, 0, &reference)
-    }
+                sender
+                    .send(EnsureObjectMessages::Data(SplitStreamWriterSenderData {
+                        external_data: data,
+                        inline_content,
+                        seq_num,
+                        layer_num,
+                    }))
+                    .with_context(|| {
+                        format!("Failed to send message to writer for layer {layer_num}")
+                    })?;
+            }
 
-    pub fn write_external(&mut self, data: &[u8], padding: Vec<u8>) -> Result<()> {
-        if let Some((ref mut sha256, ..)) = self.sha256 {
-            sha256.update(data);
-            sha256.update(&padding);
-        }
-        let id = self.repo.ensure_object(data)?;
-        self.write_reference(id, padding)
+            None => {
+                self.flush_inline(padding)?;
+                self.writer.update_sha(&data);
+
+                let id = self.repo.ensure_object(&data)?;
+                self.writer.write_fragment(0, &id)?;
+            }
+        };
+
+        Ok(())
     }
 
     pub fn done(mut self) -> Result<Sha256HashValue> {
         self.flush_inline(vec![])?;
-
-        if let Some((context, expected)) = self.sha256 {
-            if Into::<Sha256HashValue>::into(context.finalize()) != expected {
-                bail!("Content doesn't have expected SHA256 hash value!");
-            }
-        }
-
+        self.writer.finalize_sha256_builder()?;
         self.repo.ensure_object(&self.writer.finish()?)
     }
 }

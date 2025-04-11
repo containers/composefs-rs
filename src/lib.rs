@@ -14,6 +14,7 @@ pub mod selabel;
 pub mod splitstream;
 pub mod uki;
 pub mod util;
+pub mod zstd_encoder;
 
 #[cfg(test)]
 pub(crate) mod test;
