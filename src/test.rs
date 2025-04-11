@@ -1,6 +1,10 @@
-use std::{ffi::OsString, fs::create_dir_all, path::PathBuf};
+use std::{
+    ffi::OsString,
+    fs::{create_dir_all, File},
+    path::PathBuf,
+};
 
-use tempfile::TempDir;
+use tempfile::{tempfile_in, TempDir};
 
 use once_cell::sync::Lazy;
 
@@ -22,4 +26,8 @@ static TMPDIR: Lazy<OsString> = Lazy::new(|| {
 
 pub fn tempdir() -> TempDir {
     TempDir::with_prefix_in("composefs-test-", TMPDIR.as_os_str()).unwrap()
+}
+
+pub fn tempfile() -> File {
+    tempfile_in(TMPDIR.as_os_str()).unwrap()
 }
