@@ -1,4 +1,4 @@
-use std::os::fd::AsFd;
+use std::{io::Error, os::fd::AsFd};
 
 use rustix::io::Errno;
 use rustix::ioctl;
@@ -44,15 +44,14 @@ pub(super) fn fs_ioc_enable_verity<H: FsVerityHashValue>(
                 __reserved2: [0; 11],
             }),
         ) {
-            Err(rustix::io::Errno::NOTTY) | Err(rustix::io::Errno::OPNOTSUPP) => {
-                return Err(EnableVerityError::FilesystemNotSupported)
+            Err(Errno::NOTTY) | Err(Errno::OPNOTSUPP) => {
+                Err(EnableVerityError::FilesystemNotSupported)
             }
-            Err(e) => return Err(e.into()),
-            Ok(_) => (),
+            Err(Errno::EXIST) => Err(EnableVerityError::AlreadyEnabled),
+            Err(e) => Err(Error::from(e).into()),
+            Ok(_) => Ok(()),
         }
     }
-
-    Ok(())
 }
 
 /// Core definition of a fsverity digest.
@@ -107,7 +106,7 @@ pub(super) fn fs_ioc_measure_verity<H: FsVerityHashValue>(
         Err(Errno::OVERFLOW) => Err(MeasureVerityError::InvalidDigestSize {
             expected: digest.digest_size,
         }),
-        Err(e) => Err(std::io::Error::from(e).into()),
+        Err(e) => Err(Error::from(e).into()),
     }
 }
 
@@ -136,9 +135,8 @@ mod tests {
     fn test_fs_ioc_enable_verity_wrong_fs() {
         let file = tempfile_in("/dev/shm").unwrap();
         let fd = OwnedFd::from(file);
-        let res = fs_ioc_enable_verity::<Sha256HashValue>(&fd);
-        let err = res.err().unwrap();
-        assert_eq!(err, EnableVerityError::FilesystemNotSupported);
+        let err = fs_ioc_enable_verity::<Sha256HashValue>(&fd).unwrap_err();
+        assert!(matches!(err, EnableVerityError::FilesystemNotSupported));
         assert_eq!(err.to_string(), "Filesystem does not support fs-verity",);
     }
 
@@ -147,7 +145,7 @@ mod tests {
         let fd = ManuallyDrop::new(unsafe { OwnedFd::from_raw_fd(123456) });
         let res = fs_ioc_enable_verity::<Sha256HashValue>(fd.as_fd());
         let err = res.err().unwrap();
-        assert_eq!(err, EnableVerityError::Errno(Errno::from_raw_os_error(9)));
+        assert!(matches!(err, EnableVerityError::Io(..)));
         assert_eq!(err.to_string(), "Bad file descriptor (os error 9)",);
     }
 }
