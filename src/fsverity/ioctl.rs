@@ -1,35 +1,14 @@
-use std::os::fd::AsFd;
+use std::{io::Error, os::fd::AsFd};
 
 use rustix::io::Errno;
 use rustix::ioctl;
-use thiserror::Error;
 
-use super::FsVerityHashValue;
-
-/// Measuring fsverity failed.
-#[derive(Error, Debug)]
-pub enum MeasureVerityError {
-    #[error("i/o error")]
-    Io(#[from] std::io::Error),
-    #[error("Expected algorithm {expected}, found {found}")]
-    InvalidDigestAlgorithm { expected: u16, found: u16 },
-    #[error("Expected digest size {expected}")]
-    InvalidDigestSize { expected: u16 },
-}
-
-/// Enabling fsverity failed.
-#[derive(Error, Debug, PartialEq)]
-pub enum EnableVerifyError {
-    #[error("Filesystem does not support fs-verity")]
-    FilesystemNotSupported,
-    #[error("{0}")]
-    Errno(#[from] rustix::io::Errno),
-}
+pub use super::{EnableVerityError, FsVerityHashValue, MeasureVerityError};
 
 // See /usr/include/linux/fsverity.h
 #[repr(C)]
 #[derive(Debug)]
-pub struct FsVerityEnableArg {
+struct FsVerityEnableArg {
     version: u32,
     hash_algorithm: u32,
     block_size: u32,
@@ -47,7 +26,9 @@ const FS_IOC_ENABLE_VERITY: u32 = ioctl::opcode::write::<FsVerityEnableArg>(b'f'
 /// Enable fsverity on the target file. This is a thin safe wrapper for the underlying base `ioctl`
 /// and hence all constraints apply such as requiring the file descriptor to already be `O_RDONLY`
 /// etc.
-pub fn fs_ioc_enable_verity<F: AsFd, H: FsVerityHashValue>(fd: F) -> Result<(), EnableVerifyError> {
+pub(super) fn fs_ioc_enable_verity<H: FsVerityHashValue>(
+    fd: impl AsFd,
+) -> Result<(), EnableVerityError> {
     unsafe {
         match ioctl::ioctl(
             fd,
@@ -63,21 +44,20 @@ pub fn fs_ioc_enable_verity<F: AsFd, H: FsVerityHashValue>(fd: F) -> Result<(), 
                 __reserved2: [0; 11],
             }),
         ) {
-            Err(rustix::io::Errno::NOTTY) | Err(rustix::io::Errno::OPNOTSUPP) => {
-                return Err(EnableVerifyError::FilesystemNotSupported)
+            Err(Errno::NOTTY) | Err(Errno::OPNOTSUPP) => {
+                Err(EnableVerityError::FilesystemNotSupported)
             }
-            Err(e) => return Err(e.into()),
-            Ok(_) => (),
+            Err(Errno::EXIST) => Err(EnableVerityError::AlreadyEnabled),
+            Err(e) => Err(Error::from(e).into()),
+            Ok(_) => Ok(()),
         }
     }
-
-    Ok(())
 }
 
 /// Core definition of a fsverity digest.
 #[repr(C)]
 #[derive(Debug)]
-pub struct FsVerityDigest<F> {
+struct FsVerityDigest<F> {
     digest_algorithm: u16,
     digest_size: u16,
     digest: F,
@@ -87,9 +67,9 @@ pub struct FsVerityDigest<F> {
 const FS_IOC_MEASURE_VERITY: u32 = ioctl::opcode::read_write::<FsVerityDigest<()>>(b'f', 134);
 
 /// Measure the fsverity digest of the provided file descriptor.
-pub fn fs_ioc_measure_verity<F: AsFd, H: FsVerityHashValue>(
-    fd: F,
-) -> Result<Option<H>, MeasureVerityError> {
+pub(super) fn fs_ioc_measure_verity<H: FsVerityHashValue>(
+    fd: impl AsFd,
+) -> Result<H, MeasureVerityError> {
     let digest_size = std::mem::size_of::<H>() as u16;
     let digest_algorithm = H::ALGORITHM as u16;
 
@@ -118,34 +98,36 @@ pub fn fs_ioc_measure_verity<F: AsFd, H: FsVerityHashValue>(
                     expected: digest.digest_size,
                 });
             }
-            Ok(Some(digest.digest))
+            Ok(digest.digest)
         }
-        // This function returns Ok(None) if there's no verity digest found.
-        Err(Errno::NODATA | Errno::NOTTY | Errno::OPNOTSUPP) => Ok(None),
+        Err(Errno::NODATA | Errno::NOTTY | Errno::OPNOTSUPP) => {
+            Err(MeasureVerityError::VerityMissing)
+        }
         Err(Errno::OVERFLOW) => Err(MeasureVerityError::InvalidDigestSize {
             expected: digest.digest_size,
         }),
-        Err(e) => Err(std::io::Error::from(e).into()),
+        Err(e) => Err(Error::from(e).into()),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::fsverity::Sha256HashValue;
+    use std::{mem::ManuallyDrop, os::fd::OwnedFd};
+
     use rustix::fd::FromRawFd;
-    use std::mem::ManuallyDrop;
-    use std::os::fd::OwnedFd;
     use tempfile::tempfile_in;
 
+    use crate::fsverity::Sha256HashValue;
+
+    use super::*;
+
     #[test]
-    fn test_measure_verity_opt() -> anyhow::Result<()> {
-        let tf = tempfile::tempfile()?;
-        assert_eq!(
-            fs_ioc_measure_verity::<_, Sha256HashValue>(&tf).unwrap(),
-            None
-        );
-        Ok(())
+    fn test_measure_verity_opt() {
+        let tf = tempfile::tempfile().unwrap();
+        assert!(matches!(
+            fs_ioc_measure_verity::<Sha256HashValue>(&tf),
+            Err(MeasureVerityError::VerityMissing)
+        ));
     }
 
     #[test_with::path(/dev/shm)]
@@ -153,21 +135,17 @@ mod tests {
     fn test_fs_ioc_enable_verity_wrong_fs() {
         let file = tempfile_in("/dev/shm").unwrap();
         let fd = OwnedFd::from(file);
-        let res = fs_ioc_enable_verity::<&OwnedFd, Sha256HashValue>(&fd);
-        let err = res.err().unwrap();
-        assert_eq!(err, EnableVerifyError::FilesystemNotSupported);
+        let err = fs_ioc_enable_verity::<Sha256HashValue>(&fd).unwrap_err();
+        assert!(matches!(err, EnableVerityError::FilesystemNotSupported));
         assert_eq!(err.to_string(), "Filesystem does not support fs-verity",);
     }
 
     #[test]
     fn test_fs_ioc_enable_verity_bad_fd() {
         let fd = ManuallyDrop::new(unsafe { OwnedFd::from_raw_fd(123456) });
-        let res = fs_ioc_enable_verity::<&OwnedFd, Sha256HashValue>(&fd);
+        let res = fs_ioc_enable_verity::<Sha256HashValue>(fd.as_fd());
         let err = res.err().unwrap();
-        assert_eq!(
-            err,
-            EnableVerifyError::Errno(rustix::io::Errno::from_raw_os_error(9))
-        );
+        assert!(matches!(err, EnableVerityError::Io(..)));
         assert_eq!(err.to_string(), "Bad file descriptor (os error 9)",);
     }
 }

@@ -1,4 +1,4 @@
-FROM fedora:42 AS base
+FROM fedora:41 AS base
 COPY extra /
 COPY cfsctl /usr/bin
 RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF

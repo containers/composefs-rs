@@ -369,3 +369,60 @@ pub fn prepare_boot(
 
     write_to_path(repo, boot, output_dir)
 }
+
+#[cfg(test)]
+mod test {
+    use std::{fmt::Write, io::Read};
+
+    use rustix::fs::CWD;
+    use sha2::{Digest, Sha256};
+
+    use crate::{repository::Repository, test::tempdir};
+
+    use super::*;
+
+    fn append_data(builder: &mut ::tar::Builder<Vec<u8>>, name: &str, size: usize) {
+        let mut header = ::tar::Header::new_ustar();
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mode(0o700);
+        header.set_entry_type(::tar::EntryType::Regular);
+        header.set_size(size as u64);
+        builder
+            .append_data(&mut header, name, std::io::repeat(0u8).take(size as u64))
+            .unwrap();
+    }
+
+    fn example_layer() -> Vec<u8> {
+        let mut builder = ::tar::Builder::new(vec![]);
+        append_data(&mut builder, "file0", 0);
+        append_data(&mut builder, "file4095", 4095);
+        append_data(&mut builder, "file4096", 4096);
+        append_data(&mut builder, "file4097", 4097);
+        builder.into_inner().unwrap()
+    }
+
+    #[test]
+    fn test_layer() {
+        let layer = example_layer();
+        let mut context = Sha256::new();
+        context.update(&layer);
+        let layer_id: [u8; 32] = context.finalize().into();
+
+        let repo_dir = tempdir();
+        let repo = Repository::open_path(CWD, &repo_dir).unwrap();
+        let id = import_layer(&repo, &layer_id, Some("name"), &mut layer.as_slice()).unwrap();
+
+        let mut dump = String::new();
+        let mut split_stream = repo.open_stream("refs/name", Some(&id)).unwrap();
+        while let Some(entry) = tar::get_entry(&mut split_stream).unwrap() {
+            writeln!(dump, "{}", entry).unwrap();
+        }
+        similar_asserts::assert_eq!(dump, "\
+/file0 0 100700 1 0 0 0 0.0 - - -
+/file4095 4095 100700 1 0 0 0 0.0 53/72beb83c78537c8970c8361e3254119fafdf1763854ecd57d3f0fe2da7c719 - 5372beb83c78537c8970c8361e3254119fafdf1763854ecd57d3f0fe2da7c719
+/file4096 4096 100700 1 0 0 0 0.0 ba/bc284ee4ffe7f449377fbf6692715b43aec7bc39c094a95878904d34bac97e - babc284ee4ffe7f449377fbf6692715b43aec7bc39c094a95878904d34bac97e
+/file4097 4097 100700 1 0 0 0 0.0 09/3756e4ea9683329106d4a16982682ed182c14bf076463a9e7f97305cbac743 - 093756e4ea9683329106d4a16982682ed182c14bf076463a9e7f97305cbac743
+");
+    }
+}

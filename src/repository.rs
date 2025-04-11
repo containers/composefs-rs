@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     fsverity::{
-        self, digest::FsVerityHasher, ioctl::fs_ioc_enable_verity, FsVerityHashValue,
+        compute_verity, enable_verity, ensure_verity_equal, measure_verity, FsVerityHashValue,
         Sha256HashValue,
     },
     mount::mount_composefs_at,
@@ -77,7 +77,7 @@ impl Repository {
     }
 
     pub fn ensure_object(&self, data: &[u8]) -> Result<Sha256HashValue> {
-        let digest = FsVerityHasher::hash(data);
+        let digest: Sha256HashValue = compute_verity(data);
         let dir = PathBuf::from(format!("objects/{:02x}", digest[0]));
         let file = dir.join(hex::encode(&digest[1..]));
 
@@ -102,11 +102,8 @@ impl Repository {
         let ro_fd = open(proc_self_fd(&fd), OFlags::RDONLY, Mode::empty())?;
         drop(fd);
 
-        fs_ioc_enable_verity::<&OwnedFd, Sha256HashValue>(&ro_fd)
-            .context("Re-validating verity digest")?;
-
-        // double-check
-        fsverity::ensure_verity(&ro_fd, &digest)?;
+        enable_verity::<Sha256HashValue>(&ro_fd).context("Enabling verity digest")?;
+        ensure_verity_equal(&ro_fd, &digest).context("Double-checking verity digest")?;
 
         if let Err(err) = linkat(
             CWD,
@@ -130,7 +127,7 @@ impl Repository {
         expected_verity: &Sha256HashValue,
     ) -> Result<OwnedFd> {
         let fd = self.openat(filename, OFlags::RDONLY)?;
-        fsverity::ensure_verity(&fd, expected_verity)?;
+        ensure_verity_equal(&fd, expected_verity)?;
         Ok(fd)
     }
 
@@ -197,7 +194,7 @@ impl Repository {
     pub fn check_stream(&self, sha256: &Sha256HashValue) -> Result<Option<Sha256HashValue>> {
         match self.openat(&format!("streams/{}", hex::encode(sha256)), OFlags::RDONLY) {
             Ok(stream) => {
-                let measured_verity: Sha256HashValue = fsverity::measure_verity_digest(&stream)?;
+                let measured_verity: Sha256HashValue = measure_verity(&stream)?;
                 let mut context = Sha256::new();
                 let mut split_stream = SplitStreamReader::new(File::from(stream))?;
 
@@ -370,7 +367,7 @@ impl Repository {
 
         if !name.contains("/") {
             // A name with no slashes in it is taken to be a sha256 fs-verity digest
-            fsverity::ensure_verity(&image, &parse_sha256(name)?)?;
+            ensure_verity_equal(&image, &parse_sha256(name)?)?;
         }
 
         Ok(image)
