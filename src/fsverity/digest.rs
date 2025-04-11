@@ -33,7 +33,7 @@ impl FsVerityLayer {
 }
 
 #[derive(Debug)]
-pub struct FsVerityHasher {
+pub(super) struct FsVerityHasher {
     layers: Vec<FsVerityLayer>,
     value: Option<Sha256HashValue>,
     n_bytes: u64,
@@ -53,7 +53,7 @@ impl FsVerityHasher {
         hasher.digest()
     }
 
-    pub fn new() -> FsVerityHasher {
+    fn new() -> FsVerityHasher {
         FsVerityHasher {
             layers: vec![],
             value: None,
@@ -61,7 +61,7 @@ impl FsVerityHasher {
         }
     }
 
-    pub fn add_data(&mut self, data: &[u8]) {
+    fn add_data(&mut self, data: &[u8]) {
         if let Some(value) = self.value {
             // We had a complete value, but now we're adding new data.
             // This means that we need to add a new hash layer...
@@ -91,7 +91,7 @@ impl FsVerityHasher {
         self.value = Some(value);
     }
 
-    pub fn root_hash(&mut self) -> Sha256HashValue {
+    fn root_hash(&mut self) -> Sha256HashValue {
         if let Some(value) = self.value {
             value
         } else {
@@ -116,7 +116,7 @@ impl FsVerityHasher {
         }
     }
 
-    pub fn digest(&mut self) -> Sha256HashValue {
+    fn digest(&mut self) -> Sha256HashValue {
         /*
         let descriptor = FsVerityDescriptor {
             version: 1,
