@@ -17,27 +17,27 @@ rhel9 = ['pre-6.15']
 'pre-6.15' = []
 
 [dependencies]
-anyhow = { version = "1.0.97", default-features = false }
-async-compression = { version = "0.4.22", default-features = false, features = ["tokio", "zstd", "gzip"] }
-clap = { version = "4.5.32", default-features = false, features = ["std", "help", "usage", "derive"] }
+anyhow = { version = "1.0.87", default-features = false }
+async-compression = { version = "0.4.0", default-features = false, features = ["tokio", "zstd", "gzip"] }
+clap = { version = "4.0.1", default-features = false, features = ["std", "help", "usage", "derive"] }
 containers-image-proxy = "0.7.0"
-env_logger = "0.11.7"
-hex = "0.4.3"
-indicatif = { version = "0.17.11", features = ["tokio"] }
-log = "0.4.27"
-oci-spec = "0.7.1"
-regex-automata = { version = "0.4.9", default-features = false }
-rustix = { version = "1.0.3", features = ["fs", "mount", "process"] }
-serde = "1.0.219"
-sha2 = "0.10.8"
-tar = { version = "0.4.44", default-features = false }
-tempfile = "3.19.1"
-thiserror = "2.0.12"
-tokio = "1.44.1"
-toml = "0.8.20"
-xxhash-rust = { version = "0.8.15", features = ["xxh32"] }
-zerocopy = { version = "0.8.24", features = ["derive"] }
-zstd = "0.13.3"
+env_logger = "0.11.0"
+hex = "0.4.0"
+indicatif = { version = "0.17.0", features = ["tokio"] }
+log = "0.4.8"
+oci-spec = "0.7.0"
+regex-automata = { version = "0.4.4", default-features = false }
+rustix = { version = "1.0.0", features = ["fs", "mount", "process"] }
+serde = "1.0.145"
+sha2 = "0.10.1"
+tar = { version = "0.4.38", default-features = false }
+tempfile = "3.8.0"
+thiserror = "2.0.0"
+tokio = "1.24.2"
+toml = "0.8.0"
+xxhash-rust = { version = "0.8.2", features = ["xxh32"] }
+zerocopy = { version = "0.8.0", features = ["derive"] }
+zstd = "0.13.0"
 
 [dev-dependencies]
 insta = "1.42.2"
