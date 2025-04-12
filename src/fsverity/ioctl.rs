@@ -1,7 +1,11 @@
+use core::mem::size_of;
+
 use std::{io::Error, os::fd::AsFd};
 
-use rustix::io::Errno;
-use rustix::ioctl;
+use rustix::{
+    io::Errno,
+    ioctl::{ioctl, opcode, Opcode, Setter, Updater},
+};
 
 pub use super::{EnableVerityError, FsVerityHashValue, MeasureVerityError};
 
@@ -21,7 +25,7 @@ struct FsVerityEnableArg {
 }
 
 // #define FS_IOC_ENABLE_VERITY    _IOW('f', 133, struct fsverity_enable_arg)
-const FS_IOC_ENABLE_VERITY: u32 = ioctl::opcode::write::<FsVerityEnableArg>(b'f', 133);
+const FS_IOC_ENABLE_VERITY: Opcode = opcode::write::<FsVerityEnableArg>(b'f', 133);
 
 /// Enable fsverity on the target file. This is a thin safe wrapper for the underlying base `ioctl`
 /// and hence all constraints apply such as requiring the file descriptor to already be `O_RDONLY`
@@ -30,9 +34,9 @@ pub(super) fn fs_ioc_enable_verity<H: FsVerityHashValue>(
     fd: impl AsFd,
 ) -> Result<(), EnableVerityError> {
     unsafe {
-        match ioctl::ioctl(
+        match ioctl(
             fd,
-            ioctl::Setter::<{ FS_IOC_ENABLE_VERITY }, FsVerityEnableArg>::new(FsVerityEnableArg {
+            Setter::<{ FS_IOC_ENABLE_VERITY }, FsVerityEnableArg>::new(FsVerityEnableArg {
                 version: 1,
                 hash_algorithm: H::ALGORITHM as u32,
                 block_size: 4096,
@@ -64,13 +68,13 @@ struct FsVerityDigest<F> {
 }
 
 // #define FS_IOC_MEASURE_VERITY   _IORW('f', 134, struct fsverity_digest)
-const FS_IOC_MEASURE_VERITY: u32 = ioctl::opcode::read_write::<FsVerityDigest<()>>(b'f', 134);
+const FS_IOC_MEASURE_VERITY: Opcode = opcode::read_write::<FsVerityDigest<()>>(b'f', 134);
 
 /// Measure the fsverity digest of the provided file descriptor.
 pub(super) fn fs_ioc_measure_verity<H: FsVerityHashValue>(
     fd: impl AsFd,
 ) -> Result<H, MeasureVerityError> {
-    let digest_size = std::mem::size_of::<H>() as u16;
+    let digest_size = size_of::<H>() as u16;
     let digest_algorithm = H::ALGORITHM as u16;
 
     let mut digest = FsVerityDigest::<H> {
@@ -80,9 +84,9 @@ pub(super) fn fs_ioc_measure_verity<H: FsVerityHashValue>(
     };
 
     let r = unsafe {
-        ioctl::ioctl(
+        ioctl(
             fd,
-            ioctl::Updater::<{ FS_IOC_MEASURE_VERITY }, FsVerityDigest<H>>::new(&mut digest),
+            Updater::<{ FS_IOC_MEASURE_VERITY }, FsVerityDigest<H>>::new(&mut digest),
         )
     };
     match r {
