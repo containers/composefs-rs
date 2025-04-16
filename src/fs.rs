@@ -24,7 +24,7 @@ use rustix::{
 use zerocopy::IntoBytes;
 
 use crate::{
-    fsverity::{compute_verity, Sha256HashValue},
+    fsverity::{compute_verity, FsVerityHashValue},
     image::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
     repository::Repository,
     selabel::selabel,
@@ -70,11 +70,11 @@ fn set_file_contents(dirfd: &OwnedFd, name: &OsStr, stat: &Stat, data: &[u8]) ->
     Ok(())
 }
 
-fn write_directory(
-    dir: &Directory,
+fn write_directory<ObjectID: FsVerityHashValue>(
+    dir: &Directory<ObjectID>,
     dirfd: &OwnedFd,
     name: &OsStr,
-    repo: &Repository,
+    repo: &Repository<ObjectID>,
 ) -> Result<()> {
     match mkdirat(dirfd, name, dir.stat.st_mode.into()) {
         Ok(()) | Err(Errno::EXIST) => {}
@@ -85,7 +85,12 @@ fn write_directory(
     write_directory_contents(dir, &fd, repo)
 }
 
-fn write_leaf(leaf: &Leaf, dirfd: &OwnedFd, name: &OsStr, repo: &Repository) -> Result<()> {
+fn write_leaf<ObjectID: FsVerityHashValue>(
+    leaf: &Leaf<ObjectID>,
+    dirfd: &OwnedFd,
+    name: &OsStr,
+    repo: &Repository<ObjectID>,
+) -> Result<()> {
     let mode = leaf.stat.st_mode.into();
 
     match &leaf.content {
@@ -111,7 +116,11 @@ fn write_leaf(leaf: &Leaf, dirfd: &OwnedFd, name: &OsStr, repo: &Repository) -> 
     Ok(())
 }
 
-fn write_directory_contents(dir: &Directory, fd: &OwnedFd, repo: &Repository) -> Result<()> {
+fn write_directory_contents<ObjectID: FsVerityHashValue>(
+    dir: &Directory<ObjectID>,
+    fd: &OwnedFd,
+    repo: &Repository<ObjectID>,
+) -> Result<()> {
     for (name, inode) in dir.entries() {
         match inode {
             Inode::Directory(ref dir) => write_directory(dir, fd, name, repo),
@@ -123,19 +132,23 @@ fn write_directory_contents(dir: &Directory, fd: &OwnedFd, repo: &Repository) ->
 }
 
 // NB: hardlinks not supported
-pub fn write_to_path(repo: &Repository, dir: &Directory, output_dir: &Path) -> Result<()> {
+pub fn write_to_path<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    dir: &Directory<ObjectID>,
+    output_dir: &Path,
+) -> Result<()> {
     let fd = openat(CWD, output_dir, OFlags::PATH | OFlags::DIRECTORY, 0.into())?;
     write_directory_contents(dir, &fd, repo)
 }
 
 #[derive(Debug)]
-pub struct FilesystemReader<'repo> {
-    repo: Option<&'repo Repository>,
-    inodes: HashMap<(u64, u64), Rc<Leaf>>,
+pub struct FilesystemReader<'repo, ObjectID: FsVerityHashValue> {
+    repo: Option<&'repo Repository<ObjectID>>,
+    inodes: HashMap<(u64, u64), Rc<Leaf<ObjectID>>>,
     root_mtime: Option<i64>,
 }
 
-impl FilesystemReader<'_> {
+impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
     fn read_xattrs(fd: &OwnedFd) -> Result<BTreeMap<Box<OsStr>, Box<[u8]>>> {
         // flistxattr() and fgetxattr() don't work with with O_PATH fds, so go via /proc/self/fd.
         // Note: we want the symlink-following version of this call, which produces the correct
@@ -181,7 +194,11 @@ impl FilesystemReader<'_> {
         ))
     }
 
-    fn read_leaf_content(&mut self, fd: OwnedFd, buf: rustix::fs::Stat) -> Result<LeafContent> {
+    fn read_leaf_content(
+        &mut self,
+        fd: OwnedFd,
+        buf: rustix::fs::Stat,
+    ) -> Result<LeafContent<ObjectID>> {
         let content = match FileType::from_raw_mode(buf.st_mode) {
             FileType::Directory | FileType::Unknown => unreachable!(),
             FileType::RegularFile => {
@@ -212,7 +229,12 @@ impl FilesystemReader<'_> {
         Ok(content)
     }
 
-    fn read_leaf(&mut self, dirfd: &OwnedFd, name: &OsStr, ifmt: FileType) -> Result<Rc<Leaf>> {
+    fn read_leaf(
+        &mut self,
+        dirfd: &OwnedFd,
+        name: &OsStr,
+        ifmt: FileType,
+    ) -> Result<Rc<Leaf<ObjectID>>> {
         let oflags = match ifmt {
             FileType::RegularFile => OFlags::RDONLY,
             _ => OFlags::PATH,
@@ -241,7 +263,11 @@ impl FilesystemReader<'_> {
         }
     }
 
-    pub fn read_directory(&mut self, dirfd: impl AsFd, name: &OsStr) -> Result<Directory> {
+    pub fn read_directory(
+        &mut self,
+        dirfd: impl AsFd,
+        name: &OsStr,
+    ) -> Result<Directory<ObjectID>> {
         let fd = openat(
             dirfd,
             name,
@@ -268,7 +294,12 @@ impl FilesystemReader<'_> {
         Ok(directory)
     }
 
-    fn read_inode(&mut self, dirfd: &OwnedFd, name: &OsStr, ifmt: FileType) -> Result<Inode> {
+    fn read_inode(
+        &mut self,
+        dirfd: &OwnedFd,
+        name: &OsStr,
+        ifmt: FileType,
+    ) -> Result<Inode<ObjectID>> {
         if ifmt == FileType::Directory {
             let dir = self.read_directory(dirfd, name)?;
             Ok(Inode::Directory(Box::new(dir)))
@@ -279,7 +310,10 @@ impl FilesystemReader<'_> {
     }
 }
 
-pub fn read_from_path(path: &Path, repo: Option<&Repository>) -> Result<FileSystem> {
+pub fn read_from_path<ObjectID: FsVerityHashValue>(
+    path: &Path,
+    repo: Option<&Repository<ObjectID>>,
+) -> Result<FileSystem<ObjectID>> {
     let mut reader = FilesystemReader {
         repo,
         inodes: HashMap::new(),
@@ -300,7 +334,10 @@ pub fn read_from_path(path: &Path, repo: Option<&Repository>) -> Result<FileSyst
     Ok(fs)
 }
 
-pub fn create_image(path: &Path, repo: Option<&Repository>) -> Result<Sha256HashValue> {
+pub fn create_image<ObjectID: FsVerityHashValue>(
+    path: &Path,
+    repo: Option<&Repository<ObjectID>>,
+) -> Result<ObjectID> {
     let fs = read_from_path(path, repo)?;
     let image = crate::erofs::writer::mkfs_erofs(&fs);
     if let Some(repo) = repo {
@@ -310,8 +347,8 @@ pub fn create_image(path: &Path, repo: Option<&Repository>) -> Result<Sha256Hash
     }
 }
 
-pub fn create_dumpfile(path: &Path) -> Result<()> {
-    let fs = read_from_path(path, None)?;
+pub fn create_dumpfile<ObjectID: FsVerityHashValue>(path: &Path) -> Result<()> {
+    let fs = read_from_path::<ObjectID>(path, None)?;
     super::dumpfile::write_dumpfile(&mut std::io::stdout(), &fs)
 }
 

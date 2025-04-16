@@ -15,6 +15,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::{
     dumpfile,
+    fsverity::FsVerityHashValue,
     image::{LeafContent, RegularFile, Stat},
     splitstream::{SplitStreamData, SplitStreamReader, SplitStreamWriter},
     util::{read_exactish, read_exactish_async},
@@ -42,7 +43,10 @@ async fn read_header_async(reader: &mut (impl AsyncRead + Unpin)) -> Result<Opti
 /// Splits the tar file from tar_stream into a Split Stream.  The store_data function is
 /// responsible for ensuring that "external data" is in the composefs repository and returns the
 /// fsverity hash value of that data.
-pub fn split<R: Read>(tar_stream: &mut R, writer: &mut SplitStreamWriter) -> Result<()> {
+pub fn split<ObjectID: FsVerityHashValue>(
+    tar_stream: &mut impl Read,
+    writer: &mut SplitStreamWriter<ObjectID>,
+) -> Result<()> {
     while let Some(header) = read_header(tar_stream)? {
         // the header always gets stored as inline data
         writer.write_inline(header.as_bytes());
@@ -69,9 +73,9 @@ pub fn split<R: Read>(tar_stream: &mut R, writer: &mut SplitStreamWriter) -> Res
     Ok(())
 }
 
-pub async fn split_async(
+pub async fn split_async<ObjectID: FsVerityHashValue>(
     mut tar_stream: impl AsyncRead + Unpin,
-    writer: &mut SplitStreamWriter<'_>,
+    writer: &mut SplitStreamWriter<'_, ObjectID>,
 ) -> Result<()> {
     while let Some(header) = read_header_async(&mut tar_stream).await? {
         // the header always gets stored as inline data
@@ -100,20 +104,20 @@ pub async fn split_async(
 }
 
 #[derive(Debug)]
-pub enum TarItem {
+pub enum TarItem<ObjectID: FsVerityHashValue> {
     Directory,
-    Leaf(LeafContent),
+    Leaf(LeafContent<ObjectID>),
     Hardlink(OsString),
 }
 
 #[derive(Debug)]
-pub struct TarEntry {
+pub struct TarEntry<ObjectID: FsVerityHashValue> {
     pub path: PathBuf,
     pub stat: Stat,
-    pub item: TarItem,
+    pub item: TarItem<ObjectID>,
 }
 
-impl fmt::Display for TarEntry {
+impl<ObjectID: FsVerityHashValue> fmt::Display for TarEntry<ObjectID> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         match self.item {
             TarItem::Hardlink(ref target) => dumpfile::write_hardlink(fmt, &self.path, target),
@@ -156,7 +160,9 @@ fn symlink_target_from_tar(pax: Option<Box<[u8]>>, gnu: Vec<u8>, short: &[u8]) -
     }
 }
 
-pub fn get_entry<R: Read>(reader: &mut SplitStreamReader<R>) -> Result<Option<TarEntry>> {
+pub fn get_entry<R: Read, ObjectID: FsVerityHashValue>(
+    reader: &mut SplitStreamReader<R, ObjectID>,
+) -> Result<Option<TarEntry<ObjectID>>> {
     let mut gnu_longlink: Vec<u8> = vec![];
     let mut gnu_longname: Vec<u8> = vec![];
     let mut pax_longlink: Option<Box<[u8]>> = None;

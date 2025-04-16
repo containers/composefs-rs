@@ -101,11 +101,11 @@ pub fn write_directory(
     )
 }
 
-pub fn write_leaf(
+pub fn write_leaf<ObjectID: FsVerityHashValue>(
     writer: &mut impl fmt::Write,
     path: &Path,
     stat: &Stat,
-    content: &LeafContent,
+    content: &LeafContent<ObjectID>,
     nlink: usize,
 ) -> fmt::Result {
     match content {
@@ -204,8 +204,8 @@ pub fn write_hardlink(writer: &mut impl fmt::Write, path: &Path, target: &OsStr)
     Ok(())
 }
 
-struct DumpfileWriter<'a, W: Write> {
-    hardlinks: HashMap<*const Leaf, OsString>,
+struct DumpfileWriter<'a, W: Write, ObjectID: FsVerityHashValue> {
+    hardlinks: HashMap<*const Leaf<ObjectID>, OsString>,
     writer: &'a mut W,
 }
 
@@ -215,7 +215,7 @@ fn writeln_fmt(writer: &mut impl Write, f: impl Fn(&mut String) -> fmt::Result) 
     Ok(writeln!(writer, "{}", tmp)?)
 }
 
-impl<'a, W: Write> DumpfileWriter<'a, W> {
+impl<'a, W: Write, ObjectID: FsVerityHashValue> DumpfileWriter<'a, W, ObjectID> {
     fn new(writer: &'a mut W) -> Self {
         Self {
             hardlinks: HashMap::new(),
@@ -223,7 +223,7 @@ impl<'a, W: Write> DumpfileWriter<'a, W> {
         }
     }
 
-    fn write_dir(&mut self, path: &mut PathBuf, dir: &Directory) -> Result<()> {
+    fn write_dir(&mut self, path: &mut PathBuf, dir: &Directory<ObjectID>) -> Result<()> {
         // nlink is 2 + number of subdirectories
         // this is also true for the root dir since '..' is another self-ref
         let nlink = dir.inodes().fold(2, |count, inode| {
@@ -256,7 +256,7 @@ impl<'a, W: Write> DumpfileWriter<'a, W> {
         Ok(())
     }
 
-    fn write_leaf(&mut self, path: &Path, leaf: &Rc<Leaf>) -> Result<()> {
+    fn write_leaf(&mut self, path: &Path, leaf: &Rc<Leaf<ObjectID>>) -> Result<()> {
         let nlink = Rc::strong_count(leaf);
 
         if nlink > 1 {
@@ -276,7 +276,10 @@ impl<'a, W: Write> DumpfileWriter<'a, W> {
     }
 }
 
-pub fn write_dumpfile<W: Write>(writer: &mut W, fs: &FileSystem) -> Result<()> {
+pub fn write_dumpfile(
+    writer: &mut impl Write,
+    fs: &FileSystem<impl FsVerityHashValue>,
+) -> Result<()> {
     // default pipe capacity on Linux is 16 pages (65536 bytes), but
     // sometimes the BufWriter will write more than its capacity...
     let mut buffer = BufWriter::with_capacity(32768, writer);

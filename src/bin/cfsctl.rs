@@ -111,7 +111,7 @@ fn main() -> Result<()> {
 
     let args = App::parse();
 
-    let repo = (if let Some(path) = args.repo {
+    let repo: Repository<Sha256HashValue> = (if let Some(path) = args.repo {
         Repository::open_path(CWD, path)
     } else if args.system {
         Repository::open_system()
@@ -193,7 +193,7 @@ fn main() -> Result<()> {
             println!("{}", image_id.to_hex());
         }
         Command::CreateDumpfile { ref path } => {
-            composefs::fs::create_dumpfile(path)?;
+            composefs::fs::create_dumpfile::<Sha256HashValue>(path)?;
         }
         Command::Mount { name, mountpoint } => {
             repo.mount(&name, &mountpoint)?;

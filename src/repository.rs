@@ -20,7 +20,6 @@ use sha2::{Digest, Sha256};
 use crate::{
     fsverity::{
         compute_verity, enable_verity, ensure_verity_equal, measure_verity, FsVerityHashValue,
-        Sha256HashValue,
     },
     mount::mount_composefs_at,
     splitstream::{DigestMap, SplitStreamReader, SplitStreamWriter},
@@ -28,17 +27,18 @@ use crate::{
 };
 
 #[derive(Debug)]
-pub struct Repository {
+pub struct Repository<ObjectID: FsVerityHashValue> {
     repository: OwnedFd,
+    _data: std::marker::PhantomData<ObjectID>,
 }
 
-impl Drop for Repository {
+impl<ObjectID: FsVerityHashValue> Drop for Repository<ObjectID> {
     fn drop(&mut self) {
         flock(&self.repository, FlockOperation::Unlock).expect("repository unlock failed");
     }
 }
 
-impl Repository {
+impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     pub fn object_dir(&self) -> ErrnoResult<OwnedFd> {
         self.openat(
             "objects",
@@ -56,7 +56,10 @@ impl Repository {
         flock(&repository, FlockOperation::LockShared)
             .context("Cannot lock composefs repository")?;
 
-        Ok(Self { repository })
+        Ok(Self {
+            repository,
+            _data: std::marker::PhantomData,
+        })
     }
 
     pub fn open_user() -> Result<Self> {
@@ -76,8 +79,8 @@ impl Repository {
         })
     }
 
-    pub fn ensure_object(&self, data: &[u8]) -> Result<Sha256HashValue> {
-        let digest: Sha256HashValue = compute_verity(data);
+    pub fn ensure_object(&self, data: &[u8]) -> Result<ObjectID> {
+        let digest: ObjectID = compute_verity(data);
         let dir = PathBuf::from(format!("objects/{}", digest.to_object_dir()));
         let file = dir.join(digest.to_object_basename());
 
@@ -102,7 +105,7 @@ impl Repository {
         let ro_fd = open(proc_self_fd(&fd), OFlags::RDONLY, Mode::empty())?;
         drop(fd);
 
-        enable_verity::<Sha256HashValue>(&ro_fd).context("Enabling verity digest")?;
+        enable_verity::<ObjectID>(&ro_fd).context("Enabling verity digest")?;
         ensure_verity_equal(&ro_fd, &digest).context("Double-checking verity digest")?;
 
         if let Err(err) = linkat(
@@ -121,11 +124,7 @@ impl Repository {
         Ok(digest)
     }
 
-    fn open_with_verity(
-        &self,
-        filename: &str,
-        expected_verity: &Sha256HashValue,
-    ) -> Result<OwnedFd> {
+    fn open_with_verity(&self, filename: &str, expected_verity: &ObjectID) -> Result<OwnedFd> {
         let fd = self.openat(filename, OFlags::RDONLY)?;
         ensure_verity_equal(&fd, expected_verity)?;
         Ok(fd)
@@ -137,16 +136,16 @@ impl Repository {
     pub fn create_stream(
         &self,
         sha256: Option<Sha256Digest>,
-        maps: Option<DigestMap>,
-    ) -> SplitStreamWriter {
+        maps: Option<DigestMap<ObjectID>>,
+    ) -> SplitStreamWriter<ObjectID> {
         SplitStreamWriter::new(self, maps, sha256)
     }
 
-    fn format_object_path(id: &Sha256HashValue) -> String {
+    fn format_object_path(id: &ObjectID) -> String {
         format!("objects/{}", id.to_object_pathname())
     }
 
-    pub fn has_stream(&self, sha256: &Sha256Digest) -> Result<Option<Sha256HashValue>> {
+    pub fn has_stream(&self, sha256: &Sha256Digest) -> Result<Option<ObjectID>> {
         let stream_path = format!("streams/{}", hex::encode(sha256));
 
         match readlinkat(&self.repository, &stream_path, []) {
@@ -163,7 +162,7 @@ impl Repository {
                     bytes.starts_with(b"../"),
                     "stream symlink has incorrect prefix"
                 );
-                Ok(Some(Sha256HashValue::from_object_pathname(bytes)?))
+                Ok(Some(ObjectID::from_object_pathname(bytes)?))
             }
             Err(Errno::NOENT) => Ok(None),
             Err(err) => Err(err)?,
@@ -171,10 +170,10 @@ impl Repository {
     }
 
     /// Basically the same as has_stream() except that it performs expensive verification
-    pub fn check_stream(&self, sha256: &Sha256Digest) -> Result<Option<Sha256HashValue>> {
+    pub fn check_stream(&self, sha256: &Sha256Digest) -> Result<Option<ObjectID>> {
         match self.openat(&format!("streams/{}", hex::encode(sha256)), OFlags::RDONLY) {
             Ok(stream) => {
-                let measured_verity: Sha256HashValue = measure_verity(&stream)?;
+                let measured_verity: ObjectID = measure_verity(&stream)?;
                 let mut context = Sha256::new();
                 let mut split_stream = SplitStreamReader::new(File::from(stream))?;
 
@@ -204,9 +203,9 @@ impl Repository {
 
     pub fn write_stream(
         &self,
-        writer: SplitStreamWriter,
+        writer: SplitStreamWriter<ObjectID>,
         reference: Option<&str>,
-    ) -> Result<Sha256HashValue> {
+    ) -> Result<ObjectID> {
         let Some((.., ref sha256)) = writer.sha256 else {
             bail!("Writer doesn't have sha256 enabled");
         };
@@ -249,9 +248,9 @@ impl Repository {
     pub fn ensure_stream(
         &self,
         sha256: &Sha256Digest,
-        callback: impl FnOnce(&mut SplitStreamWriter) -> Result<()>,
+        callback: impl FnOnce(&mut SplitStreamWriter<ObjectID>) -> Result<()>,
         reference: Option<&str>,
-    ) -> Result<Sha256HashValue> {
+    ) -> Result<ObjectID> {
         let stream_path = format!("streams/{}", hex::encode(sha256));
 
         let object_id = match self.has_stream(sha256)? {
@@ -278,8 +277,8 @@ impl Repository {
     pub fn open_stream(
         &self,
         name: &str,
-        verity: Option<&Sha256HashValue>,
-    ) -> Result<SplitStreamReader<File>> {
+        verity: Option<&ObjectID>,
+    ) -> Result<SplitStreamReader<File, ObjectID>> {
         let filename = format!("streams/{}", name);
 
         let file = File::from(if let Some(verity_hash) = verity {
@@ -291,14 +290,14 @@ impl Repository {
         SplitStreamReader::new(file)
     }
 
-    pub fn open_object(&self, id: &Sha256HashValue) -> Result<OwnedFd> {
-        self.open_with_verity(&format!("objects/{}", id.to_object_pathname()), id)
+    pub fn open_object(&self, id: &ObjectID) -> Result<OwnedFd> {
+        self.open_with_verity(&Self::format_object_path(id), id)
     }
 
     pub fn merge_splitstream(
         &self,
         name: &str,
-        verity: Option<&Sha256HashValue>,
+        verity: Option<&ObjectID>,
         stream: &mut impl Write,
     ) -> Result<()> {
         let mut split_stream = self.open_stream(name, verity)?;
@@ -312,7 +311,7 @@ impl Repository {
     }
 
     /// this function is not safe for untrusted users
-    pub fn write_image(&self, name: Option<&str>, data: &[u8]) -> Result<Sha256HashValue> {
+    pub fn write_image(&self, name: Option<&str>, data: &[u8]) -> Result<ObjectID> {
         let object_id = self.ensure_object(data)?;
 
         let object_path = Self::format_object_path(&object_id);
@@ -329,7 +328,7 @@ impl Repository {
     }
 
     /// this function is not safe for untrusted users
-    pub fn import_image<R: Read>(&self, name: &str, image: &mut R) -> Result<Sha256HashValue> {
+    pub fn import_image<R: Read>(&self, name: &str, image: &mut R) -> Result<ObjectID> {
         let mut data = vec![];
         image.read_to_end(&mut data)?;
         self.write_image(Some(name), &data)
@@ -340,7 +339,7 @@ impl Repository {
 
         if !name.contains("/") {
             // A name with no slashes in it is taken to be a sha256 fs-verity digest
-            ensure_verity_equal(&image, &Sha256HashValue::from_hex(name)?)?;
+            ensure_verity_equal(&image, &ObjectID::from_hex(name)?)?;
         }
 
         Ok(image)
@@ -394,14 +393,12 @@ impl Repository {
         })
     }
 
-    fn read_symlink_hashvalue(dirfd: &OwnedFd, name: &CStr) -> Result<Sha256HashValue> {
+    fn read_symlink_hashvalue(dirfd: &OwnedFd, name: &CStr) -> Result<ObjectID> {
         let link_content = readlinkat(dirfd, name, [])?;
-        Ok(Sha256HashValue::from_object_pathname(
-            link_content.to_bytes(),
-        )?)
+        Ok(ObjectID::from_object_pathname(link_content.to_bytes())?)
     }
 
-    fn walk_symlinkdir(fd: OwnedFd, objects: &mut HashSet<Sha256HashValue>) -> Result<()> {
+    fn walk_symlinkdir(fd: OwnedFd, objects: &mut HashSet<ObjectID>) -> Result<()> {
         for item in Dir::read_from(&fd)? {
             let entry = item?;
             // NB: the underlying filesystem must support returning filetype via direntry
@@ -436,8 +433,8 @@ impl Repository {
         )
     }
 
-    fn gc_category(&self, category: &str) -> Result<HashSet<Sha256HashValue>> {
-        let mut objects = HashSet::<Sha256HashValue>::new();
+    fn gc_category(&self, category: &str) -> Result<HashSet<ObjectID>> {
+        let mut objects = HashSet::new();
 
         let category_fd = self.openat(category, OFlags::RDONLY | OFlags::DIRECTORY)?;
 
@@ -475,7 +472,7 @@ impl Repository {
         Ok(objects)
     }
 
-    pub fn objects_for_image(&self, name: &str) -> Result<HashSet<Sha256HashValue>> {
+    pub fn objects_for_image(&self, name: &str) -> Result<HashSet<ObjectID>> {
         let image = self.open_image(name)?;
         let mut data = vec![];
         std::fs::File::from(image).read_to_end(&mut data)?;
@@ -517,11 +514,9 @@ impl Repository {
                 let entry = item?;
                 let filename = entry.file_name();
                 if filename != c"." && filename != c".." {
-                    let value = Sha256HashValue::from_object_dir_and_basename(
-                        first_byte,
-                        filename.to_bytes(),
-                    )?;
-                    if !objects.contains(&value) {
+                    let id =
+                        ObjectID::from_object_dir_and_basename(first_byte, filename.to_bytes())?;
+                    if !objects.contains(&id) {
                         println!("rm objects/{first_byte:02x}/{filename:?}");
                     } else {
                         println!("# objects/{first_byte:02x}/{filename:?} lives");

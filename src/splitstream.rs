@@ -11,42 +11,42 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use zstd::stream::{read::Decoder, write::Encoder};
 
 use crate::{
-    fsverity::Sha256HashValue,
+    fsverity::FsVerityHashValue,
     repository::Repository,
     util::{read_exactish, Sha256Digest},
 };
 
 #[derive(Debug, FromBytes, Immutable, IntoBytes, KnownLayout)]
 #[repr(C)]
-pub struct DigestMapEntry {
+pub struct DigestMapEntry<ObjectID: FsVerityHashValue> {
     pub body: Sha256Digest,
-    pub verity: Sha256HashValue,
+    pub verity: ObjectID,
 }
 
 #[derive(Debug)]
-pub struct DigestMap {
-    pub map: Vec<DigestMapEntry>,
+pub struct DigestMap<ObjectID: FsVerityHashValue> {
+    pub map: Vec<DigestMapEntry<ObjectID>>,
 }
 
-impl Default for DigestMap {
+impl<ObjectID: FsVerityHashValue> Default for DigestMap<ObjectID> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl DigestMap {
+impl<ObjectID: FsVerityHashValue> DigestMap<ObjectID> {
     pub fn new() -> Self {
         DigestMap { map: vec![] }
     }
 
-    pub fn lookup(&self, body: &Sha256Digest) -> Option<&Sha256HashValue> {
+    pub fn lookup(&self, body: &Sha256Digest) -> Option<&ObjectID> {
         match self.map.binary_search_by_key(body, |e| e.body) {
             Ok(idx) => Some(&self.map[idx].verity),
             Err(..) => None,
         }
     }
 
-    pub fn insert(&mut self, body: &Sha256Digest, verity: &Sha256HashValue) {
+    pub fn insert(&mut self, body: &Sha256Digest, verity: &ObjectID) {
         match self.map.binary_search_by_key(body, |e| e.body) {
             Ok(idx) => assert_eq!(self.map[idx].verity, *verity), // or else, bad things...
             Err(idx) => self.map.insert(
@@ -60,14 +60,14 @@ impl DigestMap {
     }
 }
 
-pub struct SplitStreamWriter<'a> {
-    repo: &'a Repository,
+pub struct SplitStreamWriter<'a, ObjectID: FsVerityHashValue> {
+    repo: &'a Repository<ObjectID>,
     inline_content: Vec<u8>,
     writer: Encoder<'a, Vec<u8>>,
     pub sha256: Option<(Sha256, Sha256Digest)>,
 }
 
-impl std::fmt::Debug for SplitStreamWriter<'_> {
+impl<ObjectID: FsVerityHashValue> std::fmt::Debug for SplitStreamWriter<'_, ObjectID> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // writer doesn't impl Debug
         f.debug_struct("SplitStreamWriter")
@@ -78,10 +78,10 @@ impl std::fmt::Debug for SplitStreamWriter<'_> {
     }
 }
 
-impl<'a> SplitStreamWriter<'a> {
+impl<'a, ObjectID: FsVerityHashValue> SplitStreamWriter<'a, ObjectID> {
     pub fn new(
-        repo: &'a Repository,
-        refs: Option<DigestMap>,
+        repo: &'a Repository<ObjectID>,
+        refs: Option<DigestMap<ObjectID>>,
         sha256: Option<Sha256Digest>,
     ) -> Self {
         // SAFETY: we surely can't get an error writing the header to a Vec<u8>
@@ -135,7 +135,7 @@ impl<'a> SplitStreamWriter<'a> {
     /// write a reference to external data to the stream.  If the external data had padding in the
     /// stream which is not stored in the object then pass it here as well and it will be stored
     /// inline after the reference.
-    fn write_reference(&mut self, reference: Sha256HashValue, padding: Vec<u8>) -> Result<()> {
+    fn write_reference(&mut self, reference: &ObjectID, padding: Vec<u8>) -> Result<()> {
         // Flush the inline data before we store the external reference.  Any padding from the
         // external data becomes the start of a new inline block.
         self.flush_inline(padding)?;
@@ -149,10 +149,10 @@ impl<'a> SplitStreamWriter<'a> {
             sha256.update(&padding);
         }
         let id = self.repo.ensure_object(data)?;
-        self.write_reference(id, padding)
+        self.write_reference(&id, padding)
     }
 
-    pub fn done(mut self) -> Result<Sha256HashValue> {
+    pub fn done(mut self) -> Result<ObjectID> {
         self.flush_inline(vec![])?;
 
         if let Some((context, expected)) = self.sha256 {
@@ -166,19 +166,19 @@ impl<'a> SplitStreamWriter<'a> {
 }
 
 #[derive(Debug)]
-pub enum SplitStreamData {
+pub enum SplitStreamData<ObjectID: FsVerityHashValue> {
     Inline(Box<[u8]>),
-    External(Sha256HashValue),
+    External(ObjectID),
 }
 
 // utility class to help read splitstreams
-pub struct SplitStreamReader<R: Read> {
+pub struct SplitStreamReader<R: Read, ObjectID: FsVerityHashValue> {
     decoder: Decoder<'static, BufReader<R>>,
-    pub refs: DigestMap,
+    pub refs: DigestMap<ObjectID>,
     inline_bytes: usize,
 }
 
-impl<R: Read> std::fmt::Debug for SplitStreamReader<R> {
+impl<R: Read, ObjectID: FsVerityHashValue> std::fmt::Debug for SplitStreamReader<R, ObjectID> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // decoder doesn't impl Debug
         f.debug_struct("SplitStreamReader")
@@ -207,13 +207,13 @@ fn read_into_vec(reader: &mut impl Read, vec: &mut Vec<u8>, size: usize) -> Resu
     Ok(())
 }
 
-enum ChunkType {
+enum ChunkType<ObjectID: FsVerityHashValue> {
     Eof,
     Inline,
-    External(Sha256HashValue),
+    External(ObjectID),
 }
 
-impl<R: Read> SplitStreamReader<R> {
+impl<R: Read, ObjectID: FsVerityHashValue> SplitStreamReader<R, ObjectID> {
     pub fn new(reader: R) -> Result<Self> {
         let mut decoder = Decoder::new(reader)?;
 
@@ -223,7 +223,7 @@ impl<R: Read> SplitStreamReader<R> {
             u64::from_le_bytes(buf)
         } as usize;
 
-        let mut refs = DigestMap {
+        let mut refs = DigestMap::<ObjectID> {
             map: Vec::with_capacity(n_map_entries),
         };
         for _ in 0..n_map_entries {
@@ -242,7 +242,7 @@ impl<R: Read> SplitStreamReader<R> {
         eof_ok: bool,
         ext_ok: bool,
         expected_bytes: usize,
-    ) -> Result<ChunkType> {
+    ) -> Result<ChunkType<ObjectID>> {
         if self.inline_bytes == 0 {
             match read_u64_le(&mut self.decoder)? {
                 None => {
@@ -255,7 +255,7 @@ impl<R: Read> SplitStreamReader<R> {
                     if !ext_ok {
                         bail!("Unexpected external reference when parsing splitstream");
                     }
-                    let id = Sha256HashValue::read_from_io(&mut self.decoder)?;
+                    let id = ObjectID::read_from_io(&mut self.decoder)?;
                     return Ok(ChunkType::External(id));
                 }
                 Some(size) => {
@@ -296,7 +296,7 @@ impl<R: Read> SplitStreamReader<R> {
         &mut self,
         actual_size: usize,
         stored_size: usize,
-    ) -> Result<SplitStreamData> {
+    ) -> Result<SplitStreamData<ObjectID>> {
         if let ChunkType::External(id) = self.ensure_chunk(false, true, stored_size)? {
             // ...and the padding
             if actual_size < stored_size {
@@ -315,7 +315,7 @@ impl<R: Read> SplitStreamReader<R> {
     pub fn cat(
         &mut self,
         output: &mut impl Write,
-        mut load_data: impl FnMut(&Sha256HashValue) -> Result<Vec<u8>>,
+        mut load_data: impl FnMut(&ObjectID) -> Result<Vec<u8>>,
     ) -> Result<()> {
         let mut buffer = vec![];
 
@@ -334,7 +334,7 @@ impl<R: Read> SplitStreamReader<R> {
         }
     }
 
-    pub fn get_object_refs(&mut self, mut callback: impl FnMut(&Sha256HashValue)) -> Result<()> {
+    pub fn get_object_refs(&mut self, mut callback: impl FnMut(&ObjectID)) -> Result<()> {
         let mut buffer = vec![];
 
         for entry in &self.refs.map {
@@ -361,7 +361,7 @@ impl<R: Read> SplitStreamReader<R> {
         }
     }
 
-    pub fn lookup(&self, body: &Sha256Digest) -> Result<&Sha256HashValue> {
+    pub fn lookup(&self, body: &Sha256Digest) -> Result<&ObjectID> {
         match self.refs.lookup(body) {
             Some(id) => Ok(id),
             None => bail!("Reference is not found in splitstream"),
@@ -369,7 +369,7 @@ impl<R: Read> SplitStreamReader<R> {
     }
 }
 
-impl<F: Read> Read for SplitStreamReader<F> {
+impl<F: Read, ObjectID: FsVerityHashValue> Read for SplitStreamReader<F, ObjectID> {
     fn read(&mut self, data: &mut [u8]) -> std::io::Result<usize> {
         match self.ensure_chunk(true, false, 1) {
             Ok(ChunkType::Eof) => Ok(0),
