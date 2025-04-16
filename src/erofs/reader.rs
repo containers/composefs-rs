@@ -5,9 +5,12 @@ use std::ops::Range;
 use thiserror::Error;
 use zerocopy::{little_endian::U32, FromBytes, Immutable, KnownLayout};
 
-use super::format::{
-    CompactInodeHeader, ComposefsHeader, DataLayout, DirectoryEntryHeader, ExtendedInodeHeader,
-    InodeXAttrHeader, ModeField, Superblock, XAttrHeader,
+use super::{
+    composefs::OverlayMetacopy,
+    format::{
+        CompactInodeHeader, ComposefsHeader, DataLayout, DirectoryEntryHeader, ExtendedInodeHeader,
+        InodeXAttrHeader, ModeField, Superblock, XAttrHeader,
+    },
 };
 use crate::fsverity::Sha256HashValue;
 
@@ -491,18 +494,17 @@ pub struct ObjectCollector {
 
 impl ObjectCollector {
     fn visit_xattr(&mut self, attr: &XAttr) {
-        // TODO: "4" is a bit magic, isn't it?
+        // This is the index of "trusted".  See XATTR_PREFIXES in format.rs.
         if attr.header.name_index != 4 {
             return;
         }
         if attr.suffix() != b"overlay.metacopy" {
             return;
         }
-        let value = attr.value();
-        // TODO: oh look, more magic values...
-        if value.len() == 36 && value[..4] == [0, 36, 0, 1] {
-            // SAFETY: We already checked that the length is 4 + 32
-            self.objects.insert(value[4..].try_into().unwrap());
+        if let Ok(value) = OverlayMetacopy::read_from_bytes(attr.value()) {
+            if value.valid() {
+                self.objects.insert(value.digest);
+            }
         }
     }
 

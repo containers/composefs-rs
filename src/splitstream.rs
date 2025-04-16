@@ -7,15 +7,17 @@ use std::io::{BufReader, Read, Write};
 
 use anyhow::{bail, Result};
 use sha2::{Digest, Sha256};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use zstd::stream::{read::Decoder, write::Encoder};
 
 use crate::{
-    fsverity::{FsVerityHashValue, Sha256HashValue},
+    fsverity::Sha256HashValue,
     repository::Repository,
     util::{read_exactish, Sha256Digest},
 };
 
-#[derive(Debug)]
+#[derive(Debug, FromBytes, Immutable, IntoBytes, KnownLayout)]
+#[repr(C)]
 pub struct DigestMapEntry {
     pub body: Sha256Digest,
     pub verity: Sha256HashValue,
@@ -51,7 +53,7 @@ impl DigestMap {
                 idx,
                 DigestMapEntry {
                     body: *body,
-                    verity: *verity,
+                    verity: verity.clone(),
                 },
             ),
         }
@@ -88,10 +90,7 @@ impl SplitStreamWriter<'_> {
         match refs {
             Some(DigestMap { map }) => {
                 writer.write_all(&(map.len() as u64).to_le_bytes()).unwrap();
-                for ref entry in map {
-                    writer.write_all(&entry.body).unwrap();
-                    writer.write_all(&entry.verity).unwrap();
-                }
+                writer.write_all(map.as_bytes()).unwrap();
             }
             None => {
                 writer.write_all(&0u64.to_le_bytes()).unwrap();
@@ -141,7 +140,7 @@ impl SplitStreamWriter<'_> {
         // external data becomes the start of a new inline block.
         self.flush_inline(padding)?;
 
-        SplitStreamWriter::write_fragment(&mut self.writer, 0, &reference)
+        SplitStreamWriter::write_fragment(&mut self.writer, 0, reference.as_bytes())
     }
 
     pub fn write_external(&mut self, data: &[u8], padding: Vec<u8>) -> Result<()> {
@@ -228,12 +227,7 @@ impl<R: Read> SplitStreamReader<R> {
             map: Vec::with_capacity(n_map_entries),
         };
         for _ in 0..n_map_entries {
-            let mut body = [0u8; 32];
-            let mut verity = [0u8; 32];
-
-            decoder.read_exact(&mut body)?;
-            decoder.read_exact(&mut verity)?;
-            refs.map.push(DigestMapEntry { body, verity });
+            refs.map.push(DigestMapEntry::read_from_io(&mut decoder)?);
         }
 
         Ok(SplitStreamReader {
@@ -261,8 +255,7 @@ impl<R: Read> SplitStreamReader<R> {
                     if !ext_ok {
                         bail!("Unexpected external reference when parsing splitstream");
                     }
-                    let mut id = Sha256HashValue::EMPTY;
-                    self.decoder.read_exact(&mut id)?;
+                    let id = Sha256HashValue::read_from_io(&mut self.decoder)?;
                     return Ok(ChunkType::External(id));
                 }
                 Some(size) => {

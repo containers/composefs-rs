@@ -11,7 +11,8 @@ use xxhash_rust::xxh32::xxh32;
 use zerocopy::{Immutable, IntoBytes};
 
 use crate::{
-    erofs::{format, reader::round_up},
+    erofs::{composefs::OverlayMetacopy, format, reader::round_up},
+    fsverity::FsVerityHashValue,
     image,
 };
 
@@ -409,10 +410,12 @@ impl<'a> InodeCollector<'a> {
             ..
         }) = content
         {
-            let metacopy = [&[0, 36, 0, 1], &id[..]].concat();
-            xattrs.add(b"trusted.overlay.metacopy", &metacopy);
+            xattrs.add(
+                b"trusted.overlay.metacopy",
+                OverlayMetacopy::new(id).as_bytes(),
+            );
 
-            let redirect = format!("/{:02x}/{}", id[0], hex::encode(&id[1..]));
+            let redirect = format!("/{}", id.to_object_pathname());
             xattrs.add(b"trusted.overlay.redirect", redirect.as_bytes());
         }
 

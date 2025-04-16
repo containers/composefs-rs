@@ -13,6 +13,7 @@ use tempfile::NamedTempFile;
 use composefs::{
     dumpfile::write_dumpfile,
     erofs::{debug::debug_img, writer::mkfs_erofs},
+    fsverity::{FsVerityHashValue, Sha256HashValue},
     image::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
 };
 
@@ -50,6 +51,10 @@ fn add_leaf(dir: &mut Directory, name: impl AsRef<OsStr>, content: LeafContent) 
 }
 
 fn simple(fs: &mut FileSystem) {
+    let ext_id = Sha256HashValue::from_hex(
+        "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+    )
+    .unwrap();
     add_leaf(&mut fs.root, "fifo", LeafContent::Fifo);
     add_leaf(
         &mut fs.root,
@@ -59,7 +64,7 @@ fn simple(fs: &mut FileSystem) {
     add_leaf(
         &mut fs.root,
         "regular-external",
-        LeafContent::Regular(RegularFile::External([0x5a; 32], 1234)),
+        LeafContent::Regular(RegularFile::External(ext_id, 1234)),
     );
     add_leaf(&mut fs.root, "chrdev", LeafContent::CharacterDevice(123));
     add_leaf(&mut fs.root, "blkdev", LeafContent::BlockDevice(123));

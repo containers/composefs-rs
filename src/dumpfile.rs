@@ -12,7 +12,7 @@ use anyhow::Result;
 use rustix::fs::FileType;
 
 use crate::{
-    fsverity::Sha256HashValue,
+    fsverity::{FsVerityHashValue, Sha256HashValue},
     image::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
 };
 
@@ -66,7 +66,7 @@ fn write_entry(
     write_escaped(writer, content)?;
     write!(writer, " ")?;
     if let Some(id) = digest {
-        write!(writer, "{}", hex::encode(id))?;
+        write!(writer, "{}", id.to_hex())?;
     } else {
         write_empty(writer)?;
     }
@@ -129,7 +129,7 @@ pub fn write_leaf(
             *size,
             nlink,
             0,
-            format!("{:02x}/{}", id[0], hex::encode(&id[1..])),
+            id.to_object_pathname(),
             &[],
             Some(id),
         ),
