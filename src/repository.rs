@@ -24,7 +24,7 @@ use crate::{
     },
     mount::mount_composefs_at,
     splitstream::{DigestMap, SplitStreamReader, SplitStreamWriter},
-    util::{parse_sha256, proc_self_fd, Sha256Digest},
+    util::{proc_self_fd, Sha256Digest},
 };
 
 #[derive(Debug)]
@@ -78,8 +78,8 @@ impl Repository {
 
     pub fn ensure_object(&self, data: &[u8]) -> Result<Sha256HashValue> {
         let digest: Sha256HashValue = compute_verity(data);
-        let dir = PathBuf::from(format!("objects/{:02x}", digest[0]));
-        let file = dir.join(hex::encode(&digest[1..]));
+        let dir = PathBuf::from(format!("objects/{}", digest.to_object_dir()));
+        let file = dir.join(digest.to_object_basename());
 
         // fairly common...
         if accessat(&self.repository, &file, Access::READ_OK, AtFlags::empty()) == Ok(()) {
@@ -142,28 +142,8 @@ impl Repository {
         SplitStreamWriter::new(self, maps, sha256)
     }
 
-    fn parse_object_path(path: impl AsRef<[u8]>) -> Result<Sha256HashValue> {
-        // "objects/0c/9513d99b120ee9a709c4d6554d938f6b2b7e213cf5b26f2e255c0b77e40379"
-        let bytes = path.as_ref();
-        ensure!(bytes.len() == 73, "stream symlink has incorrect length");
-        ensure!(
-            bytes.starts_with(b"objects/"),
-            "stream symlink has incorrect prefix"
-        );
-        ensure!(
-            bytes[10] == b'/',
-            "stream symlink has incorrect path separator"
-        );
-        let mut result = Sha256HashValue::EMPTY;
-        hex::decode_to_slice(&bytes[8..10], &mut result[..1])
-            .context("stream symlink has incorrect format")?;
-        hex::decode_to_slice(&bytes[11..], &mut result[1..])
-            .context("stream symlink has incorrect format")?;
-        Ok(result)
-    }
-
     fn format_object_path(id: &Sha256HashValue) -> String {
-        format!("objects/{:02x}/{}", id[0], hex::encode(&id[1..]))
+        format!("objects/{}", id.to_object_pathname())
     }
 
     pub fn has_stream(&self, sha256: &Sha256Digest) -> Result<Option<Sha256HashValue>> {
@@ -183,7 +163,7 @@ impl Repository {
                     bytes.starts_with(b"../"),
                     "stream symlink has incorrect prefix"
                 );
-                Ok(Some(Repository::parse_object_path(&bytes[3..])?))
+                Ok(Some(Sha256HashValue::from_object_pathname(bytes)?))
             }
             Err(Errno::NOENT) => Ok(None),
             Err(err) => Err(err)?,
@@ -200,7 +180,7 @@ impl Repository {
 
                 // check the verity of all linked streams
                 for entry in &split_stream.refs.map {
-                    if self.check_stream(&entry.body)? != Some(entry.verity) {
+                    if self.check_stream(&entry.body)?.as_ref() != Some(&entry.verity) {
                         bail!("reference mismatch");
                     }
                 }
@@ -312,10 +292,7 @@ impl Repository {
     }
 
     pub fn open_object(&self, id: &Sha256HashValue) -> Result<OwnedFd> {
-        self.open_with_verity(
-            &format!("objects/{:02x}/{}", id[0], hex::encode(&id[1..])),
-            id,
-        )
+        self.open_with_verity(&format!("objects/{}", id.to_object_pathname()), id)
     }
 
     pub fn merge_splitstream(
@@ -338,12 +315,8 @@ impl Repository {
     pub fn write_image(&self, name: Option<&str>, data: &[u8]) -> Result<Sha256HashValue> {
         let object_id = self.ensure_object(data)?;
 
-        let object_path = format!(
-            "objects/{:02x}/{}",
-            object_id[0],
-            hex::encode(&object_id[1..])
-        );
-        let image_path = format!("images/{}", hex::encode(object_id));
+        let object_path = Self::format_object_path(&object_id);
+        let image_path = format!("images/{}", object_id.to_hex());
 
         self.ensure_symlink(&image_path, &object_path)?;
 
@@ -367,7 +340,7 @@ impl Repository {
 
         if !name.contains("/") {
             // A name with no slashes in it is taken to be a sha256 fs-verity digest
-            ensure_verity_equal(&image, &parse_sha256(name)?)?;
+            ensure_verity_equal(&image, &Sha256HashValue::from_hex(name)?)?;
         }
 
         Ok(image)
@@ -423,17 +396,9 @@ impl Repository {
 
     fn read_symlink_hashvalue(dirfd: &OwnedFd, name: &CStr) -> Result<Sha256HashValue> {
         let link_content = readlinkat(dirfd, name, [])?;
-        let link_bytes = link_content.to_bytes();
-        let link_size = link_bytes.len();
-        // XXX: check correctness of leading ../?
-        // XXX: or is that something for fsck?
-        if link_size > 64 {
-            let mut value = Sha256HashValue::EMPTY;
-            hex::decode_to_slice(&link_bytes[link_size - 64..link_size], &mut value)?;
-            Ok(value)
-        } else {
-            bail!("symlink has wrong format")
-        }
+        Ok(Sha256HashValue::from_object_pathname(
+            link_content.to_bytes(),
+        )?)
     }
 
     fn walk_symlinkdir(fd: OwnedFd, objects: &mut HashSet<Sha256HashValue>) -> Result<()> {
@@ -491,12 +456,19 @@ impl Repository {
                 if entry.file_type() != FileType::Symlink {
                     bail!("category directory contains non-symlink");
                 }
+
+                // TODO: we need to sort this out.  the symlink itself might be a sha256 content ID
+                // (as for splitstreams), not an object/ to be preserved.
+                continue;
+
+                /*
                 let mut value = Sha256HashValue::EMPTY;
                 hex::decode_to_slice(filename.to_bytes(), &mut value)?;
 
                 if !objects.contains(&value) {
                     println!("rm {}/{:?}", category, filename);
                 }
+                */
             }
         }
 
@@ -516,19 +488,19 @@ impl Repository {
         let mut objects = HashSet::new();
 
         for ref object in self.gc_category("images")? {
-            println!("{} lives as an image", hex::encode(object));
-            objects.insert(*object);
-            objects.extend(self.objects_for_image(&hex::encode(object))?);
+            println!("{object:?} lives as an image");
+            objects.insert(object.clone());
+            objects.extend(self.objects_for_image(&object.to_hex())?);
         }
 
         for object in self.gc_category("streams")? {
-            println!("{} lives as a stream", hex::encode(object));
-            objects.insert(object);
+            println!("{object:?} lives as a stream");
+            objects.insert(object.clone());
 
-            let mut split_stream = self.open_stream(&hex::encode(object), None)?;
+            let mut split_stream = self.open_stream(&object.to_hex(), None)?;
             split_stream.get_object_refs(|id| {
-                println!("   with {}", hex::encode(*id));
-                objects.insert(*id);
+                println!("   with {id:?}");
+                objects.insert(id.clone());
             })?;
         }
 
@@ -545,9 +517,10 @@ impl Repository {
                 let entry = item?;
                 let filename = entry.file_name();
                 if filename != c"." && filename != c".." {
-                    let mut value = Sha256HashValue::EMPTY;
-                    value[0] = first_byte;
-                    hex::decode_to_slice(filename.to_bytes(), &mut value[1..])?;
+                    let value = Sha256HashValue::from_object_dir_and_basename(
+                        first_byte,
+                        filename.to_bytes(),
+                    )?;
                     if !objects.contains(&value) {
                         println!("rm objects/{first_byte:02x}/{filename:?}");
                     } else {

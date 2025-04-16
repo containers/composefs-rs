@@ -183,11 +183,7 @@ pub fn get_entry<R: Read>(reader: &mut SplitStreamReader<R>) -> Result<Option<Ta
                     );
                     TarItem::Leaf(LeafContent::Regular(RegularFile::External(id, size)))
                 }
-                _ => bail!(
-                    "Unsupported external-chunked entry {:?} {}",
-                    header,
-                    hex::encode(id)
-                ),
+                _ => bail!("Unsupported external-chunked entry {header:?} {id:?}"),
             },
             SplitStreamData::Inline(content) => match header.entry_type() {
                 EntryType::GNULongLink => {

@@ -64,7 +64,7 @@ impl<H: FsVerityHashValue, const LG_BLKSZ: u8> FsVerityHasher<H, LG_BLKSZ> {
             // We had a complete value, but now we're adding new data.
             // This means that we need to add a new hash layer...
             let mut new_layer = FsVerityLayer::new();
-            new_layer.add_data(value.as_ref());
+            new_layer.add_data(value.as_bytes());
             self.layers.push(new_layer);
         }
 
@@ -76,7 +76,7 @@ impl<H: FsVerityHashValue, const LG_BLKSZ: u8> FsVerityHasher<H, LG_BLKSZ> {
 
         for layer in self.layers.iter_mut() {
             // We have a layer we need to hash this value into
-            layer.add_data(value.as_ref());
+            layer.add_data(value.as_bytes());
             if layer.remaining != 0 {
                 return;
             }
@@ -97,7 +97,7 @@ impl<H: FsVerityHashValue, const LG_BLKSZ: u8> FsVerityHasher<H, LG_BLKSZ> {
             for layer in self.layers.iter_mut() {
                 // We have a layer we need to hash this value into
                 if value != H::EMPTY {
-                    layer.add_data(value.as_ref());
+                    layer.add_data(value.as_bytes());
                 }
                 if layer.remaining != (1 << LG_BLKSZ) {
                     // ...but now this layer itself is complete, so get the value of *it*.
@@ -143,7 +143,7 @@ impl<H: FsVerityHashValue, const LG_BLKSZ: u8> FsVerityHasher<H, LG_BLKSZ> {
         context.update(0u8.to_le_bytes()); /* salt_size */
         context.update([0; 4]); /* reserved */
         context.update(self.n_bytes.to_le_bytes());
-        context.update(self.root_hash());
+        context.update(self.root_hash().as_bytes());
         context.update([0].repeat(64 - size_of::<H>()));
         context.update([0; 32]); /* salt */
         context.update([0; 144]); /* reserved */
@@ -162,12 +162,12 @@ mod tests {
     #[test]
     fn test_digest() {
         assert_eq!(
-            hex::encode(FsVerityHasher::<Sha256HashValue, 12>::hash(b"hello world")),
+            FsVerityHasher::<Sha256HashValue, 12>::hash(b"hello world").to_hex(),
             "1e2eaa4202d750a41174ee454970b92c1bc2f925b1e35076d8c7d5f56362ba64"
         );
 
         assert_eq!(
-            hex::encode(FsVerityHasher::<Sha512HashValue, 12>::hash(b"hello world")),
+            FsVerityHasher::<Sha512HashValue, 12>::hash(b"hello world").to_hex(),
             "18430270729d162d4e469daca123ae61893db4b0583d8f7081e3bf4f92b88ba514e7982f10733fb6aa895195c5ae8fd2eb2c47a8be05513ce5a0c51a6f570409"
         );
     }

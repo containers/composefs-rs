@@ -15,7 +15,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::{
     fs::write_to_path,
-    fsverity::Sha256HashValue,
+    fsverity::{FsVerityHashValue, Sha256HashValue},
     oci::tar::{get_entry, split_async},
     repository::Repository,
     splitstream::DigestMap,
@@ -102,7 +102,7 @@ impl<'repo> ImageOp<'repo> {
 
         if let Some(layer_id) = self.repo.check_stream(layer_sha256)? {
             self.progress
-                .println(format!("Already have layer {}", hex::encode(layer_sha256)))?;
+                .println(format!("Already have layer {layer_sha256:?}"))?;
             Ok(layer_id)
         } else {
             // Otherwise, we need to fetch it...
@@ -189,7 +189,7 @@ impl<'repo> ImageOp<'repo> {
         }
     }
 
-    pub async fn pull(&self) -> Result<(Sha256HashValue, Sha256HashValue)> {
+    pub async fn pull(&self) -> Result<ContentAndVerity> {
         let (_manifest_digest, raw_manifest) = self
             .proxy
             .fetch_manifest_raw_oci(&self.img)
@@ -220,7 +220,7 @@ pub async fn pull(repo: &Repository, imgref: &str, reference: Option<&str>) -> R
         repo.name_stream(sha256, name)?;
     }
     println!("sha256 {}", hex::encode(sha256));
-    println!("verity {}", hex::encode(id));
+    println!("verity {}", id.to_hex());
     Ok(())
 }
 
@@ -276,7 +276,7 @@ pub fn write_config(
     repo: &Repository,
     config: &ImageConfiguration,
     refs: DigestMap,
-) -> Result<(Sha256HashValue, Sha256HashValue)> {
+) -> Result<ContentAndVerity> {
     let json = config.to_string()?;
     let json_bytes = json.as_bytes();
     let sha256 = hash(json_bytes);
@@ -290,12 +290,12 @@ pub fn seal(
     repo: &Repository,
     name: &str,
     verity: Option<&Sha256HashValue>,
-) -> Result<(Sha256HashValue, Sha256HashValue)> {
+) -> Result<ContentAndVerity> {
     let (mut config, refs) = open_config(repo, name, verity)?;
     let mut myconfig = config.config().clone().context("no config!")?;
     let labels = myconfig.labels_mut().get_or_insert_with(HashMap::new);
     let id = crate::oci::image::create_image(repo, name, None, verity)?;
-    labels.insert("containers.composefs.fsverity".to_string(), hex::encode(id));
+    labels.insert("containers.composefs.fsverity".to_string(), id.to_hex());
     config.set_config(Some(myconfig));
     write_config(repo, &config, refs)
 }

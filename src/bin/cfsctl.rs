@@ -5,7 +5,12 @@ use clap::{Parser, Subcommand};
 
 use rustix::fs::CWD;
 
-use composefs::{oci, repository::Repository, util::parse_sha256};
+use composefs::{
+    fsverity::{FsVerityHashValue, Sha256HashValue},
+    oci,
+    repository::Repository,
+    util::parse_sha256,
+};
 
 /// cfsctl
 #[derive(Debug, Parser)]
@@ -130,7 +135,7 @@ fn main() -> Result<()> {
         }
         Command::ImportImage { reference } => {
             let image_id = repo.import_image(&reference, &mut std::io::stdin())?;
-            println!("{}", hex::encode(image_id));
+            println!("{}", image_id.to_hex());
         }
         Command::Oci { cmd: oci_cmd } => match oci_cmd {
             OciCommand::ImportLayer { name, sha256 } => {
@@ -140,7 +145,7 @@ fn main() -> Result<()> {
                     name.as_deref(),
                     &mut std::io::stdin(),
                 )?;
-                println!("{}", hex::encode(object_id));
+                println!("{}", object_id.to_hex());
             }
             OciCommand::LsLayer { name } => {
                 oci::ls_layer(&repo, &name)?;
@@ -150,7 +155,7 @@ fn main() -> Result<()> {
             }
             OciCommand::CreateImage { config, name } => {
                 let image_id = oci::image::create_image(&repo, &config, name.as_deref(), None)?;
-                println!("{}", hex::encode(image_id));
+                println!("{}", image_id.to_hex());
             }
             OciCommand::Pull { ref image, name } => {
                 let runtime = tokio::runtime::Builder::new_current_thread()
@@ -161,10 +166,13 @@ fn main() -> Result<()> {
                 runtime.block_on(async move { oci::pull(&repo, image, name.as_deref()).await })?;
             }
             OciCommand::Seal { verity, ref name } => {
-                let (sha256, verity) =
-                    oci::seal(&repo, name, verity.map(parse_sha256).transpose()?.as_ref())?;
+                let (sha256, verity) = oci::seal(
+                    &repo,
+                    name,
+                    verity.map(Sha256HashValue::from_hex).transpose()?.as_ref(),
+                )?;
                 println!("sha256 {}", hex::encode(sha256));
-                println!("verity {}", hex::encode(verity));
+                println!("verity {}", verity.to_hex());
             }
             OciCommand::Mount {
                 ref name,
@@ -182,7 +190,7 @@ fn main() -> Result<()> {
         },
         Command::CreateImage { ref path } => {
             let image_id = composefs::fs::create_image(path, Some(&repo))?;
-            println!("{}", hex::encode(image_id));
+            println!("{}", image_id.to_hex());
         }
         Command::CreateDumpfile { ref path } => {
             composefs::fs::create_dumpfile(path)?;
@@ -193,7 +201,7 @@ fn main() -> Result<()> {
         Command::ImageObjects { name } => {
             let objects = repo.objects_for_image(&name)?;
             for object in objects {
-                println!("{}", hex::encode(object));
+                println!("{}", object.to_hex());
             }
         }
         Command::GC => {
