@@ -284,18 +284,23 @@ fn main() -> Result<()> {
     setup_root(args)
 }
 
-#[test]
-fn test_parse() {
-    let failing = ["", "foo", "composefs", "composefs=foo"];
-    for case in failing {
-        assert!(parse_composefs_cmdline(case.as_bytes()).is_err());
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_parse() {
+        let failing = ["", "foo", "composefs", "composefs=foo"];
+        for case in failing {
+            assert!(parse_composefs_cmdline(case.as_bytes()).is_err());
+        }
+        let digest = "8b7df143d91c716ecfa5fc1730022f6b421b05cedee8fd52b1fc65a96030ad52";
+        let digest_bytes = hex::decode(digest).unwrap();
+        similar_asserts::assert_eq!(
+            parse_composefs_cmdline(format!("composefs={digest}").as_bytes())
+                .unwrap()
+                .as_slice(),
+            &digest_bytes
+        );
     }
-    let digest = "8b7df143d91c716ecfa5fc1730022f6b421b05cedee8fd52b1fc65a96030ad52";
-    let digest_bytes = hex::decode(digest).unwrap();
-    similar_asserts::assert_eq!(
-        parse_composefs_cmdline(format!("composefs={digest}").as_bytes())
-            .unwrap()
-            .as_slice(),
-        &digest_bytes
-    );
 }
