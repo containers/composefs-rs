@@ -78,12 +78,12 @@ impl std::fmt::Debug for SplitStreamWriter<'_> {
     }
 }
 
-impl SplitStreamWriter<'_> {
+impl<'a> SplitStreamWriter<'a> {
     pub fn new(
-        repo: &Repository,
+        repo: &'a Repository,
         refs: Option<DigestMap>,
         sha256: Option<Sha256Digest>,
-    ) -> SplitStreamWriter {
+    ) -> Self {
         // SAFETY: we surely can't get an error writing the header to a Vec<u8>
         let mut writer = Encoder::new(vec![], 0).unwrap();
 
@@ -97,7 +97,7 @@ impl SplitStreamWriter<'_> {
             }
         }
 
-        SplitStreamWriter {
+        Self {
             repo,
             inline_content: vec![],
             writer,
@@ -113,7 +113,7 @@ impl SplitStreamWriter<'_> {
     /// flush any buffered inline data, taking new_value as the new value of the buffer
     fn flush_inline(&mut self, new_value: Vec<u8>) -> Result<()> {
         if !self.inline_content.is_empty() {
-            SplitStreamWriter::write_fragment(
+            Self::write_fragment(
                 &mut self.writer,
                 self.inline_content.len(),
                 &self.inline_content,
@@ -140,7 +140,7 @@ impl SplitStreamWriter<'_> {
         // external data becomes the start of a new inline block.
         self.flush_inline(padding)?;
 
-        SplitStreamWriter::write_fragment(&mut self.writer, 0, reference.as_bytes())
+        Self::write_fragment(&mut self.writer, 0, reference.as_bytes())
     }
 
     pub fn write_external(&mut self, data: &[u8], padding: Vec<u8>) -> Result<()> {
@@ -214,7 +214,7 @@ enum ChunkType {
 }
 
 impl<R: Read> SplitStreamReader<R> {
-    pub fn new(reader: R) -> Result<SplitStreamReader<R>> {
+    pub fn new(reader: R) -> Result<Self> {
         let mut decoder = Decoder::new(reader)?;
 
         let n_map_entries = {
@@ -230,7 +230,7 @@ impl<R: Read> SplitStreamReader<R> {
             refs.map.push(DigestMapEntry::read_from_io(&mut decoder)?);
         }
 
-        Ok(SplitStreamReader {
+        Ok(Self {
             decoder,
             refs,
             inline_bytes: 0,
