@@ -8,7 +8,7 @@ use std::{
 
 use thiserror::Error;
 
-use crate::fsverity::Sha256HashValue;
+use crate::fsverity::FsVerityHashValue;
 
 #[derive(Debug)]
 pub struct Stat {
@@ -20,14 +20,14 @@ pub struct Stat {
 }
 
 #[derive(Debug)]
-pub enum RegularFile {
+pub enum RegularFile<ObjectID: FsVerityHashValue> {
     Inline(Box<[u8]>),
-    External(Sha256HashValue, u64),
+    External(ObjectID, u64),
 }
 
 #[derive(Debug)]
-pub enum LeafContent {
-    Regular(RegularFile),
+pub enum LeafContent<ObjectID: FsVerityHashValue> {
+    Regular(RegularFile<ObjectID>),
     BlockDevice(u64),
     CharacterDevice(u64),
     Fifo,
@@ -36,21 +36,21 @@ pub enum LeafContent {
 }
 
 #[derive(Debug)]
-pub struct Leaf {
+pub struct Leaf<ObjectID: FsVerityHashValue> {
     pub stat: Stat,
-    pub content: LeafContent,
+    pub content: LeafContent<ObjectID>,
 }
 
 #[derive(Debug)]
-pub struct Directory {
+pub struct Directory<ObjectID: FsVerityHashValue> {
     pub stat: Stat,
-    entries: BTreeMap<Box<OsStr>, Inode>,
+    entries: BTreeMap<Box<OsStr>, Inode<ObjectID>>,
 }
 
 #[derive(Debug)]
-pub enum Inode {
-    Directory(Box<Directory>),
-    Leaf(Rc<Leaf>),
+pub enum Inode<ObjectID: FsVerityHashValue> {
+    Directory(Box<Directory<ObjectID>>),
+    Leaf(Rc<Leaf<ObjectID>>),
 }
 
 #[derive(Error, Debug)]
@@ -67,7 +67,7 @@ pub enum ImageError {
     IsNotRegular(Box<OsStr>),
 }
 
-impl Inode {
+impl<ObjectID: FsVerityHashValue> Inode<ObjectID> {
     pub fn stat(&self) -> &Stat {
         match self {
             Inode::Directory(dir) => &dir.stat,
@@ -76,7 +76,7 @@ impl Inode {
     }
 }
 
-impl Directory {
+impl<ObjectID: FsVerityHashValue> Directory<ObjectID> {
     pub fn new(stat: Stat) -> Self {
         Self {
             stat,
@@ -85,7 +85,7 @@ impl Directory {
     }
 
     /// Iterates over all inodes in the current directory, in no particular order.
-    pub fn inodes(&self) -> impl Iterator<Item = &Inode> + use<'_> {
+    pub fn inodes(&self) -> impl Iterator<Item = &Inode<ObjectID>> + use<'_, ObjectID> {
         self.entries.values()
     }
 
@@ -96,7 +96,8 @@ impl Directory {
     /// point.
     ///
     /// ```
-    /// let fs = composefs::image::FileSystem::new();
+    /// use composefs::{image::FileSystem, fsverity::Sha256HashValue};
+    /// let fs = FileSystem::<Sha256HashValue>::new();
     ///
     /// // populate the fs...
     ///
@@ -104,13 +105,15 @@ impl Directory {
     ///   // name: &OsStr, inode: &Inode
     /// }
     /// ```
-    pub fn entries(&self) -> impl Iterator<Item = (&OsStr, &Inode)> + use<'_> {
+    pub fn entries(&self) -> impl Iterator<Item = (&OsStr, &Inode<ObjectID>)> + use<'_, ObjectID> {
         self.entries.iter().map(|(k, v)| (k.as_ref(), v))
     }
 
     /// Iterates over all entries in the current directory, in asciibetical order of name.  The
     /// iterator returns pairs of `(&OsStr, &Inode)`.
-    pub fn sorted_entries(&self) -> impl Iterator<Item = (&OsStr, &Inode)> + use<'_> {
+    pub fn sorted_entries(
+        &self,
+    ) -> impl Iterator<Item = (&OsStr, &Inode<ObjectID>)> + use<'_, ObjectID> {
         self.entries.iter().map(|(k, v)| (k.as_ref(), v))
     }
 
@@ -132,7 +135,7 @@ impl Directory {
     /// On success, this returns a reference to the named directory.
     ///
     /// On failure, can return any number of errors from ImageError.
-    pub fn get_directory(&self, pathname: &OsStr) -> Result<&Directory, ImageError> {
+    pub fn get_directory(&self, pathname: &OsStr) -> Result<&Directory<ObjectID>, ImageError> {
         let path = Path::new(pathname);
         let mut dir = self;
 
@@ -156,7 +159,10 @@ impl Directory {
     /// Gets a mutable reference to a subdirectory of this directory.
     ///
     /// This is the mutable version of `Directory::get_directory()`.
-    pub fn get_directory_mut(&mut self, pathname: &OsStr) -> Result<&mut Directory, ImageError> {
+    pub fn get_directory_mut(
+        &mut self,
+        pathname: &OsStr,
+    ) -> Result<&mut Directory<ObjectID>, ImageError> {
         let path = Path::new(pathname);
         let mut dir = self;
 
@@ -200,7 +206,7 @@ impl Directory {
     pub fn split<'d, 'n>(
         &'d self,
         pathname: &'n OsStr,
-    ) -> Result<(&'d Directory, &'n OsStr), ImageError> {
+    ) -> Result<(&'d Directory<ObjectID>, &'n OsStr), ImageError> {
         let path = Path::new(pathname);
 
         let Some(filename) = path.file_name() else {
@@ -222,7 +228,7 @@ impl Directory {
     pub fn split_mut<'d, 'n>(
         &'d mut self,
         pathname: &'n OsStr,
-    ) -> Result<(&'d mut Directory, &'n OsStr), ImageError> {
+    ) -> Result<(&'d mut Directory<ObjectID>, &'n OsStr), ImageError> {
         let path = Path::new(pathname);
 
         let Some(filename) = path.file_name() else {
@@ -252,7 +258,7 @@ impl Directory {
     /// is returned.
     ///
     /// On failure, can return any number of errors from ImageError.
-    pub fn ref_leaf(&self, filename: &OsStr) -> Result<Rc<Leaf>, ImageError> {
+    pub fn ref_leaf(&self, filename: &OsStr) -> Result<Rc<Leaf<ObjectID>>, ImageError> {
         match self.entries.get(filename) {
             Some(Inode::Leaf(leaf)) => Ok(Rc::clone(leaf)),
             Some(Inode::Directory(..)) => Err(ImageError::IsADirectory(Box::from(filename))),
@@ -275,7 +281,10 @@ impl Directory {
     ///  * an external reference, with size information
     ///
     /// On failure, can return any number of errors from ImageError.
-    pub fn get_file<'a>(&'a self, filename: &OsStr) -> Result<&'a RegularFile, ImageError> {
+    pub fn get_file<'a>(
+        &'a self,
+        filename: &OsStr,
+    ) -> Result<&'a RegularFile<ObjectID>, ImageError> {
         match self.entries.get(filename) {
             Some(Inode::Leaf(leaf)) => match &leaf.content {
                 LeafContent::Regular(file) => Ok(file),
@@ -301,7 +310,7 @@ impl Directory {
     ///  * `filename`: the filename in the current directory.  If you need to support full
     ///    pathnames then you should call `Directory::split()` first.
     ///  * `inode`: the inode to store under the `filename`
-    pub fn merge(&mut self, filename: &OsStr, inode: Inode) {
+    pub fn merge(&mut self, filename: &OsStr, inode: Inode<ObjectID>) {
         // If we're putting a directory on top of a directory, then update the stat information but
         // keep the old entries in place.
         if let Inode::Directory(new_dir) = inode {
@@ -328,7 +337,7 @@ impl Directory {
     ///  * `filename`: the filename in the current directory.  If you need to support full
     ///    pathnames then you should call `Directory::split()` first.
     ///  * `inode`: the inode to store under the `filename`
-    pub fn insert(&mut self, filename: &OsStr, inode: Inode) {
+    pub fn insert(&mut self, filename: &OsStr, inode: Inode<ObjectID>) {
         self.entries.insert(Box::from(filename), inode);
     }
 
@@ -365,17 +374,17 @@ impl Directory {
 }
 
 #[derive(Debug)]
-pub struct FileSystem {
-    pub root: Directory,
+pub struct FileSystem<ObjectID: FsVerityHashValue> {
+    pub root: Directory<ObjectID>,
 }
 
-impl Default for FileSystem {
+impl<ObjectID: FsVerityHashValue> Default for FileSystem<ObjectID> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl FileSystem {
+impl<ObjectID: FsVerityHashValue> FileSystem<ObjectID> {
     pub fn new() -> Self {
         Self {
             root: Directory::new(Stat {

@@ -82,21 +82,21 @@ struct Directory<'a> {
 }
 
 #[derive(Debug)]
-struct Leaf<'a> {
-    content: &'a image::LeafContent,
+struct Leaf<'a, ObjectID: FsVerityHashValue> {
+    content: &'a image::LeafContent<ObjectID>,
     nlink: usize,
 }
 
 #[derive(Debug)]
-enum InodeContent<'a> {
+enum InodeContent<'a, ObjectID: FsVerityHashValue> {
     Directory(Directory<'a>),
-    Leaf(Leaf<'a>),
+    Leaf(Leaf<'a, ObjectID>),
 }
 
-struct Inode<'a> {
+struct Inode<'a, ObjectID: FsVerityHashValue> {
     stat: &'a image::Stat,
     xattrs: InodeXAttrs,
-    content: InodeContent<'a>,
+    content: InodeContent<'a, ObjectID>,
 }
 
 impl XAttr {
@@ -263,7 +263,7 @@ impl<'a> Directory<'a> {
     }
 }
 
-impl Leaf<'_> {
+impl<ObjectID: FsVerityHashValue> Leaf<'_, ObjectID> {
     fn inode_meta(&self) -> (format::DataLayout, u32, u64, usize) {
         let (layout, u, size) = match &self.content {
             image::LeafContent::Regular(image::RegularFile::Inline(data)) => {
@@ -299,7 +299,7 @@ impl Leaf<'_> {
     }
 }
 
-impl Inode<'_> {
+impl<ObjectID: FsVerityHashValue> Inode<'_, ObjectID> {
     fn file_type(&self) -> format::FileType {
         match &self.content {
             InodeContent::Directory(..) => format::FileType::Directory,
@@ -395,13 +395,13 @@ impl Inode<'_> {
     }
 }
 
-struct InodeCollector<'a> {
-    inodes: Vec<Inode<'a>>,
-    hardlinks: HashMap<*const image::Leaf, usize>,
+struct InodeCollector<'a, ObjectID: FsVerityHashValue> {
+    inodes: Vec<Inode<'a, ObjectID>>,
+    hardlinks: HashMap<*const image::Leaf<ObjectID>, usize>,
 }
 
-impl<'a> InodeCollector<'a> {
-    fn push_inode(&mut self, stat: &'a image::Stat, content: InodeContent<'a>) -> usize {
+impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
+    fn push_inode(&mut self, stat: &'a image::Stat, content: InodeContent<'a, ObjectID>) -> usize {
         let mut xattrs = InodeXAttrs::default();
 
         // We need to record extra xattrs for some files.  These come first.
@@ -442,7 +442,7 @@ impl<'a> InodeCollector<'a> {
         inode
     }
 
-    fn collect_leaf(&mut self, leaf: &'a Rc<image::Leaf>) -> usize {
+    fn collect_leaf(&mut self, leaf: &'a Rc<image::Leaf<ObjectID>>) -> usize {
         let nlink = Rc::strong_count(leaf);
 
         if nlink > 1 {
@@ -481,7 +481,7 @@ impl<'a> InodeCollector<'a> {
         entries.insert(point, entry);
     }
 
-    fn collect_dir(&mut self, dir: &'a image::Directory, parent: usize) -> usize {
+    fn collect_dir(&mut self, dir: &'a image::Directory<ObjectID>, parent: usize) -> usize {
         // The root inode number needs to fit in a u16.  That more or less compels us to write the
         // directory inode before the inode of the children of the directory.  Reserve a slot.
         let me = self.push_inode(&dir.stat, InodeContent::Directory(Directory::default()));
@@ -509,7 +509,7 @@ impl<'a> InodeCollector<'a> {
         me
     }
 
-    pub fn collect(fs: &'a image::FileSystem) -> Vec<Inode<'a>> {
+    pub fn collect(fs: &'a image::FileSystem<ObjectID>) -> Vec<Inode<'a, ObjectID>> {
         let mut this = Self {
             inodes: vec![],
             hardlinks: HashMap::new(),
@@ -525,7 +525,7 @@ impl<'a> InodeCollector<'a> {
 
 /// Takes a list of inodes where each inode contains only local xattr values, determines which
 /// xattrs (key, value) pairs appear more than once, and shares them.
-fn share_xattrs(inodes: &mut [Inode]) -> Vec<XAttr> {
+fn share_xattrs<ObjectID: FsVerityHashValue>(inodes: &mut [Inode<ObjectID>]) -> Vec<XAttr> {
     let mut xattrs: BTreeMap<XAttr, usize> = BTreeMap::new();
 
     // Collect all xattrs from the inodes
@@ -563,7 +563,11 @@ fn share_xattrs(inodes: &mut [Inode]) -> Vec<XAttr> {
     xattrs.into_keys().collect()
 }
 
-fn write_erofs(output: &mut impl Output, inodes: &[Inode], xattrs: &[XAttr]) {
+fn write_erofs<ObjectID: FsVerityHashValue>(
+    output: &mut impl Output,
+    inodes: &[Inode<ObjectID>],
+    xattrs: &[XAttr],
+) {
     // Write composefs header
     output.note_offset(Offset::Header);
     output.write_struct(format::ComposefsHeader {
@@ -684,7 +688,7 @@ impl Output for FirstPass {
     }
 }
 
-pub fn mkfs_erofs(fs: &image::FileSystem) -> Box<[u8]> {
+pub fn mkfs_erofs<ObjectID: FsVerityHashValue>(fs: &image::FileSystem<ObjectID>) -> Box<[u8]> {
     // Create the intermediate representation: flattened inodes and shared xattrs
     let mut inodes = InodeCollector::collect(fs);
     let xattrs = share_xattrs(&mut inodes);

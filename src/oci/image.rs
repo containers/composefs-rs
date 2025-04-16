@@ -6,7 +6,7 @@ use oci_spec::image::ImageConfiguration;
 use crate::{
     dumpfile::write_dumpfile,
     erofs::writer::mkfs_erofs,
-    fsverity::Sha256HashValue,
+    fsverity::FsVerityHashValue,
     image::{Directory, FileSystem, Inode, Leaf},
     oci::{
         self,
@@ -16,7 +16,10 @@ use crate::{
     selabel::selabel,
 };
 
-pub fn process_entry(filesystem: &mut FileSystem, entry: TarEntry) -> Result<()> {
+pub fn process_entry<ObjectID: FsVerityHashValue>(
+    filesystem: &mut FileSystem<ObjectID>,
+    entry: TarEntry<ObjectID>,
+) -> Result<()> {
     let inode = match entry.item {
         TarItem::Directory => Inode::Directory(Box::from(Directory::new(entry.stat))),
         TarItem::Leaf(content) => Inode::Leaf(Rc::new(Leaf {
@@ -46,8 +49,11 @@ pub fn process_entry(filesystem: &mut FileSystem, entry: TarEntry) -> Result<()>
     Ok(())
 }
 
-pub fn compose_filesystem(repo: &Repository, layers: &[String]) -> Result<FileSystem> {
-    let mut filesystem = FileSystem::new();
+pub fn compose_filesystem<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    layers: &[String],
+) -> Result<FileSystem<ObjectID>> {
+    let mut filesystem = FileSystem::<ObjectID>::new();
 
     for layer in layers {
         let mut split_stream = repo.open_stream(layer, None)?;
@@ -62,19 +68,22 @@ pub fn compose_filesystem(repo: &Repository, layers: &[String]) -> Result<FileSy
     Ok(filesystem)
 }
 
-pub fn create_dumpfile(repo: &Repository, layers: &[String]) -> Result<()> {
+pub fn create_dumpfile<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    layers: &[String],
+) -> Result<()> {
     let filesystem = compose_filesystem(repo, layers)?;
     let mut stdout = std::io::stdout();
     write_dumpfile(&mut stdout, &filesystem)?;
     Ok(())
 }
 
-pub fn create_image(
-    repo: &Repository,
+pub fn create_image<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
     config: &str,
     name: Option<&str>,
-    verity: Option<&Sha256HashValue>,
-) -> Result<Sha256HashValue> {
+    verity: Option<&ObjectID>,
+) -> Result<ObjectID> {
     let mut filesystem = FileSystem::new();
 
     let mut config_stream = repo.open_stream(config, verity)?;
@@ -99,12 +108,15 @@ pub fn create_image(
 
 #[cfg(test)]
 mod test {
-    use crate::image::{LeafContent, RegularFile, Stat};
+    use crate::{
+        fsverity::Sha256HashValue,
+        image::{LeafContent, RegularFile, Stat},
+    };
     use std::{cell::RefCell, collections::BTreeMap, io::BufRead, path::PathBuf};
 
     use super::*;
 
-    fn file_entry(path: &str) -> oci::tar::TarEntry {
+    fn file_entry<ObjectID: FsVerityHashValue>(path: &str) -> oci::tar::TarEntry<ObjectID> {
         oci::tar::TarEntry {
             path: PathBuf::from(path),
             stat: Stat {
@@ -118,7 +130,7 @@ mod test {
         }
     }
 
-    fn dir_entry(path: &str) -> oci::tar::TarEntry {
+    fn dir_entry<ObjectID: FsVerityHashValue>(path: &str) -> oci::tar::TarEntry<ObjectID> {
         oci::tar::TarEntry {
             path: PathBuf::from(path),
             stat: Stat {
@@ -132,7 +144,7 @@ mod test {
         }
     }
 
-    fn assert_files(fs: &FileSystem, expected: &[&str]) -> Result<()> {
+    fn assert_files(fs: &FileSystem<impl FsVerityHashValue>, expected: &[&str]) -> Result<()> {
         let mut out = vec![];
         write_dumpfile(&mut out, fs)?;
         let actual: Vec<String> = out
@@ -146,7 +158,7 @@ mod test {
 
     #[test]
     fn test_process_entry() -> Result<()> {
-        let mut fs = FileSystem::new();
+        let mut fs = FileSystem::<Sha256HashValue>::new();
 
         // both with and without leading slash should be supported
         process_entry(&mut fs, dir_entry("/a"))?;

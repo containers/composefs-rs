@@ -167,7 +167,7 @@ fn open_root_fs(path: &Path) -> Result<OwnedFd> {
 }
 
 fn mount_composefs_image(sysroot: &OwnedFd, name: &str) -> Result<OwnedFd> {
-    let repo = Repository::open_path(sysroot, "composefs")?;
+    let repo = Repository::<Sha256HashValue>::open_path(sysroot, "composefs")?;
     let image = repo.open_image(name)?;
     composefs_fsmount(image, name, repo.object_dir()?).context("Failed to mount composefs image")
 }
@@ -200,11 +200,11 @@ fn mount_subdir(
 }
 
 // Implementation
-fn parse_composefs_cmdline(cmdline: &[u8]) -> Result<Sha256HashValue> {
+fn parse_composefs_cmdline<H: FsVerityHashValue>(cmdline: &[u8]) -> Result<H> {
     // TODO?: officially we need to understand quoting with double-quotes...
     for part in cmdline.split(|c| c.is_ascii_whitespace()) {
         if let Some(digest) = part.strip_prefix(b"composefs=") {
-            return Sha256HashValue::from_hex(digest).context("Parsing composefs=");
+            return H::from_hex(digest).context("Parsing composefs=");
         }
     }
     bail!("Unable to find composefs= cmdline parameter");
@@ -236,7 +236,7 @@ fn setup_root(args: Args) -> Result<()> {
         Some(cmdline) => cmdline.as_bytes(),
         None => &std::fs::read("/proc/cmdline")?,
     };
-    let image = parse_composefs_cmdline(cmdline)?.to_hex();
+    let image = parse_composefs_cmdline::<Sha256HashValue>(cmdline)?.to_hex();
 
     let new_root = match args.root_fs {
         Some(path) => open_root_fs(&path).context("Failed to clone specified root fs")?,
@@ -290,11 +290,12 @@ mod test {
     fn test_parse() {
         let failing = ["", "foo", "composefs", "composefs=foo"];
         for case in failing {
-            assert!(parse_composefs_cmdline(case.as_bytes()).is_err());
+            assert!(parse_composefs_cmdline::<Sha256HashValue>(case.as_bytes()).is_err());
         }
         let digest = "8b7df143d91c716ecfa5fc1730022f6b421b05cedee8fd52b1fc65a96030ad52";
         similar_asserts::assert_eq!(
-            parse_composefs_cmdline(format!("composefs={digest}").as_bytes()).unwrap(),
+            parse_composefs_cmdline::<Sha256HashValue>(format!("composefs={digest}").as_bytes())
+                .unwrap(),
             Sha256HashValue::from_hex(digest).unwrap()
         );
     }
