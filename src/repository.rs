@@ -24,7 +24,7 @@ use crate::{
     },
     mount::mount_composefs_at,
     splitstream::{DigestMap, SplitStreamReader, SplitStreamWriter},
-    util::{parse_sha256, proc_self_fd},
+    util::{parse_sha256, proc_self_fd, Sha256Digest},
 };
 
 #[derive(Debug)]
@@ -136,7 +136,7 @@ impl Repository {
     /// store the result.
     pub fn create_stream(
         &self,
-        sha256: Option<Sha256HashValue>,
+        sha256: Option<Sha256Digest>,
         maps: Option<DigestMap>,
     ) -> SplitStreamWriter {
         SplitStreamWriter::new(self, maps, sha256)
@@ -166,7 +166,7 @@ impl Repository {
         format!("objects/{:02x}/{}", id[0], hex::encode(&id[1..]))
     }
 
-    pub fn has_stream(&self, sha256: &Sha256HashValue) -> Result<Option<Sha256HashValue>> {
+    pub fn has_stream(&self, sha256: &Sha256Digest) -> Result<Option<Sha256HashValue>> {
         let stream_path = format!("streams/{}", hex::encode(sha256));
 
         match readlinkat(&self.repository, &stream_path, []) {
@@ -191,7 +191,7 @@ impl Repository {
     }
 
     /// Basically the same as has_stream() except that it performs expensive verification
-    pub fn check_stream(&self, sha256: &Sha256HashValue) -> Result<Option<Sha256HashValue>> {
+    pub fn check_stream(&self, sha256: &Sha256Digest) -> Result<Option<Sha256HashValue>> {
         match self.openat(&format!("streams/{}", hex::encode(sha256)), OFlags::RDONLY) {
             Ok(stream) => {
                 let measured_verity: Sha256HashValue = measure_verity(&stream)?;
@@ -245,7 +245,7 @@ impl Repository {
 
     /// Assign the given name to a stream.  The stream must already exist.  After this operation it
     /// will be possible to refer to the stream by its new name 'refs/{name}'.
-    pub fn name_stream(&self, sha256: Sha256HashValue, name: &str) -> Result<()> {
+    pub fn name_stream(&self, sha256: Sha256Digest, name: &str) -> Result<()> {
         let stream_path = format!("streams/{}", hex::encode(sha256));
         let reference_path = format!("streams/refs/{name}");
         self.symlink(&reference_path, &stream_path)?;
@@ -268,7 +268,7 @@ impl Repository {
     /// ID will be used when referring to the stream from other linked streams.
     pub fn ensure_stream(
         &self,
-        sha256: &Sha256HashValue,
+        sha256: &Sha256Digest,
         callback: impl FnOnce(&mut SplitStreamWriter) -> Result<()>,
         reference: Option<&str>,
     ) -> Result<Sha256HashValue> {

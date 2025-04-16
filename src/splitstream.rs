@@ -12,12 +12,12 @@ use zstd::stream::{read::Decoder, write::Encoder};
 use crate::{
     fsverity::{FsVerityHashValue, Sha256HashValue},
     repository::Repository,
-    util::read_exactish,
+    util::{read_exactish, Sha256Digest},
 };
 
 #[derive(Debug)]
 pub struct DigestMapEntry {
-    pub body: Sha256HashValue,
+    pub body: Sha256Digest,
     pub verity: Sha256HashValue,
 }
 
@@ -37,14 +37,14 @@ impl DigestMap {
         DigestMap { map: vec![] }
     }
 
-    pub fn lookup(&self, body: &Sha256HashValue) -> Option<&Sha256HashValue> {
+    pub fn lookup(&self, body: &Sha256Digest) -> Option<&Sha256HashValue> {
         match self.map.binary_search_by_key(body, |e| e.body) {
             Ok(idx) => Some(&self.map[idx].verity),
             Err(..) => None,
         }
     }
 
-    pub fn insert(&mut self, body: &Sha256HashValue, verity: &Sha256HashValue) {
+    pub fn insert(&mut self, body: &Sha256Digest, verity: &Sha256HashValue) {
         match self.map.binary_search_by_key(body, |e| e.body) {
             Ok(idx) => assert_eq!(self.map[idx].verity, *verity), // or else, bad things...
             Err(idx) => self.map.insert(
@@ -62,7 +62,7 @@ pub struct SplitStreamWriter<'a> {
     repo: &'a Repository,
     inline_content: Vec<u8>,
     writer: Encoder<'a, Vec<u8>>,
-    pub sha256: Option<(Sha256, Sha256HashValue)>,
+    pub sha256: Option<(Sha256, Sha256Digest)>,
 }
 
 impl std::fmt::Debug for SplitStreamWriter<'_> {
@@ -80,7 +80,7 @@ impl SplitStreamWriter<'_> {
     pub fn new(
         repo: &Repository,
         refs: Option<DigestMap>,
-        sha256: Option<Sha256HashValue>,
+        sha256: Option<Sha256Digest>,
     ) -> SplitStreamWriter {
         // SAFETY: we surely can't get an error writing the header to a Vec<u8>
         let mut writer = Encoder::new(vec![], 0).unwrap();
@@ -157,7 +157,7 @@ impl SplitStreamWriter<'_> {
         self.flush_inline(vec![])?;
 
         if let Some((context, expected)) = self.sha256 {
-            if Into::<Sha256HashValue>::into(context.finalize()) != expected {
+            if Into::<Sha256Digest>::into(context.finalize()) != expected {
                 bail!("Content doesn't have expected SHA256 hash value!");
             }
         }
@@ -362,13 +362,13 @@ impl<R: Read> SplitStreamReader<R> {
         }
     }
 
-    pub fn get_stream_refs(&mut self, mut callback: impl FnMut(&Sha256HashValue)) {
+    pub fn get_stream_refs(&mut self, mut callback: impl FnMut(&Sha256Digest)) {
         for entry in &self.refs.map {
             callback(&entry.body);
         }
     }
 
-    pub fn lookup(&self, body: &Sha256HashValue) -> Result<&Sha256HashValue> {
+    pub fn lookup(&self, body: &Sha256Digest) -> Result<&Sha256HashValue> {
         match self.refs.lookup(body) {
             Some(id) => Ok(id),
             None => bail!("Reference is not found in splitstream"),

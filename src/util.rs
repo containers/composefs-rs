@@ -5,8 +5,6 @@ use std::{
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use crate::fsverity::{FsVerityHashValue, Sha256HashValue};
-
 /// Formats a string like "/proc/self/fd/3" for the given fd.  This can be used to work with kernel
 /// APIs that don't directly accept file descriptors.
 ///
@@ -83,14 +81,17 @@ pub(crate) async fn read_exactish_async(
     Ok(true)
 }
 
-/// Parse a string containing a SHA256 digest in hexidecimal form into a Sha256HashValue.
+/// A utility type representing a SHA-256 digest in binary.
+pub type Sha256Digest = [u8; 32];
+
+/// Parse a string containing a SHA256 digest in hexidecimal form into a Sha256Digest.
 ///
 /// The string must contain exactly 64 characters and consist entirely of [0-9a-f], case
 /// insensitive.
 ///
 /// In case of a failure to parse the string, this function returns ErrorKind::InvalidInput.
-pub fn parse_sha256(string: impl AsRef<str>) -> Result<Sha256HashValue> {
-    let mut value = Sha256HashValue::EMPTY;
+pub fn parse_sha256(string: impl AsRef<str>) -> Result<Sha256Digest> {
+    let mut value = [0u8; 32];
     hex::decode_to_slice(string.as_ref(), &mut value)
         .map_err(|source| Error::new(ErrorKind::InvalidInput, source))?;
     Ok(value)

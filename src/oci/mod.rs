@@ -19,12 +19,12 @@ use crate::{
     oci::tar::{get_entry, split_async},
     repository::Repository,
     splitstream::DigestMap,
-    util::parse_sha256,
+    util::{parse_sha256, Sha256Digest},
 };
 
 pub fn import_layer(
     repo: &Repository,
-    sha256: &Sha256HashValue,
+    sha256: &Sha256Digest,
     name: Option<&str>,
     tar_stream: &mut impl Read,
 ) -> Result<Sha256HashValue> {
@@ -48,21 +48,21 @@ struct ImageOp<'repo> {
     progress: MultiProgress,
 }
 
-fn sha256_from_descriptor(descriptor: &Descriptor) -> Result<Sha256HashValue> {
+fn sha256_from_descriptor(descriptor: &Descriptor) -> Result<Sha256Digest> {
     let Some(digest) = descriptor.as_digest_sha256() else {
         bail!("Descriptor in oci config is not sha256");
     };
     Ok(parse_sha256(digest)?)
 }
 
-fn sha256_from_digest(digest: &str) -> Result<Sha256HashValue> {
+fn sha256_from_digest(digest: &str) -> Result<Sha256Digest> {
     match digest.strip_prefix("sha256:") {
         Some(rest) => Ok(parse_sha256(rest)?),
         None => bail!("Manifest has non-sha256 digest"),
     }
 }
 
-type ContentAndVerity = (Sha256HashValue, Sha256HashValue);
+type ContentAndVerity = (Sha256Digest, Sha256HashValue);
 
 impl<'repo> ImageOp<'repo> {
     async fn new(repo: &'repo Repository, imgref: &str) -> Result<Self> {
@@ -93,7 +93,7 @@ impl<'repo> ImageOp<'repo> {
 
     pub async fn ensure_layer(
         &self,
-        layer_sha256: &Sha256HashValue,
+        layer_sha256: &Sha256Digest,
         descriptor: &Descriptor,
     ) -> Result<Sha256HashValue> {
         // We need to use the per_manifest descriptor to download the compressed layer but it gets
@@ -245,7 +245,7 @@ pub fn open_config(
     Ok((config, stream.refs))
 }
 
-fn hash(bytes: &[u8]) -> Sha256HashValue {
+fn hash(bytes: &[u8]) -> Sha256Digest {
     let mut context = Sha256::new();
     context.update(bytes);
     context.finalize().into()
