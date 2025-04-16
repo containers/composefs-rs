@@ -12,7 +12,7 @@ use anyhow::Result;
 use rustix::fs::FileType;
 
 use crate::{
-    fsverity::{FsVerityHashValue, Sha256HashValue},
+    fsverity::FsVerityHashValue,
     image::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
 };
 
@@ -49,7 +49,7 @@ fn write_entry(
     rdev: u64,
     payload: impl AsRef<OsStr>,
     content: &[u8],
-    digest: Option<&Sha256HashValue>,
+    digest: Option<&str>,
 ) -> fmt::Result {
     let mode = stat.st_mode | ifmt.as_raw_mode();
     let uid = stat.st_uid;
@@ -66,7 +66,7 @@ fn write_entry(
     write_escaped(writer, content)?;
     write!(writer, " ")?;
     if let Some(id) = digest {
-        write!(writer, "{}", id.to_hex())?;
+        write!(writer, "{}", id)?;
     } else {
         write_empty(writer)?;
     }
@@ -131,7 +131,7 @@ pub fn write_leaf(
             0,
             id.to_object_pathname(),
             &[],
-            Some(id),
+            Some(&id.to_hex()),
         ),
         LeafContent::BlockDevice(rdev) => write_entry(
             writer,
