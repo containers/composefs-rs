@@ -98,82 +98,82 @@ pub fn create_image(
 }
 
 #[cfg(test)]
-use crate::image::{LeafContent, RegularFile, Stat};
-#[cfg(test)]
-use std::{cell::RefCell, collections::BTreeMap, io::BufRead, path::PathBuf};
+mod test {
+    use crate::image::{LeafContent, RegularFile, Stat};
+    use std::{cell::RefCell, collections::BTreeMap, io::BufRead, path::PathBuf};
 
-#[cfg(test)]
-fn file_entry(path: &str) -> oci::tar::TarEntry {
-    oci::tar::TarEntry {
-        path: PathBuf::from(path),
-        stat: Stat {
-            st_mode: 0o644,
-            st_uid: 0,
-            st_gid: 0,
-            st_mtim_sec: 0,
-            xattrs: RefCell::new(BTreeMap::new()),
-        },
-        item: oci::tar::TarItem::Leaf(LeafContent::Regular(RegularFile::Inline([].into()))),
+    use super::*;
+
+    fn file_entry(path: &str) -> oci::tar::TarEntry {
+        oci::tar::TarEntry {
+            path: PathBuf::from(path),
+            stat: Stat {
+                st_mode: 0o644,
+                st_uid: 0,
+                st_gid: 0,
+                st_mtim_sec: 0,
+                xattrs: RefCell::new(BTreeMap::new()),
+            },
+            item: oci::tar::TarItem::Leaf(LeafContent::Regular(RegularFile::Inline([].into()))),
+        }
     }
-}
 
-#[cfg(test)]
-fn dir_entry(path: &str) -> oci::tar::TarEntry {
-    oci::tar::TarEntry {
-        path: PathBuf::from(path),
-        stat: Stat {
-            st_mode: 0o755,
-            st_uid: 0,
-            st_gid: 0,
-            st_mtim_sec: 0,
-            xattrs: RefCell::new(BTreeMap::new()),
-        },
-        item: oci::tar::TarItem::Directory,
+    fn dir_entry(path: &str) -> oci::tar::TarEntry {
+        oci::tar::TarEntry {
+            path: PathBuf::from(path),
+            stat: Stat {
+                st_mode: 0o755,
+                st_uid: 0,
+                st_gid: 0,
+                st_mtim_sec: 0,
+                xattrs: RefCell::new(BTreeMap::new()),
+            },
+            item: oci::tar::TarItem::Directory,
+        }
     }
-}
 
-#[cfg(test)]
-fn assert_files(fs: &FileSystem, expected: &[&str]) -> Result<()> {
-    let mut out = vec![];
-    write_dumpfile(&mut out, fs)?;
-    let actual: Vec<String> = out
-        .lines()
-        .map(|line| line.unwrap().split_once(' ').unwrap().0.into())
-        .collect();
+    fn assert_files(fs: &FileSystem, expected: &[&str]) -> Result<()> {
+        let mut out = vec![];
+        write_dumpfile(&mut out, fs)?;
+        let actual: Vec<String> = out
+            .lines()
+            .map(|line| line.unwrap().split_once(' ').unwrap().0.into())
+            .collect();
 
-    similar_asserts::assert_eq!(actual, expected);
-    Ok(())
-}
+        similar_asserts::assert_eq!(actual, expected);
+        Ok(())
+    }
 
-#[test]
-fn test_process_entry() -> Result<()> {
-    let mut fs = FileSystem::new();
+    #[test]
+    fn test_process_entry() -> Result<()> {
+        let mut fs = FileSystem::new();
 
-    // both with and without leading slash should be supported
-    process_entry(&mut fs, dir_entry("/a"))?;
-    process_entry(&mut fs, dir_entry("b"))?;
-    process_entry(&mut fs, dir_entry("c"))?;
-    assert_files(&fs, &["/", "/a", "/b", "/c"])?;
+        // both with and without leading slash should be supported
+        process_entry(&mut fs, dir_entry("/a"))?;
+        process_entry(&mut fs, dir_entry("b"))?;
+        process_entry(&mut fs, dir_entry("c"))?;
+        assert_files(&fs, &["/", "/a", "/b", "/c"])?;
 
-    // add some files
-    process_entry(&mut fs, file_entry("/a/b"))?;
-    process_entry(&mut fs, file_entry("/a/c"))?;
-    process_entry(&mut fs, file_entry("/b/a"))?;
-    process_entry(&mut fs, file_entry("/b/c"))?;
-    process_entry(&mut fs, file_entry("/c/a"))?;
-    process_entry(&mut fs, file_entry("/c/c"))?;
-    assert_files(
-        &fs,
-        &[
-            "/", "/a", "/a/b", "/a/c", "/b", "/b/a", "/b/c", "/c", "/c/a", "/c/c",
-        ],
-    )?;
+        // add some files
+        process_entry(&mut fs, file_entry("/a/b"))?;
+        process_entry(&mut fs, file_entry("/a/c"))?;
+        process_entry(&mut fs, file_entry("/b/a"))?;
+        process_entry(&mut fs, file_entry("/b/c"))?;
+        process_entry(&mut fs, file_entry("/c/a"))?;
+        process_entry(&mut fs, file_entry("/c/c"))?;
+        assert_files(
+            &fs,
+            &[
+                "/", "/a", "/a/b", "/a/c", "/b", "/b/a", "/b/c", "/c", "/c/a", "/c/c",
+            ],
+        )?;
 
-    // try some whiteouts
-    process_entry(&mut fs, file_entry(".wh.a"))?; // entire dir
-    process_entry(&mut fs, file_entry("/b/.wh..wh.opq"))?; // opaque dir
-    process_entry(&mut fs, file_entry("/c/.wh.c"))?; // single file
-    assert_files(&fs, &["/", "/b", "/c", "/c/a"])?;
+        // try some whiteouts
+        process_entry(&mut fs, file_entry(".wh.a"))?; // entire dir
+        process_entry(&mut fs, file_entry("/b/.wh..wh.opq"))?; // opaque dir
+        process_entry(&mut fs, file_entry("/c/.wh.c"))?; // single file
+        assert_files(&fs, &["/", "/b", "/c", "/c/a"])?;
 
-    Ok(())
+        Ok(())
+    }
 }
