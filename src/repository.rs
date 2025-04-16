@@ -46,7 +46,7 @@ impl Repository {
         )
     }
 
-    pub fn open_path(dirfd: impl AsFd, path: impl AsRef<Path>) -> Result<Repository> {
+    pub fn open_path(dirfd: impl AsFd, path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
 
         // O_PATH isn't enough because flock()
@@ -56,17 +56,17 @@ impl Repository {
         flock(&repository, FlockOperation::LockShared)
             .context("Cannot lock composefs repository")?;
 
-        Ok(Repository { repository })
+        Ok(Self { repository })
     }
 
-    pub fn open_user() -> Result<Repository> {
+    pub fn open_user() -> Result<Self> {
         let home = std::env::var("HOME").with_context(|| "$HOME must be set when in user mode")?;
 
-        Repository::open_path(CWD, PathBuf::from(home).join(".var/lib/composefs"))
+        Self::open_path(CWD, PathBuf::from(home).join(".var/lib/composefs"))
     }
 
-    pub fn open_system() -> Result<Repository> {
-        Repository::open_path(CWD, PathBuf::from("/sysroot/composefs".to_string()))
+    pub fn open_system() -> Result<Self> {
+        Self::open_path(CWD, PathBuf::from("/sysroot/composefs".to_string()))
     }
 
     fn ensure_dir(&self, dir: impl AsRef<Path>) -> ErrnoResult<()> {
@@ -212,7 +212,7 @@ impl Repository {
         };
         let stream_path = format!("streams/{}", hex::encode(sha256));
         let object_id = writer.done()?;
-        let object_path = Repository::format_object_path(&object_id);
+        let object_path = Self::format_object_path(&object_id);
         self.ensure_symlink(&stream_path, &object_path)?;
 
         if let Some(name) = reference {
@@ -261,7 +261,7 @@ impl Repository {
                 callback(&mut writer)?;
                 let object_id = writer.done()?;
 
-                let object_path = Repository::format_object_path(&object_id);
+                let object_path = Self::format_object_path(&object_id);
                 self.ensure_symlink(&stream_path, &object_path)?;
                 object_id
             }
@@ -411,11 +411,11 @@ impl Repository {
                     let filename = entry.file_name();
                     if filename != c"." && filename != c".." {
                         let dirfd = openat(&fd, filename, OFlags::RDONLY, Mode::empty())?;
-                        Repository::walk_symlinkdir(dirfd, objects)?;
+                        Self::walk_symlinkdir(dirfd, objects)?;
                     }
                 }
                 FileType::Symlink => {
-                    objects.insert(Repository::read_symlink_hashvalue(&fd, entry.file_name())?);
+                    objects.insert(Self::read_symlink_hashvalue(&fd, entry.file_name())?);
                 }
                 _ => {
                     bail!("Unexpected file type encountered");
@@ -447,7 +447,7 @@ impl Repository {
             OFlags::RDONLY | OFlags::DIRECTORY,
             Mode::empty(),
         )?;
-        Repository::walk_symlinkdir(refs, &mut objects)?;
+        Self::walk_symlinkdir(refs, &mut objects)?;
 
         for item in Dir::read_from(&category_fd)? {
             let entry = item?;

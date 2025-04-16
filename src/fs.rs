@@ -176,7 +176,7 @@ impl FilesystemReader<'_> {
                 st_uid: buf.st_uid,
                 st_gid: buf.st_gid,
                 st_mtim_sec: buf.st_mtime as i64,
-                xattrs: RefCell::new(FilesystemReader::read_xattrs(fd)?),
+                xattrs: RefCell::new(Self::read_xattrs(fd)?),
             },
         ))
     }
@@ -225,7 +225,7 @@ impl FilesystemReader<'_> {
             Mode::empty(),
         )?;
 
-        let (buf, stat) = FilesystemReader::stat(&fd, ifmt)?;
+        let (buf, stat) = Self::stat(&fd, ifmt)?;
 
         // NB: We could check `st_nlink > 1` to find out if we should track a file as a potential
         // hardlink or not, but some filesystems (like fuse-overlayfs) can report this incorrectly.
@@ -249,7 +249,7 @@ impl FilesystemReader<'_> {
             Mode::empty(),
         )?;
 
-        let (_, stat) = FilesystemReader::stat(&fd, FileType::Directory)?;
+        let (_, stat) = Self::stat(&fd, FileType::Directory)?;
         let mut directory = Directory::new(stat);
 
         for item in Dir::read_from(&fd)? {
