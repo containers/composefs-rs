@@ -181,6 +181,7 @@ mod tests {
     fn rdonly_file_with(data: &[u8]) -> OwnedFd {
         let mut file = tempfile();
         file.write_all(data).unwrap();
+        file.sync_data().unwrap();
         let fd = open(
             proc_self_fd(&file),
             OFlags::RDONLY | OFlags::CLOEXEC,
