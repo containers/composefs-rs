@@ -152,8 +152,8 @@ fn get_value(map: &HashMap<&str, &str>, keys: &[&str]) -> Option<String> {
 /// to "ID" and/or "VERSION" if they are not present).
 ///
 /// For more information, see:
-///  - https://uapi-group.org/specifications/specs/boot_loader_specification/
-///  - https://www.freedesktop.org/software/systemd/man/latest/os-release.html
+///  - <https://uapi-group.org/specifications/specs/boot_loader_specification/>
+///  - <https://www.freedesktop.org/software/systemd/man/latest/os-release.html>
 ///
 /// # Arguments
 ///
