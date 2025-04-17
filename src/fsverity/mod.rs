@@ -74,7 +74,7 @@ pub enum CompareVerityError {
 /// It's possible to choose the hash algorithm (via the generic parameter) but the blocksize is
 /// currently hardcoded to 4096.  Salt is not supported.
 ///
-/// See https://www.kernel.org/doc/html/latest/filesystems/fsverity.html#file-digest-computation
+/// See <https://www.kernel.org/doc/html/latest/filesystems/fsverity.html#file-digest-computation>
 ///
 /// # Arguments:
 ///
