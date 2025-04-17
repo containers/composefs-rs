@@ -17,7 +17,7 @@ use composefs::{
     image::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
 };
 
-fn debug_fs<ObjectID: FsVerityHashValue>(mut fs: FileSystem<ObjectID>) -> String {
+fn debug_fs(mut fs: FileSystem<impl FsVerityHashValue>) -> String {
     fs.done();
     let image = mkfs_erofs(&fs);
     let mut output = vec![];
@@ -25,7 +25,7 @@ fn debug_fs<ObjectID: FsVerityHashValue>(mut fs: FileSystem<ObjectID>) -> String
     String::from_utf8(output).unwrap()
 }
 
-fn empty<ObjectID: FsVerityHashValue>(_fs: &mut FileSystem<ObjectID>) {}
+fn empty(_fs: &mut FileSystem<impl FsVerityHashValue>) {}
 
 #[test]
 fn test_empty() {

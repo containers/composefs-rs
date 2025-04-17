@@ -101,11 +101,11 @@ pub fn write_directory(
     )
 }
 
-pub fn write_leaf<ObjectID: FsVerityHashValue>(
+pub fn write_leaf(
     writer: &mut impl fmt::Write,
     path: &Path,
     stat: &Stat,
-    content: &LeafContent<ObjectID>,
+    content: &LeafContent<impl FsVerityHashValue>,
     nlink: usize,
 ) -> fmt::Result {
     match content {
