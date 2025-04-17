@@ -525,7 +525,7 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
 
 /// Takes a list of inodes where each inode contains only local xattr values, determines which
 /// xattrs (key, value) pairs appear more than once, and shares them.
-fn share_xattrs<ObjectID: FsVerityHashValue>(inodes: &mut [Inode<ObjectID>]) -> Vec<XAttr> {
+fn share_xattrs(inodes: &mut [Inode<impl FsVerityHashValue>]) -> Vec<XAttr> {
     let mut xattrs: BTreeMap<XAttr, usize> = BTreeMap::new();
 
     // Collect all xattrs from the inodes
@@ -563,9 +563,9 @@ fn share_xattrs<ObjectID: FsVerityHashValue>(inodes: &mut [Inode<ObjectID>]) -> 
     xattrs.into_keys().collect()
 }
 
-fn write_erofs<ObjectID: FsVerityHashValue>(
+fn write_erofs(
     output: &mut impl Output,
-    inodes: &[Inode<ObjectID>],
+    inodes: &[Inode<impl FsVerityHashValue>],
     xattrs: &[XAttr],
 ) {
     // Write composefs header

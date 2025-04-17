@@ -212,8 +212,8 @@ impl<'repo, ObjectID: FsVerityHashValue> ImageOp<'repo, ObjectID> {
 
 /// Pull the target image, and add the provided tag. If this is a mountable
 /// image (i.e. not an artifact), it is *not* unpacked by default.
-pub async fn pull<ObjectID: FsVerityHashValue>(
-    repo: &Repository<ObjectID>,
+pub async fn pull(
+    repo: &Repository<impl FsVerityHashValue>,
     imgref: &str,
     reference: Option<&str>,
 ) -> Result<()> {

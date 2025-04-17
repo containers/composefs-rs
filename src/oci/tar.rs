@@ -43,9 +43,9 @@ async fn read_header_async(reader: &mut (impl AsyncRead + Unpin)) -> Result<Opti
 /// Splits the tar file from tar_stream into a Split Stream.  The store_data function is
 /// responsible for ensuring that "external data" is in the composefs repository and returns the
 /// fsverity hash value of that data.
-pub fn split<ObjectID: FsVerityHashValue>(
+pub fn split(
     tar_stream: &mut impl Read,
-    writer: &mut SplitStreamWriter<ObjectID>,
+    writer: &mut SplitStreamWriter<impl FsVerityHashValue>,
 ) -> Result<()> {
     while let Some(header) = read_header(tar_stream)? {
         // the header always gets stored as inline data
@@ -73,9 +73,9 @@ pub fn split<ObjectID: FsVerityHashValue>(
     Ok(())
 }
 
-pub async fn split_async<ObjectID: FsVerityHashValue>(
+pub async fn split_async(
     mut tar_stream: impl AsyncRead + Unpin,
-    writer: &mut SplitStreamWriter<'_, ObjectID>,
+    writer: &mut SplitStreamWriter<'_, impl FsVerityHashValue>,
 ) -> Result<()> {
     while let Some(header) = read_header_async(&mut tar_stream).await? {
         // the header always gets stored as inline data

@@ -68,10 +68,7 @@ pub fn compose_filesystem<ObjectID: FsVerityHashValue>(
     Ok(filesystem)
 }
 
-pub fn create_dumpfile<ObjectID: FsVerityHashValue>(
-    repo: &Repository<ObjectID>,
-    layers: &[String],
-) -> Result<()> {
+pub fn create_dumpfile(repo: &Repository<impl FsVerityHashValue>, layers: &[String]) -> Result<()> {
     let filesystem = compose_filesystem(repo, layers)?;
     let mut stdout = std::io::stdout();
     write_dumpfile(&mut stdout, &filesystem)?;
