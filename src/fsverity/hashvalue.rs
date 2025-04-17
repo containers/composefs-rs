@@ -125,3 +125,82 @@ impl FsVerityHashValue for Sha512HashValue {
     const EMPTY: Self = Self([0; 64]);
     const ID: &str = "sha512";
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn test_fsverity_hash<H: FsVerityHashValue>() {
+        let len = size_of::<H>();
+        let hexlen = len * 2;
+
+        let hex = H::EMPTY.to_hex();
+        assert_eq!(hex.as_bytes(), [b'0'].repeat(hexlen));
+
+        assert_eq!(H::EMPTY.to_id(), format!("{}:{}", H::ID, hex));
+        assert_eq!(format!("{:?}", H::EMPTY), format!("{}:{}", H::ID, hex));
+
+        assert_eq!(H::from_hex(&hex), Ok(H::EMPTY));
+
+        assert_eq!(H::from_hex("lol"), Err(FromHexError::OddLength));
+        assert_eq!(H::from_hex("lolo"), Err(FromHexError::InvalidStringLength));
+        assert_eq!(
+            H::from_hex([b'l'].repeat(hexlen)),
+            Err(FromHexError::InvalidHexCharacter { c: 'l', index: 0 })
+        );
+
+        assert_eq!(H::from_object_dir_and_basename(0, &hex[2..]), Ok(H::EMPTY));
+
+        assert_eq!(H::from_object_dir_and_basename(0, &hex[2..]), Ok(H::EMPTY));
+
+        assert_eq!(
+            H::from_object_dir_and_basename(0, "lol"),
+            Err(FromHexError::InvalidStringLength)
+        );
+
+        assert_eq!(
+            H::from_object_dir_and_basename(0, [b'l'].repeat(hexlen - 2)),
+            Err(FromHexError::InvalidHexCharacter { c: 'l', index: 0 })
+        );
+
+        assert_eq!(
+            H::from_object_pathname(format!("{}/{}", &hex[0..2], &hex[2..])),
+            Ok(H::EMPTY)
+        );
+
+        assert_eq!(
+            H::from_object_pathname(format!("../this/is/ignored/{}/{}", &hex[0..2], &hex[2..])),
+            Ok(H::EMPTY)
+        );
+
+        assert_eq!(
+            H::from_object_pathname(&hex),
+            Err(FromHexError::InvalidStringLength)
+        );
+
+        assert_eq!(
+            H::from_object_pathname("lol"),
+            Err(FromHexError::InvalidStringLength)
+        );
+
+        assert_eq!(
+            H::from_object_pathname([b'l'].repeat(hexlen + 1)),
+            Err(FromHexError::InvalidHexCharacter { c: 'l', index: 0 })
+        );
+
+        assert_eq!(
+            H::from_object_pathname(format!("{}0{}", &hex[0..2], &hex[2..])),
+            Err(FromHexError::InvalidHexCharacter { c: '0', index: 2 })
+        );
+    }
+
+    #[test]
+    fn test_sha256hashvalue() {
+        test_fsverity_hash::<Sha256HashValue>();
+    }
+
+    #[test]
+    fn test_sha512hashvalue() {
+        test_fsverity_hash::<Sha512HashValue>();
+    }
+}
