@@ -15,23 +15,26 @@ use tokio::io::AsyncReadExt;
 
 use crate::{
     fs::write_to_path,
-    fsverity::Sha256HashValue,
+    fsverity::FsVerityHashValue,
     oci::tar::{get_entry, split_async},
     repository::Repository,
     splitstream::DigestMap,
-    util::parse_sha256,
+    util::{parse_sha256, Sha256Digest},
 };
 
-pub fn import_layer(
-    repo: &Repository,
-    sha256: &Sha256HashValue,
+pub fn import_layer<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    sha256: &Sha256Digest,
     name: Option<&str>,
     tar_stream: &mut impl Read,
-) -> Result<Sha256HashValue> {
+) -> Result<ObjectID> {
     repo.ensure_stream(sha256, |writer| tar::split(tar_stream, writer), name)
 }
 
-pub fn ls_layer(repo: &Repository, name: &str) -> Result<()> {
+pub fn ls_layer<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    name: &str,
+) -> Result<()> {
     let mut split_stream = repo.open_stream(name, None)?;
 
     while let Some(entry) = get_entry(&mut split_stream)? {
@@ -41,31 +44,31 @@ pub fn ls_layer(repo: &Repository, name: &str) -> Result<()> {
     Ok(())
 }
 
-struct ImageOp<'repo> {
-    repo: &'repo Repository,
+struct ImageOp<'repo, ObjectID: FsVerityHashValue> {
+    repo: &'repo Repository<ObjectID>,
     proxy: ImageProxy,
     img: OpenedImage,
     progress: MultiProgress,
 }
 
-fn sha256_from_descriptor(descriptor: &Descriptor) -> Result<Sha256HashValue> {
+fn sha256_from_descriptor(descriptor: &Descriptor) -> Result<Sha256Digest> {
     let Some(digest) = descriptor.as_digest_sha256() else {
         bail!("Descriptor in oci config is not sha256");
     };
     Ok(parse_sha256(digest)?)
 }
 
-fn sha256_from_digest(digest: &str) -> Result<Sha256HashValue> {
+fn sha256_from_digest(digest: &str) -> Result<Sha256Digest> {
     match digest.strip_prefix("sha256:") {
         Some(rest) => Ok(parse_sha256(rest)?),
         None => bail!("Manifest has non-sha256 digest"),
     }
 }
 
-type ContentAndVerity = (Sha256HashValue, Sha256HashValue);
+type ContentAndVerity<ObjectID> = (Sha256Digest, ObjectID);
 
-impl<'repo> ImageOp<'repo> {
-    async fn new(repo: &'repo Repository, imgref: &str) -> Result<Self> {
+impl<'repo, ObjectID: FsVerityHashValue> ImageOp<'repo, ObjectID> {
+    async fn new(repo: &'repo Repository<ObjectID>, imgref: &str) -> Result<Self> {
         // See https://github.com/containers/skopeo/issues/2563
         let skopeo_cmd = if imgref.starts_with("containers-storage:") {
             let mut cmd = Command::new("podman");
@@ -93,16 +96,16 @@ impl<'repo> ImageOp<'repo> {
 
     pub async fn ensure_layer(
         &self,
-        layer_sha256: &Sha256HashValue,
+        layer_sha256: &Sha256Digest,
         descriptor: &Descriptor,
-    ) -> Result<Sha256HashValue> {
+    ) -> Result<ObjectID> {
         // We need to use the per_manifest descriptor to download the compressed layer but it gets
         // stored in the repository via the per_config descriptor.  Our return value is the
         // fsverity digest for the corresponding splitstream.
 
         if let Some(layer_id) = self.repo.check_stream(layer_sha256)? {
             self.progress
-                .println(format!("Already have layer {}", hex::encode(layer_sha256)))?;
+                .println(format!("Already have layer {layer_sha256:?}"))?;
             Ok(layer_id)
         } else {
             // Otherwise, we need to fetch it...
@@ -142,7 +145,7 @@ impl<'repo> ImageOp<'repo> {
         &self,
         manifest_layers: &[Descriptor],
         descriptor: &Descriptor,
-    ) -> Result<ContentAndVerity> {
+    ) -> Result<ContentAndVerity<ObjectID>> {
         let config_sha256 = sha256_from_descriptor(descriptor)?;
         if let Some(config_id) = self.repo.check_stream(&config_sha256)? {
             // We already got this config?  Nice.
@@ -189,7 +192,7 @@ impl<'repo> ImageOp<'repo> {
         }
     }
 
-    pub async fn pull(&self) -> Result<(Sha256HashValue, Sha256HashValue)> {
+    pub async fn pull(&self) -> Result<ContentAndVerity<ObjectID>> {
         let (_manifest_digest, raw_manifest) = self
             .proxy
             .fetch_manifest_raw_oci(&self.img)
@@ -209,7 +212,11 @@ impl<'repo> ImageOp<'repo> {
 
 /// Pull the target image, and add the provided tag. If this is a mountable
 /// image (i.e. not an artifact), it is *not* unpacked by default.
-pub async fn pull(repo: &Repository, imgref: &str, reference: Option<&str>) -> Result<()> {
+pub async fn pull(
+    repo: &Repository<impl FsVerityHashValue>,
+    imgref: &str,
+    reference: Option<&str>,
+) -> Result<()> {
     let op = ImageOp::new(repo, imgref).await?;
     let (sha256, id) = op
         .pull()
@@ -220,15 +227,15 @@ pub async fn pull(repo: &Repository, imgref: &str, reference: Option<&str>) -> R
         repo.name_stream(sha256, name)?;
     }
     println!("sha256 {}", hex::encode(sha256));
-    println!("verity {}", hex::encode(id));
+    println!("verity {}", id.to_hex());
     Ok(())
 }
 
-pub fn open_config(
-    repo: &Repository,
+pub fn open_config<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
     name: &str,
-    verity: Option<&Sha256HashValue>,
-) -> Result<(ImageConfiguration, DigestMap)> {
+    verity: Option<&ObjectID>,
+) -> Result<(ImageConfiguration, DigestMap<ObjectID>)> {
     let id = match verity {
         Some(id) => id,
         None => {
@@ -245,16 +252,16 @@ pub fn open_config(
     Ok((config, stream.refs))
 }
 
-fn hash(bytes: &[u8]) -> Sha256HashValue {
+fn hash(bytes: &[u8]) -> Sha256Digest {
     let mut context = Sha256::new();
     context.update(bytes);
     context.finalize().into()
 }
 
-pub fn open_config_shallow(
-    repo: &Repository,
+pub fn open_config_shallow<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
     name: &str,
-    verity: Option<&Sha256HashValue>,
+    verity: Option<&ObjectID>,
 ) -> Result<ImageConfiguration> {
     match verity {
         // with verity deep opens are just as fast as shallow ones
@@ -272,11 +279,11 @@ pub fn open_config_shallow(
     }
 }
 
-pub fn write_config(
-    repo: &Repository,
+pub fn write_config<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
     config: &ImageConfiguration,
-    refs: DigestMap,
-) -> Result<(Sha256HashValue, Sha256HashValue)> {
+    refs: DigestMap<ObjectID>,
+) -> Result<ContentAndVerity<ObjectID>> {
     let json = config.to_string()?;
     let json_bytes = json.as_bytes();
     let sha256 = hash(json_bytes);
@@ -286,25 +293,25 @@ pub fn write_config(
     Ok((sha256, id))
 }
 
-pub fn seal(
-    repo: &Repository,
+pub fn seal<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
     name: &str,
-    verity: Option<&Sha256HashValue>,
-) -> Result<(Sha256HashValue, Sha256HashValue)> {
+    verity: Option<&ObjectID>,
+) -> Result<ContentAndVerity<ObjectID>> {
     let (mut config, refs) = open_config(repo, name, verity)?;
     let mut myconfig = config.config().clone().context("no config!")?;
     let labels = myconfig.labels_mut().get_or_insert_with(HashMap::new);
     let id = crate::oci::image::create_image(repo, name, None, verity)?;
-    labels.insert("containers.composefs.fsverity".to_string(), hex::encode(id));
+    labels.insert("containers.composefs.fsverity".to_string(), id.to_hex());
     config.set_config(Some(myconfig));
     write_config(repo, &config, refs)
 }
 
-pub fn mount(
-    repo: &Repository,
+pub fn mount<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
     name: &str,
     mountpoint: &str,
-    verity: Option<&Sha256HashValue>,
+    verity: Option<&ObjectID>,
 ) -> Result<()> {
     let config = open_config_shallow(repo, name, verity)?;
     let Some(id) = config.get_config_annotation("containers.composefs.fsverity") else {
@@ -313,7 +320,11 @@ pub fn mount(
     repo.mount(id, mountpoint)
 }
 
-pub fn meta_layer(repo: &Repository, name: &str, verity: Option<&Sha256HashValue>) -> Result<()> {
+pub fn meta_layer<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    name: &str,
+    verity: Option<&ObjectID>,
+) -> Result<()> {
     let (config, refs) = open_config(repo, name, verity)?;
 
     let ids = config.rootfs().diff_ids();
@@ -330,10 +341,10 @@ pub fn meta_layer(repo: &Repository, name: &str, verity: Option<&Sha256HashValue
     }
 }
 
-pub fn prepare_boot(
-    repo: &Repository,
+pub fn prepare_boot<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
     name: &str,
-    verity: Option<&Sha256HashValue>,
+    verity: Option<&ObjectID>,
     output_dir: &Path,
 ) -> Result<()> {
     let (config, refs) = open_config(repo, name, verity)?;
@@ -377,7 +388,7 @@ mod test {
     use rustix::fs::CWD;
     use sha2::{Digest, Sha256};
 
-    use crate::{repository::Repository, test::tempdir};
+    use crate::{fsverity::Sha256HashValue, repository::Repository, test::tempdir};
 
     use super::*;
 
@@ -410,7 +421,7 @@ mod test {
         let layer_id: [u8; 32] = context.finalize().into();
 
         let repo_dir = tempdir();
-        let repo = Repository::open_path(CWD, &repo_dir).unwrap();
+        let repo = Repository::<Sha256HashValue>::open_path(CWD, &repo_dir).unwrap();
         let id = import_layer(&repo, &layer_id, Some("name"), &mut layer.as_slice()).unwrap();
 
         let mut dump = String::new();

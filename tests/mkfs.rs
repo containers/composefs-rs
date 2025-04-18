@@ -13,10 +13,11 @@ use tempfile::NamedTempFile;
 use composefs::{
     dumpfile::write_dumpfile,
     erofs::{debug::debug_img, writer::mkfs_erofs},
+    fsverity::{FsVerityHashValue, Sha256HashValue},
     image::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
 };
 
-fn debug_fs(mut fs: FileSystem) -> String {
+fn debug_fs(mut fs: FileSystem<impl FsVerityHashValue>) -> String {
     fs.done();
     let image = mkfs_erofs(&fs);
     let mut output = vec![];
@@ -24,16 +25,20 @@ fn debug_fs(mut fs: FileSystem) -> String {
     String::from_utf8(output).unwrap()
 }
 
-fn empty(_fs: &mut FileSystem) {}
+fn empty(_fs: &mut FileSystem<impl FsVerityHashValue>) {}
 
 #[test]
 fn test_empty() {
-    let mut fs = FileSystem::new();
+    let mut fs = FileSystem::<Sha256HashValue>::new();
     empty(&mut fs);
     insta::assert_snapshot!(debug_fs(fs));
 }
 
-fn add_leaf(dir: &mut Directory, name: impl AsRef<OsStr>, content: LeafContent) {
+fn add_leaf<ObjectID: FsVerityHashValue>(
+    dir: &mut Directory<ObjectID>,
+    name: impl AsRef<OsStr>,
+    content: LeafContent<ObjectID>,
+) {
     dir.insert(
         name.as_ref(),
         Inode::Leaf(Rc::new(Leaf {
@@ -49,7 +54,11 @@ fn add_leaf(dir: &mut Directory, name: impl AsRef<OsStr>, content: LeafContent) 
     );
 }
 
-fn simple(fs: &mut FileSystem) {
+fn simple(fs: &mut FileSystem<Sha256HashValue>) {
+    let ext_id = Sha256HashValue::from_hex(
+        "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+    )
+    .unwrap();
     add_leaf(&mut fs.root, "fifo", LeafContent::Fifo);
     add_leaf(
         &mut fs.root,
@@ -59,7 +68,7 @@ fn simple(fs: &mut FileSystem) {
     add_leaf(
         &mut fs.root,
         "regular-external",
-        LeafContent::Regular(RegularFile::External([0x5a; 32], 1234)),
+        LeafContent::Regular(RegularFile::External(ext_id, 1234)),
     );
     add_leaf(&mut fs.root, "chrdev", LeafContent::CharacterDevice(123));
     add_leaf(&mut fs.root, "blkdev", LeafContent::BlockDevice(123));
@@ -73,12 +82,12 @@ fn simple(fs: &mut FileSystem) {
 
 #[test]
 fn test_simple() {
-    let mut fs = FileSystem::new();
+    let mut fs = FileSystem::<Sha256HashValue>::new();
     simple(&mut fs);
     insta::assert_snapshot!(debug_fs(fs));
 }
 
-fn foreach_case(f: fn(&FileSystem)) {
+fn foreach_case(f: fn(&FileSystem<Sha256HashValue>)) {
     for case in [empty, simple] {
         let mut fs = FileSystem::new();
         case(&mut fs);

@@ -1,36 +1,12 @@
 mod digest;
+mod hashvalue;
 mod ioctl;
 
 use std::{io::Error, os::fd::AsFd};
 
-use sha2::{digest::FixedOutputReset, digest::Output, Digest, Sha256, Sha512};
 use thiserror::Error;
 
-pub trait FsVerityHashValue
-where
-    Self: Eq + AsRef<[u8]> + Clone,
-    Self: From<Output<Self::Digest>>,
-{
-    type Digest: Digest + FixedOutputReset + std::fmt::Debug;
-    const ALGORITHM: u8;
-    const EMPTY: Self;
-}
-
-pub type Sha256HashValue = [u8; 32];
-
-impl FsVerityHashValue for Sha256HashValue {
-    type Digest = Sha256;
-    const ALGORITHM: u8 = 1;
-    const EMPTY: Self = [0; 32];
-}
-
-pub type Sha512HashValue = [u8; 64];
-
-impl FsVerityHashValue for Sha512HashValue {
-    type Digest = Sha512;
-    const ALGORITHM: u8 = 2;
-    const EMPTY: Self = [0; 64];
-}
+pub use hashvalue::{FsVerityHashValue, Sha256HashValue, Sha512HashValue};
 
 /// Measuring fsverity failed.
 #[derive(Error, Debug)] // can't derive PartialEq because of std::io::Error
@@ -156,8 +132,8 @@ pub fn ensure_verity_equal(
         Ok(())
     } else {
         Err(CompareVerityError::DigestMismatch {
-            expected: hex::encode(expected),
-            found: hex::encode(found.as_ref()),
+            expected: expected.to_hex(),
+            found: found.to_hex(),
         })
     }
 }
@@ -166,10 +142,7 @@ pub fn ensure_verity_equal(
 mod tests {
     use std::{collections::BTreeSet, io::Write};
 
-    use crate::{
-        test::tempfile,
-        util::{parse_sha256, proc_self_fd},
-    };
+    use crate::{test::tempfile, util::proc_self_fd};
     use rustix::{
         fd::OwnedFd,
         fs::{open, Mode, OFlags},
@@ -225,26 +198,33 @@ mod tests {
         ));
 
         assert_eq!(
-            hex::encode(measure_verity::<Sha256HashValue>(&tf).unwrap()),
+            measure_verity::<Sha256HashValue>(&tf).unwrap().to_hex(),
             "1e2eaa4202d750a41174ee454970b92c1bc2f925b1e35076d8c7d5f56362ba64"
         );
 
         assert_eq!(
-            hex::encode(measure_verity_opt::<Sha256HashValue>(&tf).unwrap().unwrap()),
+            measure_verity_opt::<Sha256HashValue>(&tf)
+                .unwrap()
+                .unwrap()
+                .to_hex(),
             "1e2eaa4202d750a41174ee454970b92c1bc2f925b1e35076d8c7d5f56362ba64"
         );
 
         ensure_verity_equal(
             &tf,
-            &parse_sha256("1e2eaa4202d750a41174ee454970b92c1bc2f925b1e35076d8c7d5f56362ba64")
-                .unwrap(),
+            &Sha256HashValue::from_hex(
+                "1e2eaa4202d750a41174ee454970b92c1bc2f925b1e35076d8c7d5f56362ba64",
+            )
+            .unwrap(),
         )
         .unwrap();
 
         let Err(CompareVerityError::DigestMismatch { expected, found }) = ensure_verity_equal(
             &tf,
-            &parse_sha256("1e2eaa4202d750a41174ee454970b92c1bc2f925b1e35076d8c7000000000000")
-                .unwrap(),
+            &Sha256HashValue::from_hex(
+                "1e2eaa4202d750a41174ee454970b92c1bc2f925b1e35076d8c7000000000000",
+            )
+            .unwrap(),
         ) else {
             panic!("Didn't fail with expected error");
         };

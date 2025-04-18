@@ -5,11 +5,14 @@ use std::ops::Range;
 use thiserror::Error;
 use zerocopy::{little_endian::U32, FromBytes, Immutable, KnownLayout};
 
-use super::format::{
-    CompactInodeHeader, ComposefsHeader, DataLayout, DirectoryEntryHeader, ExtendedInodeHeader,
-    InodeXAttrHeader, ModeField, Superblock, XAttrHeader,
+use super::{
+    composefs::OverlayMetacopy,
+    format::{
+        CompactInodeHeader, ComposefsHeader, DataLayout, DirectoryEntryHeader, ExtendedInodeHeader,
+        InodeXAttrHeader, ModeField, Superblock, XAttrHeader,
+    },
 };
-use crate::fsverity::Sha256HashValue;
+use crate::fsverity::FsVerityHashValue;
 
 pub fn round_up(n: usize, to: usize) -> usize {
     (n + to - 1) & !(to - 1)
@@ -483,26 +486,25 @@ pub enum ErofsReaderError {
 type ReadResult<T> = Result<T, ErofsReaderError>;
 
 #[derive(Debug)]
-pub struct ObjectCollector {
+pub struct ObjectCollector<ObjectID: FsVerityHashValue> {
     visited_nids: HashSet<u64>,
     nids_to_visit: BTreeSet<u64>,
-    objects: HashSet<Sha256HashValue>,
+    objects: HashSet<ObjectID>,
 }
 
-impl ObjectCollector {
+impl<ObjectID: FsVerityHashValue> ObjectCollector<ObjectID> {
     fn visit_xattr(&mut self, attr: &XAttr) {
-        // TODO: "4" is a bit magic, isn't it?
+        // This is the index of "trusted".  See XATTR_PREFIXES in format.rs.
         if attr.header.name_index != 4 {
             return;
         }
         if attr.suffix() != b"overlay.metacopy" {
             return;
         }
-        let value = attr.value();
-        // TODO: oh look, more magic values...
-        if value.len() == 36 && value[..4] == [0, 36, 0, 1] {
-            // SAFETY: We already checked that the length is 4 + 32
-            self.objects.insert(value[4..].try_into().unwrap());
+        if let Ok(value) = OverlayMetacopy::read_from_bytes(attr.value()) {
+            if value.valid() {
+                self.objects.insert(value.digest);
+            }
         }
     }
 
@@ -550,7 +552,7 @@ impl ObjectCollector {
     }
 }
 
-pub fn collect_objects(image: &[u8]) -> ReadResult<HashSet<Sha256HashValue>> {
+pub fn collect_objects<ObjectID: FsVerityHashValue>(image: &[u8]) -> ReadResult<HashSet<ObjectID>> {
     let img = Image::open(image);
     let mut this = ObjectCollector {
         visited_nids: HashSet::new(),

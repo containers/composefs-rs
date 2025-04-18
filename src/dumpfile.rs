@@ -12,7 +12,7 @@ use anyhow::Result;
 use rustix::fs::FileType;
 
 use crate::{
-    fsverity::Sha256HashValue,
+    fsverity::FsVerityHashValue,
     image::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
 };
 
@@ -49,7 +49,7 @@ fn write_entry(
     rdev: u64,
     payload: impl AsRef<OsStr>,
     content: &[u8],
-    digest: Option<&Sha256HashValue>,
+    digest: Option<&str>,
 ) -> fmt::Result {
     let mode = stat.st_mode | ifmt.as_raw_mode();
     let uid = stat.st_uid;
@@ -66,7 +66,7 @@ fn write_entry(
     write_escaped(writer, content)?;
     write!(writer, " ")?;
     if let Some(id) = digest {
-        write!(writer, "{}", hex::encode(id))?;
+        write!(writer, "{}", id)?;
     } else {
         write_empty(writer)?;
     }
@@ -105,7 +105,7 @@ pub fn write_leaf(
     writer: &mut impl fmt::Write,
     path: &Path,
     stat: &Stat,
-    content: &LeafContent,
+    content: &LeafContent<impl FsVerityHashValue>,
     nlink: usize,
 ) -> fmt::Result {
     match content {
@@ -129,9 +129,9 @@ pub fn write_leaf(
             *size,
             nlink,
             0,
-            format!("{:02x}/{}", id[0], hex::encode(&id[1..])),
+            id.to_object_pathname(),
             &[],
-            Some(id),
+            Some(&id.to_hex()),
         ),
         LeafContent::BlockDevice(rdev) => write_entry(
             writer,
@@ -204,8 +204,8 @@ pub fn write_hardlink(writer: &mut impl fmt::Write, path: &Path, target: &OsStr)
     Ok(())
 }
 
-struct DumpfileWriter<'a, W: Write> {
-    hardlinks: HashMap<*const Leaf, OsString>,
+struct DumpfileWriter<'a, W: Write, ObjectID: FsVerityHashValue> {
+    hardlinks: HashMap<*const Leaf<ObjectID>, OsString>,
     writer: &'a mut W,
 }
 
@@ -215,7 +215,7 @@ fn writeln_fmt(writer: &mut impl Write, f: impl Fn(&mut String) -> fmt::Result) 
     Ok(writeln!(writer, "{}", tmp)?)
 }
 
-impl<'a, W: Write> DumpfileWriter<'a, W> {
+impl<'a, W: Write, ObjectID: FsVerityHashValue> DumpfileWriter<'a, W, ObjectID> {
     fn new(writer: &'a mut W) -> Self {
         Self {
             hardlinks: HashMap::new(),
@@ -223,7 +223,7 @@ impl<'a, W: Write> DumpfileWriter<'a, W> {
         }
     }
 
-    fn write_dir(&mut self, path: &mut PathBuf, dir: &Directory) -> Result<()> {
+    fn write_dir(&mut self, path: &mut PathBuf, dir: &Directory<ObjectID>) -> Result<()> {
         // nlink is 2 + number of subdirectories
         // this is also true for the root dir since '..' is another self-ref
         let nlink = dir.inodes().fold(2, |count, inode| {
@@ -256,7 +256,7 @@ impl<'a, W: Write> DumpfileWriter<'a, W> {
         Ok(())
     }
 
-    fn write_leaf(&mut self, path: &Path, leaf: &Rc<Leaf>) -> Result<()> {
+    fn write_leaf(&mut self, path: &Path, leaf: &Rc<Leaf<ObjectID>>) -> Result<()> {
         let nlink = Rc::strong_count(leaf);
 
         if nlink > 1 {
@@ -276,7 +276,10 @@ impl<'a, W: Write> DumpfileWriter<'a, W> {
     }
 }
 
-pub fn write_dumpfile<W: Write>(writer: &mut W, fs: &FileSystem) -> Result<()> {
+pub fn write_dumpfile(
+    writer: &mut impl Write,
+    fs: &FileSystem<impl FsVerityHashValue>,
+) -> Result<()> {
     // default pipe capacity on Linux is 16 pages (65536 bytes), but
     // sometimes the BufWriter will write more than its capacity...
     let mut buffer = BufWriter::with_capacity(32768, writer);

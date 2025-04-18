@@ -11,6 +11,7 @@ use anyhow::{bail, ensure, Context, Result};
 use regex_automata::{hybrid::dfa, util::syntax, Anchored, Input};
 
 use crate::{
+    fsverity::FsVerityHashValue,
     image::{Directory, FileSystem, ImageError, Inode, Leaf, LeafContent, RegularFile, Stat},
     repository::Repository,
 };
@@ -105,10 +106,10 @@ struct Policy {
     contexts: Vec<String>,
 }
 
-pub fn openat<'a>(
-    dir: &'a Directory,
+pub fn openat<'a, H: FsVerityHashValue>(
+    dir: &'a Directory<H>,
     filename: impl AsRef<OsStr>,
-    repo: &Repository,
+    repo: &Repository<H>,
 ) -> Result<Option<Box<dyn Read + 'a>>> {
     match dir.get_file(filename.as_ref()) {
         Ok(RegularFile::Inline(data)) => Ok(Some(Box::new(&**data))),
@@ -119,7 +120,7 @@ pub fn openat<'a>(
 }
 
 impl Policy {
-    pub fn build(dir: &Directory, repo: &Repository) -> Result<Self> {
+    pub fn build<H: FsVerityHashValue>(dir: &Directory<H>, repo: &Repository<H>) -> Result<Self> {
         let mut aliases = HashMap::new();
         let mut regexps = vec![];
         let mut contexts = vec![];
@@ -201,7 +202,7 @@ fn relabel(stat: &Stat, path: &Path, ifmt: u8, policy: &mut Policy) {
     }
 }
 
-fn relabel_leaf(leaf: &Leaf, path: &Path, policy: &mut Policy) {
+fn relabel_leaf<H: FsVerityHashValue>(leaf: &Leaf<H>, path: &Path, policy: &mut Policy) {
     let ifmt = match leaf.content {
         LeafContent::Regular(..) => b'-',
         LeafContent::Fifo => b'p', // NB: 'pipe', not 'fifo'
@@ -213,14 +214,14 @@ fn relabel_leaf(leaf: &Leaf, path: &Path, policy: &mut Policy) {
     relabel(&leaf.stat, path, ifmt, policy);
 }
 
-fn relabel_inode(inode: &Inode, path: &mut PathBuf, policy: &mut Policy) {
+fn relabel_inode<H: FsVerityHashValue>(inode: &Inode<H>, path: &mut PathBuf, policy: &mut Policy) {
     match inode {
         Inode::Directory(ref dir) => relabel_dir(dir, path, policy),
         Inode::Leaf(ref leaf) => relabel_leaf(leaf, path, policy),
     }
 }
 
-fn relabel_dir(dir: &Directory, path: &mut PathBuf, policy: &mut Policy) {
+fn relabel_dir<H: FsVerityHashValue>(dir: &Directory<H>, path: &mut PathBuf, policy: &mut Policy) {
     relabel(&dir.stat, path, b'd', policy);
 
     for (name, inode) in dir.sorted_entries() {
@@ -245,7 +246,7 @@ fn parse_config(file: impl Read) -> Result<Option<String>> {
     Ok(None)
 }
 
-pub fn selabel(fs: &mut FileSystem, repo: &Repository) -> Result<()> {
+pub fn selabel<H: FsVerityHashValue>(fs: &mut FileSystem<H>, repo: &Repository<H>) -> Result<()> {
     // if /etc/selinux/config doesn't exist then it's not an error
     let etc_selinux = match fs.root.get_directory("etc/selinux".as_ref()) {
         Err(ImageError::NotFound(..)) => return Ok(()),
