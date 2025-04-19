@@ -2,16 +2,17 @@ use std::{
     collections::HashSet,
     ffi::CStr,
     fs::File,
-    io::{ErrorKind, Read, Write},
+    io::{Read, Write},
     os::fd::{AsFd, OwnedFd},
     path::{Path, PathBuf},
 };
 
 use anyhow::{bail, ensure, Context, Result};
+use once_cell::sync::OnceCell;
 use rustix::{
     fs::{
-        accessat, fdatasync, flock, linkat, mkdirat, open, openat, readlinkat, symlinkat, Access,
-        AtFlags, Dir, FileType, FlockOperation, Mode, OFlags, CWD,
+        fdatasync, flock, linkat, mkdirat, open, openat, readlinkat, symlinkat, AtFlags, Dir,
+        FileType, FlockOperation, Mode, OFlags, CWD,
     },
     io::{Errno, Result as ErrnoResult},
 };
@@ -26,9 +27,35 @@ use crate::{
     util::{proc_self_fd, Sha256Digest},
 };
 
+/// Call openat() on the named subdirectory of "dirfd", possibly creating it first.
+///
+/// We assume that the directory will probably exist (ie: we try the open first), and on ENOENT, we
+/// mkdirat() and retry.
+fn ensure_dir_and_openat(dirfd: impl AsFd, filename: &str, flags: OFlags) -> ErrnoResult<OwnedFd> {
+    match openat(
+        &dirfd,
+        filename,
+        flags | OFlags::CLOEXEC | OFlags::DIRECTORY,
+        0o666.into(),
+    ) {
+        Ok(file) => Ok(file),
+        Err(Errno::NOENT) => match mkdirat(&dirfd, filename, 0o777.into()) {
+            Ok(()) | Err(Errno::EXIST) => openat(
+                dirfd,
+                filename,
+                flags | OFlags::CLOEXEC | OFlags::DIRECTORY,
+                0o666.into(),
+            ),
+            Err(other) => Err(other),
+        },
+        Err(other) => Err(other),
+    }
+}
+
 #[derive(Debug)]
 pub struct Repository<ObjectID: FsVerityHashValue> {
     repository: OwnedFd,
+    objects: OnceCell<OwnedFd>,
     _data: std::marker::PhantomData<ObjectID>,
 }
 
@@ -39,11 +66,9 @@ impl<ObjectID: FsVerityHashValue> Drop for Repository<ObjectID> {
 }
 
 impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
-    pub fn object_dir(&self) -> ErrnoResult<OwnedFd> {
-        self.openat(
-            "objects",
-            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        )
+    pub fn objects_dir(&self) -> ErrnoResult<&OwnedFd> {
+        self.objects
+            .get_or_try_init(|| ensure_dir_and_openat(&self.repository, "objects", OFlags::PATH))
     }
 
     pub fn open_path(dirfd: impl AsFd, path: impl AsRef<Path>) -> Result<Self> {
@@ -58,6 +83,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
         Ok(Self {
             repository,
+            objects: OnceCell::new(),
             _data: std::marker::PhantomData,
         })
     }
@@ -80,48 +106,61 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     }
 
     pub fn ensure_object(&self, data: &[u8]) -> Result<ObjectID> {
-        let digest: ObjectID = compute_verity(data);
-        let dir = PathBuf::from(format!("objects/{}", digest.to_object_dir()));
-        let file = dir.join(digest.to_object_basename());
+        let dirfd = self.objects_dir()?;
+        let id: ObjectID = compute_verity(data);
 
-        // fairly common...
-        if accessat(&self.repository, &file, Access::READ_OK, AtFlags::empty()) == Ok(()) {
-            return Ok(digest);
-        }
+        let path = id.to_object_pathname();
 
-        self.ensure_dir("objects")?;
-        self.ensure_dir(&dir)?;
-
-        let fd = openat(
-            &self.repository,
-            &dir,
-            OFlags::RDWR | OFlags::CLOEXEC | OFlags::TMPFILE,
-            0o666.into(),
-        )?;
-        rustix::io::write(&fd, data)?; // TODO: no write_all() here...
-        fdatasync(&fd)?;
-
-        // We can't enable verity with an open writable fd, so re-open and close the old one.
-        let ro_fd = open(proc_self_fd(&fd), OFlags::RDONLY, Mode::empty())?;
-        drop(fd);
-
-        enable_verity::<ObjectID>(&ro_fd).context("Enabling verity digest")?;
-        ensure_verity_equal(&ro_fd, &digest).context("Double-checking verity digest")?;
-
-        if let Err(err) = linkat(
-            CWD,
-            proc_self_fd(&ro_fd),
-            &self.repository,
-            file,
-            AtFlags::SYMLINK_FOLLOW,
+        // the usual case is that the file will already exist
+        match openat(
+            dirfd,
+            &path,
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
         ) {
-            if err.kind() != ErrorKind::AlreadyExists {
-                return Err(err.into());
+            Ok(fd) => {
+                // measure the existing file to ensure that it's correct
+                // TODO: try to replace file if it's broken?
+                ensure_verity_equal(fd, &id)?;
+                return Ok(id);
+            }
+            Err(Errno::NOENT) => {
+                // in this case we'll create the file
+            }
+            Err(other) => {
+                return Err(other).context("Checking for existing object in repository")?;
             }
         }
 
-        drop(ro_fd);
-        Ok(digest)
+        let fd = ensure_dir_and_openat(dirfd, &id.to_object_dir(), OFlags::RDWR | OFlags::TMPFILE)?;
+        let mut file = File::from(fd);
+        file.write_all(data)?;
+        fdatasync(&file)?;
+
+        // We can't enable verity with an open writable fd, so re-open and close the old one.
+        let ro_fd = open(proc_self_fd(&file), OFlags::RDONLY, Mode::empty())?;
+        drop(file);
+
+        enable_verity::<ObjectID>(&ro_fd).context("Enabling verity digest")?;
+        ensure_verity_equal(&ro_fd, &id).context("Double-checking verity digest")?;
+
+        match linkat(
+            CWD,
+            proc_self_fd(&ro_fd),
+            dirfd,
+            path,
+            AtFlags::SYMLINK_FOLLOW,
+        ) {
+            Ok(()) => {}
+            Err(Errno::EXIST) => {
+                // TODO: strictly, we should measure the newly-appeared file
+            }
+            Err(other) => {
+                return Err(other).context("Linking created object file");
+            }
+        }
+
+        Ok(id)
     }
 
     fn open_with_verity(&self, filename: &str, expected_verity: &ObjectID) -> Result<OwnedFd> {
@@ -350,7 +389,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(mount_composefs_at(
             image,
             name,
-            &self.object_dir()?,
+            self.objects_dir()?,
             mountpoint,
         )?)
     }
