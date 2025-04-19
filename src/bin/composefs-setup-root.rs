@@ -169,7 +169,7 @@ fn open_root_fs(path: &Path) -> Result<OwnedFd> {
 fn mount_composefs_image(sysroot: &OwnedFd, name: &str) -> Result<OwnedFd> {
     let repo = Repository::<Sha256HashValue>::open_path(sysroot, "composefs")?;
     let image = repo.open_image(name)?;
-    composefs_fsmount(image, name, repo.object_dir()?).context("Failed to mount composefs image")
+    composefs_fsmount(image, name, repo.objects_dir()?).context("Failed to mount composefs image")
 }
 
 fn mount_subdir(

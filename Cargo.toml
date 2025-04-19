@@ -26,6 +26,7 @@ hex = "0.4.0"
 indicatif = { version = "0.17.0", features = ["tokio"] }
 log = "0.4.8"
 oci-spec = "0.7.0"
+once_cell = { version = "1.21.3", default-features = false }
 regex-automata = { version = "0.4.4", default-features = false }
 rustix = { version = "1.0.0", features = ["fs", "mount", "process"] }
 serde = "1.0.145"
@@ -41,7 +42,6 @@ zstd = "0.13.0"
 
 [dev-dependencies]
 insta = "1.42.2"
-once_cell = "1.21.3"
 similar-asserts = "1.7.0"
 test-with = { version = "0.14", default-features = false, features = ["executable", "runtime"] }
 tokio-test = "0.4.4"

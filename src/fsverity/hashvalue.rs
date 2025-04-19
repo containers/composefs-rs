@@ -60,15 +60,15 @@ where
     }
 
     fn to_object_pathname(&self) -> String {
-        format!("{:02x}/{}", self.as_bytes()[0], self.to_object_basename())
+        format!(
+            "{:02x}/{}",
+            self.as_bytes()[0],
+            hex::encode(&self.as_bytes()[1..])
+        )
     }
 
     fn to_object_dir(&self) -> String {
         format!("{:02x}", self.as_bytes()[0])
-    }
-
-    fn to_object_basename(&self) -> String {
-        hex::encode(&self.as_bytes()[1..])
     }
 
     fn to_hex(&self) -> String {
