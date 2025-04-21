@@ -94,7 +94,7 @@ pub async fn split_async(
         if header.entry_type() == EntryType::Regular && actual_size > INLINE_CONTENT_MAX {
             // non-empty regular file: store the data in the object store
             let padding = buffer.split_off(actual_size);
-            writer.write_external(&buffer, padding)?;
+            writer.write_external_async(buffer, padding).await?;
         } else {
             // else: store the data inline in the split stream
             writer.write_inline(&buffer);

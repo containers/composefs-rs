@@ -7,11 +7,11 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 pub trait FsVerityHashValue
 where
     Self: Clone,
-    Self: Send + Sync + 'static,
     Self: From<Output<Self::Digest>>,
     Self: FromBytes + Immutable + IntoBytes + KnownLayout + Unaligned,
     Self: Hash + Eq,
     Self: fmt::Debug,
+    Self: Send + Sync + Unpin + 'static,
 {
     type Digest: Digest + FixedOutputReset + fmt::Debug;
     const ALGORITHM: u8;
