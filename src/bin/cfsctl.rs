@@ -106,7 +106,8 @@ enum Command {
     },
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     env_logger::init();
 
     let args = App::parse();
@@ -158,12 +159,7 @@ fn main() -> Result<()> {
                 println!("{}", image_id.to_hex());
             }
             OciCommand::Pull { ref image, name } => {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("Failed to build tokio runtime");
-                // And invoke the async_main
-                runtime.block_on(async move { oci::pull(&repo, image, name.as_deref()).await })?;
+                oci::pull(&repo, image, name.as_deref()).await?
             }
             OciCommand::Seal { verity, ref name } => {
                 let (sha256, verity) = oci::seal(
