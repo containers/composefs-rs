@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -141,7 +141,7 @@ async fn main() -> Result<()> {
         Command::Oci { cmd: oci_cmd } => match oci_cmd {
             OciCommand::ImportLayer { name, sha256 } => {
                 let object_id = oci::import_layer(
-                    &repo,
+                    &Arc::new(repo),
                     &parse_sha256(sha256)?,
                     name.as_deref(),
                     &mut std::io::stdin(),
@@ -159,11 +159,11 @@ async fn main() -> Result<()> {
                 println!("{}", image_id.to_hex());
             }
             OciCommand::Pull { ref image, name } => {
-                oci::pull(&repo, image, name.as_deref()).await?
+                oci::pull(&Arc::new(repo), image, name.as_deref()).await?
             }
             OciCommand::Seal { verity, ref name } => {
                 let (sha256, verity) = oci::seal(
-                    &repo,
+                    &Arc::new(repo),
                     name,
                     verity.map(Sha256HashValue::from_hex).transpose()?.as_ref(),
                 )?;

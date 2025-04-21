@@ -3,7 +3,10 @@
  * See doc/splitstream.md
  */
 
-use std::io::{BufReader, Read, Write};
+use std::{
+    io::{BufReader, Read, Write},
+    sync::Arc,
+};
 
 use anyhow::{bail, Result};
 use sha2::{Digest, Sha256};
@@ -60,14 +63,14 @@ impl<ObjectID: FsVerityHashValue> DigestMap<ObjectID> {
     }
 }
 
-pub struct SplitStreamWriter<'a, ObjectID: FsVerityHashValue> {
-    repo: &'a Repository<ObjectID>,
+pub struct SplitStreamWriter<ObjectID: FsVerityHashValue> {
+    repo: Arc<Repository<ObjectID>>,
     inline_content: Vec<u8>,
-    writer: Encoder<'a, Vec<u8>>,
+    writer: Encoder<'static, Vec<u8>>,
     pub sha256: Option<(Sha256, Sha256Digest)>,
 }
 
-impl<ObjectID: FsVerityHashValue> std::fmt::Debug for SplitStreamWriter<'_, ObjectID> {
+impl<ObjectID: FsVerityHashValue> std::fmt::Debug for SplitStreamWriter<ObjectID> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // writer doesn't impl Debug
         f.debug_struct("SplitStreamWriter")
@@ -78,9 +81,9 @@ impl<ObjectID: FsVerityHashValue> std::fmt::Debug for SplitStreamWriter<'_, Obje
     }
 }
 
-impl<'a, ObjectID: FsVerityHashValue> SplitStreamWriter<'a, ObjectID> {
+impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
     pub fn new(
-        repo: &'a Repository<ObjectID>,
+        repo: &Arc<Repository<ObjectID>>,
         refs: Option<DigestMap<ObjectID>>,
         sha256: Option<Sha256Digest>,
     ) -> Self {
@@ -98,7 +101,7 @@ impl<'a, ObjectID: FsVerityHashValue> SplitStreamWriter<'a, ObjectID> {
         }
 
         Self {
-            repo,
+            repo: Arc::clone(repo),
             inline_content: vec![],
             writer,
             sha256: sha256.map(|x| (Sha256::new(), x)),

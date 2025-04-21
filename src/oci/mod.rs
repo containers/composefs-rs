@@ -3,7 +3,7 @@ use std::process::Command;
 pub mod image;
 pub mod tar;
 
-use std::{collections::HashMap, io::Read, iter::zip, path::Path};
+use std::{collections::HashMap, io::Read, iter::zip, path::Path, sync::Arc};
 
 use anyhow::{bail, ensure, Context, Result};
 use async_compression::tokio::bufread::{GzipDecoder, ZstdDecoder};
@@ -23,7 +23,7 @@ use crate::{
 };
 
 pub fn import_layer<ObjectID: FsVerityHashValue>(
-    repo: &Repository<ObjectID>,
+    repo: &Arc<Repository<ObjectID>>,
     sha256: &Sha256Digest,
     name: Option<&str>,
     tar_stream: &mut impl Read,
@@ -44,8 +44,8 @@ pub fn ls_layer<ObjectID: FsVerityHashValue>(
     Ok(())
 }
 
-struct ImageOp<'repo, ObjectID: FsVerityHashValue> {
-    repo: &'repo Repository<ObjectID>,
+struct ImageOp<ObjectID: FsVerityHashValue> {
+    repo: Arc<Repository<ObjectID>>,
     proxy: ImageProxy,
     img: OpenedImage,
     progress: MultiProgress,
@@ -67,8 +67,8 @@ fn sha256_from_digest(digest: &str) -> Result<Sha256Digest> {
 
 type ContentAndVerity<ObjectID> = (Sha256Digest, ObjectID);
 
-impl<'repo, ObjectID: FsVerityHashValue> ImageOp<'repo, ObjectID> {
-    async fn new(repo: &'repo Repository<ObjectID>, imgref: &str) -> Result<Self> {
+impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
+    async fn new(repo: &Arc<Repository<ObjectID>>, imgref: &str) -> Result<Self> {
         // See https://github.com/containers/skopeo/issues/2563
         let skopeo_cmd = if imgref.starts_with("containers-storage:") {
             let mut cmd = Command::new("podman");
@@ -87,7 +87,7 @@ impl<'repo, ObjectID: FsVerityHashValue> ImageOp<'repo, ObjectID> {
         let img = proxy.open_image(imgref).await.context("Opening image")?;
         let progress = MultiProgress::new();
         Ok(ImageOp {
-            repo,
+            repo: Arc::clone(repo),
             proxy,
             img,
             progress,
@@ -142,7 +142,7 @@ impl<'repo, ObjectID: FsVerityHashValue> ImageOp<'repo, ObjectID> {
     }
 
     pub async fn ensure_config(
-        &self,
+        self: &Arc<Self>,
         manifest_layers: &[Descriptor],
         descriptor: &Descriptor,
     ) -> Result<ContentAndVerity<ObjectID>> {
@@ -192,7 +192,7 @@ impl<'repo, ObjectID: FsVerityHashValue> ImageOp<'repo, ObjectID> {
         }
     }
 
-    pub async fn pull(&self) -> Result<ContentAndVerity<ObjectID>> {
+    pub async fn pull(self: &Arc<Self>) -> Result<ContentAndVerity<ObjectID>> {
         let (_manifest_digest, raw_manifest) = self
             .proxy
             .fetch_manifest_raw_oci(&self.img)
@@ -213,11 +213,11 @@ impl<'repo, ObjectID: FsVerityHashValue> ImageOp<'repo, ObjectID> {
 /// Pull the target image, and add the provided tag. If this is a mountable
 /// image (i.e. not an artifact), it is *not* unpacked by default.
 pub async fn pull(
-    repo: &Repository<impl FsVerityHashValue>,
+    repo: &Arc<Repository<impl FsVerityHashValue>>,
     imgref: &str,
     reference: Option<&str>,
 ) -> Result<()> {
-    let op = ImageOp::new(repo, imgref).await?;
+    let op = Arc::new(ImageOp::new(repo, imgref).await?);
     let (sha256, id) = op
         .pull()
         .await
@@ -280,7 +280,7 @@ pub fn open_config_shallow<ObjectID: FsVerityHashValue>(
 }
 
 pub fn write_config<ObjectID: FsVerityHashValue>(
-    repo: &Repository<ObjectID>,
+    repo: &Arc<Repository<ObjectID>>,
     config: &ImageConfiguration,
     refs: DigestMap<ObjectID>,
 ) -> Result<ContentAndVerity<ObjectID>> {
@@ -294,7 +294,7 @@ pub fn write_config<ObjectID: FsVerityHashValue>(
 }
 
 pub fn seal<ObjectID: FsVerityHashValue>(
-    repo: &Repository<ObjectID>,
+    repo: &Arc<Repository<ObjectID>>,
     name: &str,
     verity: Option<&ObjectID>,
 ) -> Result<ContentAndVerity<ObjectID>> {
@@ -421,7 +421,7 @@ mod test {
         let layer_id: [u8; 32] = context.finalize().into();
 
         let repo_dir = tempdir();
-        let repo = Repository::<Sha256HashValue>::open_path(CWD, &repo_dir).unwrap();
+        let repo = Arc::new(Repository::<Sha256HashValue>::open_path(CWD, &repo_dir).unwrap());
         let id = import_layer(&repo, &layer_id, Some("name"), &mut layer.as_slice()).unwrap();
 
         let mut dump = String::new();

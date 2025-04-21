@@ -75,7 +75,7 @@ pub fn split(
 
 pub async fn split_async(
     mut tar_stream: impl AsyncRead + Unpin,
-    writer: &mut SplitStreamWriter<'_, impl FsVerityHashValue>,
+    writer: &mut SplitStreamWriter<impl FsVerityHashValue>,
 ) -> Result<()> {
     while let Some(header) = read_header_async(&mut tar_stream).await? {
         // the header always gets stored as inline data

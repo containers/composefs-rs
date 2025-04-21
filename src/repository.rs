@@ -5,6 +5,7 @@ use std::{
     io::{Read, Write},
     os::fd::{AsFd, OwnedFd},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{bail, ensure, Context, Result};
@@ -173,7 +174,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// You should write the data to the returned object and then pass it to .store_stream() to
     /// store the result.
     pub fn create_stream(
-        &self,
+        self: &Arc<Self>,
         sha256: Option<Sha256Digest>,
         maps: Option<DigestMap<ObjectID>>,
     ) -> SplitStreamWriter<ObjectID> {
@@ -285,7 +286,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// On success, the object ID of the new object is returned.  It is expected that this object
     /// ID will be used when referring to the stream from other linked streams.
     pub fn ensure_stream(
-        &self,
+        self: &Arc<Self>,
         sha256: &Sha256Digest,
         callback: impl FnOnce(&mut SplitStreamWriter<ObjectID>) -> Result<()>,
         reference: Option<&str>,
