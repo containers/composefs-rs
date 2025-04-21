@@ -106,6 +106,11 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         })
     }
 
+    pub async fn ensure_object_async(self: &Arc<Self>, data: Vec<u8>) -> Result<ObjectID> {
+        let self_ = Arc::clone(self);
+        tokio::task::spawn_blocking(move || self_.ensure_object(&data)).await?
+    }
+
     pub fn ensure_object(&self, data: &[u8]) -> Result<ObjectID> {
         let dirfd = self.objects_dir()?;
         let id: ObjectID = compute_verity(data);

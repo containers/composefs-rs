@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::{cmp::Reverse, process::Command, thread::available_parallelism};
 
 pub mod image;
 pub mod tar;
@@ -11,7 +11,7 @@ use containers_image_proxy::{ImageProxy, ImageProxyConfig, OpenedImage};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use oci_spec::image::{Descriptor, ImageConfiguration, ImageManifest, MediaType};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncReadExt;
+use tokio::{io::AsyncReadExt, sync::Semaphore};
 
 use crate::{
     fs::write_to_path,
@@ -96,14 +96,14 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
 
     pub async fn ensure_layer(
         &self,
-        layer_sha256: &Sha256Digest,
+        layer_sha256: Sha256Digest,
         descriptor: &Descriptor,
     ) -> Result<ObjectID> {
         // We need to use the per_manifest descriptor to download the compressed layer but it gets
         // stored in the repository via the per_config descriptor.  Our return value is the
         // fsverity digest for the corresponding splitstream.
 
-        if let Some(layer_id) = self.repo.check_stream(layer_sha256)? {
+        if let Some(layer_id) = self.repo.check_stream(&layer_sha256)? {
             self.progress
                 .println(format!("Already have layer {}", hex::encode(layer_sha256)))?;
             Ok(layer_id)
@@ -122,7 +122,7 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             self.progress
                 .println(format!("Fetching layer {}", hex::encode(layer_sha256)))?;
 
-            let mut splitstream = self.repo.create_stream(Some(*layer_sha256), None);
+            let mut splitstream = self.repo.create_stream(Some(layer_sha256), None);
             match descriptor.media_type() {
                 MediaType::ImageLayer => {
                     split_async(progress, &mut splitstream).await?;
@@ -172,14 +172,31 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             let raw_config = config?;
             let config = ImageConfiguration::from_reader(&raw_config[..])?;
 
+            // We want to sort the layers based on size so we can get started on the big layers
+            // first.  The last thing we want is to start on the biggest layer right at the end.
+            let mut layers: Vec<_> = zip(manifest_layers, config.rootfs().diff_ids()).collect();
+            layers.sort_by_key(|(mld, ..)| Reverse(mld.size()));
+
+            // Bound the number of tasks to the available parallelism.
+            let threads = available_parallelism()?;
+            let sem = Arc::new(Semaphore::new(threads.into()));
+            let mut entries = vec![];
+            for (mld, diff_id) in layers {
+                let self_ = Arc::clone(self);
+                let permit = Arc::clone(&sem).acquire_owned().await?;
+                let layer_sha256 = sha256_from_digest(diff_id)?;
+                let descriptor = mld.clone();
+                let future = tokio::spawn(async move {
+                    let _permit = permit;
+                    self_.ensure_layer(layer_sha256, &descriptor).await
+                });
+                entries.push((layer_sha256, future));
+            }
+
+            // Collect the results.
             let mut config_maps = DigestMap::new();
-            for (mld, cld) in zip(manifest_layers, config.rootfs().diff_ids()) {
-                let layer_sha256 = sha256_from_digest(cld)?;
-                let layer_id = self
-                    .ensure_layer(&layer_sha256, mld)
-                    .await
-                    .with_context(|| format!("Failed to fetch layer {cld} via {mld:?}"))?;
-                config_maps.insert(&layer_sha256, &layer_id);
+            for (layer_sha256, future) in entries {
+                config_maps.insert(&layer_sha256, &future.await??);
             }
 
             let mut splitstream = self
