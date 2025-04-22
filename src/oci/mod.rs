@@ -105,7 +105,7 @@ impl<'repo, ObjectID: FsVerityHashValue> ImageOp<'repo, ObjectID> {
 
         if let Some(layer_id) = self.repo.check_stream(layer_sha256)? {
             self.progress
-                .println(format!("Already have layer {layer_sha256:?}"))?;
+                .println(format!("Already have layer {}", hex::encode(layer_sha256)))?;
             Ok(layer_id)
         } else {
             // Otherwise, we need to fetch it...
