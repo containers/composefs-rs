@@ -140,6 +140,11 @@ enum Command {
     ImageObjects {
         name: String,
     },
+    #[cfg(feature = "http")]
+    Fetch {
+        url: String,
+        name: String,
+    },
 }
 
 fn verity_opt(opt: &Option<String>) -> Result<Option<Sha256HashValue>> {
@@ -344,6 +349,12 @@ async fn main() -> Result<()> {
         }
         Command::GC => {
             repo.gc()?;
+        }
+        #[cfg(feature = "http")]
+        Command::Fetch { url, name } => {
+            let (sha256, verity) = composefs_http::download(&url, &name, Arc::new(repo)).await?;
+            println!("sha256 {}", hex::encode(sha256));
+            println!("verity {}", verity.to_hex());
         }
     }
     Ok(())
