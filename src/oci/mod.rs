@@ -136,7 +136,13 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
                 other => bail!("Unsupported layer media type {:?}", other),
             };
             let layer_id = self.repo.write_stream(splitstream, None)?;
-            driver.await?;
+
+            // We intentionally explicitly ignore this, even though we're supposed to check it.
+            // See https://github.com/containers/containers-image-proxy-rs/issues/80 for discussion
+            // about why.  Note: we only care about the uncompressed layer tar, and we checksum it
+            // ourselves.
+            drop(driver);
+
             Ok(layer_id)
         }
     }
