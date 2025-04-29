@@ -176,7 +176,6 @@ pub fn get_entry<R: Read, ObjectID: FsVerityHashValue>(
         }
 
         let header = tar::Header::from_byte_slice(&buf);
-        assert!(header.as_ustar().is_some());
 
         let size = header.entry_size()?;
 
