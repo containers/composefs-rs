@@ -1,6 +1,6 @@
 use std::{ffi::OsStr, os::unix::ffi::OsStrExt, rc::Rc};
 
-use anyhow::Result;
+use anyhow::{ensure, Context, Result};
 use oci_spec::image::ImageConfiguration;
 
 use crate::{
@@ -20,6 +20,19 @@ pub fn process_entry<ObjectID: FsVerityHashValue>(
     filesystem: &mut FileSystem<ObjectID>,
     entry: TarEntry<ObjectID>,
 ) -> Result<()> {
+    if entry.path.file_name().is_none() {
+        // special handling for the root directory
+        ensure!(
+            matches!(entry.item, TarItem::Directory),
+            "Unpacking layer tar: filename {:?} must be a directory",
+            entry.path
+        );
+
+        // Update the stat, but don't do anything else
+        filesystem.set_root_stat(entry.stat);
+        return Ok(());
+    }
+
     let inode = match entry.item {
         TarItem::Directory => Inode::Directory(Box::from(Directory::new(entry.stat))),
         TarItem::Leaf(content) => Inode::Leaf(Rc::new(Leaf {
@@ -32,7 +45,15 @@ pub fn process_entry<ObjectID: FsVerityHashValue>(
         }
     };
 
-    let (dir, filename) = filesystem.root.split_mut(entry.path.as_os_str())?;
+    let (dir, filename) = filesystem
+        .root
+        .split_mut(entry.path.as_os_str())
+        .with_context(|| {
+            format!(
+                "Error unpacking container layer file {:?} {:?}",
+                entry.path, inode
+            )
+        })?;
 
     let bytes = filename.as_bytes();
     if let Some(whiteout) = bytes.strip_prefix(b".wh.") {
