@@ -55,12 +55,6 @@ jobs:
           systemd-boot-efi
         sudo apt-get build-dep systemd e2fsprogs
 
-    - name: Get a newer podman for heredoc support (from plucky)
-      run: |
-        echo 'deb http://azure.archive.ubuntu.com/ubuntu plucky universe main' | sudo tee /etc/apt/sources.list.d/plucky.list
-        sudo apt update
-        sudo apt install -y crun/plucky podman/plucky
-
     - uses: actions/checkout@v4
 
     - name: Install patched tools
