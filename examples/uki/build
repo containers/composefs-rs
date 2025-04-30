@@ -58,11 +58,6 @@ FINAL_IMAGE_FSVERITY="$(${CFSCTL} oci compute-id --bootable "${FINAL_ID}")"
 
 ## IMPORTANT: the filesystems of the base and final images are identical
 test "${BASE_IMAGE_FSVERITY}" = "${FINAL_IMAGE_FSVERITY}"
-
-mkdir -p "tmp/sysroot/state/${BASE_IMAGE_FSVERITY}/etc/work"
-mkdir -p "tmp/sysroot/state/${BASE_IMAGE_FSVERITY}/etc/upper"
-mkdir -p "tmp/sysroot/state/${BASE_IMAGE_FSVERITY}/var"
-
 ${CFSCTL} oci prepare-boot "${FINAL_ID}" --bootdir tmp/efi
 
 ../common/install-systemd-boot

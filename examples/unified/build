@@ -30,12 +30,6 @@ podman build \
 
 IMAGE_ID="$(sed s/sha256:// tmp/iid)"
 ${CFSCTL} oci pull containers-storage:"${IMAGE_ID}"
-IMAGE_FSVERITY="$(${CFSCTL} oci compute-id --bootable "${IMAGE_ID}")"
-
-mkdir -p "tmp/sysroot/state/${IMAGE_FSVERITY}/etc/work"
-mkdir -p "tmp/sysroot/state/${IMAGE_FSVERITY}/etc/upper"
-mkdir -p "tmp/sysroot/state/${IMAGE_FSVERITY}/var"
-
 ${CFSCTL} oci prepare-boot "${IMAGE_ID}" --bootdir tmp/efi
 
 ../common/install-systemd-boot

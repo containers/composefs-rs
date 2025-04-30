@@ -1,4 +1,8 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    fs::create_dir_all,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -249,7 +253,19 @@ async fn main() -> Result<()> {
                 ref bootdir,
             } => {
                 let verity = verity_opt(config_verity)?;
-                oci::prepare_boot(&repo, config_name, verity.as_ref(), bootdir)?;
+                let id = oci::prepare_boot(&repo, config_name, verity.as_ref(), bootdir)?;
+
+                let state = args
+                    .repo
+                    .as_ref()
+                    .map(|p: &PathBuf| p.parent().unwrap())
+                    .unwrap_or(Path::new("/sysroot"))
+                    .join("state")
+                    .join(id.to_hex());
+
+                create_dir_all(state.join("var"))?;
+                create_dir_all(state.join("etc/upper"))?;
+                create_dir_all(state.join("etc/work"))?;
             }
         },
         Command::ComputeId {
