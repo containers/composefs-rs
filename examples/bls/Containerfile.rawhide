@@ -1,9 +1,18 @@
 FROM fedora:rawhide
 COPY extra /
-COPY cfsctl /usr/bin
 RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
     set -eux
-    dnf --setopt keepcache=1 install --allowerasing -y systemd util-linux skopeo composefs strace dosfstools kernel openssh-server
+
+    dnf --setopt keepcache=1 install --allowerasing -y \
+        composefs \
+        dosfstools \
+        kernel \
+        openssh-server \
+        skopeo \
+        strace \
+        systemd \
+        util-linux
+
     systemctl enable systemd-networkd
     passwd -d root
     mkdir /sysroot
@@ -11,4 +20,5 @@ RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
     mv /boot /composefs-meta
     mkdir /boot
 EOF
+COPY cfsctl /usr/bin
 RUN true  # hack to get an extra layer

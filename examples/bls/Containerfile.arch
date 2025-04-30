@@ -1,18 +1,30 @@
 FROM archlinux AS base
 COPY extra /
-COPY cfsctl /usr/bin
 RUN <<EOF
     set -eux
+
     touch /etc/machine-id
     echo 'root=/dev/vda2' > /etc/kernel/cmdline
+
     pacman -Syu --noconfirm
-    pacman -Sy --noconfirm skopeo composefs strace dosfstools linux mkinitcpio btrfs-progs openssh
+    pacman -Sy --noconfirm \
+        btrfs-progs \
+        composefs \
+        dosfstools \
+        linux \
+        mkinitcpio \
+        openssh \
+        skopeo \
+        strace
+
+    kernel-install add "$(ls /usr/lib/modules)" /usr/lib/modules/"$(ls /usr/lib/modules)"/vmlinuz
+
     systemctl enable systemd-networkd systemd-resolved sshd
     passwd -d root
     mkdir /sysroot
-    kernel-install add "$(ls /usr/lib/modules)" /usr/lib/modules/"$(ls /usr/lib/modules)"/vmlinuz
     mkdir /composefs-meta
     mv /boot /composefs-meta
     mkdir /boot
 EOF
+COPY cfsctl /usr/bin
 RUN true

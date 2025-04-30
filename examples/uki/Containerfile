@@ -15,9 +15,9 @@
 
 FROM fedora:41 AS base
 COPY extra /
-COPY cfsctl /usr/bin
 RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
     set -eux
+
     # we should install kernel-modules here, but can't
     # because it'll pull in the entire kernel with it
     # it seems to work fine for now....
@@ -31,11 +31,13 @@ RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
         strace \
         systemd \
         util-linux
+
     systemctl enable systemd-networkd
     semanage permissive -a systemd_gpt_generator_t  # for volatile-root workaround
     passwd -d root
     mkdir /sysroot
 EOF
+COPY cfsctl /usr/bin
 
 FROM base AS kernel
 ARG COMPOSEFS_FSVERITY
