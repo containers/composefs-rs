@@ -329,7 +329,7 @@ impl<ObjectID: FsVerityHashValue> Directory<ObjectID> {
 
     /// Inserts the given inode into the directory.
     ///
-    /// If the `filename` existed previously, the content is completely overwitten, including the
+    /// If the `filename` existed previously, the content is completely overwritten, including the
     /// case that it was a directory.
     ///
     /// # Arguments
