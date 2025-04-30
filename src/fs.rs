@@ -203,7 +203,9 @@ impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
             FileType::Directory | FileType::Unknown => unreachable!(),
             FileType::RegularFile => {
                 let mut buffer = Vec::with_capacity(buf.st_size as usize);
-                read(fd, spare_capacity(&mut buffer))?;
+                if buf.st_size > 0 {
+                    read(fd, spare_capacity(&mut buffer))?;
+                }
                 let buffer = Box::from(buffer);
 
                 if buf.st_size > INLINE_CONTENT_MAX as i64 {
