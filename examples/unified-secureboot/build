@@ -55,6 +55,9 @@ mkdir -p "tmp/sysroot/state/${IMAGE_FSVERITY}/etc/work"
 mkdir -p "tmp/sysroot/state/${IMAGE_FSVERITY}/etc/upper"
 mkdir -p "tmp/sysroot/state/${IMAGE_FSVERITY}/var"
 
+${CFSCTL} oci prepare-boot "${IMAGE_ID}" tmp/efi
+
+# install a signed copy of systemd-boot
 mkdir -p tmp/efi/loader
 echo 'timeout 3' > tmp/efi/loader/loader.conf
 mkdir -p tmp/efi/EFI/BOOT tmp/efi/EFI/systemd
@@ -62,6 +65,5 @@ sbsign --key secureboot/db.key --cert secureboot/db.crt \
     /usr/lib/systemd/boot/efi/systemd-bootx64.efi \
     --output tmp/efi/EFI/systemd/systemd-bootx64.efi
 cp tmp/efi/EFI/{systemd/systemd-bootx64.efi,BOOT/BOOTX64.EFI}
-${CFSCTL} oci prepare-boot "${IMAGE_ID}" tmp/efi
 
 ../common/make-image fedora-unified-secureboot-efi.qcow2
