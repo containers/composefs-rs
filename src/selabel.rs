@@ -12,8 +12,8 @@ use regex_automata::{hybrid::dfa, util::syntax, Anchored, Input};
 
 use crate::{
     fsverity::FsVerityHashValue,
-    image::{Directory, FileSystem, ImageError, Inode, Leaf, LeafContent, RegularFile, Stat},
     repository::Repository,
+    tree::{Directory, FileSystem, ImageError, Inode, Leaf, LeafContent, RegularFile, Stat},
 };
 
 /* We build the entire SELinux policy into a single "lazy DFA" such that:

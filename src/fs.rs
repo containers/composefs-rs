@@ -25,9 +25,9 @@ use zerocopy::IntoBytes;
 
 use crate::{
     fsverity::{compute_verity, FsVerityHashValue},
-    image::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
     repository::Repository,
     selabel::selabel,
+    tree::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
     util::proc_self_fd,
     INLINE_CONTENT_MAX,
 };

@@ -16,8 +16,8 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use crate::{
     dumpfile,
     fsverity::FsVerityHashValue,
-    image::{LeafContent, RegularFile, Stat},
     splitstream::{SplitStreamData, SplitStreamReader, SplitStreamWriter},
+    tree::{LeafContent, RegularFile, Stat},
     util::{read_exactish, read_exactish_async},
     INLINE_CONTENT_MAX,
 };

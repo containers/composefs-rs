@@ -13,7 +13,7 @@ use rustix::fs::FileType;
 
 use crate::{
     fsverity::FsVerityHashValue,
-    image::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
+    tree::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
 };
 
 fn write_empty(writer: &mut impl fmt::Write) -> fmt::Result {

@@ -14,7 +14,7 @@ use composefs::{
     dumpfile::write_dumpfile,
     erofs::{debug::debug_img, writer::mkfs_erofs},
     fsverity::{FsVerityHashValue, Sha256HashValue},
-    image::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
+    tree::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
 };
 
 fn debug_fs(mut fs: FileSystem<impl FsVerityHashValue>) -> String {
