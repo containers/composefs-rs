@@ -26,7 +26,6 @@ snapshot_kind: text
       +4     mode: 0040555 (directory)
       +8     size: U64(27)
      +14     ino: U32(36)
-     +20     mtime: U64(18446744073709551615)
      +2c     nlink: U32(2)
      +40 --- inline directory entries ---
       +0     inode_offset: U64(36)
