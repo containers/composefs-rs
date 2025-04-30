@@ -49,7 +49,6 @@ podman build \
 IMAGE_ID="$(sed s/sha256:// tmp/iid)"
 ${CFSCTL} oci pull containers-storage:"${IMAGE_ID}"
 IMAGE_FSVERITY="$(${CFSCTL} oci create-image "${IMAGE_ID}")"
-fsck.erofs "tmp/sysroot/composefs/images/${IMAGE_FSVERITY}"
 
 mkdir -p "tmp/sysroot/state/${IMAGE_FSVERITY}/etc/work"
 mkdir -p "tmp/sysroot/state/${IMAGE_FSVERITY}/etc/upper"
