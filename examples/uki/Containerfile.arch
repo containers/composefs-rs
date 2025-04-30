@@ -1,16 +1,25 @@
 FROM archlinux AS base
 COPY extra /
-COPY cfsctl /usr/bin
 RUN <<EOF
     set -eux
+
     touch /etc/machine-id
     mkdir -p boot/EFI/Linux
+
     pacman -Syu --noconfirm
-    pacman -Sy --noconfirm skopeo composefs strace dosfstools openssh linux
+    pacman -Sy --noconfirm \
+        composefs \
+        dosfstools \
+        linux \
+        openssh \
+        strace \
+        skopeo
+
     systemctl enable systemd-networkd systemd-resolved sshd
     passwd -d root
     mkdir /sysroot
 EOF
+COPY cfsctl /usr/bin
 
 FROM base AS kernel
 ARG COMPOSEFS_FSVERITY
