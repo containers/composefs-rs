@@ -64,11 +64,7 @@ mkdir -p "tmp/sysroot/state/${BASE_IMAGE_FSVERITY}/etc/work"
 mkdir -p "tmp/sysroot/state/${BASE_IMAGE_FSVERITY}/etc/upper"
 mkdir -p "tmp/sysroot/state/${BASE_IMAGE_FSVERITY}/var"
 
-mkdir -p tmp/efi/loader
-echo 'timeout 3' > tmp/efi/loader/loader.conf
-mkdir -p tmp/efi/EFI/BOOT tmp/efi/EFI/systemd
-cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi tmp/efi/EFI/systemd
-cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi tmp/efi/EFI/BOOT/BOOTX64.EFI
 ${CFSCTL} oci prepare-boot "${FINAL_ID}" tmp/efi
 
+../common/install-systemd-boot
 ../common/make-image "${os}-uki-efi.qcow2"
