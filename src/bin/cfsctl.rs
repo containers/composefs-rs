@@ -39,20 +39,31 @@ enum OciCommand {
         /// the name of the stream
         name: String,
     },
-    CreateDumpfile {
-        layers: Vec<String>,
+    Dump {
+        config_name: String,
+        config_verity: Option<String>,
     },
     Pull {
         image: String,
         name: Option<String>,
     },
+    ComputeId {
+        config_name: String,
+        config_verity: Option<String>,
+        #[clap(long)]
+        bootable: bool,
+    },
     CreateImage {
-        config: String,
-        name: Option<String>,
+        config_name: String,
+        config_verity: Option<String>,
+        #[clap(long)]
+        bootable: bool,
+        #[clap(long)]
+        image_name: Option<String>,
     },
     Seal {
-        name: String,
-        verity: Option<String>,
+        config_name: String,
+        config_verity: Option<String>,
     },
     Mount {
         name: String,
@@ -62,8 +73,10 @@ enum OciCommand {
         name: String,
     },
     PrepareBoot {
-        name: String,
-        bootdir: Option<PathBuf>,
+        config_name: String,
+        config_verity: Option<String>,
+        #[clap(long, default_value = "/boot")]
+        bootdir: PathBuf,
     },
 }
 
@@ -97,13 +110,36 @@ enum Command {
     },
     CreateImage {
         path: PathBuf,
+        #[clap(long)]
+        bootable: bool,
+        #[clap(long)]
+        stat_root: bool,
+        image_name: Option<String>,
+    },
+    ComputeId {
+        path: PathBuf,
+        #[clap(long)]
+        bootable: bool,
+        #[clap(long)]
+        stat_root: bool,
     },
     CreateDumpfile {
         path: PathBuf,
+        #[clap(long)]
+        bootable: bool,
+        #[clap(long)]
+        stat_root: bool,
     },
     ImageObjects {
         name: String,
     },
+}
+
+fn verity_opt(opt: &Option<String>) -> Result<Option<Sha256HashValue>> {
+    Ok(match opt {
+        Some(value) => Some(FsVerityHashValue::from_hex(value)?),
+        None => None,
+    })
 }
 
 #[tokio::main]
@@ -112,7 +148,7 @@ async fn main() -> Result<()> {
 
     let args = App::parse();
 
-    let repo: Repository<Sha256HashValue> = (if let Some(path) = args.repo {
+    let repo: Repository<Sha256HashValue> = (if let Some(path) = &args.repo {
         Repository::open_path(CWD, path)
     } else if args.system {
         Repository::open_system()
@@ -136,7 +172,7 @@ async fn main() -> Result<()> {
         }
         Command::ImportImage { reference } => {
             let image_id = repo.import_image(&reference, &mut std::io::stdin())?;
-            println!("{}", image_id.to_hex());
+            println!("{}", image_id.to_id());
         }
         Command::Oci { cmd: oci_cmd } => match oci_cmd {
             OciCommand::ImportLayer { name, sha256 } => {
@@ -146,29 +182,57 @@ async fn main() -> Result<()> {
                     name.as_deref(),
                     &mut std::io::stdin(),
                 )?;
-                println!("{}", object_id.to_hex());
+                println!("{}", object_id.to_id());
             }
             OciCommand::LsLayer { name } => {
                 oci::ls_layer(&repo, &name)?;
             }
-            OciCommand::CreateDumpfile { layers } => {
-                oci::image::create_dumpfile(&repo, &layers)?;
+            OciCommand::Dump {
+                ref config_name,
+                ref config_verity,
+            } => {
+                let verity = verity_opt(config_verity)?;
+                let mut fs = oci::image::create_filesystem(&repo, config_name, verity.as_ref())?;
+                fs.print_dumpfile()?;
             }
-            OciCommand::CreateImage { config, name } => {
-                let image_id = oci::image::create_image(&repo, &config, name.as_deref(), None)?;
-                println!("{}", image_id.to_hex());
+            OciCommand::ComputeId {
+                ref config_name,
+                ref config_verity,
+                bootable,
+            } => {
+                let verity = verity_opt(config_verity)?;
+                let mut fs = oci::image::create_filesystem(&repo, config_name, verity.as_ref())?;
+                if bootable {
+                    fs.transform_for_boot(&repo)?;
+                }
+                let id = fs.compute_image_id();
+                println!("{}", id.to_hex());
+            }
+            OciCommand::CreateImage {
+                ref config_name,
+                ref config_verity,
+                bootable,
+                ref image_name,
+            } => {
+                let verity = verity_opt(config_verity)?;
+                let mut fs = oci::image::create_filesystem(&repo, config_name, verity.as_ref())?;
+                if bootable {
+                    fs.transform_for_boot(&repo)?;
+                }
+                let image_id = fs.commit_image(&repo, image_name.as_deref())?;
+                println!("{}", image_id.to_id());
             }
             OciCommand::Pull { ref image, name } => {
                 oci::pull(&Arc::new(repo), image, name.as_deref()).await?
             }
-            OciCommand::Seal { verity, ref name } => {
-                let (sha256, verity) = oci::seal(
-                    &Arc::new(repo),
-                    name,
-                    verity.map(Sha256HashValue::from_hex).transpose()?.as_ref(),
-                )?;
+            OciCommand::Seal {
+                ref config_name,
+                ref config_verity,
+            } => {
+                let verity = verity_opt(config_verity)?;
+                let (sha256, verity) = oci::seal(&Arc::new(repo), config_name, verity.as_ref())?;
                 println!("sha256 {}", hex::encode(sha256));
-                println!("verity {}", verity.to_hex());
+                println!("verity {}", verity.to_id());
             }
             OciCommand::Mount {
                 ref name,
@@ -179,17 +243,50 @@ async fn main() -> Result<()> {
             OciCommand::MetaLayer { ref name } => {
                 oci::meta_layer(&repo, name, None)?;
             }
-            OciCommand::PrepareBoot { ref name, bootdir } => {
-                let output = bootdir.unwrap_or(PathBuf::from("/boot"));
-                oci::prepare_boot(&repo, name, None, &output)?;
+            OciCommand::PrepareBoot {
+                ref config_name,
+                ref config_verity,
+                ref bootdir,
+            } => {
+                let verity = verity_opt(config_verity)?;
+                oci::prepare_boot(&repo, config_name, verity.as_ref(), bootdir)?;
             }
         },
-        Command::CreateImage { ref path } => {
-            let image_id = composefs::fs::create_image(path, Some(&repo))?;
-            println!("{}", image_id.to_hex());
+        Command::ComputeId {
+            ref path,
+            bootable,
+            stat_root,
+        } => {
+            let mut fs = composefs::fs::read_from_path(path, Some(&repo), stat_root)?;
+            if bootable {
+                fs.transform_for_boot(&repo)?;
+            }
+            let id = fs.compute_image_id();
+            println!("{}", id.to_hex());
         }
-        Command::CreateDumpfile { ref path } => {
-            composefs::fs::create_dumpfile::<Sha256HashValue>(path)?;
+        Command::CreateImage {
+            ref path,
+            bootable,
+            stat_root,
+            ref image_name,
+        } => {
+            let mut fs = composefs::fs::read_from_path(path, Some(&repo), stat_root)?;
+            if bootable {
+                fs.transform_for_boot(&repo)?;
+            }
+            let id = fs.commit_image(&repo, image_name.as_deref())?;
+            println!("{}", id.to_id());
+        }
+        Command::CreateDumpfile {
+            ref path,
+            bootable,
+            stat_root,
+        } => {
+            let mut fs = composefs::fs::read_from_path(path, Some(&repo), stat_root)?;
+            if bootable {
+                fs.transform_for_boot(&repo)?;
+            }
+            fs.print_dumpfile()?;
         }
         Command::Mount { name, mountpoint } => {
             repo.mount(&name, &mountpoint)?;
@@ -197,7 +294,7 @@ async fn main() -> Result<()> {
         Command::ImageObjects { name } => {
             let objects = repo.objects_for_image(&name)?;
             for object in objects {
-                println!("{}", object.to_hex());
+                println!("{}", object.to_id());
             }
         }
         Command::GC => {

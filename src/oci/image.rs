@@ -4,15 +4,12 @@ use anyhow::{ensure, Context, Result};
 use oci_spec::image::ImageConfiguration;
 
 use crate::{
-    dumpfile::write_dumpfile,
-    erofs::writer::mkfs_erofs,
     fsverity::FsVerityHashValue,
     oci::{
         self,
         tar::{TarEntry, TarItem},
     },
     repository::Repository,
-    selabel::selabel,
     tree::{Directory, FileSystem, Inode, Leaf},
 };
 
@@ -70,41 +67,16 @@ pub fn process_entry<ObjectID: FsVerityHashValue>(
     Ok(())
 }
 
-pub fn compose_filesystem<ObjectID: FsVerityHashValue>(
+/// Creates a filesystem from the given OCI container.  No special transformations are performed to
+/// make the filesystem bootable.
+pub fn create_filesystem<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
-    layers: &[String],
+    config_name: &str,
+    config_verity: Option<&ObjectID>,
 ) -> Result<FileSystem<ObjectID>> {
     let mut filesystem = FileSystem::default();
 
-    for layer in layers {
-        let mut split_stream = repo.open_stream(layer, None)?;
-        while let Some(entry) = oci::tar::get_entry(&mut split_stream)? {
-            process_entry(&mut filesystem, entry)?;
-        }
-    }
-
-    selabel(&mut filesystem, repo)?;
-    filesystem.ensure_root_stat();
-
-    Ok(filesystem)
-}
-
-pub fn create_dumpfile(repo: &Repository<impl FsVerityHashValue>, layers: &[String]) -> Result<()> {
-    let filesystem = compose_filesystem(repo, layers)?;
-    let mut stdout = std::io::stdout();
-    write_dumpfile(&mut stdout, &filesystem)?;
-    Ok(())
-}
-
-pub fn create_image<ObjectID: FsVerityHashValue>(
-    repo: &Repository<ObjectID>,
-    config: &str,
-    name: Option<&str>,
-    verity: Option<&ObjectID>,
-) -> Result<ObjectID> {
-    let mut filesystem = FileSystem::default();
-
-    let mut config_stream = repo.open_stream(config, verity)?;
+    let mut config_stream = repo.open_stream(config_name, config_verity)?;
     let config = ImageConfiguration::from_reader(&mut config_stream)?;
 
     for diff_id in config.rootfs().diff_ids() {
@@ -117,16 +89,13 @@ pub fn create_image<ObjectID: FsVerityHashValue>(
         }
     }
 
-    selabel(&mut filesystem, repo)?;
-    filesystem.ensure_root_stat();
-
-    let erofs = mkfs_erofs(&filesystem);
-    repo.write_image(name, &erofs)
+    Ok(filesystem)
 }
 
 #[cfg(test)]
 mod test {
     use crate::{
+        dumpfile::write_dumpfile,
         fsverity::Sha256HashValue,
         tree::{LeafContent, RegularFile, Stat},
     };
