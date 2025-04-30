@@ -7,13 +7,13 @@ use crate::{
     dumpfile::write_dumpfile,
     erofs::writer::mkfs_erofs,
     fsverity::FsVerityHashValue,
-    image::{Directory, FileSystem, Inode, Leaf},
     oci::{
         self,
         tar::{TarEntry, TarItem},
     },
     repository::Repository,
     selabel::selabel,
+    tree::{Directory, FileSystem, Inode, Leaf},
 };
 
 pub fn process_entry<ObjectID: FsVerityHashValue>(
@@ -107,7 +107,7 @@ pub fn create_image<ObjectID: FsVerityHashValue>(
 mod test {
     use crate::{
         fsverity::Sha256HashValue,
-        image::{LeafContent, RegularFile, Stat},
+        tree::{LeafContent, RegularFile, Stat},
     };
     use std::{cell::RefCell, collections::BTreeMap, io::BufRead, path::PathBuf};
 

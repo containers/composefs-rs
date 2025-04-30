@@ -96,7 +96,7 @@ impl<ObjectID: FsVerityHashValue> Directory<ObjectID> {
     /// point.
     ///
     /// ```
-    /// use composefs::{image::FileSystem, fsverity::Sha256HashValue};
+    /// use composefs::{tree::FileSystem, fsverity::Sha256HashValue};
     /// let fs = FileSystem::<Sha256HashValue>::new();
     ///
     /// // populate the fs...

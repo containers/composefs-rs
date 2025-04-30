@@ -13,7 +13,7 @@ use zerocopy::{Immutable, IntoBytes};
 use crate::{
     erofs::{composefs::OverlayMetacopy, format, reader::round_up},
     fsverity::FsVerityHashValue,
-    image,
+    tree,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -83,7 +83,7 @@ struct Directory<'a> {
 
 #[derive(Debug)]
 struct Leaf<'a, ObjectID: FsVerityHashValue> {
-    content: &'a image::LeafContent<ObjectID>,
+    content: &'a tree::LeafContent<ObjectID>,
     nlink: usize,
 }
 
@@ -94,7 +94,7 @@ enum InodeContent<'a, ObjectID: FsVerityHashValue> {
 }
 
 struct Inode<'a, ObjectID: FsVerityHashValue> {
-    stat: &'a image::Stat,
+    stat: &'a tree::Stat,
     xattrs: InodeXAttrs,
     content: InodeContent<'a, ObjectID>,
 }
@@ -266,23 +266,23 @@ impl<'a> Directory<'a> {
 impl<ObjectID: FsVerityHashValue> Leaf<'_, ObjectID> {
     fn inode_meta(&self) -> (format::DataLayout, u32, u64, usize) {
         let (layout, u, size) = match &self.content {
-            image::LeafContent::Regular(image::RegularFile::Inline(data)) => {
+            tree::LeafContent::Regular(tree::RegularFile::Inline(data)) => {
                 if data.is_empty() {
                     (format::DataLayout::FlatPlain, 0, data.len() as u64)
                 } else {
                     (format::DataLayout::FlatInline, 0, data.len() as u64)
                 }
             }
-            image::LeafContent::Regular(image::RegularFile::External(.., size)) => {
+            tree::LeafContent::Regular(tree::RegularFile::External(.., size)) => {
                 (format::DataLayout::ChunkBased, 31, *size)
             }
-            image::LeafContent::CharacterDevice(rdev) | image::LeafContent::BlockDevice(rdev) => {
+            tree::LeafContent::CharacterDevice(rdev) | tree::LeafContent::BlockDevice(rdev) => {
                 (format::DataLayout::FlatPlain, *rdev as u32, 0)
             }
-            image::LeafContent::Fifo | image::LeafContent::Socket => {
+            tree::LeafContent::Fifo | tree::LeafContent::Socket => {
                 (format::DataLayout::FlatPlain, 0, 0)
             }
-            image::LeafContent::Symlink(target) => {
+            tree::LeafContent::Symlink(target) => {
                 (format::DataLayout::FlatInline, 0, target.len() as u64)
             }
         };
@@ -291,9 +291,9 @@ impl<ObjectID: FsVerityHashValue> Leaf<'_, ObjectID> {
 
     fn write_inline(&self, output: &mut impl Output) {
         output.write(match self.content {
-            image::LeafContent::Regular(image::RegularFile::Inline(data)) => data,
-            image::LeafContent::Regular(image::RegularFile::External(..)) => b"\xff\xff\xff\xff", // null chunk
-            image::LeafContent::Symlink(target) => target.as_bytes(),
+            tree::LeafContent::Regular(tree::RegularFile::Inline(data)) => data,
+            tree::LeafContent::Regular(tree::RegularFile::External(..)) => b"\xff\xff\xff\xff", // null chunk
+            tree::LeafContent::Symlink(target) => target.as_bytes(),
             _ => &[],
         });
     }
@@ -304,12 +304,12 @@ impl<ObjectID: FsVerityHashValue> Inode<'_, ObjectID> {
         match &self.content {
             InodeContent::Directory(..) => format::FileType::Directory,
             InodeContent::Leaf(leaf) => match &leaf.content {
-                image::LeafContent::Regular(..) => format::FileType::RegularFile,
-                image::LeafContent::CharacterDevice(..) => format::FileType::CharacterDevice,
-                image::LeafContent::BlockDevice(..) => format::FileType::BlockDevice,
-                image::LeafContent::Fifo => format::FileType::Fifo,
-                image::LeafContent::Socket => format::FileType::Socket,
-                image::LeafContent::Symlink(..) => format::FileType::Symlink,
+                tree::LeafContent::Regular(..) => format::FileType::RegularFile,
+                tree::LeafContent::CharacterDevice(..) => format::FileType::CharacterDevice,
+                tree::LeafContent::BlockDevice(..) => format::FileType::BlockDevice,
+                tree::LeafContent::Fifo => format::FileType::Fifo,
+                tree::LeafContent::Socket => format::FileType::Socket,
+                tree::LeafContent::Symlink(..) => format::FileType::Symlink,
             },
         }
     }
@@ -397,16 +397,16 @@ impl<ObjectID: FsVerityHashValue> Inode<'_, ObjectID> {
 
 struct InodeCollector<'a, ObjectID: FsVerityHashValue> {
     inodes: Vec<Inode<'a, ObjectID>>,
-    hardlinks: HashMap<*const image::Leaf<ObjectID>, usize>,
+    hardlinks: HashMap<*const tree::Leaf<ObjectID>, usize>,
 }
 
 impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
-    fn push_inode(&mut self, stat: &'a image::Stat, content: InodeContent<'a, ObjectID>) -> usize {
+    fn push_inode(&mut self, stat: &'a tree::Stat, content: InodeContent<'a, ObjectID>) -> usize {
         let mut xattrs = InodeXAttrs::default();
 
         // We need to record extra xattrs for some files.  These come first.
         if let InodeContent::Leaf(Leaf {
-            content: image::LeafContent::Regular(image::RegularFile::External(id, ..)),
+            content: tree::LeafContent::Regular(tree::RegularFile::External(id, ..)),
             ..
         }) = content
         {
@@ -442,7 +442,7 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
         inode
     }
 
-    fn collect_leaf(&mut self, leaf: &'a Rc<image::Leaf<ObjectID>>) -> usize {
+    fn collect_leaf(&mut self, leaf: &'a Rc<tree::Leaf<ObjectID>>) -> usize {
         let nlink = Rc::strong_count(leaf);
 
         if nlink > 1 {
@@ -481,7 +481,7 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
         entries.insert(point, entry);
     }
 
-    fn collect_dir(&mut self, dir: &'a image::Directory<ObjectID>, parent: usize) -> usize {
+    fn collect_dir(&mut self, dir: &'a tree::Directory<ObjectID>, parent: usize) -> usize {
         // The root inode number needs to fit in a u16.  That more or less compels us to write the
         // directory inode before the inode of the children of the directory.  Reserve a slot.
         let me = self.push_inode(&dir.stat, InodeContent::Directory(Directory::default()));
@@ -490,8 +490,8 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
 
         for (name, inode) in dir.sorted_entries() {
             let child = match inode {
-                image::Inode::Directory(dir) => self.collect_dir(dir, me),
-                image::Inode::Leaf(leaf) => self.collect_leaf(leaf),
+                tree::Inode::Directory(dir) => self.collect_dir(dir, me),
+                tree::Inode::Leaf(leaf) => self.collect_leaf(leaf),
             };
             entries.push(DirEnt {
                 name: name.as_bytes(),
@@ -509,7 +509,7 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
         me
     }
 
-    pub fn collect(fs: &'a image::FileSystem<ObjectID>) -> Vec<Inode<'a, ObjectID>> {
+    pub fn collect(fs: &'a tree::FileSystem<ObjectID>) -> Vec<Inode<'a, ObjectID>> {
         let mut this = Self {
             inodes: vec![],
             hardlinks: HashMap::new(),
@@ -688,7 +688,7 @@ impl Output for FirstPass {
     }
 }
 
-pub fn mkfs_erofs<ObjectID: FsVerityHashValue>(fs: &image::FileSystem<ObjectID>) -> Box<[u8]> {
+pub fn mkfs_erofs<ObjectID: FsVerityHashValue>(fs: &tree::FileSystem<ObjectID>) -> Box<[u8]> {
     // Create the intermediate representation: flattened inodes and shared xattrs
     let mut inodes = InodeCollector::collect(fs);
     let xattrs = share_xattrs(&mut inodes);
