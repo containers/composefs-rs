@@ -33,7 +33,7 @@ else
     echo "Not running with Secure Boot enabled"
 
     qemu_args=(
-        '-bios /usr/share/edk2/ovmf/OVMF_CODE.fd'
+        '-bios' '/usr/share/edk2/ovmf/OVMF_CODE.fd'
     )
 fi
 
