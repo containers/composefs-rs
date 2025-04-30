@@ -76,6 +76,22 @@ impl<ObjectID: FsVerityHashValue> Inode<ObjectID> {
     }
 }
 
+// For some reason #[derive(Default)] doesn't work, so let's DIY
+impl<ObjectID: FsVerityHashValue> Default for Directory<ObjectID> {
+    fn default() -> Self {
+        Self {
+            stat: Stat {
+                st_uid: 0,
+                st_gid: 0,
+                st_mode: 0o555,
+                st_mtim_sec: 0,
+                xattrs: Default::default(),
+            },
+            entries: BTreeMap::default(),
+        }
+    }
+}
+
 impl<ObjectID: FsVerityHashValue> Directory<ObjectID> {
     pub fn new(stat: Stat) -> Self {
         Self {
@@ -97,7 +113,7 @@ impl<ObjectID: FsVerityHashValue> Directory<ObjectID> {
     ///
     /// ```
     /// use composefs::{tree::FileSystem, fsverity::Sha256HashValue};
-    /// let fs = FileSystem::<Sha256HashValue>::new();
+    /// let fs = FileSystem::<Sha256HashValue>::default();
     ///
     /// // populate the fs...
     ///
@@ -358,7 +374,7 @@ impl<ObjectID: FsVerityHashValue> Directory<ObjectID> {
         self.entries.clear();
     }
 
-    fn newest_file(&self) -> i64 {
+    pub fn newest_file(&self) -> i64 {
         let mut newest = self.stat.st_mtim_sec;
         for inode in self.entries.values() {
             let mtime = match inode {
@@ -376,43 +392,28 @@ impl<ObjectID: FsVerityHashValue> Directory<ObjectID> {
 #[derive(Debug)]
 pub struct FileSystem<ObjectID: FsVerityHashValue> {
     pub root: Directory<ObjectID>,
+    pub have_root_stat: bool,
 }
 
 impl<ObjectID: FsVerityHashValue> Default for FileSystem<ObjectID> {
     fn default() -> Self {
-        Self::new()
+        Self {
+            root: Directory::default(),
+            have_root_stat: false,
+        }
     }
 }
 
 impl<ObjectID: FsVerityHashValue> FileSystem<ObjectID> {
-    pub fn new() -> Self {
-        Self {
-            root: Directory::new(Stat {
-                st_mode: u32::MAX, // assigned later
-                st_uid: u32::MAX,  // assigned later
-                st_gid: u32::MAX,  // assigned later
-                st_mtim_sec: -1,   // assigned later
-                xattrs: RefCell::new(BTreeMap::new()),
-            }),
-        }
+    pub fn set_root_stat(&mut self, stat: Stat) {
+        self.have_root_stat = true;
+        self.root.stat = stat;
     }
 
-    pub fn done(&mut self) {
-        // We need to look at the root entry and deal with the "assign later" fields
-        let stat = &mut self.root.stat;
-
-        if stat.st_mode == u32::MAX {
-            stat.st_mode = 0o555;
-        }
-        if stat.st_uid == u32::MAX {
-            stat.st_uid = 0;
-        }
-        if stat.st_gid == u32::MAX {
-            stat.st_gid = 0;
-        }
-        if stat.st_mtim_sec == -1 {
-            // write this in full to avoid annoying the borrow checker
+    pub fn ensure_root_stat(&mut self) {
+        if !self.have_root_stat {
             self.root.stat.st_mtim_sec = self.root.newest_file();
+            self.have_root_stat = true;
         }
     }
 }

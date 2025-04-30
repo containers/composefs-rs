@@ -53,7 +53,7 @@ pub fn compose_filesystem<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     layers: &[String],
 ) -> Result<FileSystem<ObjectID>> {
-    let mut filesystem = FileSystem::<ObjectID>::new();
+    let mut filesystem = FileSystem::default();
 
     for layer in layers {
         let mut split_stream = repo.open_stream(layer, None)?;
@@ -63,7 +63,7 @@ pub fn compose_filesystem<ObjectID: FsVerityHashValue>(
     }
 
     selabel(&mut filesystem, repo)?;
-    filesystem.done();
+    filesystem.ensure_root_stat();
 
     Ok(filesystem)
 }
@@ -81,7 +81,7 @@ pub fn create_image<ObjectID: FsVerityHashValue>(
     name: Option<&str>,
     verity: Option<&ObjectID>,
 ) -> Result<ObjectID> {
-    let mut filesystem = FileSystem::new();
+    let mut filesystem = FileSystem::default();
 
     let mut config_stream = repo.open_stream(config, verity)?;
     let config = ImageConfiguration::from_reader(&mut config_stream)?;
@@ -97,7 +97,7 @@ pub fn create_image<ObjectID: FsVerityHashValue>(
     }
 
     selabel(&mut filesystem, repo)?;
-    filesystem.done();
+    filesystem.ensure_root_stat();
 
     let erofs = mkfs_erofs(&filesystem);
     repo.write_image(name, &erofs)
@@ -155,7 +155,7 @@ mod test {
 
     #[test]
     fn test_process_entry() -> Result<()> {
-        let mut fs = FileSystem::<Sha256HashValue>::new();
+        let mut fs = FileSystem::<Sha256HashValue>::default();
 
         // both with and without leading slash should be supported
         process_entry(&mut fs, dir_entry("/a"))?;

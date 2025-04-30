@@ -1,6 +1,5 @@
 use std::{
     cell::RefCell,
-    cmp::max,
     collections::{BTreeMap, HashMap},
     ffi::{CStr, OsStr},
     fs::File,
@@ -145,7 +144,6 @@ pub fn write_to_path<ObjectID: FsVerityHashValue>(
 pub struct FilesystemReader<'repo, ObjectID: FsVerityHashValue> {
     repo: Option<&'repo Repository<ObjectID>>,
     inodes: HashMap<(u64, u64), Rc<Leaf<ObjectID>>>,
-    root_mtime: Option<i64>,
 }
 
 impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
@@ -269,6 +267,7 @@ impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
         &mut self,
         dirfd: impl AsFd,
         name: &OsStr,
+        stat_self: bool,
     ) -> Result<Directory<ObjectID>> {
         let fd = openat(
             dirfd,
@@ -277,8 +276,12 @@ impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
             Mode::empty(),
         )?;
 
-        let (_, stat) = Self::stat(&fd, FileType::Directory)?;
-        let mut directory = Directory::new(stat);
+        let mut directory = if stat_self {
+            let (_, stat) = Self::stat(&fd, FileType::Directory)?;
+            Directory::new(stat)
+        } else {
+            Directory::default()
+        };
 
         for item in Dir::read_from(&fd)? {
             let entry = item?;
@@ -289,7 +292,6 @@ impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
             }
 
             let inode = self.read_inode(&fd, name, entry.file_type())?;
-            self.root_mtime = max(self.root_mtime, Some(inode.stat().st_mtim_sec));
             directory.insert(name, inode);
         }
 
@@ -303,7 +305,7 @@ impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
         ifmt: FileType,
     ) -> Result<Inode<ObjectID>> {
         if ifmt == FileType::Directory {
-            let dir = self.read_directory(dirfd, name)?;
+            let dir = self.read_directory(dirfd, name, true)?;
             Ok(Inode::Directory(Box::new(dir)))
         } else {
             let leaf = self.read_leaf(dirfd, name, ifmt)?;
@@ -315,18 +317,19 @@ impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
 pub fn read_from_path<ObjectID: FsVerityHashValue>(
     path: &Path,
     repo: Option<&Repository<ObjectID>>,
+    stat_root: bool,
 ) -> Result<FileSystem<ObjectID>> {
     let mut reader = FilesystemReader {
         repo,
         inodes: HashMap::new(),
-        root_mtime: None,
-    };
-    let mut fs = FileSystem {
-        root: reader.read_directory(CWD, path.as_os_str())?,
     };
 
-    // A filesystem with no files ends up in the 1970s...
-    fs.root.stat.st_mtim_sec = reader.root_mtime.unwrap_or(0);
+    let root = reader.read_directory(CWD, path.as_os_str(), stat_root)?;
+
+    let mut fs = FileSystem {
+        root,
+        have_root_stat: stat_root,
+    };
 
     // We can only relabel if we have the repo because we need to read the config and policy files
     if let Some(repo) = repo {
@@ -340,7 +343,7 @@ pub fn create_image<ObjectID: FsVerityHashValue>(
     path: &Path,
     repo: Option<&Repository<ObjectID>>,
 ) -> Result<ObjectID> {
-    let fs = read_from_path(path, repo)?;
+    let fs = read_from_path(path, repo, false)?;
     let image = crate::erofs::writer::mkfs_erofs(&fs);
     if let Some(repo) = repo {
         Ok(repo.write_image(None, &image)?)
@@ -350,7 +353,7 @@ pub fn create_image<ObjectID: FsVerityHashValue>(
 }
 
 pub fn create_dumpfile<ObjectID: FsVerityHashValue>(path: &Path) -> Result<()> {
-    let fs = read_from_path::<ObjectID>(path, None)?;
+    let fs = read_from_path::<ObjectID>(path, None, false)?;
     super::dumpfile::write_dumpfile(&mut std::io::stdout(), &fs)
 }
 

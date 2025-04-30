@@ -391,7 +391,7 @@ pub fn prepare_boot<ObjectID: FsVerityHashValue>(
         .with_context(|| "Attachments layer {layer} is not connected to image {name}")?;
 
     // read the layer into a FileSystem object
-    let mut filesystem = crate::tree::FileSystem::new();
+    let mut filesystem = crate::tree::FileSystem::default();
     let mut split_stream = repo.open_stream(&hex::encode(layer_sha256), Some(layer_verity))?;
     while let Some(entry) = tar::get_entry(&mut split_stream)? {
         image::process_entry(&mut filesystem, entry)?;

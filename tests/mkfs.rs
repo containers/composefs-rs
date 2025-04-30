@@ -18,7 +18,7 @@ use composefs::{
 };
 
 fn debug_fs(mut fs: FileSystem<impl FsVerityHashValue>) -> String {
-    fs.done();
+    fs.ensure_root_stat();
     let image = mkfs_erofs(&fs);
     let mut output = vec![];
     debug_img(&mut output, &image).unwrap();
@@ -29,7 +29,7 @@ fn empty(_fs: &mut FileSystem<impl FsVerityHashValue>) {}
 
 #[test]
 fn test_empty() {
-    let mut fs = FileSystem::<Sha256HashValue>::new();
+    let mut fs = FileSystem::<Sha256HashValue>::default();
     empty(&mut fs);
     insta::assert_snapshot!(debug_fs(fs));
 }
@@ -82,16 +82,16 @@ fn simple(fs: &mut FileSystem<Sha256HashValue>) {
 
 #[test]
 fn test_simple() {
-    let mut fs = FileSystem::<Sha256HashValue>::new();
+    let mut fs = FileSystem::<Sha256HashValue>::default();
     simple(&mut fs);
     insta::assert_snapshot!(debug_fs(fs));
 }
 
 fn foreach_case(f: fn(&FileSystem<Sha256HashValue>)) {
     for case in [empty, simple] {
-        let mut fs = FileSystem::new();
+        let mut fs = FileSystem::default();
         case(&mut fs);
-        fs.done();
+        fs.ensure_root_stat();
         f(&fs);
     }
 }
