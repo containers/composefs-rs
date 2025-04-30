@@ -318,13 +318,13 @@ pub fn write_config<ObjectID: FsVerityHashValue>(
 
 pub fn seal<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
-    name: &str,
-    verity: Option<&ObjectID>,
+    config_name: &str,
+    config_verity: Option<&ObjectID>,
 ) -> Result<ContentAndVerity<ObjectID>> {
-    let (mut config, refs) = open_config(repo, name, verity)?;
+    let (mut config, refs) = open_config(repo, config_name, config_verity)?;
     let mut myconfig = config.config().clone().context("no config!")?;
     let labels = myconfig.labels_mut().get_or_insert_with(HashMap::new);
-    let mut fs = crate::oci::image::create_filesystem(repo, name, verity)?;
+    let mut fs = crate::oci::image::create_filesystem(repo, config_name, config_verity)?;
     let id = fs.compute_image_id();
     labels.insert("containers.composefs.fsverity".to_string(), id.to_hex());
     config.set_config(Some(myconfig));

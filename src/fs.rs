@@ -313,7 +313,8 @@ impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
     }
 }
 
-pub fn read_from_path<ObjectID: FsVerityHashValue>(
+pub fn read_filesystem<ObjectID: FsVerityHashValue>(
+    dirfd: impl AsFd,
     path: &Path,
     repo: Option<&Repository<ObjectID>>,
     stat_root: bool,
@@ -323,7 +324,7 @@ pub fn read_from_path<ObjectID: FsVerityHashValue>(
         inodes: HashMap::new(),
     };
 
-    let root = reader.read_directory(CWD, path.as_os_str(), stat_root)?;
+    let root = reader.read_directory(dirfd, path.as_os_str(), stat_root)?;
 
     Ok(FileSystem {
         root,

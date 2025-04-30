@@ -257,7 +257,7 @@ async fn main() -> Result<()> {
             bootable,
             stat_root,
         } => {
-            let mut fs = composefs::fs::read_from_path(path, Some(&repo), stat_root)?;
+            let mut fs = composefs::fs::read_filesystem(CWD, path, Some(&repo), stat_root)?;
             if bootable {
                 fs.transform_for_boot(&repo)?;
             }
@@ -270,7 +270,7 @@ async fn main() -> Result<()> {
             stat_root,
             ref image_name,
         } => {
-            let mut fs = composefs::fs::read_from_path(path, Some(&repo), stat_root)?;
+            let mut fs = composefs::fs::read_filesystem(CWD, path, Some(&repo), stat_root)?;
             if bootable {
                 fs.transform_for_boot(&repo)?;
             }
@@ -282,7 +282,7 @@ async fn main() -> Result<()> {
             bootable,
             stat_root,
         } => {
-            let mut fs = composefs::fs::read_from_path(path, Some(&repo), stat_root)?;
+            let mut fs = composefs::fs::read_filesystem(CWD, path, Some(&repo), stat_root)?;
             if bootable {
                 fs.transform_for_boot(&repo)?;
             }
