@@ -52,9 +52,5 @@ RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
     dnf --setopt keepcache=1 install -y kernel btrfs-progs systemd-boot-unsigned systemd-ukify
 EOF
 
-# This could (better?) be done from cfsctl...
 FROM base AS bootable
-COPY --from=kernel /boot /composefs-meta/boot
-# https://github.com/containers/buildah/issues/5950
-RUN --mount=type=tmpfs,target=/run \
-    rm -rf /composefs-meta
+COPY --from=kernel /boot /boot

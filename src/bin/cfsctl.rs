@@ -4,7 +4,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 
 use rustix::fs::CWD;
@@ -73,14 +73,15 @@ enum OciCommand {
         name: String,
         mountpoint: String,
     },
-    MetaLayer {
-        name: String,
-    },
     PrepareBoot {
         config_name: String,
         config_verity: Option<String>,
         #[clap(long, default_value = "/boot")]
         bootdir: PathBuf,
+        #[clap(long)]
+        entry_id: Option<String>,
+        #[clap(long)]
+        cmdline: Vec<String>,
     },
 }
 
@@ -244,16 +245,31 @@ async fn main() -> Result<()> {
             } => {
                 oci::mount(&repo, name, mountpoint, None)?;
             }
-            OciCommand::MetaLayer { ref name } => {
-                oci::meta_layer(&repo, name, None)?;
-            }
             OciCommand::PrepareBoot {
                 ref config_name,
                 ref config_verity,
                 ref bootdir,
+                ref entry_id,
+                ref cmdline,
             } => {
                 let verity = verity_opt(config_verity)?;
-                let id = oci::prepare_boot(&repo, config_name, verity.as_ref(), bootdir)?;
+                let mut fs = oci::image::create_filesystem(&repo, config_name, verity.as_ref())?;
+                let entries = fs.transform_for_boot(&repo)?;
+                let id = fs.commit_image(&repo, None)?;
+
+                let Some(entry) = entries.into_iter().next() else {
+                    bail!("No boot entries!");
+                };
+
+                let cmdline_refs: Vec<&str> = cmdline.iter().map(String::as_str).collect();
+                composefs::write_boot::write_boot_simple(
+                    &repo,
+                    entry,
+                    &id,
+                    bootdir,
+                    entry_id.as_deref(),
+                    &cmdline_refs,
+                )?;
 
                 let state = args
                     .repo

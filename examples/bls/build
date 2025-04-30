@@ -49,19 +49,9 @@ podman build \
     .
 
 BASE_ID="$(sed s/sha256:// tmp/base.iid)"
-${CFSCTL} oci pull containers-storage:${BASE_ID}
-BASE_IMAGE_FSVERITY="$(${CFSCTL} oci compute-id --bootable "${BASE_ID}")"
-${CFSCTL} oci prepare-boot "${BASE_ID}" --bootdir tmp/efi
 
-OPTIONS="console=ttyS0,115200 composefs=${BASE_IMAGE_FSVERITY} rw"
-BLE="$(echo tmp/efi/loader/entries/*.conf)"
-test -f "${BLE}"
-if grep '^options ' "${BLE}"; then
-    sed -i "s|^options .*$|\0 ${OPTIONS}|" "${BLE}"
-else
-    echo "options    ${OPTIONS}" >> "${BLE}"
-fi
-sed -i 's@ /boot/@ /@' "${BLE}"
+${CFSCTL} oci pull containers-storage:${BASE_ID}
+${CFSCTL} oci prepare-boot "${BASE_ID}" --bootdir tmp/efi --cmdline console=ttyS0,115200 --entry-id=example --cmdline rw
 
 ../common/install-systemd-boot
 ../common/make-image "${os}-bls-efi.qcow2"

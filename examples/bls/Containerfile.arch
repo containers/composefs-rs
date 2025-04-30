@@ -22,9 +22,5 @@ RUN <<EOF
     systemctl enable systemd-networkd systemd-resolved sshd
     passwd -d root
     mkdir /sysroot
-    mkdir /composefs-meta
-    mv /boot /composefs-meta
-    mkdir /boot
 EOF
 COPY cfsctl /usr/bin
-RUN true

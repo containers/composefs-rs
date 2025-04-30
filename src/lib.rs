@@ -1,5 +1,6 @@
 #![deny(missing_debug_implementations)]
 
+pub mod bootloader;
 pub mod cmdline;
 pub mod dumpfile;
 pub mod dumpfile_parse;
@@ -17,6 +18,7 @@ pub mod splitstream;
 pub mod tree;
 pub mod uki;
 pub mod util;
+pub mod write_boot;
 
 #[cfg(test)]
 pub(crate) mod test;

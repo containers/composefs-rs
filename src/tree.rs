@@ -19,7 +19,7 @@ pub struct Stat {
     pub xattrs: RefCell<BTreeMap<Box<OsStr>, Box<[u8]>>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum RegularFile<ObjectID: FsVerityHashValue> {
     Inline(Box<[u8]>),
     External(ObjectID, u64),
