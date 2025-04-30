@@ -23,9 +23,5 @@ RUN --mount=type=cache,target=/var/cache/dnf <<EOF
     systemctl enable tmp.mount
     passwd -d root
     mkdir /sysroot
-    mkdir /composefs-meta
-    mv /boot /composefs-meta
-    mkdir /boot
 EOF
 COPY cfsctl /usr/bin
-RUN true  # hack to get an extra layer

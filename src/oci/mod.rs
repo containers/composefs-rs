@@ -3,7 +3,7 @@ use std::{cmp::Reverse, process::Command, thread::available_parallelism};
 pub mod image;
 pub mod tar;
 
-use std::{collections::HashMap, io::Read, iter::zip, path::Path, sync::Arc};
+use std::{collections::HashMap, io::Read, iter::zip, sync::Arc};
 
 use anyhow::{bail, ensure, Context, Result};
 use async_compression::tokio::bufread::{GzipDecoder, ZstdDecoder};
@@ -14,7 +14,6 @@ use sha2::{Digest, Sha256};
 use tokio::{io::AsyncReadExt, sync::Semaphore};
 
 use crate::{
-    fs::write_to_path,
     fsverity::FsVerityHashValue,
     oci::tar::{get_entry, split_async},
     repository::Repository,
@@ -342,70 +341,6 @@ pub fn mount<ObjectID: FsVerityHashValue>(
         bail!("Can only mount sealed containers");
     };
     repo.mount(id, mountpoint)
-}
-
-pub fn meta_layer<ObjectID: FsVerityHashValue>(
-    repo: &Repository<ObjectID>,
-    name: &str,
-    verity: Option<&ObjectID>,
-) -> Result<()> {
-    let (config, refs) = open_config(repo, name, verity)?;
-
-    let ids = config.rootfs().diff_ids();
-    if ids.len() >= 3 {
-        let layer_sha256 = sha256_from_digest(&ids[ids.len() - 2])?;
-        let layer_verity = refs.lookup(&layer_sha256).context("bzzt")?;
-        repo.merge_splitstream(
-            &hex::encode(layer_sha256),
-            Some(layer_verity),
-            &mut std::io::stdout(),
-        )
-    } else {
-        bail!("No meta layer here");
-    }
-}
-
-pub fn prepare_boot<ObjectID: FsVerityHashValue>(
-    repo: &Repository<ObjectID>,
-    name: &str,
-    verity: Option<&ObjectID>,
-    output_dir: &Path,
-) -> Result<ObjectID> {
-    let (config, refs) = open_config(repo, name, verity)?;
-
-    /* TODO: check created image ID against composefs label on container, if set */
-    /* TODO: check created image ID against composefs= .cmdline in UKI or loader entry */
-    let mut fs = crate::oci::image::create_filesystem(repo, name, verity)?;
-    let id = fs.commit_image(repo, None)?;
-
-    /*
-    let layer_digest = config
-        .get_config_annotation("containers.composefs.attachments")
-        .with_context(|| format!("Can't find attachments layer for container {name}"))?;
-    let layer_sha256 = sha256_from_digest(layer_digest)?;
-    */
-
-    let ids = config.rootfs().diff_ids();
-    ensure!(ids.len() >= 3, "No meta layer here");
-    let layer_sha256 = sha256_from_digest(&ids[ids.len() - 2])?;
-    let layer_verity = refs
-        .lookup(&layer_sha256)
-        .with_context(|| "Attachments layer {layer} is not connected to image {name}")?;
-
-    // read the layer into a FileSystem object
-    let mut filesystem = crate::tree::FileSystem::default();
-    let mut split_stream = repo.open_stream(&hex::encode(layer_sha256), Some(layer_verity))?;
-    while let Some(entry) = tar::get_entry(&mut split_stream)? {
-        image::process_entry(&mut filesystem, entry)?;
-    }
-
-    let boot = filesystem
-        .root
-        .get_directory("composefs-meta/boot".as_ref())?;
-
-    write_to_path(repo, boot, output_dir)?;
-
-    Ok(id)
 }
 
 #[cfg(test)]
