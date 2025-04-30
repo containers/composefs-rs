@@ -370,13 +370,13 @@ pub fn prepare_boot<ObjectID: FsVerityHashValue>(
     name: &str,
     verity: Option<&ObjectID>,
     output_dir: &Path,
-) -> Result<()> {
+) -> Result<ObjectID> {
     let (config, refs) = open_config(repo, name, verity)?;
 
     /* TODO: check created image ID against composefs label on container, if set */
     /* TODO: check created image ID against composefs= .cmdline in UKI or loader entry */
     let mut fs = crate::oci::image::create_filesystem(repo, name, verity)?;
-    fs.commit_image(repo, None)?;
+    let id = fs.commit_image(repo, None)?;
 
     /*
     let layer_digest = config
@@ -403,7 +403,9 @@ pub fn prepare_boot<ObjectID: FsVerityHashValue>(
         .root
         .get_directory("composefs-meta/boot".as_ref())?;
 
-    write_to_path(repo, boot, output_dir)
+    write_to_path(repo, boot, output_dir)?;
+
+    Ok(id)
 }
 
 #[cfg(test)]
