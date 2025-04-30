@@ -25,7 +25,6 @@ use zerocopy::IntoBytes;
 use crate::{
     fsverity::{compute_verity, FsVerityHashValue},
     repository::Repository,
-    selabel::selabel,
     tree::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
     util::proc_self_fd,
     INLINE_CONTENT_MAX,
@@ -326,35 +325,10 @@ pub fn read_from_path<ObjectID: FsVerityHashValue>(
 
     let root = reader.read_directory(CWD, path.as_os_str(), stat_root)?;
 
-    let mut fs = FileSystem {
+    Ok(FileSystem {
         root,
         have_root_stat: stat_root,
-    };
-
-    // We can only relabel if we have the repo because we need to read the config and policy files
-    if let Some(repo) = repo {
-        selabel(&mut fs, repo)?;
-    }
-
-    Ok(fs)
-}
-
-pub fn create_image<ObjectID: FsVerityHashValue>(
-    path: &Path,
-    repo: Option<&Repository<ObjectID>>,
-) -> Result<ObjectID> {
-    let fs = read_from_path(path, repo, false)?;
-    let image = crate::erofs::writer::mkfs_erofs(&fs);
-    if let Some(repo) = repo {
-        Ok(repo.write_image(None, &image)?)
-    } else {
-        Ok(compute_verity(&image))
-    }
-}
-
-pub fn create_dumpfile<ObjectID: FsVerityHashValue>(path: &Path) -> Result<()> {
-    let fs = read_from_path::<ObjectID>(path, None, false)?;
-    super::dumpfile::write_dumpfile(&mut std::io::stdout(), &fs)
+    })
 }
 
 #[cfg(test)]

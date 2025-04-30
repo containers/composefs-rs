@@ -50,13 +50,13 @@ podman build \
 
 BASE_ID="$(sed s/sha256:// tmp/base.iid)"
 ${CFSCTL} oci pull containers-storage:${BASE_ID}
-BASE_IMAGE_FSVERITY="$(${CFSCTL} oci create-image "${BASE_ID}")"
+BASE_IMAGE_FSVERITY="$(${CFSCTL} oci compute-id --bootable "${BASE_ID}")"
 
 mkdir -p "tmp/sysroot/state/${BASE_IMAGE_FSVERITY}/etc/work"
 mkdir -p "tmp/sysroot/state/${BASE_IMAGE_FSVERITY}/etc/upper"
 mkdir -p "tmp/sysroot/state/${BASE_IMAGE_FSVERITY}/var"
 
-${CFSCTL} oci prepare-boot "${BASE_ID}" tmp/efi
+${CFSCTL} oci prepare-boot "${BASE_ID}" --bootdir tmp/efi
 
 OPTIONS="console=ttyS0,115200 composefs=${BASE_IMAGE_FSVERITY} rw"
 BLE="$(echo tmp/efi/loader/entries/*.conf)"

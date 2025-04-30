@@ -42,7 +42,7 @@ ${PODMAN_BUILD} \
 
 BASE_ID="$(sed s/sha256:// tmp/base.iid)"
 ${CFSCTL} oci pull containers-storage:"${BASE_ID}"
-BASE_IMAGE_FSVERITY="$(${CFSCTL} oci create-image "${BASE_ID}")"
+BASE_IMAGE_FSVERITY="$(${CFSCTL} oci compute-id --bootable "${BASE_ID}")"
 
 ${PODMAN_BUILD} \
     --iidfile=tmp/final.iid \
@@ -54,7 +54,7 @@ ${PODMAN_BUILD} \
 
 FINAL_ID="$(sed s/sha256:// tmp/final.iid)"
 ${CFSCTL} oci pull containers-storage:"${FINAL_ID}"
-FINAL_IMAGE_FSVERITY="$(${CFSCTL} oci create-image "${FINAL_ID}")"
+FINAL_IMAGE_FSVERITY="$(${CFSCTL} oci compute-id --bootable "${FINAL_ID}")"
 
 ## IMPORTANT: the filesystems of the base and final images are identical
 test "${BASE_IMAGE_FSVERITY}" = "${FINAL_IMAGE_FSVERITY}"
@@ -63,7 +63,7 @@ mkdir -p "tmp/sysroot/state/${BASE_IMAGE_FSVERITY}/etc/work"
 mkdir -p "tmp/sysroot/state/${BASE_IMAGE_FSVERITY}/etc/upper"
 mkdir -p "tmp/sysroot/state/${BASE_IMAGE_FSVERITY}/var"
 
-${CFSCTL} oci prepare-boot "${FINAL_ID}" tmp/efi
+${CFSCTL} oci prepare-boot "${FINAL_ID}" --bootdir tmp/efi
 
 ../common/install-systemd-boot
 ../common/make-image "${os}-uki-efi.qcow2"

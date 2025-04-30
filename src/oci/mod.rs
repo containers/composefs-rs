@@ -324,7 +324,8 @@ pub fn seal<ObjectID: FsVerityHashValue>(
     let (mut config, refs) = open_config(repo, name, verity)?;
     let mut myconfig = config.config().clone().context("no config!")?;
     let labels = myconfig.labels_mut().get_or_insert_with(HashMap::new);
-    let id = crate::oci::image::create_image(repo, name, None, verity)?;
+    let mut fs = crate::oci::image::create_filesystem(repo, name, verity)?;
+    let id = fs.compute_image_id();
     labels.insert("containers.composefs.fsverity".to_string(), id.to_hex());
     config.set_config(Some(myconfig));
     write_config(repo, &config, refs)
@@ -374,7 +375,8 @@ pub fn prepare_boot<ObjectID: FsVerityHashValue>(
 
     /* TODO: check created image ID against composefs label on container, if set */
     /* TODO: check created image ID against composefs= .cmdline in UKI or loader entry */
-    crate::oci::image::create_image(repo, name, None, verity)?;
+    let mut fs = crate::oci::image::create_filesystem(repo, name, verity)?;
+    fs.commit_image(repo, None)?;
 
     /*
     let layer_digest = config
