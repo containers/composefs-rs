@@ -9,6 +9,7 @@ pub mod fsverity;
 pub mod mount;
 pub mod mountcompat;
 pub mod oci;
+pub mod os_release;
 pub mod repository;
 pub mod selabel;
 pub mod splitstream;
