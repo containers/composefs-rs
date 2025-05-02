@@ -1,10 +1,7 @@
 use std::{
     ffi::OsString,
     io::ErrorKind,
-    os::{
-        fd::{AsFd, OwnedFd},
-        unix::ffi::OsStrExt,
-    },
+    os::fd::{AsFd, OwnedFd},
     path::{Path, PathBuf},
 };
 
@@ -21,6 +18,7 @@ use rustix::{
 use serde::Deserialize;
 
 use composefs::{
+    cmdline::get_cmdline_value,
     fsverity::{FsVerityHashValue, Sha256HashValue},
     mount::{composefs_fsmount, mount_at, FsHandle},
     mountcompat::{overlayfs_set_fd, overlayfs_set_lower_and_data_fds, prepare_mount},
@@ -86,7 +84,7 @@ struct Args {
     root_fs: Option<PathBuf>,
 
     #[arg(long, help = "Kernel commandline args (for testing)")]
-    cmdline: Option<OsString>,
+    cmdline: Option<String>,
 
     #[arg(long, help = "Mountpoint (don't replace sysroot, for testing)")]
     target: Option<PathBuf>,
@@ -200,14 +198,12 @@ fn mount_subdir(
 }
 
 // Implementation
-fn parse_composefs_cmdline<H: FsVerityHashValue>(cmdline: &[u8]) -> Result<H> {
-    // TODO?: officially we need to understand quoting with double-quotes...
-    for part in cmdline.split(|c| c.is_ascii_whitespace()) {
-        if let Some(digest) = part.strip_prefix(b"composefs=") {
-            return H::from_hex(digest).context("Parsing composefs=");
-        }
-    }
-    bail!("Unable to find composefs= cmdline parameter");
+fn parse_composefs_cmdline<H: FsVerityHashValue>(cmdline: &str) -> Result<H> {
+    let Some(digest) = get_cmdline_value(cmdline, "composefs=") else {
+        bail!("Unable to find composefs= cmdline parameter");
+    };
+
+    H::from_hex(digest).context("Parsing composefs=")
 }
 
 fn gpt_workaround() -> Result<()> {
@@ -233,8 +229,8 @@ fn setup_root(args: Args) -> Result<()> {
         .with_context(|| format!("Failed to open sysroot {:?}", args.sysroot))?;
 
     let cmdline = match &args.cmdline {
-        Some(cmdline) => cmdline.as_bytes(),
-        None => &std::fs::read("/proc/cmdline")?,
+        Some(cmdline) => cmdline,
+        None => &std::fs::read_to_string("/proc/cmdline")?,
     };
     let image = parse_composefs_cmdline::<Sha256HashValue>(cmdline)?.to_hex();
 
@@ -290,12 +286,11 @@ mod test {
     fn test_parse() {
         let failing = ["", "foo", "composefs", "composefs=foo"];
         for case in failing {
-            assert!(parse_composefs_cmdline::<Sha256HashValue>(case.as_bytes()).is_err());
+            assert!(parse_composefs_cmdline::<Sha256HashValue>(case).is_err());
         }
         let digest = "8b7df143d91c716ecfa5fc1730022f6b421b05cedee8fd52b1fc65a96030ad52";
         similar_asserts::assert_eq!(
-            parse_composefs_cmdline::<Sha256HashValue>(format!("composefs={digest}").as_bytes())
-                .unwrap(),
+            parse_composefs_cmdline::<Sha256HashValue>(&format!("composefs={digest}")).unwrap(),
             Sha256HashValue::from_hex(digest).unwrap()
         );
     }
