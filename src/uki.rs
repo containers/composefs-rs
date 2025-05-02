@@ -1,10 +1,10 @@
-use std::collections::HashMap;
-
 use thiserror::Error;
 use zerocopy::{
     little_endian::{U16, U32},
     FromBytes, Immutable, KnownLayout,
 };
+
+use crate::os_release::OsReleaseInfo;
 
 // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format
 #[derive(Debug, FromBytes, Immutable, KnownLayout)]
@@ -102,50 +102,6 @@ fn get_osrel_section(image: &[u8]) -> Option<Result<&str, UkiError>> {
     Some(Err(UkiError::MissingOsrelSection))
 }
 
-// We could be using 'shlex' for this but we really only need to parse a subset of the spec and
-// it's easy enough to do for ourselves.  Also note that the spec itself suggests using
-// `ast.literal_eval()` in Python which is substantially different from a proper shlex,
-// particularly in terms of treatment of escape sequences.
-fn dequote(value: &str) -> Option<String> {
-    // https://pubs.opengroup.org/onlinepubs/009604499/utilities/xcu_chap02.html
-    let mut result = String::new();
-    let mut iter = value.trim().chars();
-
-    // os-release spec says we don't have to support concatenation of independently-quoted
-    // substrings, but honestly, it's easier if we do...
-    while let Some(c) = iter.next() {
-        match c {
-            '"' => loop {
-                result.push(match iter.next()? {
-                    // Strictly speaking, we should only handle \" \$ \` and \\...
-                    '\\' => iter.next()?,
-                    '"' => break,
-                    other => other,
-                });
-            },
-
-            '\'' => loop {
-                result.push(match iter.next()? {
-                    '\'' => break,
-                    other => other,
-                });
-            },
-
-            // Per POSIX we should handle '\\' sequences here, but os-release spec says we'll only
-            // encounter A-Za-z0-9 outside of quotes, so let's not bother with that for now...
-            other => result.push(other),
-        }
-    }
-
-    Some(result)
-}
-
-/// Gets the value that matches the first key that's present and successfully dequotes, or None.
-fn get_value(map: &HashMap<&str, &str>, keys: &[&str]) -> Option<String> {
-    keys.iter()
-        .find_map(|key| map.get(key).and_then(|v| dequote(v)))
-}
-
 /// Gets an appropriate label for display in the boot menu for the given UKI image, according to
 /// the "Type #2 EFI Unified Kernel Images" section in the Boot Loader Specification.  This will be
 /// based on the "PRETTY_NAME" and "VERSION_ID" fields found in the os-release file (falling back
@@ -169,22 +125,9 @@ fn get_value(map: &HashMap<&str, &str>, keys: &[&str]) -> Option<String> {
 /// returned.
 pub fn get_boot_label(image: &[u8]) -> Result<String, UkiError> {
     let osrel = get_osrel_section(image).ok_or(UkiError::PortableExecutableError)??;
-    let map = HashMap::from_iter(
-        osrel
-            .lines()
-            .filter(|line| !line.trim().starts_with('#'))
-            .filter_map(|line| line.split_once('=')),
-    );
-
-    // At least one of the name fields must be present
-    let mut result = get_value(&map, &["PRETTY_NAME", "NAME", "ID"]).ok_or(UkiError::NoName)?;
-
-    // But version is optional
-    if let Some(version) = get_value(&map, &["VERSION_ID", "VERSION"]) {
-        result.push_str(&format!(" {version}"));
-    }
-
-    Ok(result)
+    OsReleaseInfo::parse(osrel)
+        .get_boot_label()
+        .ok_or(UkiError::NoName)
 }
 
 #[cfg(test)]
@@ -195,82 +138,6 @@ mod test {
     use zerocopy::IntoBytes;
 
     use super::*;
-
-    #[test]
-    fn test_dequote() {
-        let cases = r##"
-
-        We encode the testcases inside of a custom string format to give
-        us more flexibility and less visual noise.  Lines with 4 pipes
-        are successful testcases (left is quoted, right is unquoted):
-
-            |"example"|        |example|
-
-        and lines with 2 pipes are failing testcases:
-
-            |"broken example|
-
-        Lines with no pipes are ignored as comments.  Now, the cases:
-
-            ||                  ||              Empty is empty...
-            |""|                ||
-            |''|                ||
-            |""''""|            ||
-
-        Unquoted stuff
-
-            |hello|             |hello|
-            |1234|              |1234|
-            |\\\\|              |\\\\|          ...this is non-POSIX...
-            |\$\`\\|            |\$\`\\|        ...this too...
-
-        Double quotes
-
-            |"closed"|          |closed|
-            |"closed\\"|        |closed\|
-            |"a"|               |a|
-            |" "|               | |
-            |"\""|              |"|
-            |"\\"|              |\|
-            |"\$5"|             |$5|
-            |"$5"|              |$5|            non-POSIX
-            |"\`tick\`"|        |`tick`|
-            |"`tick`"|          |`tick`|        non-POSIX
-
-            |"\'"|              |'|             non-POSIX
-            |"\'"|              |'|             non-POSIX
-
-            ...failures...
-            |"not closed|
-            |"not closed\"|
-            |"|
-            |"\\|
-            |"\"|
-
-        Single quotes
-
-            |'a'|               |a|
-            |' '|               | |
-            |'\'|               |\|
-            |'\$'|              |\$|
-            |'closed\'|         |closed\|
-
-            ...failures...
-            |'|                 not closed
-            |'not closed|
-            |'\''|              this is '\' + a second unclosed quote '
-
-        "##;
-
-        for case in cases.lines() {
-            match case.split('|').collect::<Vec<&str>>()[..] {
-                [_comment] => {}
-                [_, quoted, _, result, _] => assert_eq!(dequote(quoted).as_deref(), Some(result)),
-                [_, quoted, _] => assert_eq!(dequote(quoted), None),
-                _ => unreachable!("Invalid test line {case:?}"),
-            }
-        }
-    }
 
     fn data_offset(n_sections: usize) -> usize {
         size_of::<DosStub>() + size_of::<PeHeader>() + n_sections * size_of::<SectionHeader>()
@@ -323,63 +190,20 @@ mod test {
     }
 
     #[test]
-    fn test_fallbacks() {
-        let cases = [
-            (
-                r#"
+    fn test_simple() {
+        let uki = ukify(
+            br#"
 PRETTY_NAME='prettyOS'
 VERSION_ID="Rocky Racoon"
 VERSION=42
 ID=pretty-os
 "#,
-                "prettyOS Rocky Racoon",
-            ),
-            (
-                r#"
-PRETTY_NAME='prettyOS
-VERSION_ID="Rocky Racoon"
-VERSION=42
-ID=pretty-os
-"#,
-                "pretty-os Rocky Racoon",
-            ),
-            (
-                r#"
-PRETTY_NAME='prettyOS
-VERSION=42
-ID=pretty-os
-"#,
-                "pretty-os 42",
-            ),
-            (
-                r#"
-PRETTY_NAME='prettyOS
-VERSION=42
-ID=pretty-os
-"#,
-                "pretty-os 42",
-            ),
-            (
-                r#"
-PRETTY_NAME='prettyOS'
-ID=pretty-os
-"#,
-                "prettyOS",
-            ),
-            (
-                r#"
-ID=pretty-os
-"#,
-                "pretty-os",
-            ),
-        ];
+        );
 
-        for (osrel, label) in cases {
-            assert_eq!(
-                get_boot_label(&ukify(osrel.as_bytes())).as_deref(),
-                Ok(label)
-            );
-        }
+        assert_eq!(
+            get_boot_label(uki.as_ref()).unwrap(),
+            "prettyOS Rocky Racoon"
+        );
     }
 
     #[test]
