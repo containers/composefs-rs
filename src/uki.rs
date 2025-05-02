@@ -53,16 +53,15 @@ struct SectionHeader {
     number_of_line_numbers: U16,
     characteristics: U32,
 }
-const OSREL_SECTION: [u8; 8] = *b".osrel\0\0";
 
 #[derive(Debug, Error, PartialEq)]
 pub enum UkiError {
     #[error("UKI is not valid EFI executable")]
     PortableExecutableError,
-    #[error("UKI doesn't contain a '.osrel' section")]
-    MissingOsrelSection,
-    #[error(".osrel section is not UTF-8")]
-    UnicodeError,
+    #[error("UKI doesn't contain a '{0}' section")]
+    MissingSection(&'static str),
+    #[error("UKI section '{0}' is not UTF-8")]
+    UnicodeError(&'static str),
     #[error("No name information found in .osrel section")]
     NoName,
 }
@@ -72,7 +71,15 @@ pub enum UkiError {
 //   - the error types returned from FromBytes can't be used with `?` because they try to return a
 //     reference to the data, which causes problems with lifetime rules
 //   - it saves us from having to type Err(UkiError::PortableExecutableError) everywhere
-fn get_osrel_section(image: &[u8]) -> Option<Result<&str, UkiError>> {
+fn get_text_section<'a>(
+    image: &'a [u8],
+    section_name: &'static str,
+) -> Option<Result<&'a str, UkiError>> {
+    // Turn the section_name ".osrel" into a section_key b".osrel\0\0".
+    // This will panic if section_name.len() > 8, which is what we want.
+    let mut section_key = [0u8; 8];
+    section_key[..section_name.len()].copy_from_slice(section_name.as_bytes());
+
     // Skip the DOS stub
     let (dos_stub, ..) = DosStub::ref_from_prefix(image).ok()?;
     let rest = image.get(dos_stub.pe_offset.get() as usize..)?;
@@ -91,15 +98,15 @@ fn get_osrel_section(image: &[u8]) -> Option<Result<&str, UkiError>> {
     let (sections, ..) = <[SectionHeader]>::ref_from_prefix_with_elems(rest, n_sections).ok()?;
 
     for section in sections {
-        if section.name == OSREL_SECTION {
+        if section.name == section_key {
             let bytes = image
                 .get(section.pointer_to_raw_data.get() as usize..)?
                 .get(..section.virtual_size.get() as usize)?;
-            return Some(std::str::from_utf8(bytes).or(Err(UkiError::UnicodeError)));
+            return Some(std::str::from_utf8(bytes).or(Err(UkiError::UnicodeError(section_name))));
         }
     }
 
-    Some(Err(UkiError::MissingOsrelSection))
+    Some(Err(UkiError::MissingSection(section_name)))
 }
 
 /// Gets an appropriate label for display in the boot menu for the given UKI image, according to
@@ -124,10 +131,15 @@ fn get_osrel_section(image: &[u8]) -> Option<Result<&str, UkiError>> {
 /// If we couldn't parse the PE file or couldn't find an ".osrel" section then an error will be
 /// returned.
 pub fn get_boot_label(image: &[u8]) -> Result<String, UkiError> {
-    let osrel = get_osrel_section(image).ok_or(UkiError::PortableExecutableError)??;
+    let osrel = get_text_section(image, ".osrel").ok_or(UkiError::PortableExecutableError)??;
     OsReleaseInfo::parse(osrel)
         .get_boot_label()
         .ok_or(UkiError::NoName)
+}
+
+/// Gets the contents of the .cmdline section of a UKI.
+pub fn get_cmdline(image: &[u8]) -> Result<&str, UkiError> {
+    get_text_section(image, ".cmdline").ok_or(UkiError::PortableExecutableError)?
 }
 
 #[cfg(test)]
@@ -180,7 +192,7 @@ mod test {
         peify(
             b"",
             &[SectionHeader {
-                name: OSREL_SECTION,
+                name: *b".osrel\0\0",
                 virtual_size: U32::new(osrel.len() as u32),
                 pointer_to_raw_data: U32::new(osrel_offset as u32),
                 ..Default::default()
@@ -212,7 +224,7 @@ ID=pretty-os
             assert_eq!(get_boot_label(img), Err(UkiError::PortableExecutableError));
         }
         fn no_sec(img: &[u8]) {
-            assert_eq!(get_boot_label(img), Err(UkiError::MissingOsrelSection));
+            assert_eq!(get_boot_label(img), Err(UkiError::MissingSection(".osrel")));
         }
 
         pe_err(b"");
@@ -248,7 +260,7 @@ ID=pretty-os
         pe_err(&peify(
             b"",
             &[SectionHeader {
-                name: OSREL_SECTION,
+                name: *b".osrel\0\0",
                 pointer_to_raw_data: U32::new(1234567),
                 ..Default::default()
             }],
