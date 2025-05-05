@@ -1,0 +1,24 @@
+[package]
+name = "composefs-boot"
+description = "Helpers for bootable composefs systems"
+keywords = ["composefs", "boot"]
+
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow = { version = "1.0.87", default-features = false }
+composefs = { workspace = true }
+regex-automata = { version = "0.4.4", default-features = false, features=["hybrid", "std", "syntax"] }
+thiserror = { version = "2.0.0", default-features = false }
+zerocopy = { version = "0.8.0", default-features = false, features = ["derive"] }
+
+[dev-dependencies]
+similar-asserts = "1.7.0"
+
+[lints]
+workspace = true

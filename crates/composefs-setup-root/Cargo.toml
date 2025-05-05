@@ -1,0 +1,32 @@
+[package]
+name = "composefs-setup-root"
+description = "initramfs setup tool for composefs"
+keywords = ["composefs", "boot", "initramfs"]
+
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[features]
+default = ['pre-6.15']
+rhel9 = ['composefs/rhel9']
+'pre-6.15' = ['composefs/pre-6.15']
+
+[dependencies]
+anyhow = { version = "1.0.87", default-features = false }
+clap = { version = "4.0.1", default-features = false, features = ["std", "help", "usage", "derive"] }
+composefs = { workspace = true }
+composefs-boot = { workspace = true }
+env_logger = { version = "0.11.0", default-features = false }
+rustix = { version = "1.0.0", default-features = false }
+serde = { version = "1.0.145", default-features = false, features = ["derive"] }
+toml = { version = "0.8.0", default-features = false, features = ["parse"] }
+
+[dev-dependencies]
+similar-asserts = "1.7.0"
+
+[lints]
+workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "erofs-debug"
+description = "erofs image debugging tool"
+publish = false
+
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+clap = { version = "4.0.1", default-features = false, features = ["std", "help", "usage", "derive"] }
+composefs = { workspace = true }
+
+[lints]
+workspace = true

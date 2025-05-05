@@ -10,31 +10,29 @@ cd "${0%/*}"
 case "${os}" in
     fedora)
         containerfile='Containerfile'
-        features='--features=pre-6.15'
+        cargo build --release --features=pre-6.15
         ;;
     arch)
         containerfile='Containerfile.arch'
-        features='--features=pre-6.15'
+        cargo build --release --features=pre-6.15
         ;;
     rhel9)
         containerfile='Containerfile.rhel9'
-        features='--features=rhel9'
+        cargo build --release --features=rhel9
         ;;
     ubuntu)
         containerfile='Containerfile.ubuntu'
-        features='--features=pre-6.15'
+        cargo build --release --features=pre-6.15
         ;;
     rawhide)
         containerfile='Containerfile.rawhide'
-        features='--no-default-features'
+        cargo build --release --no-default-features --features=oci
         ;;
     *)
         echo "*** unknown variant ${os}"
         false
         ;;
 esac
-
-cargo build --release "${features}"
 
 cp ../../target/release/cfsctl .
 cp ../../target/release/composefs-setup-root extra/usr/lib/dracut/modules.d/37composefs/

@@ -10,7 +10,7 @@ use std::{
 use anyhow::{bail, ensure, Context, Result};
 use regex_automata::{hybrid::dfa, util::syntax, Anchored, Input};
 
-use crate::{
+use composefs::{
     fsverity::FsVerityHashValue,
     repository::Repository,
     tree::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},

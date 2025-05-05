@@ -32,7 +32,7 @@ pub(crate) fn proc_self_fd(fd: impl AsFd) -> String {
 ///  - in case of an unexpected EOF after some bytes were read, the function returns an Error with
 ///    ErrorKind::UnexpectedEof
 ///  - in case of underlying errors from the Read implementation, the error is returned directly
-pub(crate) fn read_exactish(reader: &mut impl Read, buf: &mut [u8]) -> Result<bool> {
+pub fn read_exactish(reader: &mut impl Read, buf: &mut [u8]) -> Result<bool> {
     let buflen = buf.len();
     let mut todo: &mut [u8] = buf;
 
@@ -57,7 +57,7 @@ pub(crate) fn read_exactish(reader: &mut impl Read, buf: &mut [u8]) -> Result<bo
 /// multiple reads to do so (and also retrying if required to deal with EINTR).
 ///
 /// This is the async version of read_exactish().
-pub(crate) async fn read_exactish_async(
+pub async fn read_exactish_async(
     reader: &mut (impl AsyncRead + Unpin),
     buf: &mut [u8],
 ) -> Result<bool> {
