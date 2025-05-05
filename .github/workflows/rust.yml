@@ -10,6 +10,16 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  nightly:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+    - uses: actions-rs/toolchain@v1
+      with:
+        toolchain: nightly
+    - uses: actions/checkout@v4
+    - run: cargo +nightly -Z package-workspace package
+
   fedora:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -26,4 +36,3 @@ jobs:
     - run: cargo fmt --check
     - run: cargo clippy -- -Dwarnings
     - run: env CFS_TEST_TMPDIR=/run/host/var/tmp cargo test --verbose
-    - run: cargo publish --dry-run

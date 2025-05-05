@@ -1,30 +1,14 @@
 use anyhow::Result;
 
 use crate::{
-    bootloader::{get_boot_resources, BootEntry},
     dumpfile::write_dumpfile,
     erofs::writer::mkfs_erofs,
     fsverity::{compute_verity, FsVerityHashValue},
     repository::Repository,
-    selabel::selabel,
     tree::FileSystem,
 };
 
 impl<ObjectID: FsVerityHashValue> FileSystem<ObjectID> {
-    pub fn transform_for_boot(
-        &mut self,
-        repo: &Repository<ObjectID>,
-    ) -> Result<Vec<BootEntry<ObjectID>>> {
-        let boot_entries = get_boot_resources(self, repo)?;
-        let boot = self.root.get_directory_mut("boot".as_ref())?;
-        boot.stat.st_mtim_sec = 0;
-        boot.clear();
-
-        selabel(self, repo)?;
-
-        Ok(boot_entries)
-    }
-
     pub fn commit_image(
         &mut self,
         repository: &Repository<ObjectID>,

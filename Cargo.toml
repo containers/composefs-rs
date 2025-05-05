@@ -1,55 +1,23 @@
-[package]
-name = "composefs"
-version = "0.2.0"
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
 edition = "2021"
-rust-version = "1.82.0"
-description = "Rust library for the composefs filesystem"
-keywords = ["composefs"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/containers/composefs-rs"
 readme = "README.md"
-default-run = "cfsctl"
-exclude = ["/.git*", "/examples/"]
+repository = "https://github.com/containers/composefs-rs"
+rust-version = "1.82.0"
+version = "0.2.0"
 
-[features]
-default = ['pre-6.15']
-rhel9 = ['pre-6.15']
-'pre-6.15' = []
+[workspace.lints.rust]
+missing_debug_implementations = "deny"
 
-[dependencies]
-anyhow = { version = "1.0.87", default-features = false }
-async-compression = { version = "0.4.0", default-features = false, features = ["tokio", "zstd", "gzip"] }
-clap = { version = "4.0.1", default-features = false, features = ["std", "help", "usage", "derive"] }
-containers-image-proxy = "0.7.1"
-env_logger = "0.11.0"
-hex = "0.4.0"
-indicatif = { version = "0.17.0", features = ["tokio"] }
-log = "0.4.8"
-oci-spec = "0.7.0"
-once_cell = { version = "1.21.3", default-features = false }
-regex-automata = { version = "0.4.4", default-features = false }
-rustix = { version = "1.0.0", features = ["fs", "mount", "process"] }
-serde = "1.0.145"
-sha2 = "0.10.1"
-tar = { version = "0.4.38", default-features = false }
-tempfile = "3.8.0"
-thiserror = "2.0.0"
-tokio = { version = "1.24.2", features = ["rt-multi-thread"] }
-toml = "0.8.0"
-xxhash-rust = { version = "0.8.2", features = ["xxh32"] }
-zerocopy = { version = "0.8.0", features = ["derive", "std"] }
-zstd = "0.13.0"
-
-[dev-dependencies]
-insta = "1.42.2"
-similar-asserts = "1.7.0"
-test-with = { version = "0.14", default-features = false, features = ["executable", "runtime"] }
-tokio-test = "0.4.4"
+[workspace.dependencies]
+composefs = { version = "0.2.0", path = "crates/composefs", default-features = false }
+composefs-oci = { version = "0.2.0", path = "crates/composefs-oci", default-features = false }
+composefs-boot = { version = "0.2.0", path = "crates/composefs-boot", default-features = false }
 
 [profile.dev.package.sha2]
 # this is *really* slow otherwise
 opt-level = 3
-
-[lib]
-name = "composefs"
-path = "src/lib.rs"

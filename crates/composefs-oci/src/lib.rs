@@ -13,13 +13,14 @@ use oci_spec::image::{Descriptor, ImageConfiguration, ImageManifest, MediaType};
 use sha2::{Digest, Sha256};
 use tokio::{io::AsyncReadExt, sync::Semaphore};
 
-use crate::{
+use composefs::{
     fsverity::FsVerityHashValue,
-    oci::tar::{get_entry, split_async},
     repository::Repository,
     splitstream::DigestMap,
     util::{parse_sha256, Sha256Digest},
 };
+
+use crate::tar::{get_entry, split_async};
 
 pub fn import_layer<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
@@ -321,7 +322,7 @@ pub fn seal<ObjectID: FsVerityHashValue>(
     let (mut config, refs) = open_config(repo, config_name, config_verity)?;
     let mut myconfig = config.config().clone().context("no config!")?;
     let labels = myconfig.labels_mut().get_or_insert_with(HashMap::new);
-    let mut fs = crate::oci::image::create_filesystem(repo, config_name, config_verity)?;
+    let mut fs = crate::image::create_filesystem(repo, config_name, config_verity)?;
     let id = fs.compute_image_id();
     labels.insert("containers.composefs.fsverity".to_string(), id.to_hex());
     config.set_config(Some(myconfig));
@@ -348,7 +349,7 @@ mod test {
     use rustix::fs::CWD;
     use sha2::{Digest, Sha256};
 
-    use crate::{fsverity::Sha256HashValue, repository::Repository, test::tempdir};
+    use composefs::{fsverity::Sha256HashValue, repository::Repository, test::tempdir};
 
     use super::*;
 

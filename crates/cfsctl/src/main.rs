@@ -4,16 +4,16 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use rustix::fs::CWD;
 
+use composefs_boot::{write_boot, BootOps};
+
 use composefs::{
     fsverity::{FsVerityHashValue, Sha256HashValue},
-    oci,
     repository::Repository,
-    util::parse_sha256,
 };
 
 /// cfsctl
@@ -31,6 +31,7 @@ pub struct App {
     cmd: Command,
 }
 
+#[cfg(feature = "oci")]
 #[derive(Debug, Subcommand)]
 enum OciCommand {
     /// Stores a tar file as a splitstream in the repository.
@@ -102,6 +103,7 @@ enum Command {
         reference: String,
     },
     /// Commands for dealing with OCI layers
+    #[cfg(feature = "oci")]
     Oci {
         #[clap(subcommand)]
         cmd: OciCommand,
@@ -179,25 +181,27 @@ async fn main() -> Result<()> {
             let image_id = repo.import_image(&reference, &mut std::io::stdin())?;
             println!("{}", image_id.to_id());
         }
+        #[cfg(feature = "oci")]
         Command::Oci { cmd: oci_cmd } => match oci_cmd {
             OciCommand::ImportLayer { name, sha256 } => {
-                let object_id = oci::import_layer(
+                let object_id = composefs_oci::import_layer(
                     &Arc::new(repo),
-                    &parse_sha256(sha256)?,
+                    &composefs::util::parse_sha256(sha256)?,
                     name.as_deref(),
                     &mut std::io::stdin(),
                 )?;
                 println!("{}", object_id.to_id());
             }
             OciCommand::LsLayer { name } => {
-                oci::ls_layer(&repo, &name)?;
+                composefs_oci::ls_layer(&repo, &name)?;
             }
             OciCommand::Dump {
                 ref config_name,
                 ref config_verity,
             } => {
                 let verity = verity_opt(config_verity)?;
-                let mut fs = oci::image::create_filesystem(&repo, config_name, verity.as_ref())?;
+                let mut fs =
+                    composefs_oci::image::create_filesystem(&repo, config_name, verity.as_ref())?;
                 fs.print_dumpfile()?;
             }
             OciCommand::ComputeId {
@@ -206,7 +210,8 @@ async fn main() -> Result<()> {
                 bootable,
             } => {
                 let verity = verity_opt(config_verity)?;
-                let mut fs = oci::image::create_filesystem(&repo, config_name, verity.as_ref())?;
+                let mut fs =
+                    composefs_oci::image::create_filesystem(&repo, config_name, verity.as_ref())?;
                 if bootable {
                     fs.transform_for_boot(&repo)?;
                 }
@@ -220,7 +225,8 @@ async fn main() -> Result<()> {
                 ref image_name,
             } => {
                 let verity = verity_opt(config_verity)?;
-                let mut fs = oci::image::create_filesystem(&repo, config_name, verity.as_ref())?;
+                let mut fs =
+                    composefs_oci::image::create_filesystem(&repo, config_name, verity.as_ref())?;
                 if bootable {
                     fs.transform_for_boot(&repo)?;
                 }
@@ -228,7 +234,8 @@ async fn main() -> Result<()> {
                 println!("{}", image_id.to_id());
             }
             OciCommand::Pull { ref image, name } => {
-                let (sha256, verity) = oci::pull(&Arc::new(repo), image, name.as_deref()).await?;
+                let (sha256, verity) =
+                    composefs_oci::pull(&Arc::new(repo), image, name.as_deref()).await?;
 
                 println!("sha256 {}", hex::encode(sha256));
                 println!("verity {}", verity.to_hex());
@@ -238,7 +245,8 @@ async fn main() -> Result<()> {
                 ref config_verity,
             } => {
                 let verity = verity_opt(config_verity)?;
-                let (sha256, verity) = oci::seal(&Arc::new(repo), config_name, verity.as_ref())?;
+                let (sha256, verity) =
+                    composefs_oci::seal(&Arc::new(repo), config_name, verity.as_ref())?;
                 println!("sha256 {}", hex::encode(sha256));
                 println!("verity {}", verity.to_id());
             }
@@ -246,7 +254,7 @@ async fn main() -> Result<()> {
                 ref name,
                 ref mountpoint,
             } => {
-                oci::mount(&repo, name, mountpoint, None)?;
+                composefs_oci::mount(&repo, name, mountpoint, None)?;
             }
             OciCommand::PrepareBoot {
                 ref config_name,
@@ -256,16 +264,17 @@ async fn main() -> Result<()> {
                 ref cmdline,
             } => {
                 let verity = verity_opt(config_verity)?;
-                let mut fs = oci::image::create_filesystem(&repo, config_name, verity.as_ref())?;
+                let mut fs =
+                    composefs_oci::image::create_filesystem(&repo, config_name, verity.as_ref())?;
                 let entries = fs.transform_for_boot(&repo)?;
                 let id = fs.commit_image(&repo, None)?;
 
                 let Some(entry) = entries.into_iter().next() else {
-                    bail!("No boot entries!");
+                    anyhow::bail!("No boot entries!");
                 };
 
                 let cmdline_refs: Vec<&str> = cmdline.iter().map(String::as_str).collect();
-                composefs::write_boot::write_boot_simple(
+                write_boot::write_boot_simple(
                     &repo,
                     entry,
                     &id,

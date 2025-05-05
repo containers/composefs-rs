@@ -142,12 +142,13 @@ pub fn ensure_verity_equal(
 mod tests {
     use std::{collections::BTreeSet, io::Write};
 
-    use crate::{test::tempfile, util::proc_self_fd};
     use rustix::{
         fd::OwnedFd,
         fs::{open, Mode, OFlags},
     };
     use tempfile::tempfile_in;
+
+    use crate::{test::tempfile, util::proc_self_fd};
 
     use super::*;
 
