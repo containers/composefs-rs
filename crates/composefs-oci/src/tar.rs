@@ -13,7 +13,7 @@ use rustix::fs::makedev;
 use tar::{EntryType, Header, PaxExtensions};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use crate::{
+use composefs::{
     dumpfile,
     fsverity::FsVerityHashValue,
     splitstream::{SplitStreamData, SplitStreamReader, SplitStreamWriter},

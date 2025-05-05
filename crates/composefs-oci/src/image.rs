@@ -3,15 +3,13 @@ use std::{ffi::OsStr, os::unix::ffi::OsStrExt, rc::Rc};
 use anyhow::{ensure, Context, Result};
 use oci_spec::image::ImageConfiguration;
 
-use crate::{
+use composefs::{
     fsverity::FsVerityHashValue,
-    oci::{
-        self,
-        tar::{TarEntry, TarItem},
-    },
     repository::Repository,
     tree::{Directory, FileSystem, Inode, Leaf},
 };
+
+use crate::tar::{TarEntry, TarItem};
 
 pub fn process_entry<ObjectID: FsVerityHashValue>(
     filesystem: &mut FileSystem<ObjectID>,
@@ -84,7 +82,7 @@ pub fn create_filesystem<ObjectID: FsVerityHashValue>(
         let layer_verity = config_stream.lookup(&layer_sha256)?;
 
         let mut layer_stream = repo.open_stream(&hex::encode(layer_sha256), Some(layer_verity))?;
-        while let Some(entry) = oci::tar::get_entry(&mut layer_stream)? {
+        while let Some(entry) = crate::tar::get_entry(&mut layer_stream)? {
             process_entry(&mut filesystem, entry)?;
         }
     }
@@ -94,7 +92,7 @@ pub fn create_filesystem<ObjectID: FsVerityHashValue>(
 
 #[cfg(test)]
 mod test {
-    use crate::{
+    use composefs::{
         dumpfile::write_dumpfile,
         fsverity::Sha256HashValue,
         tree::{LeafContent, RegularFile, Stat},
@@ -103,8 +101,8 @@ mod test {
 
     use super::*;
 
-    fn file_entry<ObjectID: FsVerityHashValue>(path: &str) -> oci::tar::TarEntry<ObjectID> {
-        oci::tar::TarEntry {
+    fn file_entry<ObjectID: FsVerityHashValue>(path: &str) -> TarEntry<ObjectID> {
+        TarEntry {
             path: PathBuf::from(path),
             stat: Stat {
                 st_mode: 0o644,
@@ -113,12 +111,12 @@ mod test {
                 st_mtim_sec: 0,
                 xattrs: RefCell::new(BTreeMap::new()),
             },
-            item: oci::tar::TarItem::Leaf(LeafContent::Regular(RegularFile::Inline([].into()))),
+            item: TarItem::Leaf(LeafContent::Regular(RegularFile::Inline([].into()))),
         }
     }
 
-    fn dir_entry<ObjectID: FsVerityHashValue>(path: &str) -> oci::tar::TarEntry<ObjectID> {
-        oci::tar::TarEntry {
+    fn dir_entry<ObjectID: FsVerityHashValue>(path: &str) -> TarEntry<ObjectID> {
+        TarEntry {
             path: PathBuf::from(path),
             stat: Stat {
                 st_mode: 0o755,
@@ -127,7 +125,7 @@ mod test {
                 st_mtim_sec: 0,
                 xattrs: RefCell::new(BTreeMap::new()),
             },
-            item: oci::tar::TarItem::Directory,
+            item: TarItem::Directory,
         }
     }
 

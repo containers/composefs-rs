@@ -5,12 +5,13 @@ use std::{
 
 use anyhow::{bail, ensure, Result};
 
-use crate::{
-    cmdline::split_cmdline,
+use composefs::{
     fsverity::FsVerityHashValue,
     repository::Repository,
     tree::{Directory, FileSystem, ImageError, Inode, LeafContent, RegularFile},
 };
+
+use crate::cmdline::split_cmdline;
 
 /// Strips the key (if it matches) plus the following whitespace from a single line in a "Type #1
 /// Boot Loader Specification Entry" file.
