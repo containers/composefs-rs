@@ -18,12 +18,12 @@ use rustix::{
 use serde::Deserialize;
 
 use composefs::{
-    cmdline::get_cmdline_value,
     fsverity::{FsVerityHashValue, Sha256HashValue},
     mount::{composefs_fsmount, mount_at, FsHandle},
     mountcompat::{overlayfs_set_fd, overlayfs_set_lower_and_data_fds, prepare_mount},
     repository::Repository,
 };
+use composefs_boot::cmdline::get_cmdline_value;
 
 // Config file
 #[derive(Clone, Copy, Debug, Deserialize)]

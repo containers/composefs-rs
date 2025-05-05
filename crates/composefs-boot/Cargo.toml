@@ -1,0 +1,24 @@
+[package]
+name = "composefs-boot"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.82.0"
+description = "Rust library for the composefs filesystem"
+keywords = ["composefs"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/containers/composefs-rs"
+readme = "README.md"
+exclude = ["/.git*", "/examples/"]
+
+[dependencies]
+composefs = "0.2.0"
+anyhow = { version = "1.0.87", default-features = false }
+regex-automata = { version = "0.4.4", default-features = false }
+thiserror = { version = "2.0.0", default-features = false }
+zerocopy = { version = "0.8.0", default-features = false, features = ["derive"] }
+
+[dev-dependencies]
+insta = "1.42.2"
+similar-asserts = "1.7.0"
+test-with = { version = "0.14", default-features = false, features = ["executable", "runtime"] }
+tokio-test = "0.4.4"

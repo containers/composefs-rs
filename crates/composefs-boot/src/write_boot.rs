@@ -5,11 +5,11 @@ use std::{
 
 use anyhow::{bail, ensure, Result};
 
+use composefs::{fsverity::FsVerityHashValue, repository::Repository};
+
 use crate::{
     bootloader::{read_file, BootEntry, Type1Entry, Type2Entry},
     cmdline::get_cmdline_value,
-    fsverity::FsVerityHashValue,
-    repository::Repository,
     uki,
 };
 
