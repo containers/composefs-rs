@@ -238,7 +238,7 @@ pub async fn pull(
     repo: &Arc<Repository<impl FsVerityHashValue>>,
     imgref: &str,
     reference: Option<&str>,
-) -> Result<()> {
+) -> Result<(Sha256Digest, impl FsVerityHashValue)> {
     let op = Arc::new(ImageOp::new(repo, imgref).await?);
     let (sha256, id) = op
         .pull()
@@ -248,9 +248,7 @@ pub async fn pull(
     if let Some(name) = reference {
         repo.name_stream(sha256, name)?;
     }
-    println!("sha256 {}", hex::encode(sha256));
-    println!("verity {}", id.to_hex());
-    Ok(())
+    Ok((sha256, id))
 }
 
 pub fn open_config<ObjectID: FsVerityHashValue>(
