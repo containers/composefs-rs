@@ -74,7 +74,7 @@ struct Args {
 
     #[arg(
         long,
-        default_value = "/usr/lib/ostree/prepare-root.conf",
+        default_value = "/usr/lib/composefs/setup-root.conf",
         help = "Config path (for testing)"
     )]
     config: PathBuf,

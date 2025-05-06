@@ -1,0 +1,27 @@
+#!/bin/sh
+
+set -eux
+
+cd "${0%/*}"
+image="${1:-docker://quay.io/fedora/fedora-bootc:42}"
+
+cargo build --release
+cp ../../target/release/cfsctl .
+mkdir -p initrd/usr/bin
+cp ../../target/release/composefs-setup-root initrd/usr/bin
+
+# rm -rf tmp
+../common/install-systemd-boot
+
+mkdir -p tmp/sysroot/composefs
+./cfsctl --repo tmp/sysroot/composefs oci pull "${image}" image
+./cfsctl --repo tmp/sysroot/composefs oci prepare-boot refs/image --bootdir tmp/efi --cmdline rw --cmdline console=ttyS0,115200 --cmdline enforcing=0 --cmdline root=/dev/vda2 --entry-id example
+
+(
+    cd initrd
+    find -print0 | cpio --null -ov --format=newc
+) | gzip -9 > tmp/efi/composefs-setup-root.img
+
+echo 'initrd /composefs-setup-root.img' >> tmp/efi/loader/entries/example.conf
+
+../common/make-image bootc-efi.qcow2
