@@ -52,6 +52,7 @@ pub(super) fn fs_ioc_enable_verity<H: FsVerityHashValue>(
                 Err(EnableVerityError::FilesystemNotSupported)
             }
             Err(Errno::EXIST) => Err(EnableVerityError::AlreadyEnabled),
+            Err(Errno::TXTBSY) => Err(EnableVerityError::FileOpenedForWrite),
             Err(e) => Err(Error::from(e).into()),
             Ok(_) => Ok(()),
         }

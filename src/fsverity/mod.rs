@@ -30,6 +30,8 @@ pub enum EnableVerityError {
     FilesystemNotSupported,
     #[error("fs-verity is already enabled on file")]
     AlreadyEnabled,
+    #[error("File is opened for writing")]
+    FileOpenedForWrite,
 }
 
 /// A verity comparison failed.
@@ -69,7 +71,20 @@ pub fn compute_verity<H: FsVerityHashValue>(data: &[u8]) -> H {
 /// It's possible to choose the hash algorithm (via the generic parameter) but the blocksize is
 /// currently hardcoded to 4096.  Salt is not supported.
 pub fn enable_verity<H: FsVerityHashValue>(fd: impl AsFd) -> Result<(), EnableVerityError> {
-    ioctl::fs_ioc_enable_verity::<H>(fd)
+    match ioctl::fs_ioc_enable_verity::<H>(&fd) {
+        Err(EnableVerityError::FileOpenedForWrite) => {
+            // https://github.com/containers/composefs-rs/issues/106
+            // On btrfs, sometimes after the writable fd is closed,
+            // attempting to enable verity will still result in
+            // ETXTBSY.  In this case it appears to be sufficient to
+            // call `syncfs()` and retry enabling verity.  This isn't
+            // ideal since it's a lot slower, but better than
+            // hard-erroring.
+            rustix::fs::syncfs(&fd).map_err(Into::<std::io::Error>::into)?;
+            ioctl::fs_ioc_enable_verity::<H>(&fd)
+        }
+        other => other,
+    }
 }
 
 /// Measures fs-verity on the given file.
