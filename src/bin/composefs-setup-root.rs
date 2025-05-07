@@ -49,6 +49,13 @@ struct MountConfig {
 }
 
 #[derive(Deserialize, Default)]
+#[allow(dead_code)]
+struct ComposeFS {
+    #[serde(deserialize_with = "yes_no_bool")]
+    enabled: bool,
+}
+
+#[derive(Deserialize, Default)]
 struct Config {
     #[serde(default)]
     etc: MountConfig,
@@ -56,6 +63,9 @@ struct Config {
     var: MountConfig,
     #[serde(default)]
     root: RootConfig,
+    #[allow(dead_code)]
+    #[serde(default)]
+    composefs: ComposeFS,
 }
 
 // Command-line arguments
@@ -88,6 +98,28 @@ struct Args {
 
     #[arg(long, help = "Mountpoint (don't replace sysroot, for testing)")]
     target: Option<PathBuf>,
+}
+
+// bootc images have the file "/usr/lib/ostree/prepare-root.conf" with the following contents
+//
+// ```toml
+// [composefs]
+// enable = yes
+// ```
+//
+// "enable = yes" is not correct toml, so serde panics while parsing
+fn yes_no_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+
+    match s.to_lowercase().as_str() {
+        "yes" | "true" => Ok(true),
+        "no" | "false" => Ok(false),
+
+        _ => Err(serde::de::Error::custom("expected yes/no or true/false")),
+    }
 }
 
 // Helpers
