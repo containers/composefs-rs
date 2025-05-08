@@ -13,7 +13,7 @@ use regex_automata::{hybrid::dfa, util::syntax, Anchored, Input};
 use crate::{
     fsverity::FsVerityHashValue,
     repository::Repository,
-    tree::{Directory, FileSystem, ImageError, Inode, Leaf, LeafContent, RegularFile, Stat},
+    tree::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
 };
 
 /* We build the entire SELinux policy into a single "lazy DFA" such that:
@@ -106,16 +106,18 @@ struct Policy {
     contexts: Vec<String>,
 }
 
+/// Open a file in the composefs store, handling inline vs external files.
 pub fn openat<'a, H: FsVerityHashValue>(
     dir: &'a Directory<H>,
     filename: impl AsRef<OsStr>,
     repo: &Repository<H>,
 ) -> Result<Option<Box<dyn Read + 'a>>> {
-    match dir.get_file(filename.as_ref()) {
-        Ok(RegularFile::Inline(data)) => Ok(Some(Box::new(&**data))),
-        Ok(RegularFile::External(id, ..)) => Ok(Some(Box::new(File::from(repo.open_object(id)?)))),
-        Err(ImageError::NotFound(..)) => Ok(None),
-        Err(other) => Err(other)?,
+    match dir.get_file_opt(filename.as_ref())? {
+        Some(file) => match file {
+            RegularFile::Inline(data) => Ok(Some(Box::new(&**data))),
+            RegularFile::External(id, ..) => Ok(Some(Box::new(File::from(repo.open_object(id)?)))),
+        },
+        None => Ok(None),
     }
 }
 
@@ -248,10 +250,9 @@ fn parse_config(file: impl Read) -> Result<Option<String>> {
 
 pub fn selabel<H: FsVerityHashValue>(fs: &mut FileSystem<H>, repo: &Repository<H>) -> Result<()> {
     // if /etc/selinux/config doesn't exist then it's not an error
-    let etc_selinux = match fs.root.get_directory("etc/selinux".as_ref()) {
-        Err(ImageError::NotFound(..)) => return Ok(()),
-        other => other,
-    }?;
+    let Some(etc_selinux) = fs.root.get_directory_opt("etc/selinux".as_ref())? else {
+        return Ok(());
+    };
 
     let Some(etc_selinux_config) = openat(etc_selinux, "config", repo)? else {
         return Ok(());

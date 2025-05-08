@@ -152,6 +152,17 @@ impl<ObjectID: FsVerityHashValue> Directory<ObjectID> {
     ///
     /// On failure, can return any number of errors from ImageError.
     pub fn get_directory(&self, pathname: &OsStr) -> Result<&Directory<ObjectID>, ImageError> {
+        match self.get_directory_opt(pathname)? {
+            Some(r) => Ok(r),
+            None => Err(ImageError::NotFound(Box::from(pathname))),
+        }
+    }
+
+    /// Like [`Self::get_directory()`] but maps [`ImageError::NotFound`] to [`Option`].
+    pub fn get_directory_opt(
+        &self,
+        pathname: &OsStr,
+    ) -> Result<Option<&Directory<ObjectID>>, ImageError> {
         let path = Path::new(pathname);
         let mut dir = self;
 
@@ -164,12 +175,12 @@ impl<ObjectID: FsVerityHashValue> Directory<ObjectID> {
                 Component::Normal(filename) => match dir.entries.get(filename) {
                     Some(Inode::Directory(subdir)) => subdir,
                     Some(_) => return Err(ImageError::NotADirectory(filename.into())),
-                    None => return Err(ImageError::NotFound(filename.into())),
+                    None => return Ok(None),
                 },
             }
         }
 
-        Ok(dir)
+        Ok(Some(dir))
     }
 
     /// Gets a mutable reference to a subdirectory of this directory.
@@ -301,13 +312,22 @@ impl<ObjectID: FsVerityHashValue> Directory<ObjectID> {
         &'a self,
         filename: &OsStr,
     ) -> Result<&'a RegularFile<ObjectID>, ImageError> {
+        self.get_file_opt(filename)?
+            .ok_or_else(|| ImageError::NotFound(Box::from(filename)))
+    }
+
+    /// Like [`Self::get_file()`] but maps [`ImageError::NotFound`] to [`Option`].
+    pub fn get_file_opt<'a>(
+        &'a self,
+        filename: &OsStr,
+    ) -> Result<Option<&'a RegularFile<ObjectID>>, ImageError> {
         match self.entries.get(filename) {
             Some(Inode::Leaf(leaf)) => match &leaf.content {
-                LeafContent::Regular(file) => Ok(file),
+                LeafContent::Regular(file) => Ok(Some(file)),
                 _ => Err(ImageError::IsNotRegular(filename.into())),
             },
             Some(Inode::Directory(..)) => Err(ImageError::IsADirectory(filename.into())),
-            None => Err(ImageError::NotFound(filename.into())),
+            None => Ok(None),
         }
     }
 
