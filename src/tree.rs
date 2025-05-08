@@ -437,3 +437,294 @@ impl<ObjectID: FsVerityHashValue> FileSystem<ObjectID> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fsverity::Sha256HashValue;
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    use std::ffi::{OsStr, OsString};
+    use std::rc::Rc;
+
+    // Helper to create a Stat with a specific mtime
+    fn stat_with_mtime(mtime: i64) -> Stat {
+        Stat {
+            st_mode: 0o755,
+            st_uid: 1000,
+            st_gid: 1000,
+            st_mtim_sec: mtime,
+            xattrs: RefCell::new(BTreeMap::new()),
+        }
+    }
+
+    // Helper to create a simple Leaf (e.g., an empty inline file)
+    fn new_leaf_file(mtime: i64) -> Rc<Leaf<Sha256HashValue>> {
+        Rc::new(Leaf {
+            stat: stat_with_mtime(mtime),
+            content: LeafContent::Regular(RegularFile::Inline(Box::new([]))),
+        })
+    }
+
+    // Helper to create a simple Leaf (symlink)
+    fn new_leaf_symlink(target: &str, mtime: i64) -> Rc<Leaf<Sha256HashValue>> {
+        Rc::new(Leaf {
+            stat: stat_with_mtime(mtime),
+            content: LeafContent::Symlink(OsString::from(target).into_boxed_os_str()),
+        })
+    }
+
+    // Helper to create an empty Directory Inode with a specific mtime
+    fn new_dir_inode(mtime: i64) -> Inode<Sha256HashValue> {
+        Inode::Directory(Box::new(Directory {
+            stat: stat_with_mtime(mtime),
+            entries: BTreeMap::new(),
+        }))
+    }
+
+    // Helper to create a Directory Inode with specific stat
+    fn new_dir_inode_with_stat(stat: Stat) -> Inode<Sha256HashValue> {
+        Inode::Directory(Box::new(Directory {
+            stat,
+            entries: BTreeMap::new(),
+        }))
+    }
+
+    #[test]
+    fn test_directory_default() {
+        let dir = Directory::<Sha256HashValue>::default();
+        assert_eq!(dir.stat.st_uid, 0);
+        assert_eq!(dir.stat.st_gid, 0);
+        assert_eq!(dir.stat.st_mode, 0o555);
+        assert_eq!(dir.stat.st_mtim_sec, 0);
+        assert!(dir.stat.xattrs.borrow().is_empty());
+        assert!(dir.entries.is_empty());
+    }
+
+    #[test]
+    fn test_directory_new() {
+        let stat = stat_with_mtime(123);
+        let dir = Directory::<Sha256HashValue>::new(stat);
+        assert_eq!(dir.stat.st_mtim_sec, 123);
+        assert!(dir.entries.is_empty());
+    }
+
+    #[test]
+    fn test_insert_and_get_leaf() {
+        let mut dir = Directory::<Sha256HashValue>::default();
+        let leaf = new_leaf_file(10);
+        dir.insert(OsStr::new("file.txt"), Inode::Leaf(Rc::clone(&leaf)));
+        assert_eq!(dir.entries.len(), 1);
+
+        let retrieved_leaf_rc = dir.ref_leaf(OsStr::new("file.txt")).unwrap();
+        assert!(Rc::ptr_eq(&retrieved_leaf_rc, &leaf));
+
+        let regular_file_content = dir.get_file(OsStr::new("file.txt")).unwrap();
+        assert!(matches!(regular_file_content, RegularFile::Inline(_)));
+    }
+
+    #[test]
+    fn test_insert_and_get_directory() {
+        let mut dir = Directory::<Sha256HashValue>::default();
+        let sub_dir_inode = new_dir_inode(20);
+        dir.insert(OsStr::new("subdir"), sub_dir_inode);
+        assert_eq!(dir.entries.len(), 1);
+
+        let retrieved_subdir = dir.get_directory(OsStr::new("subdir")).unwrap();
+        assert_eq!(retrieved_subdir.stat.st_mtim_sec, 20);
+
+        let retrieved_subdir_opt = dir
+            .get_directory_opt(OsStr::new("subdir"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(retrieved_subdir_opt.stat.st_mtim_sec, 20);
+    }
+
+    #[test]
+    fn test_get_directory_errors() {
+        let mut root = Directory::<Sha256HashValue>::default();
+        root.insert(OsStr::new("dir1"), new_dir_inode(10));
+        root.insert(OsStr::new("file1"), Inode::Leaf(new_leaf_file(30)));
+
+        match root.get_directory(OsStr::new("nonexistent")) {
+            Err(ImageError::NotFound(name)) => assert_eq!(name.to_str().unwrap(), "nonexistent"),
+            _ => panic!("Expected NotFound"),
+        }
+        assert!(root
+            .get_directory_opt(OsStr::new("nonexistent"))
+            .unwrap()
+            .is_none());
+
+        match root.get_directory(OsStr::new("file1")) {
+            Err(ImageError::NotADirectory(name)) => assert_eq!(name.to_str().unwrap(), "file1"),
+            _ => panic!("Expected NotADirectory"),
+        }
+    }
+
+    #[test]
+    fn test_get_file_errors() {
+        let mut dir = Directory::<Sha256HashValue>::default();
+        dir.insert(OsStr::new("subdir"), new_dir_inode(10));
+        dir.insert(
+            OsStr::new("link.txt"),
+            Inode::Leaf(new_leaf_symlink("target", 20)),
+        );
+
+        match dir.get_file(OsStr::new("nonexistent.txt")) {
+            Err(ImageError::NotFound(name)) => {
+                assert_eq!(name.to_str().unwrap(), "nonexistent.txt")
+            }
+            _ => panic!("Expected NotFound"),
+        }
+        assert!(dir
+            .get_file_opt(OsStr::new("nonexistent.txt"))
+            .unwrap()
+            .is_none());
+
+        match dir.get_file(OsStr::new("subdir")) {
+            Err(ImageError::IsADirectory(name)) => assert_eq!(name.to_str().unwrap(), "subdir"),
+            _ => panic!("Expected IsADirectory"),
+        }
+        match dir.get_file(OsStr::new("link.txt")) {
+            Err(ImageError::IsNotRegular(name)) => assert_eq!(name.to_str().unwrap(), "link.txt"),
+            res => panic!("Expected IsNotRegular, got {:?}", res),
+        }
+    }
+
+    #[test]
+    fn test_remove() {
+        let mut dir = Directory::<Sha256HashValue>::default();
+        dir.insert(OsStr::new("file1.txt"), Inode::Leaf(new_leaf_file(10)));
+        dir.insert(OsStr::new("subdir"), new_dir_inode(20));
+        assert_eq!(dir.entries.len(), 2);
+
+        dir.remove(OsStr::new("file1.txt"));
+        assert_eq!(dir.entries.len(), 1);
+        assert!(dir.entries.get(OsStr::new("file1.txt")).is_none());
+
+        dir.remove(OsStr::new("nonexistent")); // Should be no-op
+        assert_eq!(dir.entries.len(), 1);
+    }
+
+    #[test]
+    fn test_merge() {
+        let mut dir = Directory::<Sha256HashValue>::default();
+
+        // Merge Leaf onto empty
+        dir.merge(OsStr::new("item"), Inode::Leaf(new_leaf_file(10)));
+        assert_eq!(
+            dir.entries
+                .get(OsStr::new("item"))
+                .unwrap()
+                .stat()
+                .st_mtim_sec,
+            10
+        );
+
+        // Merge Directory onto existing Directory
+        let mut existing_dir_inode = new_dir_inode_with_stat(stat_with_mtime(80));
+        if let Inode::Directory(ref mut ed_box) = existing_dir_inode {
+            ed_box.insert(OsStr::new("inner_file"), Inode::Leaf(new_leaf_file(85)));
+        }
+        dir.insert(OsStr::new("merged_dir"), existing_dir_inode);
+
+        let new_merging_dir_inode = new_dir_inode_with_stat(stat_with_mtime(90));
+        dir.merge(OsStr::new("merged_dir"), new_merging_dir_inode);
+
+        match dir.entries.get(OsStr::new("merged_dir")) {
+            Some(Inode::Directory(d)) => {
+                assert_eq!(d.stat.st_mtim_sec, 90); // Stat updated
+                assert_eq!(d.entries.len(), 1); // Inner file preserved
+                assert!(d.entries.get(OsStr::new("inner_file")).is_some());
+            }
+            _ => panic!("Expected directory after merge"),
+        }
+
+        // Merge Leaf onto Directory (replaces)
+        dir.merge(OsStr::new("merged_dir"), Inode::Leaf(new_leaf_file(100)));
+        assert!(matches!(
+            dir.entries.get(OsStr::new("merged_dir")),
+            Some(Inode::Leaf(_))
+        ));
+        assert_eq!(
+            dir.entries
+                .get(OsStr::new("merged_dir"))
+                .unwrap()
+                .stat()
+                .st_mtim_sec,
+            100
+        );
+    }
+
+    #[test]
+    fn test_clear() {
+        let mut dir = Directory::<Sha256HashValue>::default();
+        dir.insert(OsStr::new("file1"), Inode::Leaf(new_leaf_file(10)));
+        dir.stat.st_mtim_sec = 100;
+
+        dir.clear();
+        assert!(dir.entries.is_empty());
+        assert_eq!(dir.stat.st_mtim_sec, 100); // Stat should be unmodified
+    }
+
+    #[test]
+    fn test_newest_file() {
+        let mut root = Directory::<Sha256HashValue>::new(stat_with_mtime(5));
+        assert_eq!(root.newest_file(), 5);
+
+        root.insert(OsStr::new("file1"), Inode::Leaf(new_leaf_file(10)));
+        assert_eq!(root.newest_file(), 10);
+
+        let subdir_stat = stat_with_mtime(15);
+        let mut subdir = Box::new(Directory::new(subdir_stat));
+        subdir.insert(OsStr::new("subfile1"), Inode::Leaf(new_leaf_file(12)));
+        root.insert(OsStr::new("subdir"), Inode::Directory(subdir));
+        assert_eq!(root.newest_file(), 15);
+
+        if let Some(Inode::Directory(sd)) = root.entries.get_mut(OsStr::new("subdir")) {
+            sd.insert(OsStr::new("subfile2"), Inode::Leaf(new_leaf_file(20)));
+        }
+        assert_eq!(root.newest_file(), 20);
+
+        root.stat.st_mtim_sec = 25;
+        assert_eq!(root.newest_file(), 25);
+    }
+
+    #[test]
+    fn test_iteration_entries_sorted_inodes() {
+        let mut dir = Directory::<Sha256HashValue>::default();
+        dir.insert(OsStr::new("b_file"), Inode::Leaf(new_leaf_file(10)));
+        dir.insert(OsStr::new("a_dir"), new_dir_inode(20));
+        dir.insert(
+            OsStr::new("c_link"),
+            Inode::Leaf(new_leaf_symlink("target", 30)),
+        );
+
+        let names_from_entries: Vec<&OsStr> = dir.entries().map(|(name, _)| name).collect();
+        assert_eq!(names_from_entries.len(), 3); // BTreeMap iter is sorted
+        assert!(names_from_entries.contains(&OsStr::new("a_dir")));
+        assert!(names_from_entries.contains(&OsStr::new("b_file")));
+        assert!(names_from_entries.contains(&OsStr::new("c_link")));
+
+        let sorted_names: Vec<&OsStr> = dir.sorted_entries().map(|(name, _)| name).collect();
+        assert_eq!(
+            sorted_names,
+            vec![
+                OsStr::new("a_dir"),
+                OsStr::new("b_file"),
+                OsStr::new("c_link")
+            ]
+        );
+
+        let mut inode_types = vec![];
+        for inode in dir.inodes() {
+            match inode {
+                Inode::Directory(_) => inode_types.push("dir"),
+                Inode::Leaf(_) => inode_types.push("leaf"),
+            }
+        }
+        assert_eq!(inode_types.len(), 3);
+        assert_eq!(inode_types.iter().filter(|&&t| t == "dir").count(), 1);
+        assert_eq!(inode_types.iter().filter(|&&t| t == "leaf").count(), 2);
+    }
+}
