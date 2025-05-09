@@ -87,7 +87,10 @@ pub fn write_boot_simple<ObjectID: FsVerityHashValue>(
         }
         BootEntry::UsrLibModulesUki(_entry) => todo!(),
         BootEntry::UsrLibModulesVmLinuz(entry) => {
-            let t1 = entry.into_type1(entry_id);
+            let mut t1 = entry.into_type1(entry_id);
+            if let Some(name) = entry_id {
+                t1.relocate(name)?;
+            }
             write_t1_simple(t1, bootdir, root_id, cmdline_extra, repo)?;
         }
     };
