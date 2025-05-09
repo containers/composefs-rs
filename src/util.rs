@@ -1,9 +1,19 @@
 use std::{
     io::{Error, ErrorKind, Read, Result},
     os::fd::{AsFd, AsRawFd},
+    path::Path,
 };
 
 use tokio::io::{AsyncRead, AsyncReadExt};
+
+/// Podman always creates this file
+const CONTAINER_ENV_PATH: &str = "/run/.containerenv";
+
+/// Check if we're running inside a podman container
+/// We cannot test for `/proc/1/cgroup` as the contianer might be running with `--host-pid`
+pub(crate) fn is_podman_container() -> bool {
+    Path::new(CONTAINER_ENV_PATH).exists()
+}
 
 /// Formats a string like "/proc/self/fd/3" for the given fd.  This can be used to work with kernel
 /// APIs that don't directly accept file descriptors.
