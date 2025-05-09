@@ -1,9 +1,10 @@
 use core::ops::Range;
 use std::{
-    collections::HashMap, ffi::OsStr, fs::File, io::Read, os::unix::ffi::OsStrExt, str::from_utf8,
+    collections::HashMap, ffi::OsStr, fs::File, io::Read, os::unix::ffi::OsStrExt, path::Path,
+    str::from_utf8,
 };
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{anyhow, bail, ensure, Result};
 
 use crate::{
     cmdline::split_cmdline,
@@ -143,7 +144,7 @@ impl<ObjectID: FsVerityHashValue> Type1Entry<ObjectID> {
     // This is a bit of a strange operation: for each file mentioned in the bootloader entry, move
     // the file into the given 'entry_id' pathname and rename the entry file itself to
     // "{entry_id}.conf".
-    pub fn relocate(&mut self, entry_id: &str) {
+    pub fn relocate(&mut self, entry_id: &str, abs_entry_path: Option<&str>) -> Result<()> {
         self.filename = Box::from(format!("{entry_id}.conf").as_ref());
         for line in &mut self.entry.lines {
             for key in ["linux", "initrd", "efi"] {
@@ -157,14 +158,29 @@ impl<ObjectID: FsVerityHashValue> Type1Entry<ObjectID> {
                 let file = self.files.remove(value);
 
                 let new = format!("/{entry_id}/{basename}");
+                let new_entry_path = Path::new(&new);
                 let range = substr_range(line, value).unwrap();
-                line.replace_range(range, &new);
+
+                let final_path = if let Some(abs_entry_path) = abs_entry_path {
+                    Path::new(abs_entry_path)
+                        .join(new_entry_path.strip_prefix("/").unwrap_or(new_entry_path))
+                } else {
+                    new_entry_path.to_path_buf()
+                };
+
+                let final_path = final_path
+                    .to_str()
+                    .ok_or_else(|| anyhow!("Failed to convert Path '{final_path:?}' to string"))?;
+
+                line.replace_range(range, final_path);
 
                 if let Some(file) = file {
                     self.files.insert(new.into_boxed_str(), file);
                 }
             }
         }
+
+        Ok(())
     }
 
     pub fn load(
