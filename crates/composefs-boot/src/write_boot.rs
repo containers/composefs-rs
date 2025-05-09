@@ -67,31 +67,32 @@ pub fn write_boot_simple<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     entry: BootEntry<ObjectID>,
     root_id: &ObjectID,
-    bootdir: &Path,
+    boot_partition: &Path,
     entry_id: Option<&str>,
+    boot_subdir: Option<&str>,
     cmdline_extra: &[&str],
 ) -> Result<()> {
     match entry {
         BootEntry::Type1(mut t1) => {
             if let Some(name) = entry_id {
-                t1.relocate(name);
+                t1.relocate(name, boot_subdir)?;
             }
-            write_t1_simple(t1, bootdir, root_id, cmdline_extra, repo)?;
+            write_t1_simple(t1, boot_partition, root_id, cmdline_extra, repo)?;
         }
         BootEntry::Type2(mut t2) => {
             if let Some(name) = entry_id {
                 t2.rename(name);
             }
             ensure!(cmdline_extra.is_empty(), "Can't add --cmdline args to UKIs");
-            write_t2_simple(t2, bootdir, root_id, repo)?;
+            write_t2_simple(t2, boot_partition, root_id, repo)?;
         }
         BootEntry::UsrLibModulesUki(_entry) => todo!(),
         BootEntry::UsrLibModulesVmLinuz(entry) => {
             let mut t1 = entry.into_type1(entry_id);
             if let Some(name) = entry_id {
-                t1.relocate(name)?;
+                t1.relocate(name, boot_subdir)?;
             }
-            write_t1_simple(t1, bootdir, root_id, cmdline_extra, repo)?;
+            write_t1_simple(t1, boot_partition, root_id, cmdline_extra, repo)?;
         }
     };
 
