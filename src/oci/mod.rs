@@ -13,6 +13,7 @@ use oci_spec::image::{Descriptor, ImageConfiguration, ImageManifest, MediaType};
 use sha2::{Digest, Sha256};
 use tokio::{io::AsyncReadExt, sync::Semaphore};
 
+use crate::util::is_podman_container;
 use crate::{
     fsverity::FsVerityHashValue,
     oci::tar::{get_entry, split_async},
@@ -69,7 +70,8 @@ type ContentAndVerity<ObjectID> = (Sha256Digest, ObjectID);
 impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
     async fn new(repo: &Arc<Repository<ObjectID>>, imgref: &str) -> Result<Self> {
         // See https://github.com/containers/skopeo/issues/2563
-        let skopeo_cmd = if imgref.starts_with("containers-storage:") {
+        // TODO: Also check here for Docker container...
+        let skopeo_cmd = if imgref.starts_with("containers-storage:") && !is_podman_container() {
             let mut cmd = Command::new("podman");
             cmd.args(["unshare", "skopeo"]);
             Some(cmd)
