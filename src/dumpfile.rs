@@ -29,7 +29,7 @@ fn write_escaped(writer: &mut impl fmt::Write, bytes: &[u8]) -> fmt::Result {
         let c = *c;
 
         if c < b'!' || c == b'=' || c == b'\\' || c > b'~' {
-            write!(writer, "\\x{:02x}", c)?;
+            write!(writer, "\\x{c:02x}")?;
         } else {
             writer.write_char(c as char)?;
         }
@@ -66,7 +66,7 @@ fn write_entry(
     write_escaped(writer, content)?;
     write!(writer, " ")?;
     if let Some(id) = digest {
-        write!(writer, "{}", id)?;
+        write!(writer, "{id}")?;
     } else {
         write_empty(writer)?;
     }
@@ -212,7 +212,7 @@ struct DumpfileWriter<'a, W: Write, ObjectID: FsVerityHashValue> {
 fn writeln_fmt(writer: &mut impl Write, f: impl Fn(&mut String) -> fmt::Result) -> Result<()> {
     let mut tmp = String::with_capacity(256);
     f(&mut tmp)?;
-    Ok(writeln!(writer, "{}", tmp)?)
+    Ok(writeln!(writer, "{tmp}")?)
 }
 
 impl<'a, W: Write, ObjectID: FsVerityHashValue> DumpfileWriter<'a, W, ObjectID> {

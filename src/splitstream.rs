@@ -392,7 +392,7 @@ impl<F: Read, ObjectID: FsVerityHashValue> Read for SplitStreamReader<F, ObjectI
                 Ok(n_bytes)
             }
             Ok(ChunkType::External(..)) => unreachable!(),
-            Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+            Err(e) => Err(std::io::Error::other(e)),
         }
     }
 }

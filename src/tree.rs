@@ -587,7 +587,7 @@ mod tests {
         }
         match dir.get_file(OsStr::new("link.txt")) {
             Err(ImageError::IsNotRegular(name)) => assert_eq!(name.to_str().unwrap(), "link.txt"),
-            res => panic!("Expected IsNotRegular, got {:?}", res),
+            res => panic!("Expected IsNotRegular, got {res:?}"),
         }
     }
 
@@ -600,7 +600,7 @@ mod tests {
 
         dir.remove(OsStr::new("file1.txt"));
         assert_eq!(dir.entries.len(), 1);
-        assert!(dir.entries.get(OsStr::new("file1.txt")).is_none());
+        assert!(!dir.entries.contains_key(OsStr::new("file1.txt")));
 
         dir.remove(OsStr::new("nonexistent")); // Should be no-op
         assert_eq!(dir.entries.len(), 1);
@@ -635,7 +635,7 @@ mod tests {
             Some(Inode::Directory(d)) => {
                 assert_eq!(d.stat.st_mtim_sec, 90); // Stat updated
                 assert_eq!(d.entries.len(), 1); // Inner file preserved
-                assert!(d.entries.get(OsStr::new("inner_file")).is_some());
+                assert!(d.entries.contains_key(OsStr::new("inner_file")));
             }
             _ => panic!("Expected directory after merge"),
         }

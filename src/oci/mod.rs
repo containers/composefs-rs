@@ -37,7 +37,7 @@ pub fn ls_layer<ObjectID: FsVerityHashValue>(
     let mut split_stream = repo.open_stream(name, None)?;
 
     while let Some(entry) = get_entry(&mut split_stream)? {
-        println!("{}", entry);
+        println!("{entry}");
     }
 
     Ok(())
@@ -387,7 +387,7 @@ mod test {
         let mut dump = String::new();
         let mut split_stream = repo.open_stream("refs/name", Some(&id)).unwrap();
         while let Some(entry) = tar::get_entry(&mut split_stream).unwrap() {
-            writeln!(dump, "{}", entry).unwrap();
+            writeln!(dump, "{entry}").unwrap();
         }
         similar_asserts::assert_eq!(dump, "\
 /file0 0 100700 1 0 0 0 0.0 - - -

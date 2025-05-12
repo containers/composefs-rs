@@ -324,7 +324,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         name: &str,
         verity: Option<&ObjectID>,
     ) -> Result<SplitStreamReader<File, ObjectID>> {
-        let filename = format!("streams/{}", name);
+        let filename = format!("streams/{name}");
 
         let file = File::from(if let Some(verity_hash) = verity {
             self.open_with_verity(&filename, verity_hash)?
@@ -365,7 +365,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         self.ensure_symlink(&image_path, &object_path)?;
 
         if let Some(reference) = name {
-            let ref_path = format!("images/refs/{}", reference);
+            let ref_path = format!("images/refs/{reference}");
             self.symlink(&ref_path, &image_path)?;
         }
 
@@ -380,7 +380,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     }
 
     pub fn open_image(&self, name: &str) -> Result<OwnedFd> {
-        let image = self.openat(&format!("images/{}", name), OFlags::RDONLY)?;
+        let image = self.openat(&format!("images/{name}"), OFlags::RDONLY)?;
 
         if !name.contains("/") {
             // A name with no slashes in it is taken to be a sha256 fs-verity digest
