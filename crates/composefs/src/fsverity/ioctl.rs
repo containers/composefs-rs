@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 use core::mem::size_of;
 
 use std::{io::Error, os::fd::AsFd};

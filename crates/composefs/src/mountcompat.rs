@@ -166,6 +166,7 @@ mod tmpmount {
 /// Required before 6.12: erofs can't directly mount files.
 #[cfg(feature = "rhel9")]
 mod loopback {
+    #![allow(unsafe_code)]
     use std::{
         io::Result,
         os::fd::{AsFd, AsRawFd, OwnedFd},
