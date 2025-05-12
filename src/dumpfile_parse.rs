@@ -291,7 +291,7 @@ fn escape<W: std::fmt::Write>(out: &mut W, s: &[u8], mode: EscapeMode) -> std::f
                 b'\n' => out.write_str(r"\n")?,
                 b'\t' => out.write_str(r"\t")?,
                 b'\r' => out.write_str(r"\r")?,
-                o => write!(out, "\\x{:02x}", o)?,
+                o => write!(out, "\\x{o:02x}")?,
             }
         }
     }

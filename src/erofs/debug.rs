@@ -47,7 +47,7 @@ macro_rules! write_fields {
 
 fn utf8_or_hex(data: &[u8]) -> String {
     if let Ok(string) = std::str::from_utf8(data) {
-        format!("{:?}", string)
+        format!("{string:?}")
     } else {
         hex::encode(data)
     }
@@ -322,8 +322,7 @@ impl<T: fmt::Debug + InodeHeader> fmt::Debug for Inode<T> {
             let offset = addr!(dir) - addr!(self);
             return write!(
                 f,
-                "     +{offset:02x} --- inline directory entries ---{:#?}",
-                dir
+                "     +{offset:02x} --- inline directory entries ---{dir:#?}"
             );
         }
 
