@@ -26,3 +26,9 @@ opt-level = 3
 [profile.profiling]
 inherits = "release"
 debug = true
+
+[workspace.metadata.vendor-filter]
+# match cargo-vendor-filterer config from bootc
+platforms = ["*-unknown-linux-gnu"]
+tier = "2"
+all-features = true
