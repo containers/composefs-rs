@@ -22,3 +22,7 @@ composefs-boot = { version = "0.2.0", path = "crates/composefs-boot", default-fe
 [profile.dev.package.sha2]
 # this is *really* slow otherwise
 opt-level = 3
+
+[profile.profiling]
+inherits = "release"
+debug = true
