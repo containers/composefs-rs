@@ -24,6 +24,13 @@ case "${os}" in
         containerfile='Containerfile.ubuntu'
         cargo build --release --features=pre-6.15
         ;;
+    rawhide-compat)
+        # try a variant with rawhide using the old mount APIs
+        # this is currently failing due to a suspected kernel behaviour change
+        # https://lore.kernel.org/linux-fsdevel/CAOYeF9WQhFDe+BGW=Dp5fK8oRy5AgZ6zokVyTj1Wp4EUiYgt4w@mail.gmail.com
+        containerfile='Containerfile.rawhide'
+        cargo build --release --features=pre-6.15
+        ;;
     rawhide)
         containerfile='Containerfile.rawhide'
         cargo build --release --no-default-features --features=oci
