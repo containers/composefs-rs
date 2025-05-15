@@ -15,9 +15,8 @@ jobs:
       - name: Clone repository
         uses: actions/checkout@v4
 
-      - name: Publish crate
-        run: cargo publish -p composefs
-        run: cargo publish -p composefs-oci
-        run: cargo publish -p composefs-boot
-        run: cargo publish -p cfsctl
-        run: cargo publish -p composefs-setup-root
+      - run: cargo publish -p composefs
+      - run: cargo publish -p composefs-oci
+      - run: cargo publish -p composefs-boot
+      - run: cargo publish -p cfsctl
+      - run: cargo publish -p composefs-setup-root
