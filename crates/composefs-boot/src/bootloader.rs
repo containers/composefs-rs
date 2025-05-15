@@ -145,7 +145,7 @@ impl<ObjectID: FsVerityHashValue> Type1Entry<ObjectID> {
     // This is a bit of a strange operation: for each file mentioned in the bootloader entry, move
     // the file into the given 'entry_id' pathname and rename the entry file itself to
     // "{entry_id}.conf".
-    pub fn relocate(&mut self, entry_id: &str, boot_subdir: Option<&str>) -> Result<()> {
+    pub fn relocate(&mut self, boot_subdir: Option<&str>, entry_id: &str) -> Result<()> {
         self.filename = Box::from(format!("{entry_id}.conf").as_ref());
         for line in &mut self.entry.lines {
             for key in ["linux", "initrd", "efi"] {

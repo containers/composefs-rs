@@ -71,7 +71,6 @@ pub fn write_t2_simple<ObjectID: FsVerityHashValue>(
 /// * entry          - Boot entry variant to be written
 /// * root_id        - The content hash of the generated EROFS image id
 /// * boot_partition - Path to the boot partition/directory
-/// * entry_id       - In case of a BLS entry, the name of file to be generated in `loader/entries`
 /// * boot_subdir    - If `Some(path)`, the path is prepended to `initrd` and `linux` keys in the BLS entry
 ///
 /// For example, if `boot_subdir = Some("/boot/1")` and `boot_partition = "/boot"`,
@@ -89,6 +88,7 @@ pub fn write_t2_simple<ObjectID: FsVerityHashValue>(
 /// initrd /<entry_id>/initrd
 /// ```
 ///
+/// * entry_id       - In case of a BLS entry, the name of file to be generated in `loader/entries`
 /// * cmdline_extra  - Extra kernel command line arguments
 ///
 pub fn write_boot_simple<ObjectID: FsVerityHashValue>(
@@ -96,14 +96,14 @@ pub fn write_boot_simple<ObjectID: FsVerityHashValue>(
     entry: BootEntry<ObjectID>,
     root_id: &ObjectID,
     boot_partition: &Path,
-    entry_id: Option<&str>,
     boot_subdir: Option<&str>,
+    entry_id: Option<&str>,
     cmdline_extra: &[&str],
 ) -> Result<()> {
     match entry {
         BootEntry::Type1(mut t1) => {
             if let Some(name) = entry_id {
-                t1.relocate(name, boot_subdir)?;
+                t1.relocate(boot_subdir, name)?;
             }
             write_t1_simple(t1, boot_partition, root_id, cmdline_extra, repo)?;
         }
@@ -118,7 +118,7 @@ pub fn write_boot_simple<ObjectID: FsVerityHashValue>(
         BootEntry::UsrLibModulesVmLinuz(entry) => {
             let mut t1 = entry.into_type1(entry_id);
             if let Some(name) = entry_id {
-                t1.relocate(name, boot_subdir)?;
+                t1.relocate(boot_subdir, name)?;
             }
             write_t1_simple(t1, boot_partition, root_id, cmdline_extra, repo)?;
         }
