@@ -8,16 +8,16 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/containers/composefs-rs"
 rust-version = "1.82.0"
-version = "0.2.0"
+version = "0.3.0"
 
 [workspace.lints.rust]
 missing_debug_implementations = "deny"
 unsafe_code = "deny" # https://github.com/containers/composefs-rs/issues/123
 
 [workspace.dependencies]
-composefs = { version = "0.2.0", path = "crates/composefs", default-features = false }
-composefs-oci = { version = "0.2.0", path = "crates/composefs-oci", default-features = false }
-composefs-boot = { version = "0.2.0", path = "crates/composefs-boot", default-features = false }
+composefs = { version = "0.3.0", path = "crates/composefs", default-features = false }
+composefs-oci = { version = "0.3.0", path = "crates/composefs-oci", default-features = false }
+composefs-boot = { version = "0.3.0", path = "crates/composefs-boot", default-features = false }
 
 [profile.dev.package.sha2]
 # this is *really* slow otherwise
