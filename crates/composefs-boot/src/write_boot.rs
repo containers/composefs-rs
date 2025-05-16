@@ -63,32 +63,64 @@ pub fn write_t2_simple<ObjectID: FsVerityHashValue>(
     Ok(())
 }
 
+/// Writes boot entry to the boot partition
+///
+/// # Arguments
+///
+/// * repo           - The composefs repository
+/// * entry          - Boot entry variant to be written
+/// * root_id        - The content hash of the generated EROFS image id
+/// * boot_partition - Path to the boot partition/directory
+/// * boot_subdir    - If `Some(path)`, the path is prepended to `initrd` and `linux` keys in the BLS entry
+///
+/// For example, if `boot_subdir = Some("/boot/1")` and `boot_partition = "/boot"`,
+/// the BLS entry will contain
+///
+/// ```text
+/// linux /boot/1/<entry_id>/linux
+/// initrd /boot/1/<entry_id>/initrd
+/// ```
+///
+/// If `boot_subdir = None` and `boot_partition = "/boot"`, the BLS entry will contain
+///
+/// ```text
+/// linux /<entry_id>/linux
+/// initrd /<entry_id>/initrd
+/// ```
+///
+/// * entry_id       - In case of a BLS entry, the name of file to be generated in `loader/entries`
+/// * cmdline_extra  - Extra kernel command line arguments
+///
 pub fn write_boot_simple<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     entry: BootEntry<ObjectID>,
     root_id: &ObjectID,
-    bootdir: &Path,
+    boot_partition: &Path,
+    boot_subdir: Option<&str>,
     entry_id: Option<&str>,
     cmdline_extra: &[&str],
 ) -> Result<()> {
     match entry {
         BootEntry::Type1(mut t1) => {
             if let Some(name) = entry_id {
-                t1.relocate(name);
+                t1.relocate(boot_subdir, name)?;
             }
-            write_t1_simple(t1, bootdir, root_id, cmdline_extra, repo)?;
+            write_t1_simple(t1, boot_partition, root_id, cmdline_extra, repo)?;
         }
         BootEntry::Type2(mut t2) => {
             if let Some(name) = entry_id {
                 t2.rename(name);
             }
             ensure!(cmdline_extra.is_empty(), "Can't add --cmdline args to UKIs");
-            write_t2_simple(t2, bootdir, root_id, repo)?;
+            write_t2_simple(t2, boot_partition, root_id, repo)?;
         }
         BootEntry::UsrLibModulesUki(_entry) => todo!(),
         BootEntry::UsrLibModulesVmLinuz(entry) => {
-            let t1 = entry.into_type1(entry_id);
-            write_t1_simple(t1, bootdir, root_id, cmdline_extra, repo)?;
+            let mut t1 = entry.into_type1(entry_id);
+            if let Some(name) = entry_id {
+                t1.relocate(boot_subdir, name)?;
+            }
+            write_t1_simple(t1, boot_partition, root_id, cmdline_extra, repo)?;
         }
     };
 

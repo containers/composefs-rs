@@ -279,6 +279,7 @@ async fn main() -> Result<()> {
                     entry,
                     &id,
                     bootdir,
+                    None,
                     entry_id.as_deref(),
                     &cmdline_refs,
                 )?;
