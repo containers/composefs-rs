@@ -235,11 +235,11 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
 
 /// Pull the target image, and add the provided tag. If this is a mountable
 /// image (i.e. not an artifact), it is *not* unpacked by default.
-pub async fn pull(
-    repo: &Arc<Repository<impl FsVerityHashValue>>,
+pub async fn pull<ObjectID: FsVerityHashValue>(
+    repo: &Arc<Repository<ObjectID>>,
     imgref: &str,
     reference: Option<&str>,
-) -> Result<(Sha256Digest, impl FsVerityHashValue)> {
+) -> Result<(Sha256Digest, ObjectID)> {
     let op = Arc::new(ImageOp::new(repo, imgref).await?);
     let (sha256, id) = op
         .pull()
