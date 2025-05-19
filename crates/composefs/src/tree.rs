@@ -388,6 +388,26 @@ impl<ObjectID: FsVerityHashValue> Directory<ObjectID> {
         self.entries.remove(filename);
     }
 
+    /// Does a directory lookup on the given filename, returning the Inode if it exists.
+    ///
+    /// # Arguments
+    ///
+    ///  * `filename`: the filename in the current directory.  If you need to support full
+    ///    pathnames then you should call `Directory::split()` first.
+    pub fn lookup(&self, filename: &OsStr) -> Option<&Inode<ObjectID>> {
+        self.entries.get(filename)
+    }
+
+    /// Removes an item from the directory, if it exists, returning the Inode value.
+    ///
+    /// # Arguments
+    ///
+    ///  * `filename`: the filename in the current directory.  If you need to support full
+    ///    pathnames then you should call `Directory::split_mut()` first.
+    pub fn pop(&mut self, filename: &OsStr) -> Option<Inode<ObjectID>> {
+        self.entries.remove(filename)
+    }
+
     /// Removes all content from this directory, making the directory empty.  The `stat` data
     /// remains unmodified.
     pub fn clear(&mut self) {
