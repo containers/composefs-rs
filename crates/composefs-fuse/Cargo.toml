@@ -1,0 +1,18 @@
+[package]
+name = "composefs-fuse"
+description = "FUSE backend for composefs"
+keywords = ["composefs", "fuse"]
+
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow = { version = "1.0.98", default-features = false }
+composefs = { workspace = true }
+fuser = { version = "0.15.1", default-features = false, features = ["abi-7-31"] }
+log = { version = "0.4.8", default-features = false }
+rustix = { version = "1.0.0", default-features = false, features = ["fs", "mount"] }
