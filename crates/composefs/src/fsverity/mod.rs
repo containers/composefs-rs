@@ -30,6 +30,8 @@ pub enum EnableVerityError {
     FilesystemNotSupported,
     #[error("fs-verity is already enabled on file")]
     AlreadyEnabled,
+    #[error("File is opened for writing")]
+    FileOpenedForWrite,
 }
 
 /// A verity comparison failed.
