@@ -76,7 +76,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         let path = path.as_ref();
 
         // O_PATH isn't enough because flock()
-        let repository = openat(dirfd, path, OFlags::RDONLY, Mode::empty())
+        let repository = openat(dirfd, path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
             .with_context(|| format!("Cannot open composefs repository at {}", path.display()))?;
 
         flock(&repository, FlockOperation::LockShared)
@@ -144,7 +144,11 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         fdatasync(&file)?;
 
         // We can't enable verity with an open writable fd, so re-open and close the old one.
-        let ro_fd = open(proc_self_fd(&file), OFlags::RDONLY, Mode::empty())?;
+        let ro_fd = open(
+            proc_self_fd(&file),
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
         drop(file);
 
         enable_verity::<ObjectID>(&ro_fd).context("Enabling verity digest")?;
