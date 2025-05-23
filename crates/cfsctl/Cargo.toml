@@ -12,6 +12,7 @@ version.workspace = true
 
 [features]
 default = ['pre-6.15', 'oci']
+http = ['composefs-http']
 oci = ['composefs-oci']
 rhel9 = ['composefs/rhel9']
 'pre-6.15' = ['composefs/pre-6.15']
@@ -22,6 +23,7 @@ clap = { version = "4.0.1", default-features = false, features = ["std", "help",
 composefs = { workspace = true }
 composefs-boot = { workspace = true }
 composefs-oci = { workspace = true, optional = true }
+composefs-http = { workspace = true, optional = true }
 env_logger = { version = "0.11.0", default-features = false }
 hex = { version = "0.4.0", default-features = false }
 rustix = { version = "1.0.0", default-features = false, features = ["fs", "process"] }

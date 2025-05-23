@@ -19,5 +19,6 @@ jobs:
       - run: cargo publish -p composefs-oci
       - run: cargo publish -p composefs-boot
       - run: cargo publish -p composefs-fuse
+      - run: cargo publish -p composefs-http
       - run: cargo publish -p cfsctl
       - run: cargo publish -p composefs-setup-root
