@@ -14,10 +14,11 @@ git clone -b repart-verity https://github.com/allisonkarlitskaya/systemd
 	cp _build/src/shared/*.so "${install_path}/src/shared"
 )
 
-git clone -b verity https://github.com/allisonkarlitskaya/e2fsprogs
+git clone https://github.com/tytso/e2fsprogs
 (
 	cd e2fsprogs
-	./configure
+        git checkout dd0c4efa173203484f0cd612f97eb19181240a33
+	./configure --disable-fuse2fs
 	make -j$(nproc)
 	cp misc/mke2fs "${install_path}/mkfs.ext4"
 )
