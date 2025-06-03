@@ -1,3 +1,4 @@
+pub mod client;
 pub mod image;
 pub mod skopeo;
 pub mod tar;
@@ -62,7 +63,16 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
     imgref: &str,
     reference: Option<&str>,
 ) -> Result<(Sha256Digest, ObjectID)> {
-    skopeo::pull(repo, imgref, reference).await
+    if imgref.starts_with('.') || imgref.starts_with('/') {
+        // Reserved for future oci-dir backend: eg. /abs/path, ./rel/path, ../parent/path
+        bail!("Invalid reference format");
+    } else if Some(':') == imgref.chars().filter(char::is_ascii_punctuation).next() {
+        // If the first punctuation is ':' then this is a skopeo reference (`transport:...`)
+        skopeo::pull(repo, imgref, reference).await
+    } else {
+        // Otherwise treat it as an oci-client reference (like quay.io/fedora/fedora-bootc:42)
+        client::PullOp::pull(imgref.try_into()?, repo.clone()).await
+    }
 }
 
 pub fn open_config<ObjectID: FsVerityHashValue>(
