@@ -13,15 +13,22 @@ version.workspace = true
 [dependencies]
 anyhow = { version = "1.0.87", default-features = false }
 async-compression = { version = "0.4.0", default-features = false, features = ["tokio", "zstd", "gzip"] }
+async-stream = "0.3.6"
+bytes = "1.10.1"
 composefs = { workspace = true }
 containers-image-proxy = { version = "0.7.1", default-features = false }
+futures = "0.3.31"
 hex = { version = "0.4.0", default-features = false }
 indicatif = { version = "0.17.0", default-features = false, features = ["tokio"] }
+oci-client = "0.15.0"
 oci-spec = { version = "0.7.0", default-features = false }
 rustix = { version = "1.0.0", features = ["fs"] }
 sha2 = { version = "0.10.1", default-features = false }
 tar = { version = "0.4.38", default-features = false }
 tokio = { version = "1.24.2", features = ["rt-multi-thread"] }
+tokio-util = "0.7.15"
+zstd = "0.13.3"
+zstd-chunked = "0.2.0"
 
 [dev-dependencies]
 similar-asserts = "1.7.0"
