@@ -21,7 +21,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     fsverity::{
-        compute_verity, enable_verity, ensure_verity_equal, measure_verity, FsVerityHashValue,
+        compute_verity, enable_verity, ensure_verity_equal, measure_verity, CompareVerityError,
+        EnableVerityError, FsVerityHashValue, MeasureVerityError,
     },
     mount::{composefs_fsmount, mount_at},
     splitstream::{DigestMap, SplitStreamReader, SplitStreamWriter},
@@ -57,6 +58,7 @@ fn ensure_dir_and_openat(dirfd: impl AsFd, filename: &str, flags: OFlags) -> Err
 pub struct Repository<ObjectID: FsVerityHashValue> {
     repository: OwnedFd,
     objects: OnceCell<OwnedFd>,
+    insecure: bool,
     _data: std::marker::PhantomData<ObjectID>,
 }
 
@@ -85,6 +87,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(Self {
             repository,
             objects: OnceCell::new(),
+            insecure: false,
             _data: std::marker::PhantomData,
         })
     }
@@ -127,7 +130,23 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             Ok(fd) => {
                 // measure the existing file to ensure that it's correct
                 // TODO: try to replace file if it's broken?
-                ensure_verity_equal(fd, &id)?;
+                match ensure_verity_equal(&fd, &id) {
+                    Ok(()) => {}
+                    Err(CompareVerityError::Measure(MeasureVerityError::VerityMissing))
+                        if self.insecure =>
+                    {
+                        match enable_verity::<ObjectID>(&fd) {
+                            Ok(()) => {
+                                ensure_verity_equal(&fd, &id)?;
+                            }
+                            Err(other) => Err(other)?,
+                        }
+                    }
+                    Err(CompareVerityError::Measure(
+                        MeasureVerityError::FilesystemNotSupported,
+                    )) if self.insecure => {}
+                    Err(other) => Err(other)?,
+                }
                 return Ok(id);
             }
             Err(Errno::NOENT) => {
@@ -151,8 +170,17 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         )?;
         drop(file);
 
-        enable_verity::<ObjectID>(&ro_fd).context("Enabling verity digest")?;
-        ensure_verity_equal(&ro_fd, &id).context("Double-checking verity digest")?;
+        match enable_verity::<ObjectID>(&ro_fd) {
+            Ok(()) => match ensure_verity_equal(&ro_fd, &id) {
+                Ok(()) => {}
+                Err(CompareVerityError::Measure(
+                    MeasureVerityError::VerityMissing | MeasureVerityError::FilesystemNotSupported,
+                )) if self.insecure => {}
+                Err(other) => Err(other).context("Double-checking verity digest")?,
+            },
+            Err(EnableVerityError::FilesystemNotSupported) if self.insecure => {}
+            Err(other) => Err(other).context("Enabling verity digest")?,
+        }
 
         match linkat(
             CWD,
@@ -175,8 +203,19 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
     fn open_with_verity(&self, filename: &str, expected_verity: &ObjectID) -> Result<OwnedFd> {
         let fd = self.openat(filename, OFlags::RDONLY)?;
-        ensure_verity_equal(&fd, expected_verity)?;
+        match ensure_verity_equal(&fd, expected_verity) {
+            Ok(()) => {}
+            Err(CompareVerityError::Measure(
+                MeasureVerityError::VerityMissing | MeasureVerityError::FilesystemNotSupported,
+            )) if self.insecure => {}
+            Err(other) => Err(other)?,
+        }
         Ok(fd)
+    }
+
+    pub fn set_insecure(&mut self, insecure: bool) -> &mut Self {
+        self.insecure = insecure;
+        self
     }
 
     /// Creates a SplitStreamWriter for writing a split stream.
@@ -220,9 +259,18 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
     /// Basically the same as has_stream() except that it performs expensive verification
     pub fn check_stream(&self, sha256: &Sha256Digest) -> Result<Option<ObjectID>> {
-        match self.openat(&format!("streams/{}", hex::encode(sha256)), OFlags::RDONLY) {
+        let stream_path = format!("streams/{}", hex::encode(sha256));
+        match self.openat(&stream_path, OFlags::RDONLY) {
             Ok(stream) => {
-                let measured_verity: ObjectID = measure_verity(&stream)?;
+                let path = readlinkat(&self.repository, stream_path, [])?;
+                let measured_verity = match measure_verity(&stream) {
+                    Ok(found) => found,
+                    Err(
+                        MeasureVerityError::VerityMissing
+                        | MeasureVerityError::FilesystemNotSupported,
+                    ) if self.insecure => FsVerityHashValue::from_object_pathname(path.to_bytes())?,
+                    Err(other) => Err(other)?,
+                };
                 let mut context = Sha256::new();
                 let mut split_stream = SplitStreamReader::new(File::from(stream))?;
 
@@ -383,20 +431,36 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         self.write_image(Some(name), &data)
     }
 
-    fn open_image(&self, name: &str) -> Result<OwnedFd> {
+    /// Returns the fd of the image and whether or not verity should be
+    /// enabled when mounting it.
+    fn open_image(&self, name: &str) -> Result<(OwnedFd, bool)> {
         let image = self.openat(&format!("images/{name}"), OFlags::RDONLY)?;
 
-        if !name.contains("/") {
-            // A name with no slashes in it is taken to be a sha256 fs-verity digest
-            ensure_verity_equal(&image, &ObjectID::from_hex(name)?)?;
+        if name.contains("/") {
+            return Ok((image, true));
         }
 
-        Ok(image)
+        // A name with no slashes in it is taken to be a sha256 fs-verity digest
+        match measure_verity::<ObjectID>(&image) {
+            Ok(found) if found == FsVerityHashValue::from_hex(name)? => Ok((image, true)),
+            Ok(_) => bail!("fs-verity content mismatch"),
+            Err(MeasureVerityError::VerityMissing | MeasureVerityError::FilesystemNotSupported)
+                if self.insecure =>
+            {
+                Ok((image, false))
+            }
+            Err(other) => Err(other)?,
+        }
     }
 
     pub fn mount(&self, name: &str) -> Result<OwnedFd> {
-        let image = self.open_image(name)?;
-        Ok(composefs_fsmount(image, name, self.objects_dir()?, true)?)
+        let (image, enable_verity) = self.open_image(name)?;
+        Ok(composefs_fsmount(
+            image,
+            name,
+            self.objects_dir()?,
+            enable_verity,
+        )?)
     }
 
     pub fn mount_at(&self, name: &str, mountpoint: impl AsRef<Path>) -> Result<()> {
@@ -525,7 +589,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     }
 
     pub fn objects_for_image(&self, name: &str) -> Result<HashSet<ObjectID>> {
-        let image = self.open_image(name)?;
+        let (image, _) = self.open_image(name)?;
         let mut data = vec![];
         std::fs::File::from(image).read_to_end(&mut data)?;
         Ok(crate::erofs::reader::collect_objects(&data)?)
