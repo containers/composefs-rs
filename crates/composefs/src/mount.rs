@@ -78,14 +78,21 @@ pub fn erofs_mount(image: OwnedFd) -> Result<OwnedFd> {
     )?)
 }
 
-pub fn composefs_fsmount(image: OwnedFd, name: &str, basedir: impl AsFd) -> Result<OwnedFd> {
+pub fn composefs_fsmount(
+    image: OwnedFd,
+    name: &str,
+    basedir: impl AsFd,
+    enable_verity: bool,
+) -> Result<OwnedFd> {
     let erofs_mnt = prepare_mount(erofs_mount(image)?)?;
 
     let overlayfs = FsHandle::open("overlay")?;
     fsconfig_set_string(overlayfs.as_fd(), "source", format!("composefs:{name}"))?;
     fsconfig_set_string(overlayfs.as_fd(), "metacopy", "on")?;
     fsconfig_set_string(overlayfs.as_fd(), "redirect_dir", "on")?;
-    fsconfig_set_string(overlayfs.as_fd(), "verity", "require")?;
+    if enable_verity {
+        fsconfig_set_string(overlayfs.as_fd(), "verity", "require")?;
+    }
     overlayfs_set_lower_and_data_fds(&overlayfs, &erofs_mnt, Some(&basedir))?;
     fsconfig_create(overlayfs.as_fd())?;
 
@@ -101,7 +108,8 @@ pub fn mount_composefs_at(
     name: &str,
     basedir: impl AsFd,
     mountpoint: impl AsRef<Path>,
+    enable_verity: bool,
 ) -> Result<()> {
-    let mnt = composefs_fsmount(image, name, basedir)?;
+    let mnt = composefs_fsmount(image, name, basedir, enable_verity)?;
     Ok(mount_at(mnt, CWD, &canonicalize(mountpoint)?)?)
 }
