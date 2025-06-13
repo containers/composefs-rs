@@ -6,7 +6,7 @@ use std::{
     rc::Rc,
 };
 
-use log::debug;
+use log::trace;
 use xxhash_rust::xxh32::xxh32;
 use zerocopy::{Immutable, IntoBytes};
 
@@ -130,18 +130,18 @@ impl InodeXAttrs {
 
     fn write(&self, output: &mut impl Output) {
         if self.filter != 0 {
-            debug!("  write xattrs block");
+            trace!("  write xattrs block");
             output.write_struct(format::InodeXAttrHeader {
                 name_filter: (!self.filter).into(),
                 shared_count: self.shared.len() as u8,
                 ..Default::default()
             });
             for idx in &self.shared {
-                debug!("    shared {} @{}", idx, output.len());
+                trace!("    shared {} @{}", idx, output.len());
                 output.write(&output.get_xattr(*idx).to_le_bytes());
             }
             for attr in &self.local {
-                debug!("    local @{}", output.len());
+                trace!("    local @{}", output.len());
                 attr.write(output);
             }
         }
@@ -157,7 +157,7 @@ impl<'a> Directory<'a> {
         let mut n_bytes = 0;
         let mut nlink = 0;
 
-        debug!("Directory with {} items", entries.len());
+        trace!("Directory with {} items", entries.len());
 
         // The content of the directory is fixed at this point so we may as well split it into
         // blocks.  This lets us avoid measuring and re-measuring.
@@ -165,7 +165,7 @@ impl<'a> Directory<'a> {
             let entry_size = size_of::<format::DirectoryEntryHeader>() + entry.name.len();
             assert!(entry_size <= 4096);
 
-            debug!("    {:?}", entry.file_type);
+            trace!("    {:?}", entry.file_type);
 
             if matches!(entry.file_type, format::FileType::Directory) {
                 nlink += 1;
@@ -176,7 +176,7 @@ impl<'a> Directory<'a> {
                 rest.push(entry);
             } else {
                 // It won't fit, so we need to store the existing entries in a block.
-                debug!("    block {}", rest.len());
+                trace!("    block {}", rest.len());
                 blocks.push(rest.into_boxed_slice());
 
                 // Start over
@@ -192,7 +192,7 @@ impl<'a> Directory<'a> {
             n_bytes = 0;
         }
 
-        debug!(
+        trace!(
             "  blocks {} inline {} inline_size {n_bytes}",
             blocks.len(),
             rest.len()
@@ -208,11 +208,11 @@ impl<'a> Directory<'a> {
     }
 
     fn write_block(&self, output: &mut impl Output, block: &[DirEnt]) {
-        debug!("    write dir block {} @{}", block.len(), output.len());
+        trace!("    write dir block {} @{}", block.len(), output.len());
         let mut nameofs = size_of::<format::DirectoryEntryHeader>() * block.len();
 
         for entry in block {
-            debug!(
+            trace!(
                 "      entry {:?} name {} @{}",
                 entry.file_type,
                 nameofs,
@@ -228,13 +228,13 @@ impl<'a> Directory<'a> {
         }
 
         for entry in block {
-            debug!("      name @{}", output.len());
+            trace!("      name @{}", output.len());
             output.write(entry.name.as_bytes());
         }
     }
 
     fn write_inline(&self, output: &mut impl Output) {
-        debug!(
+        trace!(
             "  write inline len {} expected size {} of {}",
             self.inline.len(),
             self.size % 4096,
@@ -338,7 +338,7 @@ impl<ObjectID: FsVerityHashValue> Inode<'_, ObjectID> {
                 // The easiest thing to do is to add padding so that the inline data starts close
                 // to the start of a fresh block boundary, while ensuring inode alignment.
                 let pad = vec![0; 4096 - end_of_metadata % 4096];
-                debug!("added pad {}", pad.len());
+                trace!("added pad {}", pad.len());
                 output.write(&pad);
                 output.pad(32);
             }
@@ -346,7 +346,7 @@ impl<ObjectID: FsVerityHashValue> Inode<'_, ObjectID> {
 
         let format = format::InodeLayout::Extended | layout;
 
-        debug!(
+        trace!(
             "write inode {idx} nid {} {:?} {:?} xattrsize{xattr_size} icount{} inline{} @{}",
             output.len() / 32,
             format,
@@ -662,7 +662,7 @@ impl Output for FirstPass {
         }
         assert_eq!(self.layout.offset_types.len(), offset_type as usize + 1);
 
-        debug!(
+        trace!(
             "{:?} #{} @{}",
             offset_type,
             self.layout.offsets.len() - self.layout.offset_types[offset_type as usize],
