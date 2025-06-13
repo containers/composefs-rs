@@ -396,7 +396,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
     pub fn mount(&self, name: &str) -> Result<OwnedFd> {
         let image = self.open_image(name)?;
-        Ok(composefs_fsmount(image, name, self.objects_dir()?)?)
+        Ok(composefs_fsmount(image, name, self.objects_dir()?, true)?)
     }
 
     pub fn mount_at(&self, name: &str, mountpoint: impl AsRef<Path>) -> Result<()> {
