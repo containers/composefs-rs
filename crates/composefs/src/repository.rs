@@ -24,7 +24,7 @@ use crate::{
         compute_verity, enable_verity, ensure_verity_equal, measure_verity, FsVerityHashValue,
         MeasureVerityError,
     },
-    mount::mount_composefs_at,
+    mount::{composefs_fsmount, mount_composefs_at},
     splitstream::{DigestMap, SplitStreamReader, SplitStreamWriter},
     util::{proc_self_fd, Sha256Digest},
 };
@@ -416,15 +416,25 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             Err(other) => Err(other)?,
         }
     }
+
+    pub fn mount(&self, name: &str) -> Result<OwnedFd> {
+        let (image, enable_verity) = self.open_image(name)?;
+        Ok(composefs_fsmount(
+            image,
+            name,
+            self.objects_dir()?,
+            enable_verity,
+        )?)
     }
 
-    pub fn mount(&self, name: &str, mountpoint: &str) -> Result<()> {
-        let image = self.open_image(name)?;
+    pub fn mount_at(&self, name: &str, mountpoint: &str) -> Result<()> {
+        let (image, enable_verity) = self.open_image(name)?;
         Ok(mount_composefs_at(
             image,
             name,
             self.objects_dir()?,
             mountpoint,
+            enable_verity,
         )?)
     }
 
