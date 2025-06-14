@@ -1,3 +1,6 @@
+use anyhow::{Context, Result};
+use composefs::fsverity::FsVerityHashValue;
+
 /// Perform kernel command line splitting.
 ///
 /// The way this works in the kernel is to split on whitespace with an extremely simple quoting
@@ -23,4 +26,15 @@ pub(crate) fn split_cmdline(cmdline: &str) -> impl Iterator<Item = &str> {
 /// but the value of the searched entry is returned verbatim (ie: not dequoted).
 pub fn get_cmdline_value<'a>(cmdline: &'a str, prefix: &str) -> Option<&'a str> {
     split_cmdline(cmdline).find_map(|item| item.strip_prefix(prefix))
+}
+
+pub fn get_cmdline_composefs<ObjectID: FsVerityHashValue>(
+    cmdline: &str,
+) -> Result<(ObjectID, bool)> {
+    let id = get_cmdline_value(cmdline, "composefs=").context("composefs= value not found")?;
+    if let Some(stripped) = id.strip_prefix('?') {
+        Ok((ObjectID::from_hex(stripped)?, true))
+    } else {
+        Ok((ObjectID::from_hex(id)?, false))
+    }
 }

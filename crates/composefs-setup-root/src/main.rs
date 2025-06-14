@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use clap::Parser;
 use rustix::{
     fs::{major, minor, mkdirat, openat, stat, symlink, Mode, OFlags, CWD},
@@ -23,7 +23,7 @@ use composefs::{
     mountcompat::{overlayfs_set_fd, overlayfs_set_lower_and_data_fds, prepare_mount},
     repository::Repository,
 };
-use composefs_boot::cmdline::get_cmdline_value;
+use composefs_boot::cmdline::get_cmdline_composefs;
 
 // Config file
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -164,9 +164,10 @@ fn open_root_fs(path: &Path) -> Result<OwnedFd> {
     Ok(rootfs)
 }
 
-fn mount_composefs_image(sysroot: &OwnedFd, name: &str) -> Result<OwnedFd> {
-    let repo = Repository::<Sha256HashValue>::open_path(sysroot, "composefs")?;
-    repo.mount(name)
+fn mount_composefs_image(sysroot: &OwnedFd, name: &str, insecure: bool) -> Result<OwnedFd> {
+    let mut repo = Repository::<Sha256HashValue>::open_path(sysroot, "composefs")?;
+    repo.set_insecure(insecure);
+    repo.mount(name).context("Failed to mount composefs image")
 }
 
 fn mount_subdir(
@@ -196,15 +197,6 @@ fn mount_subdir(
     }
 }
 
-// Implementation
-fn parse_composefs_cmdline<H: FsVerityHashValue>(cmdline: &str) -> Result<H> {
-    let Some(digest) = get_cmdline_value(cmdline, "composefs=") else {
-        bail!("Unable to find composefs= cmdline parameter");
-    };
-
-    H::from_hex(digest).context("Parsing composefs=")
-}
-
 fn gpt_workaround() -> Result<()> {
     // https://github.com/systemd/systemd/issues/35017
     let rootdev = stat("/dev/gpt-auto-root")?;
@@ -231,11 +223,11 @@ fn setup_root(args: Args) -> Result<()> {
         Some(cmdline) => cmdline,
         None => &std::fs::read_to_string("/proc/cmdline")?,
     };
-    let image = parse_composefs_cmdline::<Sha256HashValue>(cmdline)?.to_hex();
+    let (image, insecure) = get_cmdline_composefs::<Sha256HashValue>(cmdline)?;
 
     let new_root = match args.root_fs {
         Some(path) => open_root_fs(&path).context("Failed to clone specified root fs")?,
-        None => mount_composefs_image(&sysroot, &image)?,
+        None => mount_composefs_image(&sysroot, &image.to_hex(), insecure)?,
     };
 
     // we need to clone this before the next step to make sure we get the old one
@@ -258,7 +250,7 @@ fn setup_root(args: Args) -> Result<()> {
     }
 
     // etc + var
-    let state = open_dir(open_dir(&sysroot, "state")?, &image)?;
+    let state = open_dir(open_dir(&sysroot, "state")?, image.to_hex())?;
     mount_subdir(&new_root, &state, "etc", config.etc, MountType::Overlay)?;
     mount_subdir(&new_root, &state, "var", config.var, MountType::Bind)?;
 
@@ -285,12 +277,11 @@ mod test {
     fn test_parse() {
         let failing = ["", "foo", "composefs", "composefs=foo"];
         for case in failing {
-            assert!(parse_composefs_cmdline::<Sha256HashValue>(case).is_err());
+            assert!(get_cmdline_composefs::<Sha256HashValue>(case).is_err());
         }
         let digest = "8b7df143d91c716ecfa5fc1730022f6b421b05cedee8fd52b1fc65a96030ad52";
-        similar_asserts::assert_eq!(
-            parse_composefs_cmdline::<Sha256HashValue>(&format!("composefs={digest}")).unwrap(),
-            Sha256HashValue::from_hex(digest).unwrap()
-        );
+        let cmdline = &format!("composefs={digest}");
+        let (digest_cmdline, _) = get_cmdline_composefs::<Sha256HashValue>(cmdline).unwrap();
+        similar_asserts::assert_eq!(digest_cmdline, Sha256HashValue::from_hex(digest).unwrap());
     }
 }
