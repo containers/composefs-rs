@@ -27,6 +27,12 @@ pub struct App {
     #[clap(long, group = "repopath")]
     system: bool,
 
+    /// Sets the repository to insecure before running any operation and
+    /// prepend '?' to the composefs kernel command line when writing
+    /// boot entry.
+    #[clap(long)]
+    insecure: bool,
+
     #[clap(subcommand)]
     cmd: Command,
 }
@@ -160,7 +166,7 @@ async fn main() -> Result<()> {
 
     let args = App::parse();
 
-    let repo: Repository<Sha256HashValue> = (if let Some(path) = &args.repo {
+    let mut repo: Repository<Sha256HashValue> = (if let Some(path) = &args.repo {
         Repository::open_path(CWD, path)
     } else if args.system {
         Repository::open_system()
@@ -171,6 +177,8 @@ async fn main() -> Result<()> {
     } else {
         Repository::open_user()
     })?;
+
+    repo.set_insecure(args.insecure);
 
     match args.cmd {
         Command::Transaction => {
