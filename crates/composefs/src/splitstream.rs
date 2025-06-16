@@ -94,7 +94,8 @@ pub struct SplitStreamWriter<ObjectID: FsVerityHashValue> {
     total_size: u64,
     writer: Encoder<'static, Vec<u8>>,
     pub content_type: u64,
-    pub sha256: Option<(Sha256, Sha256Digest)>,
+    pub sha256: Option<Sha256>,
+    pub expected_sha256: Option<Sha256Digest>,
 }
 
 impl<ObjectID: FsVerityHashValue> std::fmt::Debug for SplitStreamWriter<ObjectID> {
@@ -103,6 +104,7 @@ impl<ObjectID: FsVerityHashValue> std::fmt::Debug for SplitStreamWriter<ObjectID
         f.debug_struct("SplitStreamWriter")
             .field("repo", &self.repo)
             .field("inline_content", &self.inline_content)
+            .field("expected_sha256", &self.expected_sha256)
             .field("sha256", &self.sha256)
             .finish()
     }
@@ -112,7 +114,8 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
     pub fn new(
         repo: &Arc<Repository<ObjectID>>,
         content_type: u64,
-        sha256: Option<Sha256Digest>,
+        compute_sha256: bool,
+        expected_sha256: Option<Sha256Digest>,
     ) -> Self {
         // SAFETY: we surely can't get an error writing the header to a Vec<u8>
         let writer = Encoder::new(vec![], 0).unwrap();
@@ -125,7 +128,12 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
             total_size: 0,
             mappings: DigestMap::new(),
             writer,
-            sha256: sha256.map(|x| (Sha256::new(), x)),
+            sha256: if compute_sha256 || expected_sha256.is_some() {
+                Some(Sha256::new())
+            } else {
+                None
+            },
+            expected_sha256: expected_sha256,
         }
     }
 
@@ -174,7 +182,7 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
     /// really, "add inline content to the buffer"
     /// you need to call .flush_inline() later
     pub fn write_inline(&mut self, data: &[u8]) {
-        if let Some((ref mut sha256, ..)) = self.sha256 {
+        if let Some(ref mut sha256) = self.sha256 {
             sha256.update(data);
         }
         self.inline_content.extend(data);
@@ -192,7 +200,7 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
     }
 
     pub fn write_external(&mut self, data: &[u8], padding: Vec<u8>) -> Result<()> {
-        if let Some((ref mut sha256, ..)) = self.sha256 {
+        if let Some(ref mut sha256, ..) = self.sha256 {
             sha256.update(data);
             sha256.update(&padding);
         }
@@ -204,7 +212,7 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
     }
 
     pub async fn write_external_async(&mut self, data: Vec<u8>, padding: Vec<u8>) -> Result<()> {
-        if let Some((ref mut sha256, ..)) = self.sha256 {
+        if let Some(ref mut sha256, ..) = self.sha256 {
             sha256.update(&data);
             sha256.update(&padding);
         }
@@ -214,14 +222,20 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
         self.write_reference(&id, padding)
     }
 
-    pub fn done(mut self) -> Result<ObjectID> {
+    pub fn done(mut self) -> Result<(ObjectID, Option<Sha256Digest>)> {
         self.flush_inline(vec![])?;
 
-        if let Some((context, expected)) = self.sha256 {
-            if Into::<Sha256Digest>::into(context.finalize()) != expected {
-                bail!("Content doesn't have expected SHA256 hash value!");
+        let sha256_digest = if let Some(sha256) = self.sha256 {
+            let actual = Into::<Sha256Digest>::into(sha256.finalize());
+            if let Some(expected) = self.expected_sha256 {
+                if actual != expected {
+                    bail!("Content doesn't have expected SHA256 hash value!");
+                }
             }
-        }
+            Some(actual)
+        } else {
+            None
+        };
 
         let mut buf = vec![];
         let header = SplitstreamHeader {
@@ -248,7 +262,7 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
 
         buf.extend_from_slice(&self.writer.finish()?);
 
-        self.repo.ensure_object(&buf)
+        Ok((self.repo.ensure_object(&buf)?, sha256_digest))
     }
 }
 
