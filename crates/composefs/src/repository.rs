@@ -226,7 +226,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         content_type: u64,
         sha256: Option<Sha256Digest>,
     ) -> SplitStreamWriter<ObjectID> {
-        SplitStreamWriter::new(self, content_type, sha256)
+        SplitStreamWriter::new(self, content_type, false, sha256)
     }
 
     fn format_object_path(id: &ObjectID) -> String {
@@ -303,11 +303,11 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         writer: SplitStreamWriter<ObjectID>,
         reference: Option<&str>,
     ) -> Result<ObjectID> {
-        let Some((.., ref sha256)) = writer.sha256 else {
+        let Some(sha256) = writer.expected_sha256 else {
             bail!("Writer doesn't have sha256 enabled");
         };
         let stream_path = format!("streams/{}", hex::encode(sha256));
-        let object_id = writer.done()?;
+        let (object_id, _) = writer.done()?;
         let object_path = Self::format_object_path(&object_id);
         self.symlink(&stream_path, &object_path)?;
 
@@ -362,7 +362,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             None => {
                 let mut writer = self.create_stream(content_type, Some(*sha256));
                 callback(&mut writer)?;
-                let object_id = writer.done()?;
+                let (object_id, _) = writer.done()?;
 
                 let object_path = Self::format_object_path(&object_id);
                 self.symlink(&stream_path, &object_path)?;
