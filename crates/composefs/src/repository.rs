@@ -271,6 +271,12 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(object_id)
     }
 
+    pub fn has_named_stream(&self, name: &str) -> bool {
+        let stream_path = format!("streams/refs/{}", name);
+
+        readlinkat(&self.repository, &stream_path, []).is_ok()
+    }
+
     /// Assign the given name to a stream.  The stream must already exist.  After this operation it
     /// will be possible to refer to the stream by its new name 'refs/{name}'.
     pub fn name_stream(&self, sha256: Sha256Digest, name: &str) -> Result<()> {
