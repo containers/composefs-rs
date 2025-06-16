@@ -3,6 +3,7 @@ use std::{
     os::fd::{AsFd, AsRawFd},
 };
 
+use rustix::io::{Errno, Result as ErrnoResult};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Formats a string like "/proc/self/fd/3" for the given fd.  This can be used to work with kernel
@@ -95,6 +96,17 @@ pub fn parse_sha256(string: impl AsRef<str>) -> Result<Sha256Digest> {
     hex::decode_to_slice(string.as_ref(), &mut value)
         .map_err(|source| Error::new(ErrorKind::InvalidInput, source))?;
     Ok(value)
+}
+
+pub(crate) fn filter_errno<T>(
+    result: rustix::io::Result<T>,
+    ignored: Errno,
+) -> ErrnoResult<Option<T>> {
+    match result {
+        Ok(result) => Ok(Some(result)),
+        Err(err) if err == ignored => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 #[cfg(test)]
