@@ -14,10 +14,10 @@ version.workspace = true
 anyhow = { version = "1.0.87", default-features = false }
 async-compression = { version = "0.4.0", default-features = false, features = ["tokio", "zstd", "gzip"] }
 composefs = { workspace = true }
-containers-image-proxy = { version = "0.7.1", default-features = false }
+containers-image-proxy = { version = "0.8.0", default-features = false }
 hex = { version = "0.4.0", default-features = false }
 indicatif = { version = "0.17.0", default-features = false, features = ["tokio"] }
-oci-spec = { version = "0.7.0", default-features = false }
+oci-spec = { version = "0.8.0", default-features = false }
 rustix = { version = "1.0.0", features = ["fs"] }
 sha2 = { version = "0.10.1", default-features = false }
 tar = { version = "0.4.38", default-features = false }
