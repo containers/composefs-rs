@@ -7,6 +7,7 @@ use async_compression::tokio::bufread::{GzipDecoder, ZstdDecoder};
 use containers_image_proxy::{ImageProxy, ImageProxyConfig, OpenedImage};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use oci_spec::image::{Descriptor, ImageConfiguration, ImageManifest, MediaType};
+use rustix::process::geteuid;
 use tokio::{io::AsyncReadExt, sync::Semaphore};
 
 use composefs::{
@@ -25,7 +26,7 @@ struct ImageOp<ObjectID: FsVerityHashValue> {
 impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
     async fn new(repo: &Arc<Repository<ObjectID>>, imgref: &str) -> Result<Self> {
         // See https://github.com/containers/skopeo/issues/2563
-        let skopeo_cmd = if imgref.starts_with("containers-storage:") {
+        let skopeo_cmd = if imgref.starts_with("containers-storage:") && !geteuid().is_root() {
             let mut cmd = Command::new("podman");
             cmd.args(["unshare", "skopeo"]);
             Some(cmd)
