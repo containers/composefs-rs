@@ -24,7 +24,7 @@ use crate::{
         compute_verity, enable_verity, ensure_verity_equal, measure_verity, FsVerityHashValue,
     },
     mount::mount_composefs_at,
-    splitstream::{DigestMap, SplitStreamReader, SplitStreamWriter},
+    splitstream::{SplitStreamReader, SplitStreamWriter},
     util::{filter_errno, proc_self_fd, replace_symlinkat, Sha256Digest},
 };
 
@@ -185,9 +185,8 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     pub fn create_stream(
         self: &Arc<Self>,
         sha256: Option<Sha256Digest>,
-        maps: Option<DigestMap<ObjectID>>,
     ) -> SplitStreamWriter<ObjectID> {
-        SplitStreamWriter::new(self, maps, sha256)
+        SplitStreamWriter::new(self, sha256)
     }
 
     fn format_object_path(id: &ObjectID) -> String {
@@ -227,8 +226,8 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                 let mut split_stream = SplitStreamReader::new(File::from(stream))?;
 
                 // check the verity of all linked streams
-                for entry in &split_stream.refs.map {
-                    if self.check_stream(&entry.body)?.as_ref() != Some(&entry.verity) {
+                for (body, verity) in split_stream.iter_mappings() {
+                    if self.check_stream(body)?.as_ref() != Some(verity) {
                         bail!("reference mismatch");
                     }
                 }
@@ -305,7 +304,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         let object_id = match self.has_stream(sha256)? {
             Some(id) => id,
             None => {
-                let mut writer = self.create_stream(Some(*sha256), None);
+                let mut writer = self.create_stream(Some(*sha256));
                 callback(&mut writer)?;
                 let object_id = writer.done()?;
 

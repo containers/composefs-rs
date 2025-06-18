@@ -83,7 +83,7 @@ pub fn open_config<ObjectID: FsVerityHashValue>(
     };
     let mut stream = repo.open_stream(name, Some(id))?;
     let config = ImageConfiguration::from_reader(&mut stream)?;
-    Ok((config, stream.refs))
+    Ok((config, stream.get_mappings()))
 }
 
 fn hash(bytes: &[u8]) -> Sha256Digest {
@@ -121,7 +121,8 @@ pub fn write_config<ObjectID: FsVerityHashValue>(
     let json = config.to_string()?;
     let json_bytes = json.as_bytes();
     let sha256 = hash(json_bytes);
-    let mut stream = repo.create_stream(Some(sha256), Some(refs));
+    let mut stream = repo.create_stream(Some(sha256));
+    stream.add_sha256_mappings(refs);
     stream.write_inline(json_bytes);
     let id = repo.write_stream(stream, None)?;
     Ok((sha256, id))

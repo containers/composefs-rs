@@ -11,7 +11,7 @@ use rustix::process::geteuid;
 use tokio::{io::AsyncReadExt, sync::Semaphore};
 
 use composefs::{
-    fsverity::FsVerityHashValue, repository::Repository, splitstream::DigestMap, util::Sha256Digest,
+    fsverity::FsVerityHashValue, repository::Repository, util::Sha256Digest,
 };
 
 use crate::{sha256_from_descriptor, sha256_from_digest, tar::split_async, ContentAndVerity};
@@ -78,7 +78,7 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             self.progress
                 .println(format!("Fetching layer {}", hex::encode(layer_sha256)))?;
 
-            let mut splitstream = self.repo.create_stream(Some(layer_sha256), None);
+            let mut splitstream = self.repo.create_stream(Some(layer_sha256));
             match descriptor.media_type() {
                 MediaType::ImageLayer => {
                     split_async(progress, &mut splitstream).await?;
@@ -155,15 +155,15 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
                 entries.push((layer_sha256, future));
             }
 
-            // Collect the results.
-            let mut config_maps = DigestMap::new();
-            for (layer_sha256, future) in entries {
-                config_maps.insert(&layer_sha256, &future.await??);
-            }
-
             let mut splitstream = self
                 .repo
-                .create_stream(Some(config_sha256), Some(config_maps));
+                .create_stream(Some(config_sha256));
+
+            // Collect the results.
+            for (layer_sha256, future) in entries {
+                splitstream.add_sha256_mapping(&layer_sha256, &future.await??);
+            }
+
             splitstream.write_inline(&raw_config);
             let config_id = self.repo.write_stream(splitstream, None)?;
 

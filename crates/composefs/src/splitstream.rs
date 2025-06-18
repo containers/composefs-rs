@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Error, Result};
 use sha2::{Digest, Sha256};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use zstd::stream::{read::Decoder, write::Encoder};
@@ -19,8 +19,30 @@ use crate::{
     util::{read_exactish, Sha256Digest},
 };
 
+pub const SPLITSTREAM_MAGIC : [u8; 7] = [b'S', b'p', b'l', b't', b'S', b't', b'r'];
+
 #[derive(Debug, FromBytes, Immutable, IntoBytes, KnownLayout)]
 #[repr(C)]
+pub struct SplitstreamHeader {
+    pub magic: [u8; 7], // Contains SPLITSTREAM_MAGIC
+    pub algorithm: u8,
+    pub total_size: u64, // total size of inline chunks and external chunks
+    pub n_refs: u64,
+    pub n_mappings: u64,
+    // Followed by n_refs ObjectIDs, sorted
+    // Followed by n_mappings MappingEntry, sorted by body
+    // Followed by zstd compressed chunks
+}
+
+#[derive(Clone, Debug, FromBytes, Immutable, IntoBytes, KnownLayout)]
+#[repr(C)]
+pub struct MappingEntry {
+    pub body: Sha256Digest,
+    pub reference_idx: u64,
+}
+
+// These are used during construction before we know the final reference indexes
+#[derive(Debug)]
 pub struct DigestMapEntry<ObjectID: FsVerityHashValue> {
     pub body: Sha256Digest,
     pub verity: ObjectID,
@@ -65,7 +87,10 @@ impl<ObjectID: FsVerityHashValue> DigestMap<ObjectID> {
 
 pub struct SplitStreamWriter<ObjectID: FsVerityHashValue> {
     repo: Arc<Repository<ObjectID>>,
+    refs: Vec<ObjectID>,
+    mappings: DigestMap<ObjectID>,
     inline_content: Vec<u8>,
+    total_size: u64,
     writer: Encoder<'static, Vec<u8>>,
     pub sha256: Option<(Sha256, Sha256Digest)>,
 }
@@ -84,28 +109,38 @@ impl<ObjectID: FsVerityHashValue> std::fmt::Debug for SplitStreamWriter<ObjectID
 impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
     pub fn new(
         repo: &Arc<Repository<ObjectID>>,
-        refs: Option<DigestMap<ObjectID>>,
         sha256: Option<Sha256Digest>,
     ) -> Self {
         // SAFETY: we surely can't get an error writing the header to a Vec<u8>
-        let mut writer = Encoder::new(vec![], 0).unwrap();
-
-        match refs {
-            Some(DigestMap { map }) => {
-                writer.write_all(&(map.len() as u64).to_le_bytes()).unwrap();
-                writer.write_all(map.as_bytes()).unwrap();
-            }
-            None => {
-                writer.write_all(&0u64.to_le_bytes()).unwrap();
-            }
-        }
+        let writer = Encoder::new(vec![], 0).unwrap();
 
         Self {
             repo: Arc::clone(repo),
             inline_content: vec![],
+            refs: vec![],
+            total_size: 0,
+            mappings: DigestMap::new(),
             writer,
             sha256: sha256.map(|x| (Sha256::new(), x)),
         }
+    }
+
+    pub fn add_external_reference(&mut self, verity: &ObjectID) {
+        match self.refs.binary_search(verity) {
+            Ok(_) => {}, // Already added
+            Err(idx) => self.refs.insert(idx, verity.clone()),
+        }
+    }
+
+    pub fn add_sha256_mappings(&mut self, maps: DigestMap<ObjectID>)  {
+        for m in maps.map {
+            self.add_sha256_mapping(&m.body, &m.verity);
+        }
+    }
+
+    pub fn add_sha256_mapping(&mut self, digest: &Sha256Digest, verity: &ObjectID) {
+        self.add_external_reference(verity);
+        self.mappings.insert(digest, verity)
     }
 
     fn write_fragment(writer: &mut impl Write, size: usize, data: &[u8]) -> Result<()> {
@@ -121,6 +156,7 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
                 self.inline_content.len(),
                 &self.inline_content,
             )?;
+            self.total_size += self.inline_content.len() as u64;
             self.inline_content = new_value;
         }
         Ok(())
@@ -152,6 +188,9 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
             sha256.update(&padding);
         }
         let id = self.repo.ensure_object(data)?;
+
+        self.add_external_reference(&id);
+        self.total_size += data.len() as u64;
         self.write_reference(&id, padding)
     }
 
@@ -160,7 +199,9 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
             sha256.update(&data);
             sha256.update(&padding);
         }
+        self.total_size += data.len() as u64;
         let id = self.repo.ensure_object_async(data).await?;
+        self.add_external_reference(&id);
         self.write_reference(&id, padding)
     }
 
@@ -173,7 +214,31 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
             }
         }
 
-        self.repo.ensure_object(&self.writer.finish()?)
+        let mut buf = vec![];
+        let header = SplitstreamHeader {
+            magic: SPLITSTREAM_MAGIC,
+            algorithm:  ObjectID::ALGORITHM,
+            total_size: u64::to_le(self.total_size),
+            n_refs: u64::to_le(self.refs.len() as u64),
+            n_mappings: u64::to_le(self.mappings.map.len() as u64),
+        };
+        buf.extend_from_slice(header.as_bytes());
+
+        for ref_id in self.refs.iter() {
+            buf.extend_from_slice(ref_id.as_bytes());
+        }
+
+        for mapping in self.mappings.map {
+            let entry = MappingEntry {
+                body: mapping.body,
+                reference_idx: u64::to_le(self.refs.binary_search(&mapping.verity).unwrap() as u64),
+            };
+            buf.extend_from_slice(entry.as_bytes());
+        }
+
+        buf.extend_from_slice(&self.writer.finish()?);
+
+        self.repo.ensure_object(&buf)
     }
 }
 
@@ -186,8 +251,10 @@ pub enum SplitStreamData<ObjectID: FsVerityHashValue> {
 // utility class to help read splitstreams
 pub struct SplitStreamReader<R: Read, ObjectID: FsVerityHashValue> {
     decoder: Decoder<'static, BufReader<R>>,
-    pub refs: DigestMap<ObjectID>,
     inline_bytes: usize,
+    pub total_size: u64,
+    pub refs: Vec<ObjectID>,
+    mappings: Vec<MappingEntry>,
 }
 
 impl<R: Read, ObjectID: FsVerityHashValue> std::fmt::Debug for SplitStreamReader<R, ObjectID> {
@@ -226,27 +293,64 @@ enum ChunkType<ObjectID: FsVerityHashValue> {
 }
 
 impl<R: Read, ObjectID: FsVerityHashValue> SplitStreamReader<R, ObjectID> {
-    pub fn new(reader: R) -> Result<Self> {
-        let mut decoder = Decoder::new(reader)?;
+    pub fn new(mut reader: R) -> Result<Self> {
 
-        let n_map_entries = {
-            let mut buf = [0u8; 8];
-            decoder.read_exact(&mut buf)?;
-            u64::from_le_bytes(buf)
-        } as usize;
+        let header = SplitstreamHeader::read_from_io(&mut reader)
+            .map_err(|e| Error::msg(format!("Error reading splitstream header: {:?}", e)))?;
 
-        let mut refs = DigestMap::<ObjectID> {
-            map: Vec::with_capacity(n_map_entries),
-        };
-        for _ in 0..n_map_entries {
-            refs.map.push(DigestMapEntry::read_from_io(&mut decoder)?);
+        if header.magic != SPLITSTREAM_MAGIC {
+            bail!("Invalida splitstream header magic value");
         }
+
+        if header.algorithm != ObjectID::ALGORITHM {
+            bail!("Invalida splitstream algorithm type");
+        }
+
+        let total_size = u64::from_le(header.total_size);
+        let n_refs = usize::try_from(u64::from_le(header.n_refs))?;
+        let n_mappings = usize::try_from(u64::from_le(header.n_mappings))?;
+
+        let mut refs = Vec::<ObjectID>::new();
+        for _ in 0..n_refs {
+            let objid = ObjectID::read_from_io(&mut reader)
+                .map_err(|e| Error::msg(format!("Invalid refs array {:?}", e)))?;
+            refs.push(objid.clone());
+        }
+
+        let mut mappings = Vec::<MappingEntry>::new();
+        for _ in 0..n_mappings {
+            let mut m = MappingEntry::read_from_io(&mut reader)
+                .map_err(|e| Error::msg(format!("Invalid mappings array {:?}", e)))?;
+            m.reference_idx = u64::from_le(m.reference_idx);
+            if m.reference_idx >= n_refs as u64 {
+                bail!("Invalid mapping reference")
+            }
+            mappings.push(m.clone());
+        }
+
+        let decoder = Decoder::new(reader)?;
 
         Ok(Self {
             decoder,
-            refs,
             inline_bytes: 0,
+            total_size,
+            refs,
+            mappings,
         })
+    }
+
+    pub fn iter_mappings(&self) -> impl Iterator<Item = (&Sha256Digest, &ObjectID)> {
+        self.mappings.iter()
+            .map(|m| (&m.body, &self.refs[m.reference_idx as usize]))
+    }
+
+    pub fn get_mappings(&self) ->  DigestMap<ObjectID> {
+        let mut m = DigestMap::new();
+
+        for (body, verity) in self.iter_mappings() {
+            m.insert(body,verity);
+        }
+        m
     }
 
     fn ensure_chunk(
@@ -347,36 +451,22 @@ impl<R: Read, ObjectID: FsVerityHashValue> SplitStreamReader<R, ObjectID> {
     }
 
     pub fn get_object_refs(&mut self, mut callback: impl FnMut(&ObjectID)) -> Result<()> {
-        let mut buffer = vec![];
-
-        for entry in &self.refs.map {
-            callback(&entry.verity);
+        for entry in &self.refs {
+            callback(&entry);
         }
-
-        loop {
-            match self.ensure_chunk(true, true, 0)? {
-                ChunkType::Eof => break Ok(()),
-                ChunkType::Inline => {
-                    read_into_vec(&mut self.decoder, &mut buffer, self.inline_bytes)?;
-                    self.inline_bytes = 0;
-                }
-                ChunkType::External(ref id) => {
-                    callback(id);
-                }
-            }
-        }
+        Ok(())
     }
 
     pub fn get_stream_refs(&mut self, mut callback: impl FnMut(&Sha256Digest)) {
-        for entry in &self.refs.map {
+        for entry in &self.mappings {
             callback(&entry.body);
         }
     }
 
     pub fn lookup(&self, body: &Sha256Digest) -> Result<&ObjectID> {
-        match self.refs.lookup(body) {
-            Some(id) => Ok(id),
-            None => bail!("Reference is not found in splitstream"),
+        match self.mappings.binary_search_by_key(body, |e| e.body) {
+            Ok(idx) => Ok(&self.refs[self.mappings[idx].reference_idx as usize]),
+            Err(..) => bail!("Reference is not found in splitstream"),
         }
     }
 }
