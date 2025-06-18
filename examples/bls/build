@@ -56,6 +56,11 @@ podman build \
 BASE_ID="$(sed s/sha256:// tmp/base.iid)"
 
 ${CFSCTL} oci pull containers-storage:${BASE_ID}
+
+if [ "${FS_VERITY_MODE:-repart}" = "none" ]; then
+    CFSCTL="$CFSCTL --insecure"
+fi
+
 ${CFSCTL} oci prepare-boot "${BASE_ID}" --bootdir tmp/efi --cmdline console=ttyS0,115200 --entry-id=example --cmdline rw
 
 ../common/install-systemd-boot

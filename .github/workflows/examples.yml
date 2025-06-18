@@ -26,6 +26,8 @@ jobs:
           - { dir: 'uki', os: 'fedora' }
           - { dir: 'unified', os: 'fedora' }
           - { dir: 'unified-secureboot', os: 'fedora' }
+          - { dir: 'bls', os: 'arch', fsfmt: 'ext4', verity: 'none' }
+          - { dir: 'bls', os: 'arch', fsfmt: 'xfs', verity: 'none' }
       fail-fast: false
 
     steps:
@@ -71,4 +73,6 @@ jobs:
     - name: Run example tests
       run: |
         export PATH="${HOME}/bin:${PATH}"
+        export FS_FORMAT=${{ matrix.example.fsfmt }}
+        export FS_VERITY_MODE=${{ matrix.example.verity }}
         examples/test/run ${{ matrix.example.dir }} ${{ matrix.example.os }}
