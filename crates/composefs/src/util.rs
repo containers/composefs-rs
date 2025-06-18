@@ -1,9 +1,17 @@
+use rand::{distr::Alphanumeric, Rng};
 use std::{
     io::{Error, ErrorKind, Read, Result},
-    os::fd::{AsFd, AsRawFd},
+    os::{
+        fd::{AsFd, AsRawFd, OwnedFd},
+        unix::ffi::OsStrExt,
+    },
+    path::Path,
 };
 
-use rustix::io::{Errno, Result as ErrnoResult};
+use rustix::{
+    fs::{readlinkat, renameat, symlinkat, unlinkat, AtFlags},
+    io::{Errno, Result as ErrnoResult},
+};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Formats a string like "/proc/self/fd/3" for the given fd.  This can be used to work with kernel
@@ -107,6 +115,55 @@ pub(crate) fn filter_errno<T>(
         Err(err) if err == ignored => Ok(None),
         Err(err) => Err(err),
     }
+}
+
+fn generate_tmpname(prefix: &str) -> String {
+    let rand_string: String = rand::rng()
+        .sample_iter(&Alphanumeric)
+        .take(12)
+        .map(char::from)
+        .collect();
+    format!("{}{}", prefix, rand_string)
+}
+
+pub(crate) fn replace_symlinkat(
+    target: impl AsRef<Path>,
+    dirfd: &OwnedFd,
+    name: impl AsRef<Path>,
+) -> ErrnoResult<()> {
+    let name = name.as_ref();
+    let target = target.as_ref();
+
+    // Step 1: try to create the symlink
+    if filter_errno(symlinkat(target, dirfd, name), Errno::EXIST)?.is_some() {
+        return Ok(());
+    };
+
+    // Step 2: the symlink already exists.  Maybe it already has the correct target?
+    if let Some(current_target) = filter_errno(readlinkat(dirfd, name, []), Errno::NOENT)? {
+        if current_target.into_bytes() == target.as_os_str().as_bytes() {
+            return Ok(());
+        }
+    }
+
+    // Step 3: full atomic replace path
+    for _ in 0..16 {
+        let tmp_name = generate_tmpname(".symlink-");
+        if filter_errno(symlinkat(target, dirfd, &tmp_name), Errno::EXIST)?.is_none() {
+            // This temporary filename already exists, try another
+            continue;
+        }
+
+        match renameat(dirfd, &tmp_name, dirfd, name) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                let _ = unlinkat(dirfd, tmp_name, AtFlags::empty());
+                return Err(e);
+            }
+        }
+    }
+
+    Err(Errno::EXIST)
 }
 
 #[cfg(test)]

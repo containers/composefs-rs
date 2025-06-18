@@ -12,8 +12,8 @@ use anyhow::{bail, ensure, Context, Result};
 use once_cell::sync::OnceCell;
 use rustix::{
     fs::{
-        fdatasync, flock, linkat, mkdirat, open, openat, readlinkat, symlinkat, AtFlags, Dir,
-        FileType, FlockOperation, Mode, OFlags, CWD,
+        fdatasync, flock, linkat, mkdirat, open, openat, readlinkat, AtFlags, Dir, FileType,
+        FlockOperation, Mode, OFlags, CWD,
     },
     io::{Errno, Result as ErrnoResult},
 };
@@ -25,7 +25,7 @@ use crate::{
     },
     mount::mount_composefs_at,
     splitstream::{DigestMap, SplitStreamReader, SplitStreamWriter},
-    util::{filter_errno, proc_self_fd, Sha256Digest},
+    util::{filter_errno, proc_self_fd, replace_symlinkat, Sha256Digest},
 };
 
 /// Call openat() on the named subdirectory of "dirfd", possibly creating it first.
@@ -261,7 +261,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         let stream_path = format!("streams/{}", hex::encode(sha256));
         let object_id = writer.done()?;
         let object_path = Self::format_object_path(&object_id);
-        self.ensure_symlink(&stream_path, &object_path)?;
+        self.symlink(&stream_path, &object_path)?;
 
         if let Some(name) = reference {
             let reference_path = format!("streams/refs/{name}");
@@ -310,7 +310,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                 let object_id = writer.done()?;
 
                 let object_path = Self::format_object_path(&object_id);
-                self.ensure_symlink(&stream_path, &object_path)?;
+                self.symlink(&stream_path, &object_path)?;
                 object_id
             }
         };
@@ -366,7 +366,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         let object_path = Self::format_object_path(&object_id);
         let image_path = format!("images/{}", object_id.to_hex());
 
-        self.ensure_symlink(&image_path, &object_path)?;
+        self.symlink(&image_path, &object_path)?;
 
         if let Some(reference) = name {
             let ref_path = format!("images/refs/{reference}");
@@ -432,14 +432,8 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             relative.push(target_component);
         }
 
-        symlinkat(relative, &self.repository, name)
-    }
-
-    pub fn ensure_symlink<P: AsRef<Path>>(&self, name: P, target: &str) -> ErrnoResult<()> {
-        self.symlink(name, target).or_else(|e| match e {
-            Errno::EXIST => Ok(()),
-            _ => Err(e),
-        })
+        // Atomically replace existing symlink
+        replace_symlinkat(&relative, &self.repository, name)
     }
 
     fn read_symlink_hashvalue(dirfd: &OwnedFd, name: &CStr) -> Result<ObjectID> {
