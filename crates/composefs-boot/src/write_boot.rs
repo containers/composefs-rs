@@ -3,13 +3,13 @@ use std::{
     path::Path,
 };
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{ensure, Result};
 
 use composefs::{fsverity::FsVerityHashValue, repository::Repository};
 
 use crate::{
     bootloader::{read_file, BootEntry, Type1Entry, Type2Entry},
-    cmdline::get_cmdline_value,
+    cmdline::get_cmdline_composefs,
     uki,
 };
 
@@ -18,6 +18,7 @@ pub fn write_t1_simple<ObjectID: FsVerityHashValue>(
     bootdir: &Path,
     boot_subdir: Option<&str>,
     root_id: &ObjectID,
+    insecure: bool,
     cmdline_extra: &[&str],
     repo: &Repository<ObjectID>,
 ) -> Result<()> {
@@ -29,7 +30,7 @@ pub fn write_t1_simple<ObjectID: FsVerityHashValue>(
     };
 
     t1.entry
-        .adjust_cmdline(Some(&root_id.to_hex()), cmdline_extra);
+        .adjust_cmdline(Some(&root_id.to_hex()), insecure, cmdline_extra);
 
     // Write the content before we write the loader entry
     for (filename, file) in &t1.files {
@@ -59,13 +60,11 @@ pub fn write_t2_simple<ObjectID: FsVerityHashValue>(
     create_dir_all(&efi_linux)?;
     let filename = efi_linux.join(t2.filename.as_ref());
     let content = read_file(&t2.file, repo)?;
-    let Some(composefs) = get_cmdline_value(uki::get_cmdline(&content)?, "composefs=") else {
-        bail!("The UKI is missing a composefs= commandline parameter");
-    };
-    let expected = root_id.to_hex();
+    let (composefs, _) = get_cmdline_composefs::<ObjectID>(uki::get_cmdline(&content)?)?;
+
     ensure!(
-        composefs == expected,
-        "The UKI has the wrong composefs= parameter (is '{composefs}', should be {expected})"
+        &composefs == root_id,
+        "The UKI has the wrong composefs= parameter (is '{composefs:?}', should be {root_id:?})"
     );
     write(filename, content)?;
     Ok(())
@@ -99,10 +98,12 @@ pub fn write_t2_simple<ObjectID: FsVerityHashValue>(
 /// * entry_id       - In case of a BLS entry, the name of file to be generated in `loader/entries`
 /// * cmdline_extra  - Extra kernel command line arguments
 ///
+#[allow(clippy::too_many_arguments)]
 pub fn write_boot_simple<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     entry: BootEntry<ObjectID>,
     root_id: &ObjectID,
+    insecure: bool,
     boot_partition: &Path,
     boot_subdir: Option<&str>,
     entry_id: Option<&str>,
@@ -118,6 +119,7 @@ pub fn write_boot_simple<ObjectID: FsVerityHashValue>(
                 boot_partition,
                 boot_subdir,
                 root_id,
+                insecure,
                 cmdline_extra,
                 repo,
             )?;
@@ -140,6 +142,7 @@ pub fn write_boot_simple<ObjectID: FsVerityHashValue>(
                 boot_partition,
                 boot_subdir,
                 root_id,
+                insecure,
                 cmdline_extra,
                 repo,
             )?;

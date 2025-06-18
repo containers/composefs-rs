@@ -11,7 +11,7 @@ use composefs::{
     tree::{Directory, FileSystem, ImageError, Inode, LeafContent, RegularFile},
 };
 
-use crate::cmdline::split_cmdline;
+use crate::cmdline::{make_cmdline_composefs, split_cmdline};
 
 /// Strips the key (if it matches) plus the following whitespace from a single line in a "Type #1
 /// Boot Loader Specification Entry" file.
@@ -101,9 +101,9 @@ impl BootLoaderEntryFile {
 
     /// Adjusts the kernel command-line arguments by adding a composefs= parameter (if appropriate)
     /// and adding additional arguments, as requested.
-    pub fn adjust_cmdline(&mut self, composefs: Option<&str>, extra: &[&str]) {
+    pub fn adjust_cmdline(&mut self, composefs: Option<&str>, insecure: bool, extra: &[&str]) {
         if let Some(id) = composefs {
-            self.add_cmdline(&format!("composefs={id}"));
+            self.add_cmdline(&make_cmdline_composefs(id, insecure));
         }
 
         for item in extra {

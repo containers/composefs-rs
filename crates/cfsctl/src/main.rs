@@ -291,6 +291,7 @@ async fn main() -> Result<()> {
                     &repo,
                     entry,
                     &id,
+                    args.insecure,
                     bootdir,
                     None,
                     entry_id.as_deref(),
