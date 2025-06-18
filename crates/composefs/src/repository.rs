@@ -156,7 +156,20 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         )?;
         drop(file);
 
-        if !self.insecure {
+        if self.insecure {
+            match measure_verity::<ObjectID>(&ro_fd) {
+                Ok(found) if found == FsVerityHashValue::from_hex(&path)? => {
+                    // insecure but file sytem supports it, so enable it anyway
+                    enable_verity::<ObjectID>(&ro_fd).context("Enabling verity digest")?;
+                    ensure_verity_equal(&ro_fd, &id).context("Double-checking verity digest")?;
+                }
+                Ok(_) => bail!("fs-verity content mismatch"),
+                Err(MeasureVerityError::VerityMissing) => {
+                    // file system doesn't support it, just continue without
+                }
+                Err(other) => Err(other)?,
+            }
+        } else {
             enable_verity::<ObjectID>(&ro_fd).context("Enabling verity digest")?;
             ensure_verity_equal(&ro_fd, &id).context("Double-checking verity digest")?;
         }
