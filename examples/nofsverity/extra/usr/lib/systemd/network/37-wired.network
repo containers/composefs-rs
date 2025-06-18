@@ -1,0 +1,9 @@
+[Match]
+Type=ether
+
+[Link]
+RequiredForOnline=routable
+
+[Network]
+DHCP=yes
+

@@ -1,0 +1,56 @@
+#!/bin/sh
+
+set -eux
+
+os="${1:-fedora}"
+cd "${0%/*}"
+
+FIX_VERITY=1 ../common/check-config
+
+case "${os}" in
+    arch)
+        containerfile='Containerfile.arch'
+        features='--features=pre-6.15'
+        ;;
+    *)
+        echo "*** unknown variant ${os}"
+        false
+        ;;
+esac
+
+# https://github.com/containers/buildah/issues/5656
+PODMAN_BUILD="podman build --no-cache"
+
+cargo build --release "${features}"
+
+cp ../../target/release/cfsctl .
+cp ../../target/release/composefs-setup-root extra/usr/lib/dracut/modules.d/37composefs/
+CFSCTL='./cfsctl --repo tmp/sysroot/composefs'
+
+rm -rf tmp
+mkdir -p tmp/sysroot/composefs
+
+${PODMAN_BUILD} \
+    --iidfile=tmp/base.iid \
+    --target=base \
+    -f "${containerfile}" \
+    .
+
+BASE_ID="$(sed s/sha256:// tmp/base.iid)"
+${CFSCTL} oci pull containers-storage:"${BASE_ID}"
+BASE_IMAGE_FSVERITY="$(${CFSCTL} oci compute-id --bootable "${BASE_ID}")"
+
+${PODMAN_BUILD} \
+    --iidfile=tmp/final.iid \
+    --build-context=base="container-image://${BASE_ID}" \
+    --build-arg=COMPOSEFS_FSVERITY="?${BASE_IMAGE_FSVERITY}" \
+    --label=containers.composefs.fsverity="${BASE_IMAGE_FSVERITY}" \
+    -f "${containerfile}" \
+    .
+
+FINAL_ID="$(sed s/sha256:// tmp/final.iid)"
+${CFSCTL} oci pull containers-storage:"${FINAL_ID}"
+${CFSCTL} oci prepare-boot "${FINAL_ID}" --bootdir tmp/efi
+
+../common/install-systemd-boot
+../common/make-image -sr "${os}-nofsverity-efi.qcow2"
