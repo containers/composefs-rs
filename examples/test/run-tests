@@ -11,7 +11,10 @@ def test_basic(m: testvm.Machine):
     m.execute('! touch /a')
 
     # the content of /sysroot is what we expect
-    assert m.execute('ls /sysroot') == 'composefs\nlost+found\nstate\n'
+    # lost+found is only available on ext4, and this also tests xfs
+    assert [
+        name for name in m.execute('ls /sysroot').splitlines() if name != 'lost+found'
+    ] == ['composefs', 'state']
 
     # make sure /etc and /var persist across a reboot
     m.write('/etc/persists.conf', 'hihi conf')

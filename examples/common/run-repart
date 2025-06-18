@@ -7,14 +7,32 @@ chcon -R system_u:object_r:usr_t:s0 tmp/sysroot/composefs
 chcon system_u:object_r:var_t:s0 tmp/sysroot/state/*/var
 chcon system_u:object_r:etc_t:s0 tmp/sysroot/state/*/etc/*
 
-definitions="${0%/*}/repart.d"
+definitions='tmp/repart.d'
+export SYSTEMD_REPART_MKFS_OPTIONS_EXT4='-O verity'
 
-if [ "${FIX_VERITY:-}" = '1' ]; then
-    export SYSTEMD_REPART_MKFS_OPTIONS_EXT4='-O verity'
-    cp -r "${definitions}" tmp/repart.d
-    sed -i 's/:fsverity=copy//' tmp/repart.d/02-sysroot.conf
-    definitions='tmp/repart.d'
+mkdir -p "$definitions"
+
+cat <<EOF > tmp/repart.d/01-esp.conf
+[Partition]
+Type=esp
+Format=vfat
+CopyFiles=/efi:/
+SizeMinBytes=512M
+SizeMaxBytes=512M
+EOF
+
+if [ "${FS_VERITY_MODE:-repart}" = 'repart' ]; then
+    COPY_FILES_FLAG="/sysroot:/:fsverity=copy"
 fi
+
+cat <<EOF > tmp/repart.d/02-sysroot.conf
+[Partition]
+Type=root
+Format=${FS_FORMAT:-ext4}
+SizeMinBytes=10G
+SizeMaxBytes=10G
+CopyFiles=${COPY_FILES_FLAG:-/sysroot:/}
+EOF
 
 # Setting TMPDIR here has a couple of advantages:
 #  - we already have our own temporary directory
@@ -30,6 +48,6 @@ TMPDIR="${PWD}/tmp" systemd-repart \
     --definitions="${definitions}" \
     "$1"
 
-if [ "${FIX_VERITY:-}" = '1' ]; then
+if [ "${FS_VERITY_MODE:-repart}" = 'fix' ]; then
     "${0%/*}/fix-verity/fix-verity" "$1"
 fi

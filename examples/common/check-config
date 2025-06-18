@@ -40,19 +40,19 @@ fi
 #
 # All the tests past this point can be skipped if we're doing after-the-fact
 # verity fixups using the fix-verity script.
-if [ "${FIX_VERITY:-}" = "1" ]; then
+if [ "${FS_VERITY_MODE:-repart}" = "fix" ] || [ "${FS_VERITY_MODE:-repart}" = "none" ]; then
     exit 0
 fi
 
 if ! grep -sq 'fsverity=' "${systemd_repart}"; then
     echo "*** Your systemd-repart doesn't seem to have fs-verity support"
-    echo "*** See the install-patched-tools script, or set FIX_VERITY=1..."
+    echo "*** See the install-patched-tools script, or set FS_VERITY_MODE=fix..."
     exit 1
 fi
 
 if ! grep -sq 'fs-verity support' "${mkfs_ext4}"; then
     echo "*** Your mkfs.ext4 doesn't seem to have fs-verity support"
-    echo "*** See the install-patched-tools script, or set FIX_VERITY=1..."
+    echo "*** See the install-patched-tools script, or set FS_VERITY_MODE=fix..."
     exit 1
 fi
 
@@ -62,6 +62,6 @@ check_metadata() {
 
 if check_metadata "$0"; then
     echo "*** Your working directory doesn't seem to support FS_IOC_READ_VERITY_METADATA"
-    echo "*** You're probably using btrfs on an older kernel version.  Try FIX_VERITY=1..."
+    echo "*** You're probably using btrfs on an older kernel version.  Try FS_VERITY_MODE=fix..."
     exit 1
 fi
