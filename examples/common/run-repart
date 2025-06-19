@@ -9,7 +9,7 @@ chcon system_u:object_r:etc_t:s0 tmp/sysroot/state/*/etc/*
 
 definitions="${0%/*}/repart.d"
 
-if [ "${FIX_VERITY:-}" = '1' ]; then
+if [ "$SETUP_REPART" = '1' ]; then
     export SYSTEMD_REPART_MKFS_OPTIONS_EXT4='-O verity'
     cp -r "${definitions}" tmp/repart.d
     sed -i 's/:fsverity=copy//' tmp/repart.d/02-sysroot.conf

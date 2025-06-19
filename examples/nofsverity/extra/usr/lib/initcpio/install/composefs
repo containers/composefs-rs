@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+
+build() {
+    add_binary "/usr/lib/dracut/modules.d/37composefs/composefs-setup-root" "/usr/bin/composefs-setup-root"
+    add_runscript
+}

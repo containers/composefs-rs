@@ -27,6 +27,9 @@ pub struct App {
     #[clap(long, group = "repopath")]
     system: bool,
 
+    #[clap(long)]
+    insecure: bool,
+
     #[clap(subcommand)]
     cmd: Command,
 }
@@ -160,7 +163,7 @@ async fn main() -> Result<()> {
 
     let args = App::parse();
 
-    let repo: Repository<Sha256HashValue> = (if let Some(path) = &args.repo {
+    let mut repo: Repository<Sha256HashValue> = (if let Some(path) = &args.repo {
         Repository::open_path(CWD, path)
     } else if args.system {
         Repository::open_system()
@@ -171,6 +174,8 @@ async fn main() -> Result<()> {
     } else {
         Repository::open_user()
     })?;
+
+    repo.set_insecure(args.insecure);
 
     match args.cmd {
         Command::Transaction => {
@@ -339,7 +344,7 @@ async fn main() -> Result<()> {
             fs.print_dumpfile()?;
         }
         Command::Mount { name, mountpoint } => {
-            repo.mount(&name, &mountpoint)?;
+            repo.mount_at(&name, &mountpoint)?;
         }
         Command::ImageObjects { name } => {
             let objects = repo.objects_for_image(&name)?;

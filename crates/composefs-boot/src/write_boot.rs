@@ -59,9 +59,14 @@ pub fn write_t2_simple<ObjectID: FsVerityHashValue>(
     create_dir_all(&efi_linux)?;
     let filename = efi_linux.join(t2.filename.as_ref());
     let content = read_file(&t2.file, repo)?;
-    let Some(composefs) = get_cmdline_value(uki::get_cmdline(&content)?, "composefs=") else {
+    let Some(mut composefs) = get_cmdline_value(uki::get_cmdline(&content)?, "composefs=") else {
         bail!("The UKI is missing a composefs= commandline parameter");
     };
+
+    if let Some(stripped) = composefs.strip_prefix('?') {
+        composefs = stripped
+    }
+
     let expected = root_id.to_hex();
     ensure!(
         composefs == expected,

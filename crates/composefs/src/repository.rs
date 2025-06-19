@@ -22,8 +22,9 @@ use sha2::{Digest, Sha256};
 use crate::{
     fsverity::{
         compute_verity, enable_verity, ensure_verity_equal, measure_verity, FsVerityHashValue,
+        MeasureVerityError,
     },
-    mount::mount_composefs_at,
+    mount::{composefs_fsmount, mount_composefs_at},
     splitstream::{DigestMap, SplitStreamReader, SplitStreamWriter},
     util::{proc_self_fd, Sha256Digest},
 };
@@ -58,6 +59,7 @@ pub struct Repository<ObjectID: FsVerityHashValue> {
     repository: OwnedFd,
     objects: OnceCell<OwnedFd>,
     _data: std::marker::PhantomData<ObjectID>,
+    insecure: bool,
 }
 
 impl<ObjectID: FsVerityHashValue> Drop for Repository<ObjectID> {
@@ -86,6 +88,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             repository,
             objects: OnceCell::new(),
             _data: std::marker::PhantomData,
+            insecure: false,
         })
     }
 
@@ -127,7 +130,9 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             Ok(fd) => {
                 // measure the existing file to ensure that it's correct
                 // TODO: try to replace file if it's broken?
-                ensure_verity_equal(fd, &id)?;
+                if !self.insecure {
+                    ensure_verity_equal(fd, &id)?;
+                }
                 return Ok(id);
             }
             Err(Errno::NOENT) => {
@@ -151,8 +156,23 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         )?;
         drop(file);
 
-        enable_verity::<ObjectID>(&ro_fd).context("Enabling verity digest")?;
-        ensure_verity_equal(&ro_fd, &id).context("Double-checking verity digest")?;
+        if self.insecure {
+            match measure_verity::<ObjectID>(&ro_fd) {
+                Ok(found) if found == FsVerityHashValue::from_hex(&path)? => {
+                    // insecure but file sytem supports it, so enable it anyway
+                    enable_verity::<ObjectID>(&ro_fd).context("Enabling verity digest")?;
+                    ensure_verity_equal(&ro_fd, &id).context("Double-checking verity digest")?;
+                }
+                Ok(_) => bail!("fs-verity content mismatch"),
+                Err(MeasureVerityError::VerityMissing) => {
+                    // file system doesn't support it, just continue without
+                }
+                Err(other) => Err(other)?,
+            }
+        } else {
+            enable_verity::<ObjectID>(&ro_fd).context("Enabling verity digest")?;
+            ensure_verity_equal(&ro_fd, &id).context("Double-checking verity digest")?;
+        }
 
         match linkat(
             CWD,
@@ -175,8 +195,15 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
     fn open_with_verity(&self, filename: &str, expected_verity: &ObjectID) -> Result<OwnedFd> {
         let fd = self.openat(filename, OFlags::RDONLY)?;
-        ensure_verity_equal(&fd, expected_verity)?;
+        if !self.insecure {
+            ensure_verity_equal(&fd, expected_verity)?;
+        }
         Ok(fd)
+    }
+
+    pub fn set_insecure(&mut self, insecure: bool) -> &mut Self {
+        self.insecure = insecure;
+        self
     }
 
     /// Creates a SplitStreamWriter for writing a split stream.
@@ -220,6 +247,10 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
     /// Basically the same as has_stream() except that it performs expensive verification
     pub fn check_stream(&self, sha256: &Sha256Digest) -> Result<Option<ObjectID>> {
+        if self.insecure {
+            return self.has_stream(sha256);
+        }
+
         match self.openat(&format!("streams/{}", hex::encode(sha256)), OFlags::RDONLY) {
             Ok(stream) => {
                 let measured_verity: ObjectID = measure_verity(&stream)?;
@@ -383,24 +414,40 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         self.write_image(Some(name), &data)
     }
 
-    pub fn open_image(&self, name: &str) -> Result<OwnedFd> {
+    fn open_image(&self, name: &str) -> Result<(OwnedFd, bool)> {
         let image = self.openat(&format!("images/{name}"), OFlags::RDONLY)?;
 
-        if !name.contains("/") {
+        if !name.contains("/") && !self.insecure {
             // A name with no slashes in it is taken to be a sha256 fs-verity digest
             ensure_verity_equal(&image, &ObjectID::from_hex(name)?)?;
         }
 
-        Ok(image)
+        match measure_verity::<ObjectID>(&image) {
+            Ok(found) if found == FsVerityHashValue::from_hex(name)? => Ok((image, true)),
+            Ok(_) => bail!("fs-verity content mismatch"),
+            Err(MeasureVerityError::VerityMissing) if self.insecure => Ok((image, false)),
+            Err(other) => Err(other)?,
+        }
     }
 
-    pub fn mount(&self, name: &str, mountpoint: &str) -> Result<()> {
-        let image = self.open_image(name)?;
+    pub fn mount(&self, name: &str) -> Result<OwnedFd> {
+        let (image, enable_verity) = self.open_image(name)?;
+        Ok(composefs_fsmount(
+            image,
+            name,
+            self.objects_dir()?,
+            enable_verity,
+        )?)
+    }
+
+    pub fn mount_at(&self, name: &str, mountpoint: &str) -> Result<()> {
+        let (image, enable_verity) = self.open_image(name)?;
         Ok(mount_composefs_at(
             image,
             name,
             self.objects_dir()?,
             mountpoint,
+            enable_verity,
         )?)
     }
 
@@ -522,7 +569,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     }
 
     pub fn objects_for_image(&self, name: &str) -> Result<HashSet<ObjectID>> {
-        let image = self.open_image(name)?;
+        let (image, _) = self.open_image(name)?;
         let mut data = vec![];
         std::fs::File::from(image).read_to_end(&mut data)?;
         Ok(crate::erofs::reader::collect_objects(&data)?)

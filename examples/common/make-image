@@ -1,12 +1,47 @@
-#!/bin/sh
+#!/bin/bash
 
 set -eux
 
-output="$1"
+FIX_VERITY=0
+SETUP_REPART=0
+FS_FORMAT=ext4
+parsecmd() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        #CMDSTART
+        -fv|--fix-verity) #
+            # run run-repart with FIX_VERITY=1
+            FIX_VERITY=1
+            ;;
+        -sr|--setup-repart) #
+            # run run-repart with SETUP_REPART=1
+            SETUP_REPART=1
+            ;;
+        -h|--help) #
+            # this help
+            echo "Usage: $0 [OPTION]..."
+            printf "\nCommand line arguments:\n"
+            sed -rn '/CMDSTART/,/CMDEND/{/\) \#|^ +# /{s/\)? #//g;s/^    //;p}}' "$0"
+            exit 0
+            ;;
+        *)
+            echo "Unknown parameter $1"
+            exit 1
+            ;;
+        esac
+        #CMDEND
+        shift
+    done
+}
+
+args=($@)
+output="${args[-1]}"
+parse_args=("${args[*]:0:${#args[@]}-1}")
+parsecmd ${parse_args[@]}
 
 # check that the image doesn't have errors
 fsck.erofs tmp/sysroot/composefs/images/*
 
-fakeroot "${0%/*}/run-repart" tmp/image.raw
+SETUP_REPART=$SETUP_REPART FIX_VERITY=$FIX_VERITY fakeroot "${0%/*}/run-repart" tmp/image.raw
 qemu-img convert -f raw tmp/image.raw -O qcow2 "${output}"
 rm tmp/image.raw

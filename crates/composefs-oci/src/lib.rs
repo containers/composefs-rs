@@ -152,7 +152,7 @@ pub fn mount<ObjectID: FsVerityHashValue>(
     let Some(id) = config.get_config_annotation("containers.composefs.fsverity") else {
         bail!("Can only mount sealed containers");
     };
-    repo.mount(id, mountpoint)
+    repo.mount_at(id, mountpoint)
 }
 
 #[cfg(test)]
