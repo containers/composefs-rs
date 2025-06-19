@@ -26,6 +26,7 @@ pub const SPLITSTREAM_MAGIC : [u8; 7] = [b'S', b'p', b'l', b't', b'S', b't', b'r
 pub struct SplitstreamHeader {
     pub magic: [u8; 7], // Contains SPLITSTREAM_MAGIC
     pub algorithm: u8,
+    pub content_type: u64, // User can put whatever magic identifier they want there
     pub total_size: u64, // total size of inline chunks and external chunks
     pub n_refs: u64,
     pub n_mappings: u64,
@@ -92,6 +93,7 @@ pub struct SplitStreamWriter<ObjectID: FsVerityHashValue> {
     inline_content: Vec<u8>,
     total_size: u64,
     writer: Encoder<'static, Vec<u8>>,
+    pub content_type: u64,
     pub sha256: Option<(Sha256, Sha256Digest)>,
 }
 
@@ -109,6 +111,7 @@ impl<ObjectID: FsVerityHashValue> std::fmt::Debug for SplitStreamWriter<ObjectID
 impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
     pub fn new(
         repo: &Arc<Repository<ObjectID>>,
+        content_type: u64,
         sha256: Option<Sha256Digest>,
     ) -> Self {
         // SAFETY: we surely can't get an error writing the header to a Vec<u8>
@@ -116,6 +119,7 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
 
         Self {
             repo: Arc::clone(repo),
+            content_type: content_type,
             inline_content: vec![],
             refs: vec![],
             total_size: 0,
@@ -218,6 +222,7 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
         let header = SplitstreamHeader {
             magic: SPLITSTREAM_MAGIC,
             algorithm:  ObjectID::ALGORITHM,
+            content_type: self.content_type,
             total_size: u64::to_le(self.total_size),
             n_refs: u64::to_le(self.refs.len() as u64),
             n_mappings: u64::to_le(self.mappings.map.len() as u64),
@@ -252,6 +257,7 @@ pub enum SplitStreamData<ObjectID: FsVerityHashValue> {
 pub struct SplitStreamReader<R: Read, ObjectID: FsVerityHashValue> {
     decoder: Decoder<'static, BufReader<R>>,
     inline_bytes: usize,
+    pub content_type: u64,
     pub total_size: u64,
     pub refs: Vec<ObjectID>,
     mappings: Vec<MappingEntry>,
@@ -293,17 +299,24 @@ enum ChunkType<ObjectID: FsVerityHashValue> {
 }
 
 impl<R: Read, ObjectID: FsVerityHashValue> SplitStreamReader<R, ObjectID> {
-    pub fn new(mut reader: R) -> Result<Self> {
+    pub fn new(mut reader: R, expected_content_type: Option<u64>) -> Result<Self> {
 
         let header = SplitstreamHeader::read_from_io(&mut reader)
             .map_err(|e| Error::msg(format!("Error reading splitstream header: {:?}", e)))?;
 
         if header.magic != SPLITSTREAM_MAGIC {
-            bail!("Invalida splitstream header magic value");
+            bail!("Invalid splitstream header magic value");
         }
 
         if header.algorithm != ObjectID::ALGORITHM {
-            bail!("Invalida splitstream algorithm type");
+            bail!("Invalid splitstream algorithm type");
+        }
+
+        let content_type = u64::from_le(header.content_type);
+        if let Some(expected) = expected_content_type {
+            if content_type != expected {
+                bail!("Invalid splitstream content type");
+            }
         }
 
         let total_size = u64::from_le(header.total_size);
@@ -333,6 +346,7 @@ impl<R: Read, ObjectID: FsVerityHashValue> SplitStreamReader<R, ObjectID> {
         Ok(Self {
             decoder,
             inline_bytes: 0,
+            content_type,
             total_size,
             refs,
             mappings,

@@ -61,7 +61,7 @@ impl<ObjectID: FsVerityHashValue> Downloader<ObjectID> {
     }
 
     fn open_splitstream(&self, id: &ObjectID) -> Result<SplitStreamReader<File, ObjectID>> {
-        SplitStreamReader::new(File::from(self.repo.open_object(id)?))
+        SplitStreamReader::new(File::from(self.repo.open_object(id)?), None)
     }
 
     fn read_object(&self, id: &ObjectID) -> Result<Vec<u8>> {

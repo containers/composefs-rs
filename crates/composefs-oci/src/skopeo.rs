@@ -16,6 +16,9 @@ use composefs::{
 
 use crate::{sha256_from_descriptor, sha256_from_digest, tar::split_async, ContentAndVerity};
 
+pub const TAR_LAYER_CONTENT_TYPE : u64 = 0x2a037edfcae1ffea;
+pub const OCI_CONFIG_CONTENT_TYPE : u64 = 0x44218c839727a80b;
+
 struct ImageOp<ObjectID: FsVerityHashValue> {
     repo: Arc<Repository<ObjectID>>,
     proxy: ImageProxy,
@@ -78,7 +81,7 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             self.progress
                 .println(format!("Fetching layer {}", hex::encode(layer_sha256)))?;
 
-            let mut splitstream = self.repo.create_stream(Some(layer_sha256));
+            let mut splitstream = self.repo.create_stream(TAR_LAYER_CONTENT_TYPE, Some(layer_sha256));
             match descriptor.media_type() {
                 MediaType::ImageLayer => {
                     split_async(progress, &mut splitstream).await?;
@@ -157,7 +160,7 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
 
             let mut splitstream = self
                 .repo
-                .create_stream(Some(config_sha256));
+                .create_stream(OCI_CONFIG_CONTENT_TYPE, Some(config_sha256));
 
             // Collect the results.
             for (layer_sha256, future) in entries {
