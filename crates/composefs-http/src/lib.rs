@@ -15,7 +15,7 @@ use tokio::task::JoinSet;
 use composefs::{
     fsverity::FsVerityHashValue,
     repository::Repository,
-    splitstream::{DigestMapEntry, SplitStreamReader},
+    splitstream::{SplitStreamReader},
     util::Sha256Digest,
 };
 
@@ -61,7 +61,7 @@ impl<ObjectID: FsVerityHashValue> Downloader<ObjectID> {
     }
 
     fn open_splitstream(&self, id: &ObjectID) -> Result<SplitStreamReader<File, ObjectID>> {
-        SplitStreamReader::new(File::from(self.repo.open_object(id)?))
+        SplitStreamReader::new(File::from(self.repo.open_object(id)?), None)
     }
 
     fn read_object(&self, id: &ObjectID) -> Result<Vec<u8>> {
@@ -107,7 +107,7 @@ impl<ObjectID: FsVerityHashValue> Downloader<ObjectID> {
 
             // this part is fast: it only touches the header
             let mut reader = self.open_splitstream(&id)?;
-            for DigestMapEntry { verity, body } in &reader.refs.map {
+            for (body, verity) in reader.iter_mappings() {
                 match splitstreams.insert(verity.clone(), Some(*body)) {
                     // This is the (normal) case if we encounter a splitstream we didn't see yet...
                     None => {

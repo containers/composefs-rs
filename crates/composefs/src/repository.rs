@@ -12,8 +12,8 @@ use anyhow::{bail, ensure, Context, Result};
 use once_cell::sync::OnceCell;
 use rustix::{
     fs::{
-        fdatasync, flock, linkat, mkdirat, open, openat, readlinkat, symlinkat, AtFlags, Dir,
-        FileType, FlockOperation, Mode, OFlags, CWD,
+        fdatasync, flock, linkat, mkdirat, open, openat, readlinkat, AtFlags, Dir, FileType,
+        FlockOperation, Mode, OFlags, CWD,
     },
     io::{Errno, Result as ErrnoResult},
 };
@@ -24,8 +24,8 @@ use crate::{
         compute_verity, enable_verity, ensure_verity_equal, measure_verity, FsVerityHashValue,
     },
     mount::mount_composefs_at,
-    splitstream::{DigestMap, SplitStreamReader, SplitStreamWriter},
-    util::{proc_self_fd, Sha256Digest},
+    splitstream::{SplitStreamReader, SplitStreamWriter},
+    util::{filter_errno, proc_self_fd, replace_symlinkat, Sha256Digest},
 };
 
 /// Call openat() on the named subdirectory of "dirfd", possibly creating it first.
@@ -184,10 +184,10 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// store the result.
     pub fn create_stream(
         self: &Arc<Self>,
+        content_type: u64,
         sha256: Option<Sha256Digest>,
-        maps: Option<DigestMap<ObjectID>>,
     ) -> SplitStreamWriter<ObjectID> {
-        SplitStreamWriter::new(self, maps, sha256)
+        SplitStreamWriter::new(self, content_type, sha256)
     }
 
     fn format_object_path(id: &ObjectID) -> String {
@@ -224,11 +224,11 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             Ok(stream) => {
                 let measured_verity: ObjectID = measure_verity(&stream)?;
                 let mut context = Sha256::new();
-                let mut split_stream = SplitStreamReader::new(File::from(stream))?;
+                let mut split_stream = SplitStreamReader::new(File::from(stream), None)?;
 
                 // check the verity of all linked streams
-                for entry in &split_stream.refs.map {
-                    if self.check_stream(&entry.body)?.as_ref() != Some(&entry.verity) {
+                for (body, verity) in split_stream.iter_mappings() {
+                    if self.check_stream(body)?.as_ref() != Some(verity) {
                         bail!("reference mismatch");
                     }
                 }
@@ -261,7 +261,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         let stream_path = format!("streams/{}", hex::encode(sha256));
         let object_id = writer.done()?;
         let object_path = Self::format_object_path(&object_id);
-        self.ensure_symlink(&stream_path, &object_path)?;
+        self.symlink(&stream_path, &object_path)?;
 
         if let Some(name) = reference {
             let reference_path = format!("streams/refs/{name}");
@@ -269,6 +269,12 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         }
 
         Ok(object_id)
+    }
+
+    pub fn has_named_stream(&self, name: &str) -> bool {
+        let stream_path = format!("streams/refs/{}", name);
+
+        readlinkat(&self.repository, &stream_path, []).is_ok()
     }
 
     /// Assign the given name to a stream.  The stream must already exist.  After this operation it
@@ -297,6 +303,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     pub fn ensure_stream(
         self: &Arc<Self>,
         sha256: &Sha256Digest,
+        content_type: u64,
         callback: impl FnOnce(&mut SplitStreamWriter<ObjectID>) -> Result<()>,
         reference: Option<&str>,
     ) -> Result<ObjectID> {
@@ -305,12 +312,12 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         let object_id = match self.has_stream(sha256)? {
             Some(id) => id,
             None => {
-                let mut writer = self.create_stream(Some(*sha256), None);
+                let mut writer = self.create_stream(content_type, Some(*sha256));
                 callback(&mut writer)?;
                 let object_id = writer.done()?;
 
                 let object_path = Self::format_object_path(&object_id);
-                self.ensure_symlink(&stream_path, &object_path)?;
+                self.symlink(&stream_path, &object_path)?;
                 object_id
             }
         };
@@ -327,16 +334,19 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         &self,
         name: &str,
         verity: Option<&ObjectID>,
+        expected_content_type: Option<u64>,
     ) -> Result<SplitStreamReader<File, ObjectID>> {
         let filename = format!("streams/{name}");
 
         let file = File::from(if let Some(verity_hash) = verity {
-            self.open_with_verity(&filename, verity_hash)?
+            self.open_with_verity(&filename, verity_hash)
+                .with_context(|| format!("Opening ref 'streams/{name}'"))?
         } else {
-            self.openat(&filename, OFlags::RDONLY)?
+            self.openat(&filename, OFlags::RDONLY)
+                .with_context(|| format!("Opening ref 'streams/{name}'"))?
         });
 
-        SplitStreamReader::new(file)
+        SplitStreamReader::new(file, expected_content_type)
     }
 
     pub fn open_object(&self, id: &ObjectID) -> Result<OwnedFd> {
@@ -347,9 +357,10 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         &self,
         name: &str,
         verity: Option<&ObjectID>,
+        expected_content_type: Option<u64>,
         stream: &mut impl Write,
     ) -> Result<()> {
-        let mut split_stream = self.open_stream(name, verity)?;
+        let mut split_stream = self.open_stream(name, verity, expected_content_type)?;
         split_stream.cat(stream, |id| -> Result<Vec<u8>> {
             let mut data = vec![];
             File::from(self.open_object(id)?).read_to_end(&mut data)?;
@@ -366,7 +377,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         let object_path = Self::format_object_path(&object_id);
         let image_path = format!("images/{}", object_id.to_hex());
 
-        self.ensure_symlink(&image_path, &object_path)?;
+        self.symlink(&image_path, &object_path)?;
 
         if let Some(reference) = name {
             let ref_path = format!("images/refs/{reference}");
@@ -384,7 +395,9 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     }
 
     pub fn open_image(&self, name: &str) -> Result<OwnedFd> {
-        let image = self.openat(&format!("images/{name}"), OFlags::RDONLY)?;
+        let image = self
+            .openat(&format!("images/{name}"), OFlags::RDONLY)
+            .with_context(|| format!("Opening ref 'images/{name}'"))?;
 
         if !name.contains("/") {
             // A name with no slashes in it is taken to be a sha256 fs-verity digest
@@ -432,14 +445,8 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             relative.push(target_component);
         }
 
-        symlinkat(relative, &self.repository, name)
-    }
-
-    pub fn ensure_symlink<P: AsRef<Path>>(&self, name: P, target: &str) -> ErrnoResult<()> {
-        self.symlink(name, target).or_else(|e| match e {
-            Errno::EXIST => Ok(()),
-            _ => Err(e),
-        })
+        // Atomically replace existing symlink
+        replace_symlinkat(&relative, &self.repository, name)
     }
 
     fn read_symlink_hashvalue(dirfd: &OwnedFd, name: &CStr) -> Result<ObjectID> {
@@ -485,15 +492,28 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     fn gc_category(&self, category: &str) -> Result<HashSet<ObjectID>> {
         let mut objects = HashSet::new();
 
-        let category_fd = self.openat(category, OFlags::RDONLY | OFlags::DIRECTORY)?;
+        let Some(category_fd) = filter_errno(
+            self.openat(category, OFlags::RDONLY | OFlags::DIRECTORY),
+            Errno::NOENT,
+        )
+        .context("Opening {category} dir in repository")?
+        else {
+            return Ok(objects);
+        };
 
-        let refs = openat(
-            &category_fd,
-            "refs",
-            OFlags::RDONLY | OFlags::DIRECTORY,
-            Mode::empty(),
-        )?;
-        Self::walk_symlinkdir(refs, &mut objects)?;
+        if let Some(refs) = filter_errno(
+            openat(
+                &category_fd,
+                "refs",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            ),
+            Errno::NOENT,
+        )
+        .context("Opening {category}/refs dir in repository")?
+        {
+            Self::walk_symlinkdir(refs, &mut objects)?;
+        }
 
         for item in Dir::read_from(&category_fd)? {
             let entry = item?;
@@ -543,7 +563,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             println!("{object:?} lives as a stream");
             objects.insert(object.clone());
 
-            let mut split_stream = self.open_stream(&object.to_hex(), None)?;
+            let mut split_stream = self.open_stream(&object.to_hex(), None, None)?;
             split_stream.get_object_refs(|id| {
                 println!("   with {id:?}");
                 objects.insert(id.clone());
