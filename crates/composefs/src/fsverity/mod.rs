@@ -15,6 +15,8 @@ pub enum MeasureVerityError {
     Io(#[from] Error),
     #[error("fs-verity is not enabled on file")]
     VerityMissing,
+    #[error("fs-verity is not support by filesystem")]
+    FilesystemNotSupported,
     #[error("Expected algorithm {expected}, found {found}")]
     InvalidDigestAlgorithm { expected: u16, found: u16 },
     #[error("Expected digest size {expected}")]
@@ -110,7 +112,9 @@ pub fn measure_verity_opt<H: FsVerityHashValue>(
 ) -> Result<Option<H>, MeasureVerityError> {
     match ioctl::fs_ioc_measure_verity(fd) {
         Ok(result) => Ok(Some(result)),
-        Err(MeasureVerityError::VerityMissing) => Ok(None),
+        Err(MeasureVerityError::VerityMissing | MeasureVerityError::FilesystemNotSupported) => {
+            Ok(None)
+        }
         Err(other) => Err(other),
     }
 }
@@ -253,7 +257,7 @@ mod tests {
 
         assert!(matches!(
             measure_verity::<Sha256HashValue>(&tf).unwrap_err(),
-            MeasureVerityError::VerityMissing
+            MeasureVerityError::FilesystemNotSupported
         ));
 
         assert!(measure_verity_opt::<Sha256HashValue>(&tf)
@@ -262,7 +266,7 @@ mod tests {
 
         assert!(matches!(
             ensure_verity_equal(&tf, &Sha256HashValue::EMPTY).unwrap_err(),
-            CompareVerityError::Measure(MeasureVerityError::VerityMissing)
+            CompareVerityError::Measure(MeasureVerityError::FilesystemNotSupported)
         ));
     }
 
