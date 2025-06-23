@@ -107,9 +107,8 @@ pub(super) fn fs_ioc_measure_verity<H: FsVerityHashValue>(
             }
             Ok(digest.digest)
         }
-        Err(Errno::NODATA | Errno::NOTTY | Errno::OPNOTSUPP) => {
-            Err(MeasureVerityError::VerityMissing)
-        }
+        Err(Errno::NODATA) => Err(MeasureVerityError::VerityMissing),
+        Err(Errno::NOTTY | Errno::OPNOTSUPP) => Err(MeasureVerityError::FilesystemNotSupported),
         Err(Errno::OVERFLOW) => Err(MeasureVerityError::InvalidDigestSize {
             expected: digest.digest_size,
         }),
@@ -124,16 +123,26 @@ mod tests {
     use rustix::fd::FromRawFd;
     use tempfile::tempfile_in;
 
-    use crate::fsverity::Sha256HashValue;
+    use crate::{fsverity::Sha256HashValue, test::tempfile};
 
     use super::*;
 
     #[test]
     fn test_measure_verity_opt() {
-        let tf = tempfile::tempfile().unwrap();
+        let tf = tempfile();
         assert!(matches!(
             fs_ioc_measure_verity::<Sha256HashValue>(&tf),
             Err(MeasureVerityError::VerityMissing)
+        ));
+    }
+
+    #[test_with::path(/dev/shm)]
+    #[test]
+    fn test_measure_verity_not_supported() {
+        let tf = tempfile_in("/dev/shm").unwrap();
+        assert!(matches!(
+            fs_ioc_measure_verity::<Sha256HashValue>(&tf),
+            Err(MeasureVerityError::FilesystemNotSupported)
         ));
     }
 
