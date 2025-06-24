@@ -106,14 +106,17 @@ pub fn parse_sha256(string: impl AsRef<str>) -> Result<Sha256Digest> {
     Ok(value)
 }
 
-pub(crate) fn filter_errno<T>(
-    result: rustix::io::Result<T>,
-    ignored: Errno,
-) -> ErrnoResult<Option<T>> {
-    match result {
-        Ok(result) => Ok(Some(result)),
-        Err(err) if err == ignored => Ok(None),
-        Err(err) => Err(err),
+pub(crate) trait ErrnoFilter<T> {
+    fn filter_errno(self, ignored: Errno) -> ErrnoResult<Option<T>>;
+}
+
+impl<T> ErrnoFilter<T> for ErrnoResult<T> {
+    fn filter_errno(self, ignored: Errno) -> ErrnoResult<Option<T>> {
+        match self {
+            Ok(result) => Ok(Some(result)),
+            Err(err) if err == ignored => Ok(None),
+            Err(err) => Err(err),
+        }
     }
 }
 
@@ -135,12 +138,15 @@ pub(crate) fn replace_symlinkat(
     let target = target.as_ref();
 
     // Step 1: try to create the symlink
-    if filter_errno(symlinkat(target, dirfd, name), Errno::EXIST)?.is_some() {
+    if symlinkat(target, dirfd, name)
+        .filter_errno(Errno::EXIST)?
+        .is_some()
+    {
         return Ok(());
     };
 
     // Step 2: the symlink already exists.  Maybe it already has the correct target?
-    if let Some(current_target) = filter_errno(readlinkat(dirfd, name, []), Errno::NOENT)? {
+    if let Some(current_target) = readlinkat(dirfd, name, []).filter_errno(Errno::NOENT)? {
         if current_target.into_bytes() == target.as_os_str().as_bytes() {
             return Ok(());
         }
@@ -149,7 +155,10 @@ pub(crate) fn replace_symlinkat(
     // Step 3: full atomic replace path
     for _ in 0..16 {
         let tmp_name = generate_tmpname(".symlink-");
-        if filter_errno(symlinkat(target, dirfd, &tmp_name), Errno::EXIST)?.is_none() {
+        if symlinkat(target, dirfd, &tmp_name)
+            .filter_errno(Errno::EXIST)?
+            .is_none()
+        {
             // This temporary filename already exists, try another
             continue;
         }
