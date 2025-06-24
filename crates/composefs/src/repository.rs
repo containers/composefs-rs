@@ -21,8 +21,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     fsverity::{
-        compute_verity, enable_verity, ensure_verity_equal, measure_verity, CompareVerityError,
-        EnableVerityError, FsVerityHashValue, MeasureVerityError,
+        compute_verity, CompareVerityError, EnableVerityError, FdVerity, FsVerityHashValue,
+        MeasureVerityError,
     },
     mount::{composefs_fsmount, mount_at},
     splitstream::{DigestMap, SplitStreamReader, SplitStreamWriter},
@@ -130,14 +130,14 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             Ok(fd) => {
                 // measure the existing file to ensure that it's correct
                 // TODO: try to replace file if it's broken?
-                match ensure_verity_equal(&fd, &id) {
+                match fd.ensure_verity_equal(&id) {
                     Ok(()) => {}
                     Err(CompareVerityError::Measure(MeasureVerityError::VerityMissing))
                         if self.insecure =>
                     {
-                        match enable_verity::<ObjectID>(&fd) {
+                        match fd.enable_verity::<ObjectID>() {
                             Ok(()) => {
-                                ensure_verity_equal(&fd, &id)?;
+                                fd.ensure_verity_equal(&id)?;
                             }
                             Err(other) => Err(other)?,
                         }
@@ -170,8 +170,8 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         )?;
         drop(file);
 
-        match enable_verity::<ObjectID>(&ro_fd) {
-            Ok(()) => match ensure_verity_equal(&ro_fd, &id) {
+        match ro_fd.enable_verity::<ObjectID>() {
+            Ok(()) => match ro_fd.ensure_verity_equal(&id) {
                 Ok(()) => {}
                 Err(CompareVerityError::Measure(
                     MeasureVerityError::VerityMissing | MeasureVerityError::FilesystemNotSupported,
@@ -203,7 +203,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
     fn open_with_verity(&self, filename: &str, expected_verity: &ObjectID) -> Result<OwnedFd> {
         let fd = self.openat(filename, OFlags::RDONLY)?;
-        match ensure_verity_equal(&fd, expected_verity) {
+        match fd.ensure_verity_equal(expected_verity) {
             Ok(()) => {}
             Err(CompareVerityError::Measure(
                 MeasureVerityError::VerityMissing | MeasureVerityError::FilesystemNotSupported,
@@ -263,7 +263,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         match self.openat(&stream_path, OFlags::RDONLY) {
             Ok(stream) => {
                 let path = readlinkat(&self.repository, stream_path, [])?;
-                let measured_verity = match measure_verity(&stream) {
+                let measured_verity = match stream.measure_verity() {
                     Ok(found) => found,
                     Err(
                         MeasureVerityError::VerityMissing
@@ -441,7 +441,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         }
 
         // A name with no slashes in it is taken to be a sha256 fs-verity digest
-        match measure_verity::<ObjectID>(&image) {
+        match image.measure_verity::<ObjectID>() {
             Ok(found) if found == FsVerityHashValue::from_hex(name)? => Ok((image, true)),
             Ok(_) => bail!("fs-verity content mismatch"),
             Err(MeasureVerityError::VerityMissing | MeasureVerityError::FilesystemNotSupported)

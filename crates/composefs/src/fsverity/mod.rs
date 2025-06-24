@@ -63,86 +63,91 @@ pub fn compute_verity<H: FsVerityHashValue>(data: &[u8]) -> H {
     digest::FsVerityHasher::<H, 12>::hash(data)
 }
 
-/// Enable fs-verity on the given file.
-///
-/// This essentially boils down to the FS_IOC_ENABLE_VERITY ioctl.
-///
-/// The file must be stored on a filesystem which supports fs-verity.  The file descriptor must be
-/// opened O_RDONLY and there must be no other writable file descriptors or mappings for the file.
-///
-/// It's possible to choose the hash algorithm (via the generic parameter) but the blocksize is
-/// currently hardcoded to 4096.  Salt is not supported.
-pub fn enable_verity<H: FsVerityHashValue>(fd: impl AsFd) -> Result<(), EnableVerityError> {
-    ioctl::fs_ioc_enable_verity::<H>(fd)
-}
+pub trait FdVerity
+where
+    Self: AsFd,
+{
+    /// Enable fs-verity on the given file.
+    ///
+    /// This essentially boils down to the FS_IOC_ENABLE_VERITY ioctl.
+    ///
+    /// The file must be stored on a filesystem which supports fs-verity.  The file descriptor must be
+    /// opened O_RDONLY and there must be no other writable file descriptors or mappings for the file.
+    ///
+    /// It's possible to choose the hash algorithm (via the generic parameter) but the blocksize is
+    /// currently hardcoded to 4096.  Salt is not supported.
+    fn enable_verity<H: FsVerityHashValue>(&self) -> Result<(), EnableVerityError> {
+        ioctl::fs_ioc_enable_verity::<H>(self)
+    }
 
-/// Measures fs-verity on the given file.
-///
-/// This essentially boils down to the FS_IOC_MEASURE_VERITY ioctl.
-///
-/// If the file has fs-verity enabled then the hash of the fs-verity descriptor is reported as the
-/// successful return value.  In this case, the kernel guarantees that the file content cannot
-/// possibly change for as long as the file descriptor exists.
-///
-/// If the file doesn't have fs-verity enabled then an error will be returned.
-///
-/// This function is generic over the hash algorithm, which means that you need to choose the
-/// expected hash algorithm in advance.  If the file has fs-verity enabled, but with a different
-/// hash algorithm, then this is also considered an error.
-///
-/// For a version of this function which returns an Option<> depending on if fs-verity is enabled
-/// or not, see `measure_verity_opt()`.
-///
-/// Simply measuring the fs-verity value of a file is not a common operation: you usually want to
-/// compare it to a value that you already know.  In that case, it's better to use the
-/// `compare_verity()` function in this module.
-pub fn measure_verity<H: FsVerityHashValue>(fd: impl AsFd) -> Result<H, MeasureVerityError> {
-    ioctl::fs_ioc_measure_verity(fd)
-}
+    /// Measures fs-verity on the given file.
+    ///
+    /// This essentially boils down to the FS_IOC_MEASURE_VERITY ioctl.
+    ///
+    /// If the file has fs-verity enabled then the hash of the fs-verity descriptor is reported as the
+    /// successful return value.  In this case, the kernel guarantees that the file content cannot
+    /// possibly change for as long as the file descriptor exists.
+    ///
+    /// If the file doesn't have fs-verity enabled then an error will be returned.
+    ///
+    /// This function is generic over the hash algorithm, which means that you need to choose the
+    /// expected hash algorithm in advance.  If the file has fs-verity enabled, but with a different
+    /// hash algorithm, then this is also considered an error.
+    ///
+    /// For a version of this function which returns an Option<> depending on if fs-verity is enabled
+    /// or not, see `measure_verity_opt()`.
+    ///
+    /// Simply measuring the fs-verity value of a file is not a common operation: you usually want to
+    /// compare it to a value that you already know.  In that case, it's better to use the
+    /// `compare_verity()` function in this module.
+    fn measure_verity<H: FsVerityHashValue>(&self) -> Result<H, MeasureVerityError> {
+        ioctl::fs_ioc_measure_verity(self)
+    }
 
-/// Measures fs-verity on the given file.
-///
-/// This essentially boils down to the FS_IOC_MEASURE_VERITY ioctl.
-///
-/// This is the `_opt()` variant of `measure_verity()`.  If the file doesn't have fs-verity
-/// enabled, or resides on a filesystem where fs-verity is unsupported, this function returns None.
-/// Other errors are still passed through.
-pub fn measure_verity_opt<H: FsVerityHashValue>(
-    fd: impl AsFd,
-) -> Result<Option<H>, MeasureVerityError> {
-    match ioctl::fs_ioc_measure_verity(fd) {
-        Ok(result) => Ok(Some(result)),
-        Err(MeasureVerityError::VerityMissing | MeasureVerityError::FilesystemNotSupported) => {
-            Ok(None)
+    /// Measures fs-verity on the given file.
+    ///
+    /// This essentially boils down to the FS_IOC_MEASURE_VERITY ioctl.
+    ///
+    /// This is the `_opt()` variant of `measure_verity()`.  If the file doesn't have fs-verity
+    /// enabled, or resides on a filesystem where fs-verity is unsupported, this function returns None.
+    /// Other errors are still passed through.
+    fn measure_verity_opt<H: FsVerityHashValue>(&self) -> Result<Option<H>, MeasureVerityError> {
+        match ioctl::fs_ioc_measure_verity(self) {
+            Ok(result) => Ok(Some(result)),
+            Err(MeasureVerityError::VerityMissing | MeasureVerityError::FilesystemNotSupported) => {
+                Ok(None)
+            }
+            Err(other) => Err(other),
         }
-        Err(other) => Err(other),
+    }
+
+    /// Compare the fs-verity digest of the file versus the expected digest.
+    ///
+    /// This calls `measure_verity()` and verifies that the result is equal to the expected value.
+    ///
+    /// If this function returns successfully then the values match.  In this case, the kernel
+    /// guarantees that the file content cannot possibly change for as long as the file descriptor
+    /// exists.
+    ///
+    /// If the file doesn't have fs-verity enabled, the hash value doesn't match, or if a different
+    /// hash algorithm is in use, the comparison will fail.
+    fn ensure_verity_equal<H: FsVerityHashValue>(
+        &self,
+        expected: &H,
+    ) -> Result<(), CompareVerityError> {
+        let found = Self::measure_verity(self)?;
+        if expected == &found {
+            Ok(())
+        } else {
+            Err(CompareVerityError::DigestMismatch {
+                expected: expected.to_hex(),
+                found: found.to_hex(),
+            })
+        }
     }
 }
 
-/// Compare the fs-verity digest of the file versus the expected digest.
-///
-/// This calls `measure_verity()` and verifies that the result is equal to the expected value.
-///
-/// If this function returns successfully then the values match.  In this case, the kernel
-/// guarantees that the file content cannot possibly change for as long as the file descriptor
-/// exists.
-///
-/// If the file doesn't have fs-verity enabled, the hash value doesn't match, or if a different
-/// hash algorithm is in use, the comparison will fail.
-pub fn ensure_verity_equal(
-    fd: impl AsFd,
-    expected: &impl FsVerityHashValue,
-) -> Result<(), CompareVerityError> {
-    let found = measure_verity(fd)?;
-    if expected == &found {
-        Ok(())
-    } else {
-        Err(CompareVerityError::DigestMismatch {
-            expected: expected.to_hex(),
-            found: found.to_hex(),
-        })
-    }
-}
+impl<T> FdVerity for T where T: AsFd {}
 
 #[cfg(test)]
 mod tests {
@@ -177,16 +182,17 @@ mod tests {
         let tf = rdonly_file_with(b"");
 
         assert!(matches!(
-            measure_verity::<Sha256HashValue>(&tf).unwrap_err(),
+            tf.measure_verity::<Sha256HashValue>().unwrap_err(),
             MeasureVerityError::VerityMissing
         ));
 
-        assert!(measure_verity_opt::<Sha256HashValue>(&tf)
+        assert!(tf
+            .measure_verity_opt::<Sha256HashValue>()
             .unwrap()
             .is_none());
 
         assert!(matches!(
-            ensure_verity_equal(&tf, &Sha256HashValue::EMPTY).unwrap_err(),
+            tf.ensure_verity_equal(&Sha256HashValue::EMPTY).unwrap_err(),
             CompareVerityError::Measure(MeasureVerityError::VerityMissing)
         ));
     }
@@ -196,29 +202,28 @@ mod tests {
         let tf = rdonly_file_with(b"hello world");
 
         // first time: success
-        enable_verity::<Sha256HashValue>(&tf).unwrap();
+        tf.enable_verity::<Sha256HashValue>().unwrap();
 
         // second time: fail with "already enabled"
         assert!(matches!(
-            enable_verity::<Sha256HashValue>(&tf).unwrap_err(),
+            tf.enable_verity::<Sha256HashValue>().unwrap_err(),
             EnableVerityError::AlreadyEnabled
         ));
 
         assert_eq!(
-            measure_verity::<Sha256HashValue>(&tf).unwrap().to_hex(),
+            tf.measure_verity::<Sha256HashValue>().unwrap().to_hex(),
             "1e2eaa4202d750a41174ee454970b92c1bc2f925b1e35076d8c7d5f56362ba64"
         );
 
         assert_eq!(
-            measure_verity_opt::<Sha256HashValue>(&tf)
+            tf.measure_verity_opt::<Sha256HashValue>()
                 .unwrap()
                 .unwrap()
                 .to_hex(),
             "1e2eaa4202d750a41174ee454970b92c1bc2f925b1e35076d8c7d5f56362ba64"
         );
 
-        ensure_verity_equal(
-            &tf,
+        tf.ensure_verity_equal(
             &Sha256HashValue::from_hex(
                 "1e2eaa4202d750a41174ee454970b92c1bc2f925b1e35076d8c7d5f56362ba64",
             )
@@ -226,8 +231,7 @@ mod tests {
         )
         .unwrap();
 
-        let Err(CompareVerityError::DigestMismatch { expected, found }) = ensure_verity_equal(
-            &tf,
+        let Err(CompareVerityError::DigestMismatch { expected, found }) = tf.ensure_verity_equal(
             &Sha256HashValue::from_hex(
                 "1e2eaa4202d750a41174ee454970b92c1bc2f925b1e35076d8c7000000000000",
             )
@@ -251,21 +255,22 @@ mod tests {
         let tf = tempfile_in("/dev/shm").unwrap();
 
         assert!(matches!(
-            enable_verity::<Sha256HashValue>(&tf).unwrap_err(),
+            tf.enable_verity::<Sha256HashValue>().unwrap_err(),
             EnableVerityError::FilesystemNotSupported
         ));
 
         assert!(matches!(
-            measure_verity::<Sha256HashValue>(&tf).unwrap_err(),
+            tf.measure_verity::<Sha256HashValue>().unwrap_err(),
             MeasureVerityError::FilesystemNotSupported
         ));
 
-        assert!(measure_verity_opt::<Sha256HashValue>(&tf)
+        assert!(tf
+            .measure_verity_opt::<Sha256HashValue>()
             .unwrap()
             .is_none());
 
         assert!(matches!(
-            ensure_verity_equal(&tf, &Sha256HashValue::EMPTY).unwrap_err(),
+            tf.ensure_verity_equal(&Sha256HashValue::EMPTY).unwrap_err(),
             CompareVerityError::Measure(MeasureVerityError::FilesystemNotSupported)
         ));
     }
@@ -275,20 +280,20 @@ mod tests {
         let tf = rdonly_file_with(b"hello world");
 
         // Enable with SHA-512 but then try to read with SHA-256
-        enable_verity::<Sha512HashValue>(&tf).unwrap();
+        tf.enable_verity::<Sha512HashValue>().unwrap();
 
         assert!(matches!(
-            measure_verity::<Sha256HashValue>(&tf).unwrap_err(),
+            tf.measure_verity::<Sha256HashValue>().unwrap_err(),
             MeasureVerityError::InvalidDigestSize { .. }
         ));
 
         assert!(matches!(
-            measure_verity_opt::<Sha256HashValue>(&tf).unwrap_err(),
+            tf.measure_verity_opt::<Sha256HashValue>().unwrap_err(),
             MeasureVerityError::InvalidDigestSize { .. }
         ));
 
         assert!(matches!(
-            ensure_verity_equal(&tf, &Sha256HashValue::EMPTY).unwrap_err(),
+            tf.ensure_verity_equal(&Sha256HashValue::EMPTY).unwrap_err(),
             CompareVerityError::Measure(MeasureVerityError::InvalidDigestSize { .. })
         ));
     }
@@ -298,20 +303,20 @@ mod tests {
         let tf = rdonly_file_with(b"hello world");
 
         // Enable with SHA-256 but then try to read with SHA-512
-        enable_verity::<Sha256HashValue>(&tf).unwrap();
+        tf.enable_verity::<Sha256HashValue>().unwrap();
 
         assert!(matches!(
-            measure_verity::<Sha512HashValue>(&tf).unwrap_err(),
+            tf.measure_verity::<Sha512HashValue>().unwrap_err(),
             MeasureVerityError::InvalidDigestAlgorithm { .. }
         ));
 
         assert!(matches!(
-            measure_verity_opt::<Sha512HashValue>(&tf).unwrap_err(),
+            tf.measure_verity_opt::<Sha512HashValue>().unwrap_err(),
             MeasureVerityError::InvalidDigestAlgorithm { .. }
         ));
 
         assert!(matches!(
-            ensure_verity_equal(&tf, &Sha512HashValue::EMPTY).unwrap_err(),
+            tf.ensure_verity_equal(&Sha512HashValue::EMPTY).unwrap_err(),
             CompareVerityError::Measure(MeasureVerityError::InvalidDigestAlgorithm { .. })
         ));
     }
@@ -348,8 +353,8 @@ mod tests {
 
         fn assert_kernel_equal<H: FsVerityHashValue>(data: &[u8], expected: H) {
             let fd = rdonly_file_with(data);
-            enable_verity::<H>(&fd).unwrap();
-            ensure_verity_equal(&fd, &expected).unwrap();
+            fd.enable_verity::<H>().unwrap();
+            fd.ensure_verity_equal(&expected).unwrap();
         }
 
         for size in cases {
