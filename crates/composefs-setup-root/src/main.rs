@@ -1,5 +1,6 @@
 use std::{
     ffi::OsString,
+    fmt::Debug,
     io::ErrorKind,
     os::fd::{AsFd, OwnedFd},
     path::{Path, PathBuf},
@@ -91,13 +92,16 @@ struct Args {
 }
 
 // Helpers
-fn open_dir(dirfd: impl AsFd, name: impl AsRef<Path>) -> rustix::io::Result<OwnedFd> {
+fn open_dir(dirfd: impl AsFd, name: impl AsRef<Path> + Debug) -> rustix::io::Result<OwnedFd> {
     openat(
         dirfd,
         name.as_ref(),
         OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
     )
+    .inspect_err(|_| {
+        eprintln!("Failed to open dir {name:?}");
+    })
 }
 
 fn ensure_dir(dirfd: impl AsFd, name: &str) -> rustix::io::Result<OwnedFd> {
@@ -116,6 +120,9 @@ fn bind_mount(fd: impl AsFd, path: &str) -> rustix::io::Result<OwnedFd> {
             | OpenTreeFlags::OPEN_TREE_CLOEXEC
             | OpenTreeFlags::AT_EMPTY_PATH,
     )
+    .inspect_err(|_| {
+        eprintln!("Open tree failed for {path}");
+    })
 }
 
 fn mount_tmpfs() -> Result<OwnedFd> {
