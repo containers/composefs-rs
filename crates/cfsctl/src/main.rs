@@ -339,7 +339,7 @@ async fn main() -> Result<()> {
             fs.print_dumpfile()?;
         }
         Command::Mount { name, mountpoint } => {
-            repo.mount(&name, &mountpoint)?;
+            repo.mount_at(&name, &mountpoint)?;
         }
         Command::ImageObjects { name } => {
             let objects = repo.objects_for_image(&name)?;
