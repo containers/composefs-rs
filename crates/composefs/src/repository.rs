@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     ffi::CStr,
-    fs::File,
+    fs::{canonicalize, File},
     io::{Read, Write},
     os::fd::{AsFd, OwnedFd},
     path::{Path, PathBuf},
@@ -23,7 +23,7 @@ use crate::{
     fsverity::{
         compute_verity, enable_verity, ensure_verity_equal, measure_verity, FsVerityHashValue,
     },
-    mount::mount_composefs_at,
+    mount::{composefs_fsmount, mount_at},
     splitstream::{DigestMap, SplitStreamReader, SplitStreamWriter},
     util::{proc_self_fd, Sha256Digest},
 };
@@ -383,7 +383,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         self.write_image(Some(name), &data)
     }
 
-    pub fn open_image(&self, name: &str) -> Result<OwnedFd> {
+    fn open_image(&self, name: &str) -> Result<OwnedFd> {
         let image = self.openat(&format!("images/{name}"), OFlags::RDONLY)?;
 
         if !name.contains("/") {
@@ -394,13 +394,16 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(image)
     }
 
-    pub fn mount(&self, name: &str, mountpoint: &str) -> Result<()> {
+    pub fn mount(&self, name: &str) -> Result<OwnedFd> {
         let image = self.open_image(name)?;
-        Ok(mount_composefs_at(
-            image,
-            name,
-            self.objects_dir()?,
-            mountpoint,
+        Ok(composefs_fsmount(image, name, self.objects_dir()?)?)
+    }
+
+    pub fn mount_at(&self, name: &str, mountpoint: impl AsRef<Path>) -> Result<()> {
+        Ok(mount_at(
+            self.mount(name)?,
+            CWD,
+            &canonicalize(mountpoint)?,
         )?)
     }
 

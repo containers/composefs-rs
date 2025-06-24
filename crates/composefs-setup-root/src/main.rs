@@ -19,7 +19,7 @@ use serde::Deserialize;
 
 use composefs::{
     fsverity::{FsVerityHashValue, Sha256HashValue},
-    mount::{composefs_fsmount, mount_at, FsHandle},
+    mount::{mount_at, FsHandle},
     mountcompat::{overlayfs_set_fd, overlayfs_set_lower_and_data_fds, prepare_mount},
     repository::Repository,
 };
@@ -166,8 +166,7 @@ fn open_root_fs(path: &Path) -> Result<OwnedFd> {
 
 fn mount_composefs_image(sysroot: &OwnedFd, name: &str) -> Result<OwnedFd> {
     let repo = Repository::<Sha256HashValue>::open_path(sysroot, "composefs")?;
-    let image = repo.open_image(name)?;
-    composefs_fsmount(image, name, repo.objects_dir()?).context("Failed to mount composefs image")
+    repo.mount(name)
 }
 
 fn mount_subdir(

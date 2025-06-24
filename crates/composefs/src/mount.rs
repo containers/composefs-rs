@@ -1,12 +1,9 @@
 use std::{
-    fs::canonicalize,
     io::Result,
     os::fd::{AsFd, BorrowedFd, OwnedFd},
-    path::Path,
 };
 
 use rustix::{
-    fs::CWD,
     mount::{
         fsconfig_create, fsconfig_set_flag, fsconfig_set_string, fsmount, fsopen, move_mount,
         FsMountFlags, FsOpenFlags, MountAttrFlags, MoveMountFlags,
@@ -94,14 +91,4 @@ pub fn composefs_fsmount(image: OwnedFd, name: &str, basedir: impl AsFd) -> Resu
         FsMountFlags::FSMOUNT_CLOEXEC,
         MountAttrFlags::empty(),
     )?)
-}
-
-pub fn mount_composefs_at(
-    image: OwnedFd,
-    name: &str,
-    basedir: impl AsFd,
-    mountpoint: impl AsRef<Path>,
-) -> Result<()> {
-    let mnt = composefs_fsmount(image, name, basedir)?;
-    Ok(mount_at(mnt, CWD, &canonicalize(mountpoint)?)?)
 }
