@@ -26,7 +26,7 @@ use crate::{
     },
     mount::{composefs_fsmount, mount_at},
     splitstream::{DigestMap, SplitStreamReader, SplitStreamWriter},
-    util::{filter_errno, proc_self_fd, replace_symlinkat, Sha256Digest},
+    util::{proc_self_fd, replace_symlinkat, ErrnoFilter, Sha256Digest},
 };
 
 /// Call openat() on the named subdirectory of "dirfd", possibly creating it first.
@@ -550,24 +550,21 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     fn gc_category(&self, category: &str) -> Result<HashSet<ObjectID>> {
         let mut objects = HashSet::new();
 
-        let Some(category_fd) = filter_errno(
-            self.openat(category, OFlags::RDONLY | OFlags::DIRECTORY),
-            Errno::NOENT,
-        )
-        .context("Opening {category} dir in repository")?
+        let Some(category_fd) = self
+            .openat(category, OFlags::RDONLY | OFlags::DIRECTORY)
+            .filter_errno(Errno::NOENT)
+            .context("Opening {category} dir in repository")?
         else {
             return Ok(objects);
         };
 
-        if let Some(refs) = filter_errno(
-            openat(
-                &category_fd,
-                "refs",
-                OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty(),
-            ),
-            Errno::NOENT,
+        if let Some(refs) = openat(
+            &category_fd,
+            "refs",
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
         )
+        .filter_errno(Errno::NOENT)
         .context("Opening {category}/refs dir in repository")?
         {
             Self::walk_symlinkdir(refs, &mut objects)?;
