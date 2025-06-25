@@ -4,8 +4,8 @@ set -eux
 
 chown -R 0:0 tmp/sysroot
 chcon -R system_u:object_r:usr_t:s0 tmp/sysroot/composefs
-chcon system_u:object_r:var_t:s0 tmp/sysroot/state/*/var
-chcon system_u:object_r:etc_t:s0 tmp/sysroot/state/*/etc/*
+chcon system_u:object_r:var_t:s0 tmp/sysroot/state/deploy/*/var
+chcon system_u:object_r:etc_t:s0 tmp/sysroot/state/deploy/*/etc/*
 
 definitions='tmp/repart.d'
 export SYSTEMD_REPART_MKFS_OPTIONS_EXT4='-O verity'

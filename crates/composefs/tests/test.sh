@@ -35,7 +35,7 @@ EOF
 blkdev="$(mkd "${top}/blkdev")"
 repo="$(mkd "${blkdev}/composefs")"
 state="$(mkd "${blkdev}/state")"
-deployment="$(mkd "${state}/${imageid}")"
+deployment="$(mkd "${state}/deploy/${imageid}")"
 dply_etc="$(mkd "${deployment}/etc")"
 dply_etc_u="$(mkd "${dply_etc}/upper")"
 dply_etc_w="$(mkd "${dply_etc}/work")"
