@@ -77,6 +77,8 @@ pub fn write_t2_simple<ObjectID: FsVerityHashValue>(
 /// * repo           - The composefs repository
 /// * entry          - Boot entry variant to be written
 /// * root_id        - The content hash of the generated EROFS image id
+/// * insecure       - Make fs-verity validation optional in case the filesystem doesn't support
+///   it, indicated by `composefs=?hash` cmdline argument
 /// * boot_partition - Path to the boot partition/directory
 /// * boot_subdir    - If `Some(path)`, the path is prepended to `initrd` and `linux` keys in the BLS entry
 ///
