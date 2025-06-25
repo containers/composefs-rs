@@ -303,7 +303,7 @@ async fn main() -> Result<()> {
                     .as_ref()
                     .map(|p: &PathBuf| p.parent().unwrap())
                     .unwrap_or(Path::new("/sysroot"))
-                    .join("state")
+                    .join("state/deploy")
                     .join(id.to_hex());
 
                 create_dir_all(state.join("var"))?;

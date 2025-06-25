@@ -257,7 +257,7 @@ fn setup_root(args: Args) -> Result<()> {
     }
 
     // etc + var
-    let state = open_dir(open_dir(&sysroot, "state")?, image.to_hex())?;
+    let state = open_dir(open_dir(&sysroot, "state/deploy")?, image.to_hex())?;
     mount_subdir(&new_root, &state, "etc", config.etc, MountType::Overlay)?;
     mount_subdir(&new_root, &state, "var", config.var, MountType::Bind)?;
 
