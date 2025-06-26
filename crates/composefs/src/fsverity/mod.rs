@@ -172,6 +172,24 @@ mod tests {
         fd
     }
 
+    /// Wrap the real method inside of the tests and do a little
+    /// sleep/retry dance.  This is known to be race-prone due to the
+    /// way the tests are run in parallel across different runner
+    /// threads, see:
+    /// https://github.com/containers/composefs-rs/issues/106
+    fn enable_verity<H: FsVerityHashValue>(fd: impl AsFd) -> Result<(), EnableVerityError> {
+        for attempt in 1..=3 {
+            match super::enable_verity::<H>(&fd) {
+                Err(EnableVerityError::FileOpenedForWrite) if attempt != 3 => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                other => return other,
+            }
+        }
+
+        unreachable!("We always return on the last iteration above");
+    }
+
     #[test]
     fn test_verity_missing() {
         let tf = rdonly_file_with(b"");
