@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     fsverity::{
-        compute_verity, enable_verity, ensure_verity_equal, measure_verity, CompareVerityError,
+        compute_verity, enable_verity_raw, ensure_verity_equal, measure_verity, CompareVerityError,
         EnableVerityError, FsVerityHashValue, MeasureVerityError,
     },
     mount::{composefs_fsmount, mount_at},
@@ -135,7 +135,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                     Err(CompareVerityError::Measure(MeasureVerityError::VerityMissing))
                         if self.insecure =>
                     {
-                        match enable_verity::<ObjectID>(&fd) {
+                        match enable_verity_raw::<ObjectID>(&fd) {
                             Ok(()) => {
                                 ensure_verity_equal(&fd, &id)?;
                             }
@@ -170,7 +170,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         )?;
         drop(file);
 
-        match enable_verity::<ObjectID>(&ro_fd) {
+        match enable_verity_raw::<ObjectID>(&ro_fd) {
             Ok(()) => match ensure_verity_equal(&ro_fd, &id) {
                 Ok(()) => {}
                 Err(CompareVerityError::Measure(
