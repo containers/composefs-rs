@@ -41,6 +41,13 @@ pub enum EnableVerityError {
     AlreadyEnabled,
     #[error("File is opened for writing")]
     FileOpenedForWrite,
+    /// temporary debugging
+    #[error("rewind")]
+    Rewind(Error),
+    #[error("openat")]
+    Openat(Error),
+    #[error("open")]
+    Open(Error),
 }
 
 /// A verity comparison failed.
@@ -190,7 +197,7 @@ fn enable_verity_on_copy<H: FsVerityHashValue>(
     let mut fd = File::from(fd);
 
     loop {
-        fd.rewind().map_err(EnableVerityError::Io)?;
+        fd.rewind().map_err(EnableVerityError::Rewind)?;
 
         let mut new_rw_fd = File::from(
             openat(
@@ -199,7 +206,7 @@ fn enable_verity_on_copy<H: FsVerityHashValue>(
                 OFlags::CLOEXEC | OFlags::RDWR | OFlags::TMPFILE,
                 mode,
             )
-            .map_err(|e| EnableVerityError::Io(e.into()))?,
+            .map_err(|e| EnableVerityError::Openat(e.into()))?,
         );
 
         std::io::copy(&mut fd, &mut new_rw_fd)?;
@@ -208,7 +215,7 @@ fn enable_verity_on_copy<H: FsVerityHashValue>(
             OFlags::RDONLY | OFlags::CLOEXEC,
             Mode::empty(),
         )
-        .map_err(|e| EnableVerityError::Io(e.into()))?;
+        .map_err(|e| EnableVerityError::Open(e.into()))?;
         drop(new_rw_fd);
         if enable_verity_with_retry::<H>(&new_ro_fd).is_ok() {
             return Ok(new_ro_fd);
