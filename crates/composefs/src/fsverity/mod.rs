@@ -529,7 +529,7 @@ mod tests {
         // file descriptor, which will never work directly, so we
         // expect to always get back a new copy of the requested file.
         let (tempdir, fd) = empty_file_in_tmpdir(OFlags::RDWR, 0o644.into());
-        let tempdir_fd = File::open(tempdir).unwrap();
+        let tempdir_fd = File::open(dbg!(tempdir.path())).unwrap();
         let mut fd = File::from(fd);
         let _ = fd.write(b"hello world").unwrap();
         let verity = enable_verity_maybe_copy::<Sha256HashValue>(&tempdir_fd, fd.into()).unwrap();
