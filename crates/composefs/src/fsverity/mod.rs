@@ -5,7 +5,10 @@ mod ioctl;
 use std::{
     fs::File,
     io::{Error, Seek},
-    os::fd::{AsFd, OwnedFd},
+    os::{
+        fd::{AsFd, OwnedFd},
+        unix::fs::PermissionsExt,
+    },
 };
 
 use rustix::fs::{open, openat, Mode, OFlags};
@@ -168,12 +171,11 @@ pub fn enable_verity_with_retry<H: FsVerityHashValue>(
 pub fn enable_verity_maybe_copy<H: FsVerityHashValue>(
     dirfd: impl AsFd,
     fd: OwnedFd,
-    mode: Mode,
 ) -> Result<VerityFd, EnableVerityError> {
     match enable_verity_with_retry::<H>(&fd) {
         Ok(_) => Ok(VerityFd::Orig(fd)),
         Err(EnableVerityError::FileOpenedForWrite) => {
-            enable_verity_on_copy::<H>(dirfd, fd, mode).map(VerityFd::Copy)
+            enable_verity_on_copy::<H>(dirfd, fd).map(VerityFd::Copy)
         }
         Err(other) => Err(other),
     }
@@ -185,9 +187,9 @@ pub fn enable_verity_maybe_copy<H: FsVerityHashValue>(
 fn enable_verity_on_copy<H: FsVerityHashValue>(
     dirfd: impl AsFd,
     fd: OwnedFd,
-    mode: Mode,
 ) -> Result<OwnedFd, EnableVerityError> {
     let mut fd = File::from(fd);
+    let mode = fd.metadata()?.permissions().mode();
 
     loop {
         fd.rewind().map_err(EnableVerityError::Io)?;
@@ -197,7 +199,7 @@ fn enable_verity_on_copy<H: FsVerityHashValue>(
                 &dirfd,
                 ".",
                 OFlags::CLOEXEC | OFlags::RDWR | OFlags::TMPFILE,
-                mode,
+                mode.into(),
             )
             .map_err(|e| EnableVerityError::Io(e.into()))?,
         );
@@ -515,10 +517,9 @@ mod tests {
         // Enabling verity on an empty file created without a
         // read-write file descriptor ever existing should always
         // succeed and hand us back the original file descriptor.
-        let mode = 0o644.into();
-        let (tempdir, fd) = empty_file_in_tmpdir(OFlags::RDONLY, mode);
+        let (tempdir, fd) = empty_file_in_tmpdir(OFlags::RDONLY, 0o644.into());
         let tempdir_fd = File::open(tempdir.path()).unwrap();
-        let verity = enable_verity_maybe_copy::<Sha256HashValue>(&tempdir_fd, fd, mode).unwrap();
+        let verity = enable_verity_maybe_copy::<Sha256HashValue>(&tempdir_fd, fd).unwrap();
         assert!(verity.is_orig());
     }
 
@@ -527,13 +528,11 @@ mod tests {
         // Here we intentionally try to enable verity on a read-write
         // file descriptor, which will never work directly, so we
         // expect to always get back a new copy of the requested file.
-        let mode = 0o644.into();
-        let (tempdir, fd) = empty_file_in_tmpdir(OFlags::RDWR, mode);
+        let (tempdir, fd) = empty_file_in_tmpdir(OFlags::RDWR, 0o644.into());
         let tempdir_fd = File::open(tempdir.path()).unwrap();
         let mut fd = File::from(fd);
         let _ = fd.write(b"hello world").unwrap();
-        let verity =
-            enable_verity_maybe_copy::<Sha256HashValue>(&tempdir_fd, fd.into(), mode).unwrap();
+        let verity = enable_verity_maybe_copy::<Sha256HashValue>(&tempdir_fd, fd.into()).unwrap();
 
         // This is not the original fd
         assert!(verity.is_copy());
