@@ -10,11 +10,9 @@ cd "${0%/*}"
 case "${os}" in
     fedora)
         containerfile='Containerfile'
-        features='--features=pre-6.15'
         ;;
     arch)
         containerfile='Containerfile.arch'
-        features='--features=pre-6.15'
         ;;
     *)
         echo "*** unknown variant ${os}"
@@ -25,7 +23,7 @@ esac
 # https://github.com/containers/buildah/issues/5656
 PODMAN_BUILD="podman build --no-cache"
 
-cargo build --release "${features}"
+cargo build --release
 
 cp ../../target/release/cfsctl .
 cp ../../target/release/composefs-setup-root extra/usr/lib/dracut/modules.d/37composefs/

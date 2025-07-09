@@ -10,11 +10,11 @@ cd "${0%/*}"
 case "${os}" in
     fedora)
         containerfile='Containerfile'
-        cargo build --release --features=pre-6.15
+        cargo build --release
         ;;
     arch)
         containerfile='Containerfile.arch'
-        cargo build --release --features=pre-6.15
+        cargo build --release
         ;;
     rhel9)
         containerfile='Containerfile.rhel9'
@@ -22,18 +22,16 @@ case "${os}" in
         ;;
     ubuntu)
         containerfile='Containerfile.ubuntu'
-        cargo build --release --features=pre-6.15
-        ;;
-    rawhide-compat)
-        # try a variant with rawhide using the old mount APIs
-        # this is currently failing due to a suspected kernel behaviour change
-        # https://lore.kernel.org/linux-fsdevel/CAOYeF9WQhFDe+BGW=Dp5fK8oRy5AgZ6zokVyTj1Wp4EUiYgt4w@mail.gmail.com
-        containerfile='Containerfile.rawhide'
-        cargo build --release --features=pre-6.15
+        cargo build --release
         ;;
     rawhide)
         containerfile='Containerfile.rawhide'
-        cargo build --release --no-default-features --features=oci
+        cargo build --release
+        ;;
+    fedora-compat)
+        # try a variant using the old mount APIs with a new kernel
+        containerfile='Containerfile'
+        cargo build --release --features=pre-6.15
         ;;
     *)
         echo "*** unknown variant ${os}"

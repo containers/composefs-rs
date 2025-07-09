@@ -12,7 +12,7 @@ if [ "${os}" != 'fedora' ]; then
     false
 fi
 
-cargo build --release --features=pre-6.15
+cargo build --release
 
 cp ../../target/release/cfsctl .
 cp ../../target/release/composefs-setup-root extra/usr/lib/dracut/modules.d/37composefs/
