@@ -19,6 +19,7 @@ jobs:
         example:
           - { dir: 'bls', os: 'arch' }
           - { dir: 'bls', os: 'fedora' }
+          - { dir: 'bls', os: 'fedora-compat' }
           - { dir: 'bls', os: 'rawhide' }
           - { dir: 'bls', os: 'rhel9' }
           - { dir: 'bls', os: 'ubuntu' }

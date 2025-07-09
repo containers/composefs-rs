@@ -11,7 +11,6 @@ rust-version.workspace = true
 version.workspace = true
 
 [features]
-default = ['pre-6.15']
 'pre-6.15' = ['tempfile']
 rhel9 = ['pre-6.15']
 test = []
