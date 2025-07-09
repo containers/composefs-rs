@@ -288,7 +288,15 @@ pub fn ensure_verity_equal(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, io::Write};
+    use std::{
+        collections::BTreeSet,
+        io::Write,
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        },
+        time::{self, Duration},
+    };
 
     use rustix::{
         fd::OwnedFd,
@@ -395,6 +403,71 @@ mod tests {
             found,
             "1e2eaa4202d750a41174ee454970b92c1bc2f925b1e35076d8c7d5f56362ba64"
         );
+    }
+
+    #[allow(unsafe_code)]
+    #[tokio::test]
+    async fn test_verity_forking() {
+        const DELAY: Duration = time::Duration::from_millis(10);
+
+        let fork_iterations = Arc::new(AtomicU64::new(0));
+        let fi = fork_iterations.clone();
+        let forker = tokio::task::spawn(async move {
+            loop {
+                fi.fetch_add(1, Ordering::AcqRel);
+                unsafe {
+                    tokio::process::Command::new("true")
+                        .pre_exec(|| {
+                            std::thread::sleep(DELAY);
+                            Ok(())
+                        })
+                        .status()
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        tokio::pin!(forker);
+        let verity_iterations = Arc::new(AtomicU64::new(0));
+        let vi = verity_iterations.clone();
+        let verity_enabler = tokio::task::spawn(async move {
+            loop {
+                vi.fetch_add(1, Ordering::AcqRel);
+                let r = tokio::task::spawn_blocking(move || {
+                    let tf = rdonly_file_with(b"hello world");
+                    enable_verity::<Sha256HashValue>(&tf)
+                })
+                .await
+                .unwrap();
+                if r.is_ok() {
+                    return;
+                }
+            }
+        });
+        tokio::pin!(verity_enabler);
+        let timer = tokio::time::interval(time::Duration::from_secs(1));
+        tokio::pin!(timer);
+        let ts = tokio::time::Instant::now();
+        loop {
+            tokio::select! {
+                _ = timer.tick() => {
+                    let forks = fork_iterations.load(Ordering::Acquire);
+                    let verity = verity_iterations.load(Ordering::Acquire);
+                    eprintln!("forks={forks} verity={verity}");
+                    continue
+                },
+                _ = forker.as_mut() => {
+                    unreachable!()
+                },
+                _ = verity_enabler.as_mut() => {
+                    let elapsed = ts.elapsed().as_secs();
+                    let forks = fork_iterations.load(Ordering::Acquire);
+                    let verity = verity_iterations.load(Ordering::Acquire);
+                    eprintln!("forks={forks} verity={verity} in {elapsed}s");
+                    break
+                }
+            }
+        }
     }
 
     #[test_with::path(/dev/shm)]
