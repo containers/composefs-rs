@@ -288,16 +288,9 @@ pub fn ensure_verity_equal(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::BTreeSet,
-        io::Write,
-        sync::{
-            atomic::{AtomicU64, Ordering},
-            Arc,
-        },
-        time::{self, Duration},
-    };
+    use std::{collections::BTreeSet, io::Write, os::unix::process::CommandExt, time::Duration};
 
+    use rand::Rng;
     use rustix::{
         fd::OwnedFd,
         fs::{open, Mode, OFlags},
@@ -408,66 +401,175 @@ mod tests {
     #[allow(unsafe_code)]
     #[tokio::test]
     async fn test_verity_forking() {
-        const DELAY: Duration = time::Duration::from_millis(10);
+        const DELAY_MIN: u64 = 0;
+        const DELAY_MAX: u64 = 10;
 
-        let fork_iterations = Arc::new(AtomicU64::new(0));
-        let fi = fork_iterations.clone();
-        let forker = tokio::task::spawn(async move {
-            loop {
-                fi.fetch_add(1, Ordering::AcqRel);
-                unsafe {
-                    tokio::process::Command::new("true")
-                        .pre_exec(|| {
-                            std::thread::sleep(DELAY);
-                            Ok(())
-                        })
-                        .status()
-                        .await
-                        .unwrap();
+        let cpus = std::thread::available_parallelism().unwrap();
+        // use half of capacity for forking
+        let threads = cpus.get() >> 1;
+        assert!(threads >= 1);
+        eprintln!("using {threads} threads");
+        let mut txs = vec![];
+        let mut jhs = vec![];
+
+        for _ in 0..threads {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let jh = std::thread::spawn(move || {
+                let mut rng = rand::rng();
+
+                loop {
+                    if rx.try_recv().is_ok() {
+                        break;
+                    }
+
+                    let delay = rng.random_range(DELAY_MIN..=DELAY_MAX);
+                    let delay = Duration::from_millis(delay);
+                    unsafe {
+                        std::process::Command::new("true")
+                            .pre_exec(move || {
+                                std::thread::sleep(delay);
+                                Ok(())
+                            })
+                            .status()
+                            .unwrap();
+                    }
                 }
-            }
-        });
-        tokio::pin!(forker);
-        let verity_iterations = Arc::new(AtomicU64::new(0));
-        let vi = verity_iterations.clone();
-        let verity_enabler = tokio::task::spawn(async move {
+            });
+
+            txs.push(tx);
+            jhs.push(jh);
+        }
+
+        let raw_verity_enabler = tokio::task::spawn(async move {
+            let mut successes = 0;
+            let mut failures = 0;
+
             loop {
-                vi.fetch_add(1, Ordering::AcqRel);
+                if successes == 100 {
+                    break;
+                }
+
                 let r = tokio::task::spawn_blocking(move || {
-                    let tf = rdonly_file_with(b"hello world");
-                    enable_verity::<Sha256HashValue>(&tf)
+                    let (tempdir, fd) = empty_file_in_tmpdir(OFlags::RDWR, 0o644.into());
+                    let _tempdir_fd = File::open(tempdir.path()).unwrap();
+                    let mut fd = File::from(fd);
+                    let _ = fd.write(b"hello world").unwrap();
+                    let ro_fd = open(
+                        proc_self_fd(&fd),
+                        OFlags::RDONLY | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    )
+                    .unwrap();
+                    drop(fd);
+                    enable_verity_raw::<Sha256HashValue>(&ro_fd)
                 })
                 .await
                 .unwrap();
                 if r.is_ok() {
-                    return;
+                    successes += 1;
+                } else {
+                    failures += 1;
                 }
             }
+
+            (successes, failures)
         });
-        tokio::pin!(verity_enabler);
-        let timer = tokio::time::interval(time::Duration::from_secs(1));
-        tokio::pin!(timer);
-        let ts = tokio::time::Instant::now();
-        loop {
-            tokio::select! {
-                _ = timer.tick() => {
-                    let forks = fork_iterations.load(Ordering::Acquire);
-                    let verity = verity_iterations.load(Ordering::Acquire);
-                    eprintln!("forks={forks} verity={verity}");
-                    continue
-                },
-                _ = forker.as_mut() => {
-                    unreachable!()
-                },
-                _ = verity_enabler.as_mut() => {
-                    let elapsed = ts.elapsed().as_secs();
-                    let forks = fork_iterations.load(Ordering::Acquire);
-                    let verity = verity_iterations.load(Ordering::Acquire);
-                    eprintln!("forks={forks} verity={verity} in {elapsed}s");
-                    break
+        tokio::pin!(raw_verity_enabler);
+
+        let retry_verity_enabler = tokio::task::spawn(async move {
+            let mut successes = 0;
+            let mut failures = 0;
+
+            loop {
+                if successes == 100 {
+                    break;
+                }
+
+                let r = tokio::task::spawn_blocking(move || {
+                    let (tempdir, fd) = empty_file_in_tmpdir(OFlags::RDWR, 0o644.into());
+                    let _tempdir_fd = File::open(tempdir.path()).unwrap();
+                    let mut fd = File::from(fd);
+                    let _ = fd.write(b"hello world").unwrap();
+                    let ro_fd = open(
+                        proc_self_fd(&fd),
+                        OFlags::RDONLY | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    )
+                    .unwrap();
+                    drop(fd);
+                    enable_verity_with_retry::<Sha256HashValue>(&ro_fd)
+                })
+                .await
+                .unwrap();
+                if r.is_ok() {
+                    successes += 1;
+                } else {
+                    failures += 1;
                 }
             }
-        }
+
+            (successes, failures)
+        });
+        tokio::pin!(retry_verity_enabler);
+
+        let copy_verity_enabler = tokio::task::spawn(async move {
+            let mut orig = 0;
+            let mut copy = 0;
+
+            loop {
+                if orig + copy == 100 {
+                    break;
+                }
+
+                let r = tokio::task::spawn_blocking(move || {
+                    let (tempdir, fd) = empty_file_in_tmpdir(OFlags::RDWR, 0o644.into());
+                    let tempdir_fd = File::open(tempdir.path()).unwrap();
+                    let mut fd = File::from(fd);
+                    let _ = fd.write(b"hello world").unwrap();
+                    let ro_fd = open(
+                        proc_self_fd(&fd),
+                        OFlags::RDONLY | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    )
+                    .unwrap();
+                    drop(fd);
+                    enable_verity_maybe_copy::<Sha256HashValue>(&tempdir_fd, ro_fd).unwrap()
+                })
+                .await
+                .unwrap();
+                if r.is_orig() {
+                    orig += 1;
+                } else {
+                    copy += 1;
+                }
+            }
+
+            (orig, copy)
+        });
+        tokio::pin!(copy_verity_enabler);
+
+        let ts = tokio::time::Instant::now();
+
+        tokio::join!(
+            async {
+                let (successes, failures) = raw_verity_enabler.as_mut().await.unwrap();
+                let elapsed = ts.elapsed().as_millis();
+                eprintln!("raw verity enabled ({successes} attempts succeeded, {failures} attempts failed) in {elapsed}ms");
+            },
+            async {
+                let (successes, failures) = retry_verity_enabler.as_mut().await.unwrap();
+                let elapsed = ts.elapsed().as_millis();
+                eprintln!("retry verity enabled ({successes} attempts succeeded, {failures} attempts failed) in {elapsed}ms");
+            },
+            async {
+                let (orig, copy) = copy_verity_enabler.as_mut().await.unwrap();
+                let elapsed = ts.elapsed().as_millis();
+                eprintln!("copy verity enabled ({orig} original, {copy} copies) in {elapsed}ms");
+            }
+        );
+
+        txs.into_iter().for_each(|tx| tx.send(()).unwrap());
+        jhs.into_iter().for_each(|jh| jh.join().unwrap());
     }
 
     #[test_with::path(/dev/shm)]
