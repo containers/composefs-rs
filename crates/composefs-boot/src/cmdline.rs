@@ -41,7 +41,7 @@ pub fn get_cmdline_composefs<ObjectID: FsVerityHashValue>(
 
 pub fn make_cmdline_composefs(id: &str, insecure: bool) -> String {
     match insecure {
-        true => format!("composefs=?{}", id),
-        false => format!("composefs={}", id),
+        true => format!("composefs=?{id}"),
+        false => format!("composefs={id}"),
     }
 }
