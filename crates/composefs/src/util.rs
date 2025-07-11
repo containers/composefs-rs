@@ -126,7 +126,7 @@ fn generate_tmpname(prefix: &str) -> String {
         .take(12)
         .map(char::from)
         .collect();
-    format!("{}{}", prefix, rand_string)
+    format!("{prefix}{rand_string}")
 }
 
 pub(crate) fn replace_symlinkat(
