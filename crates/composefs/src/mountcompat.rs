@@ -183,7 +183,7 @@ mod loopback {
 
         const IS_MUTATING: bool = false;
 
-        fn opcode(&self) -> u32 {
+        fn opcode(&self) -> rustix::ioctl::Opcode {
             LOOP_CTL_GET_FREE
         }
 
@@ -230,8 +230,8 @@ mod loopback {
         reserved: [u64; 8],
     }
 
-    const LOOP_CTL_GET_FREE: u32 = 0x4C82;
-    const LOOP_CONFIGURE: u32 = 0x4C0A;
+    const LOOP_CTL_GET_FREE: rustix::ioctl::Opcode = 0x4C82;
+    const LOOP_CONFIGURE: rustix::ioctl::Opcode = 0x4C0A;
     const LO_FLAGS_READ_ONLY: u32 = 1;
     const LO_FLAGS_AUTOCLEAR: u32 = 4;
     const LO_FLAGS_DIRECT_IO: u32 = 16;
