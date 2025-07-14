@@ -65,23 +65,6 @@ pub enum VerityFd {
     Copy(OwnedFd),
 }
 
-impl VerityFd {
-    pub fn is_orig(&self) -> bool {
-        matches!(self, Self::Orig(_))
-    }
-
-    pub fn is_copy(&self) -> bool {
-        matches!(self, Self::Copy(_))
-    }
-
-    pub fn into_inner(self) -> OwnedFd {
-        match self {
-            Self::Orig(fd) => fd,
-            Self::Copy(fd) => fd,
-        }
-    }
-}
-
 /// Compute the fs-verity digest for a given block of data, in userspace.
 ///
 /// The fs-verity digest is a cryptographic hash over the fs-verity descriptor, which itself
@@ -537,10 +520,9 @@ mod tests {
                 })
                 .await
                 .unwrap();
-                if r.is_orig() {
-                    orig += 1;
-                } else {
-                    copy += 1;
+                match r {
+                    VerityFd::Orig(_) => orig += 1,
+                    VerityFd::Copy(_) => copy += 1,
                 }
             }
 
@@ -694,8 +676,11 @@ mod tests {
         // succeed and hand us back the original file descriptor.
         let (tempdir, fd) = empty_file_in_tmpdir(OFlags::RDONLY, 0o644.into());
         let tempdir_fd = File::open(tempdir.path()).unwrap();
-        let verity = enable_verity_maybe_copy::<Sha256HashValue>(&tempdir_fd, fd).unwrap();
-        assert!(verity.is_orig());
+        let fd = enable_verity_maybe_copy::<Sha256HashValue>(&tempdir_fd, fd).unwrap();
+        match fd {
+            VerityFd::Orig(_) => {}
+            VerityFd::Copy(_) => unreachable!(),
+        }
     }
 
     #[test]
@@ -707,14 +692,16 @@ mod tests {
         let tempdir_fd = File::open(tempdir.path()).unwrap();
         let mut fd = File::from(fd);
         let _ = fd.write(b"hello world").unwrap();
-        let verity = enable_verity_maybe_copy::<Sha256HashValue>(&tempdir_fd, fd.into()).unwrap();
-
+        let fd = enable_verity_maybe_copy::<Sha256HashValue>(&tempdir_fd, fd.into()).unwrap();
         // This is not the original fd
-        assert!(verity.is_copy());
+        let fd = match fd {
+            VerityFd::Copy(fd) => fd,
+            VerityFd::Orig(_) => unreachable!(),
+        };
 
         // The new fd has the correct data
         assert!(ensure_verity_equal(
-            verity.into_inner(),
+            fd,
             &Sha256HashValue::from_hex(
                 "1e2eaa4202d750a41174ee454970b92c1bc2f925b1e35076d8c7d5f56362ba64",
             )
