@@ -21,8 +21,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     fsverity::{
-        compute_verity, enable_verity_raw, ensure_verity_equal, measure_verity, CompareVerityError,
-        EnableVerityError, FsVerityHashValue, MeasureVerityError,
+        compute_verity, enable_verity_maybe_copy, ensure_verity_equal, measure_verity,
+        CompareVerityError, EnableVerityError, FsVerityHashValue, MeasureVerityError,
     },
     mount::{composefs_fsmount, mount_at},
     splitstream::{DigestMap, SplitStreamReader, SplitStreamWriter},
@@ -135,10 +135,9 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                     Err(CompareVerityError::Measure(MeasureVerityError::VerityMissing))
                         if self.insecure =>
                     {
-                        match enable_verity_raw::<ObjectID>(&fd) {
-                            Ok(()) => {
-                                ensure_verity_equal(&fd, &id)?;
-                            }
+                        match enable_verity_maybe_copy::<ObjectID>(dirfd, fd.as_fd()) {
+                            Ok(Some(fd)) => ensure_verity_equal(&fd, &id)?,
+                            Ok(None) => ensure_verity_equal(&fd, &id)?,
                             Err(other) => Err(other)?,
                         }
                     }
@@ -170,17 +169,21 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         )?;
         drop(file);
 
-        match enable_verity_raw::<ObjectID>(&ro_fd) {
-            Ok(()) => match ensure_verity_equal(&ro_fd, &id) {
-                Ok(()) => {}
-                Err(CompareVerityError::Measure(
-                    MeasureVerityError::VerityMissing | MeasureVerityError::FilesystemNotSupported,
-                )) if self.insecure => {}
-                Err(other) => Err(other).context("Double-checking verity digest")?,
-            },
-            Err(EnableVerityError::FilesystemNotSupported) if self.insecure => {}
+        let ro_fd = match enable_verity_maybe_copy::<ObjectID>(dirfd, ro_fd.as_fd()) {
+            Ok(maybe_fd) => {
+                let ro_fd = maybe_fd.unwrap_or(ro_fd);
+                match ensure_verity_equal(&ro_fd, &id) {
+                    Ok(()) => ro_fd,
+                    Err(CompareVerityError::Measure(
+                        MeasureVerityError::VerityMissing
+                        | MeasureVerityError::FilesystemNotSupported,
+                    )) if self.insecure => ro_fd,
+                    Err(other) => Err(other).context("Double-checking verity digest")?,
+                }
+            }
+            Err(EnableVerityError::FilesystemNotSupported) if self.insecure => ro_fd,
             Err(other) => Err(other).context("Enabling verity digest")?,
-        }
+        };
 
         match linkat(
             CWD,

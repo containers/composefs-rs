@@ -6,7 +6,7 @@ use std::{
     fs::File,
     io::{Error, Seek},
     os::{
-        fd::{AsFd, OwnedFd},
+        fd::{AsFd, BorrowedFd, OwnedFd},
         unix::fs::PermissionsExt,
     },
 };
@@ -53,16 +53,6 @@ pub enum CompareVerityError {
     Measure(#[from] MeasureVerityError),
     #[error("Expected digest {expected} but found {found}")]
     DigestMismatch { expected: String, found: String },
-}
-
-/// An owned file descriptor with fsverity enabled.  Used in contexts
-/// where a user-supplied file descriptor may be returned back to the
-/// user directly (`Orig`), or a distinct copy of the file descriptor
-/// (`Copy`) may be returned in place of the original.
-#[derive(Debug)]
-pub enum VerityFd {
-    Orig(OwnedFd),
-    Copy(OwnedFd),
 }
 
 /// Compute the fs-verity digest for a given block of data, in userspace.
@@ -151,14 +141,18 @@ pub fn enable_verity_with_retry<H: FsVerityHashValue>(
 /// # Arguments:
 /// * `dirfd`: A directory file descriptor, used to determine the placement (via O_TMPFILE) of the new file (if necessary).
 /// * `fd`: The file decriptor to enable verity on
+/// # Return Value:
+/// * `Ok(None)` is returned if verity was enabled on the original file
+/// * `Ok(Some(OwnedFd))` is returned if a copy was made
 pub fn enable_verity_maybe_copy<H: FsVerityHashValue>(
     dirfd: impl AsFd,
-    fd: OwnedFd,
-) -> Result<VerityFd, EnableVerityError> {
+    fd: BorrowedFd,
+) -> Result<Option<OwnedFd>, EnableVerityError> {
     match enable_verity_with_retry::<H>(&fd) {
-        Ok(_) => Ok(VerityFd::Orig(fd)),
+        Ok(_) => Ok(None),
         Err(EnableVerityError::FileOpenedForWrite) => {
-            enable_verity_on_copy::<H>(dirfd, fd).map(VerityFd::Copy)
+            let fd = enable_verity_on_copy::<H>(dirfd, fd)?;
+            Ok(Some(fd))
         }
         Err(other) => Err(other),
     }
@@ -169,8 +163,9 @@ pub fn enable_verity_maybe_copy<H: FsVerityHashValue>(
 /// relative to `dirfd`.
 fn enable_verity_on_copy<H: FsVerityHashValue>(
     dirfd: impl AsFd,
-    fd: OwnedFd,
+    fd: BorrowedFd,
 ) -> Result<OwnedFd, EnableVerityError> {
+    let fd = fd.try_clone_to_owned().map_err(EnableVerityError::Io)?;
     let mut fd = File::from(fd);
     let mode = fd.metadata()?.permissions().mode();
 
@@ -504,7 +499,7 @@ mod tests {
                     break;
                 }
 
-                let r = tokio::task::spawn_blocking(move || {
+                let is_copy = tokio::task::spawn_blocking(|| {
                     let (tempdir, fd) = empty_file_in_tmpdir(OFlags::RDWR, 0o644.into());
                     let tempdir_fd = File::open(tempdir.path()).unwrap();
                     let mut fd = File::from(fd);
@@ -516,13 +511,17 @@ mod tests {
                     )
                     .unwrap();
                     drop(fd);
-                    enable_verity_maybe_copy::<Sha256HashValue>(&tempdir_fd, ro_fd).unwrap()
+                    enable_verity_maybe_copy::<Sha256HashValue>(&tempdir_fd, ro_fd.as_fd())
+                        .unwrap()
+                        .is_some()
                 })
                 .await
                 .unwrap();
-                match r {
-                    VerityFd::Orig(_) => orig += 1,
-                    VerityFd::Copy(_) => copy += 1,
+
+                if is_copy {
+                    copy += 1;
+                } else {
+                    orig += 1;
                 }
             }
 
@@ -676,11 +675,8 @@ mod tests {
         // succeed and hand us back the original file descriptor.
         let (tempdir, fd) = empty_file_in_tmpdir(OFlags::RDONLY, 0o644.into());
         let tempdir_fd = File::open(tempdir.path()).unwrap();
-        let fd = enable_verity_maybe_copy::<Sha256HashValue>(&tempdir_fd, fd).unwrap();
-        match fd {
-            VerityFd::Orig(_) => {}
-            VerityFd::Copy(_) => unreachable!(),
-        }
+        let fd = enable_verity_maybe_copy::<Sha256HashValue>(&tempdir_fd, fd.as_fd()).unwrap();
+        assert!(fd.is_none());
     }
 
     #[test]
@@ -692,12 +688,9 @@ mod tests {
         let tempdir_fd = File::open(tempdir.path()).unwrap();
         let mut fd = File::from(fd);
         let _ = fd.write(b"hello world").unwrap();
-        let fd = enable_verity_maybe_copy::<Sha256HashValue>(&tempdir_fd, fd.into()).unwrap();
-        // This is not the original fd
-        let fd = match fd {
-            VerityFd::Copy(fd) => fd,
-            VerityFd::Orig(_) => unreachable!(),
-        };
+        let fd = enable_verity_maybe_copy::<Sha256HashValue>(&tempdir_fd, fd.as_fd())
+            .unwrap()
+            .unwrap();
 
         // The new fd has the correct data
         assert!(ensure_verity_equal(
