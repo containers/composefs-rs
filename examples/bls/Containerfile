@@ -17,6 +17,7 @@ EOF
 
 COPY cfsctl /usr/bin
 COPY extra /
+COPY test-thing.workarounds/fedora-42 /
 RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
     kernel-install add-all
     systemctl enable systemd-networkd

@@ -29,6 +29,7 @@ EOF
 
 COPY cfsctl /usr/bin
 COPY extra /
+COPY test-thing.workarounds/debian /
 RUN <<EOF
     set -eux
 
