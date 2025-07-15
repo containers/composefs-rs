@@ -1,13 +1,14 @@
 FROM ubuntu:devel
-COPY extra /
-RUN <<EOF
+RUN --mount=type=cache,target=/var/lib/apt/lists \
+    --mount=type=cache,target=/var/cache/apt/archives <<EOF
     set -eux
 
-    touch /etc/machine-id
-    touch /etc/fstab
+    mkdir -p /etc/dracut.conf.d
+    echo export DRACUT_NO_XATTR=1 > /etc/dracut.conf.d/no-xattr.conf
 
-    apt update
-    DEBIAN_FRONTEND=noninteractive apt install -y \
+    rm /etc/apt/apt.conf.d/docker-clean
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
         btrfs-progs \
         dosfstools \
         dracut \
@@ -22,17 +23,26 @@ RUN <<EOF
         strace \
         systemd \
         udev
-    apt clean
+EOF
+
+# --- Everything above this line should hopefully stay cached ---
+
+COPY cfsctl /usr/bin
+COPY extra /
+RUN <<EOF
+    set -eux
+
+    touch /etc/machine-id
+    touch /etc/fstab
 
     dracut \
      -a "systemd-initrd composefs bash" \
      -d "erofs overlay" \
      -I "/usr/lib/systemd/systemd-sysroot-fstab-check" \
      --kver $(ls /usr/lib/modules)   --force
-    kernel-install add $(cd /usr/lib/modules && echo *) /boot/vmlinuz-$(cd /usr/lib/modules && echo *)
+    kernel-install add $(ls /usr/lib/modules) /boot/vmlinuz-*
 
     systemctl enable systemd-networkd systemd-resolved
     passwd -d root
     mkdir /sysroot
 EOF
-COPY cfsctl /usr/bin
