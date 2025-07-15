@@ -268,19 +268,24 @@ pub fn ensure_verity_equal(
 mod tests {
     use std::{collections::BTreeSet, io::Write, os::unix::process::CommandExt, time::Duration};
 
+    use once_cell::sync::Lazy;
     use rand::Rng;
     use rustix::{
         fd::OwnedFd,
         fs::{open, Mode, OFlags},
     };
-    use tempfile::tempfile_in;
+    use tempfile::{tempfile_in, TempDir};
 
-    use crate::{
-        test::{tempdir, tempfile},
-        util::proc_self_fd,
-    };
+    use crate::{test::tempdir, util::proc_self_fd};
 
     use super::*;
+
+    static TEMPDIR: Lazy<TempDir> = Lazy::new(|| tempdir());
+    static TD_FD: Lazy<File> = Lazy::new(|| File::open(TEMPDIR.path()).unwrap());
+
+    fn tempfile() -> File {
+        tempfile_in(TEMPDIR.path()).unwrap()
+    }
 
     fn rdonly_file_with(data: &[u8]) -> OwnedFd {
         let mut file = tempfile();
@@ -327,11 +332,13 @@ mod tests {
         let tf = rdonly_file_with(b"hello world");
 
         // first time: success
-        enable_verity_with_retry::<Sha256HashValue>(&tf).unwrap();
+        let tf = enable_verity_maybe_copy::<Sha256HashValue>(&*TD_FD, tf.as_fd())
+            .unwrap()
+            .unwrap_or(tf);
 
         // second time: fail with "already enabled"
         assert!(matches!(
-            enable_verity_with_retry::<Sha256HashValue>(&tf).unwrap_err(),
+            enable_verity_maybe_copy::<Sha256HashValue>(&*TD_FD, tf.as_fd()).unwrap_err(),
             EnableVerityError::AlreadyEnabled
         ));
 
@@ -428,17 +435,7 @@ mod tests {
                 }
 
                 let r = tokio::task::spawn_blocking(move || {
-                    let (tempdir, fd) = empty_file_in_tmpdir(OFlags::RDWR, 0o644.into());
-                    let _tempdir_fd = File::open(tempdir.path()).unwrap();
-                    let mut fd = File::from(fd);
-                    let _ = fd.write(b"hello world").unwrap();
-                    let ro_fd = open(
-                        proc_self_fd(&fd),
-                        OFlags::RDONLY | OFlags::CLOEXEC,
-                        Mode::empty(),
-                    )
-                    .unwrap();
-                    drop(fd);
+                    let ro_fd = rdonly_file_with(b"hello world");
                     enable_verity_raw::<Sha256HashValue>(&ro_fd)
                 })
                 .await
@@ -464,17 +461,7 @@ mod tests {
                 }
 
                 let r = tokio::task::spawn_blocking(move || {
-                    let (tempdir, fd) = empty_file_in_tmpdir(OFlags::RDWR, 0o644.into());
-                    let _tempdir_fd = File::open(tempdir.path()).unwrap();
-                    let mut fd = File::from(fd);
-                    let _ = fd.write(b"hello world").unwrap();
-                    let ro_fd = open(
-                        proc_self_fd(&fd),
-                        OFlags::RDONLY | OFlags::CLOEXEC,
-                        Mode::empty(),
-                    )
-                    .unwrap();
-                    drop(fd);
+                    let ro_fd = rdonly_file_with(b"hello world");
                     enable_verity_with_retry::<Sha256HashValue>(&ro_fd)
                 })
                 .await
@@ -500,18 +487,8 @@ mod tests {
                 }
 
                 let is_copy = tokio::task::spawn_blocking(|| {
-                    let (tempdir, fd) = empty_file_in_tmpdir(OFlags::RDWR, 0o644.into());
-                    let tempdir_fd = File::open(tempdir.path()).unwrap();
-                    let mut fd = File::from(fd);
-                    let _ = fd.write(b"hello world").unwrap();
-                    let ro_fd = open(
-                        proc_self_fd(&fd),
-                        OFlags::RDONLY | OFlags::CLOEXEC,
-                        Mode::empty(),
-                    )
-                    .unwrap();
-                    drop(fd);
-                    enable_verity_maybe_copy::<Sha256HashValue>(&tempdir_fd, ro_fd.as_fd())
+                    let ro_fd = rdonly_file_with(b"Hello world");
+                    enable_verity_maybe_copy::<Sha256HashValue>(&*TD_FD, ro_fd.as_fd())
                         .unwrap()
                         .is_some()
                 })
@@ -583,7 +560,9 @@ mod tests {
         let tf = rdonly_file_with(b"hello world");
 
         // Enable with SHA-512 but then try to read with SHA-256
-        enable_verity_with_retry::<Sha512HashValue>(&tf).unwrap();
+        let tf = enable_verity_maybe_copy::<Sha512HashValue>(&*TD_FD, tf.as_fd())
+            .unwrap()
+            .unwrap_or(tf);
 
         assert!(matches!(
             measure_verity::<Sha256HashValue>(&tf).unwrap_err(),
@@ -606,7 +585,9 @@ mod tests {
         let tf = rdonly_file_with(b"hello world");
 
         // Enable with SHA-256 but then try to read with SHA-512
-        enable_verity_with_retry::<Sha256HashValue>(&tf).unwrap();
+        let tf = enable_verity_maybe_copy::<Sha256HashValue>(&*TD_FD, tf.as_fd())
+            .unwrap()
+            .unwrap_or(tf);
 
         assert!(matches!(
             measure_verity::<Sha512HashValue>(&tf).unwrap_err(),
@@ -656,7 +637,9 @@ mod tests {
 
         fn assert_kernel_equal<H: FsVerityHashValue>(data: &[u8], expected: H) {
             let fd = rdonly_file_with(data);
-            enable_verity_with_retry::<H>(&fd).unwrap();
+            let fd = enable_verity_maybe_copy::<H>(&*TD_FD, fd.as_fd())
+                .unwrap()
+                .unwrap_or(fd);
             ensure_verity_equal(&fd, &expected).unwrap();
         }
 
