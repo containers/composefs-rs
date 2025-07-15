@@ -149,7 +149,7 @@ pub fn enable_verity_maybe_copy<H: FsVerityHashValue>(
     fd: BorrowedFd,
 ) -> Result<Option<OwnedFd>, EnableVerityError> {
     match enable_verity_with_retry::<H>(&fd) {
-        Ok(_) => Ok(None),
+        Ok(()) => Ok(None),
         Err(EnableVerityError::FileOpenedForWrite) => {
             let fd = enable_verity_on_copy::<H>(dirfd, fd)?;
             Ok(Some(fd))
