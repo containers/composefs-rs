@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+
+"""Polyfill for systemd-ssh-proxy on systems that don't have it."""
+
+import argparse
+import socket
+import sys
+
+parser = argparse.ArgumentParser(description="systemd-ssh-proxy polyfill")
+parser.add_argument("addr", type=lambda value: int(value.removeprefix("vsock/")))
+parser.add_argument("port", type=int)
+args = parser.parse_args()
+
+stdout = socket.socket(fileno=sys.stdout.fileno())
+
+vsock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+vsock.connect((args.addr, args.port))
+socket.send_fds(stdout, [b"\0"], [vsock.fileno()])
+vsock.close()

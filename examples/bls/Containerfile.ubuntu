@@ -35,4 +35,5 @@ RUN <<EOF
     passwd -d root
     mkdir /sysroot
 EOF
+COPY test-thing.workarounds/debian /
 COPY cfsctl /usr/bin

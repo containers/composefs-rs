@@ -5,9 +5,9 @@
 #    files of the final image, but not the kernel
 #
 #  - further stages, ultimately resulting in the final container image.  In
-#    this image, the kernel must be present in a whiteout-obscured directory
-#    /composefs-meta/boot/ and otherwise no other changes may be made vs. the
-#    base image.  This is best-accomplished with a multi-stage build.
+#    this image, the kernel must be present in /boot and otherwise no other
+#    changes may be made vs. the base image.  This is best-accomplished with a
+#    multi-stage build.
 #
 #  - during the build stages following 'base', the `COMPOSEFS_FSVERITY` build
 #    arg will be set to the fsverity digest of the container image.  This should
@@ -40,6 +40,7 @@ EOF
 
 COPY cfsctl /usr/bin
 COPY extra /
+COPY test-thing.fedora-42 /
 RUN <<EOF
     set -eux
 
