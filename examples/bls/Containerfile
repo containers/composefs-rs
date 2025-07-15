@@ -1,5 +1,4 @@
 FROM fedora:42
-COPY extra /
 RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
     set -eux
 
@@ -12,9 +11,15 @@ RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
         strace \
         util-linux \
         systemd
+EOF
 
+# --- Everything above this line should hopefully stay cached ---
+
+COPY cfsctl /usr/bin
+COPY extra /
+RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
+    kernel-install add-all
     systemctl enable systemd-networkd
     passwd -d root
     mkdir /sysroot
 EOF
-COPY cfsctl /usr/bin

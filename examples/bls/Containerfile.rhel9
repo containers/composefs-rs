@@ -1,13 +1,7 @@
 # FROM docker.io/redhat/ubi9  missing: dosfstools, kernel
 FROM quay.io/centos/centos:9
-COPY extra /
 RUN --mount=type=cache,target=/var/cache/dnf <<EOF
     set -eux
-    mkdir -p /etc/kernel
-    touch /etc/kernel/cmdline
-
-    echo layout=bls | tee /etc/kernel/install.conf
-
     dnf --setopt keepcache=1 install --allowerasing -y \
         NetworkManager \
         composefs \
@@ -19,9 +13,21 @@ RUN --mount=type=cache,target=/var/cache/dnf <<EOF
         strace \
         systemd \
         util-linux
+EOF
+
+# --- Everything above this line should hopefully stay cached ---
+
+COPY cfsctl /usr/bin
+COPY extra /
+RUN <<EOF
+    set -eux
+    mkdir -p /etc/kernel
+    touch /etc/kernel/cmdline
+
+    echo layout=bls | tee /etc/kernel/install.conf
+    kernel-install add $(ls /usr/lib/modules) /usr/lib/modules/*/vmlinuz
 
     systemctl enable tmp.mount
     passwd -d root
     mkdir /sysroot
 EOF
-COPY cfsctl /usr/bin
