@@ -1,0 +1,2 @@
+# Debian
+SSHD_OPTS=-o "AuthorizedKeysFile /run/credentials/@system/ssh.ephemeral-authorized_keys-all .ssh/authorized_keys"
