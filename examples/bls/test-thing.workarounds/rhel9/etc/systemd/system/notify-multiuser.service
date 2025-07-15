@@ -1,0 +1,9 @@
+[Unit]
+After=multi-user.target
+Wants=multi-user.target
+
+[Service]
+LoadCredential=vmm.notify_socket
+ExecStart=/etc/notify-multiuser.py
+Type=exec
+RemainAfterExit=yes

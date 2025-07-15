@@ -1,0 +1,3 @@
+# Needed for Fedora 42
+# https://src.fedoraproject.org/rpms/openssh/pull-request/101
+OPTIONS=-o "AuthorizedKeysFile /run/credentials/@system/ssh.ephemeral-authorized_keys-all .ssh/authorized_keys"

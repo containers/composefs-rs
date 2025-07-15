@@ -19,6 +19,7 @@ EOF
 
 COPY cfsctl /usr/bin
 COPY extra /
+COPY test-thing.workarounds/rhel9 /
 RUN <<EOF
     set -eux
     mkdir -p /etc/kernel
