@@ -3,7 +3,7 @@
 set -eux
 
 mkdir -p tmp/efi/loader
-echo 'timeout 3' > tmp/efi/loader/loader.conf
+echo 'timeout 1' > tmp/efi/loader/loader.conf
 mkdir -p tmp/efi/EFI/BOOT tmp/efi/EFI/systemd
 cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi tmp/efi/EFI/systemd
 cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi tmp/efi/EFI/BOOT/BOOTX64.EFI
