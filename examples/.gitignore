@@ -1,8 +1,9 @@
+/*/*.qcow2
 /*/VARS_CUSTOM.secboot.fd*
 /*/cfsctl
 /*/extra/usr/lib/dracut/modules.d/37composefs/composefs-setup-root
-/*/*.qcow2
 /*/secureboot
 /*/tmp/
 /common/fix-verity/fix-verity.efi
 /test/bots
+__pycache__/
