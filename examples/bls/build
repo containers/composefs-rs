@@ -44,6 +44,7 @@ cp ../../target/release/composefs-setup-root extra/usr/lib/dracut/modules.d/37co
 CFSCTL='./cfsctl --repo tmp/sysroot/composefs'
 
 rm -rf tmp
+rm -rf tmp/efi tmp/sysroot/composefs/images
 mkdir -p tmp/sysroot/composefs
 
 podman build \
