@@ -28,7 +28,11 @@ RUN <<EOF
     set -eux
 
     systemctl enable systemd-networkd
-    semanage permissive -a systemd_gpt_generator_t  # for volatile-root workaround
+
+    checkmodule -M -m -o /etc/composefs_workarounds.mod /etc/composefs_workarounds.te
+    semodule_package -o /etc/composefs_workarounds.pp -m /etc/composefs_workarounds.mod
+    semodule -i /etc/composefs_workarounds.pp
+
     passwd -d root
     mkdir /sysroot
 EOF
