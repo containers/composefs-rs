@@ -1,10 +1,7 @@
 FROM archlinux AS base
-COPY extra /
-RUN <<EOF
+RUN --mount=type=cache,target=/var/cache/pacman/pkg \
+    --mount=type=cache,target=/var/lib/pacman/sync <<EOF
     set -eux
-
-    touch /etc/machine-id
-    mkdir -p boot/EFI/Linux
 
     pacman -Syu --noconfirm
     pacman -Sy --noconfirm \
@@ -13,21 +10,30 @@ RUN <<EOF
         linux \
         openssh \
         strace \
-        skopeo
+        skopeo \
+        systemd-ukify
+EOF
+
+# --- Everything above this line should hopefully stay cached ---
+
+COPY cfsctl /usr/bin
+COPY extra /
+RUN <<EOF
+    set -eux
+
+    touch /etc/machine-id
+    mkdir -p boot/EFI/Linux
 
     systemctl enable systemd-networkd systemd-resolved sshd
     passwd -d root
     mkdir /sysroot
 EOF
-COPY cfsctl /usr/bin
 
 FROM base AS kernel
 ARG COMPOSEFS_FSVERITY
 RUN <<EOF
     set -eux
-    # systemd-boot-unsigned: ditto
     echo "root=/dev/vda2 console=ttyS0,115200 composefs=${COMPOSEFS_FSVERITY} rw" > /etc/kernel/cmdline
-    pacman -Sy --noconfirm systemd-ukify
     mkinitcpio -p linux
 EOF
 
