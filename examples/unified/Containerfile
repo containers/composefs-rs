@@ -44,7 +44,7 @@ RUN --mount=type=bind,from=base,target=/mnt/base <<EOF
     COMPOSEFS_FSVERITY="$(cfsctl --repo /tmp/sysroot compute-id --bootable /mnt/base)"
 
     mkdir -p /etc/kernel /etc/dracut.conf.d
-    echo "console=ttyS0,115200 composefs=${COMPOSEFS_FSVERITY} rw" > /etc/kernel/cmdline
+    echo "composefs=${COMPOSEFS_FSVERITY} rw" > /etc/kernel/cmdline
     kernel-install add-all
 EOF
 
