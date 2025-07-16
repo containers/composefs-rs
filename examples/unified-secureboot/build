@@ -52,7 +52,7 @@ ${CFSCTL} oci prepare-boot "${IMAGE_ID}" --bootdir tmp/efi
 
 # install a signed copy of systemd-boot
 mkdir -p tmp/efi/loader
-echo 'timeout 3' > tmp/efi/loader/loader.conf
+echo 'timeout 1' > tmp/efi/loader/loader.conf
 mkdir -p tmp/efi/EFI/BOOT tmp/efi/EFI/systemd
 sbsign --key secureboot/db.key --cert secureboot/db.crt \
     /usr/lib/systemd/boot/efi/systemd-bootx64.efi \
