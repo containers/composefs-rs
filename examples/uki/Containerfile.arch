@@ -33,7 +33,7 @@ FROM base AS kernel
 ARG COMPOSEFS_FSVERITY
 RUN <<EOF
     set -eux
-    echo "root=/dev/vda2 console=ttyS0,115200 composefs=${COMPOSEFS_FSVERITY} rw" > /etc/kernel/cmdline
+    echo "root=/dev/vda2 composefs=${COMPOSEFS_FSVERITY} rw" > /etc/kernel/cmdline
     mkinitcpio -p linux
 EOF
 

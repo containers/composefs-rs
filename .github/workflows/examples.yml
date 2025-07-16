@@ -41,10 +41,12 @@ jobs:
 
     - name: Setup /dev/kvm
       run: |
+        set -eux
         echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+        echo 'KERNEL=="vhost-vsock", GROUP="kvm", MODE="0666", OPTIONS+="static_node=vhost-vsock"' | sudo tee /etc/udev/rules.d/99-vhost-vsock.rules
         sudo udevadm control --reload-rules
-        sudo udevadm trigger --name-match=kvm --settle
-        ls -l /dev/kvm
+        sudo udevadm trigger --settle
+        ls -l /dev/kvm /dev/vhost-vsock
 
     - name: Install dependencies
       run: |
@@ -55,10 +57,8 @@ jobs:
           erofs-utils \
           fsverity \
           mtools \
-          libvirt-daemon \
-          libvirt-daemon-driver-qemu \
-          python3-libvirt \
-          qemu-system \
+          python3-pytest-asyncio \
+          qemu-kvm \
           systemd-boot-efi
 
     - name: Get a newer podman for heredoc support (from plucky)
@@ -83,6 +83,9 @@ jobs:
           mkdir ~/bin
           examples/common/install-patched-tools ~/bin
         fi
+
+    - name: Install systemd-ssh-proxy polyfill
+      run: sudo cp examples/bls/test-thing.workarounds/systemd-ssh-proxy /usr/lib/systemd
 
     - name: Run example tests
       run: |

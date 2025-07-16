@@ -4,16 +4,8 @@ set -eux
 
 cd "${0%/*}/.."
 
-if [ ! -e test/bots ]; then
-    if [ -h ~/.config/cockpit-dev/bots ]; then
-        ln -sfT "$(realpath --relative-to=test ~/.config/cockpit-dev)/bots" test/bots
-    else
-        git clone https://github.com/cockpit-project/bots test/bots
-    fi
-fi
-
 EXAMPLE="$1"
 OS="$2"
 
 "${EXAMPLE}/build" "${OS}"
-test/run-tests "${EXAMPLE}/${OS}-${EXAMPLE}-efi.qcow2"
+TEST_IMAGE="${EXAMPLE}/${OS}-${EXAMPLE}-efi.qcow2" pytest test
