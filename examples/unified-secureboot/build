@@ -19,6 +19,7 @@ cp ../../target/release/composefs-setup-root extra/usr/lib/dracut/modules.d/37co
 CFSCTL='./cfsctl --repo tmp/sysroot/composefs'
 
 rm -rf tmp
+rm -rf tmp/efi tmp/sysroot/composefs/images
 mkdir -p tmp/sysroot/composefs
 
 # See: https://wiki.archlinux.org/title/Unified_Extensible_Firmware_Interface/Secure_Boot
@@ -38,7 +39,7 @@ if [[ ! -d "secureboot" ]]; then
 fi
 
 # For debugging, add --no-cache to podman command
-mkdir tmp/internal-sysroot
+mkdir -p tmp/internal-sysroot
 podman build \
     --iidfile=tmp/iid \
     -v "${PWD}/tmp/internal-sysroot:/tmp/sysroot:z,U" \
