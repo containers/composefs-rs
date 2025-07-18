@@ -147,6 +147,10 @@ fn path_from_tar(pax: Option<Box<[u8]>>, gnu: Vec<u8>, short: &[u8]) -> PathBuf 
         path.pop(); // this is Vec<u8>, so that's a single char.
     }
 
+    if path.last() == Some(&b'\0') {
+        path.pop();
+    }
+
     PathBuf::from(OsString::from_vec(path))
 }
 
