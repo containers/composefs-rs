@@ -112,7 +112,7 @@ impl BootLoaderEntryFile {
     }
 }
 
-pub(crate) fn read_file<ObjectID: FsVerityHashValue>(
+pub fn read_file<ObjectID: FsVerityHashValue>(
     file: &RegularFile<ObjectID>,
     repo: &Repository<ObjectID>,
 ) -> Result<Box<[u8]>> {
