@@ -22,7 +22,7 @@ case "${os}" in
         ;;
     ubuntu)
         containerfile='Containerfile.ubuntu'
-        cargo build --release
+        cargo build --release --features=pre-6.15
         ;;
     rawhide)
         containerfile='Containerfile.rawhide'

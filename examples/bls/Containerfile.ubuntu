@@ -1,4 +1,4 @@
-FROM ubuntu:devel
+FROM ubuntu:plucky
 COPY extra /
 RUN <<EOF
     set -eux
