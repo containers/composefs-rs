@@ -1,0 +1,20 @@
+module composefs_workarounds 1.0;
+
+require {
+    type sshd_t;
+    type tmpfs_t;
+    type systemd_gpt_generator_t;
+    type init_var_run_t;
+    class file read;
+    class file open;
+    class file getattr;
+    class lnk_file read;
+}
+
+# https://bugzilla.redhat.com/show_bug.cgi?id=2374928
+allow sshd_t tmpfs_t:file open;
+allow sshd_t tmpfs_t:file getattr;
+allow sshd_t tmpfs_t:file read;
+
+# for volatile-root workaround
+allow systemd_gpt_generator_t init_var_run_t:lnk_file read;
