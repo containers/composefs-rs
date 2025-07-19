@@ -60,7 +60,7 @@ if [ "${FS_VERITY_MODE:-repart}" = "none" ]; then
     CFSCTL="$CFSCTL --insecure"
 fi
 
-${CFSCTL} oci prepare-boot "${BASE_ID}" --bootdir tmp/efi --entry-id=example --cmdline rw
+${CFSCTL} oci prepare-boot "${BASE_ID}" --bootdir tmp/efi --entry-id=example --cmdline debug --cmdline printk.devkmsg=on --cmdline rw
 
 ../common/install-systemd-boot
 ../common/make-image "${os}-bls-efi.qcow2"

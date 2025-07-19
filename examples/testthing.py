@@ -623,11 +623,12 @@ class VirtualMachine:
             ("-qmp", f"unix:{self._ipc}/qmp,server,wait=off"),
             ("-device", f"vhost-vsock-pci,id=vhost-vsock-pci0,guest-cid={guest_cid}"),
             # Console stuff...
-            ("-device", "virtio-serial"),
-            ("-device", "virtconsole,chardev=console"),
+            #("-device", "virtio-serial"),
+            #("-device", "virtconsole,chardev=console"),
+            ("-serial", "chardev:console"),
             (
                 "-smbios",
-                "type=11,value=io.systemd.boot.kernel-cmdline-extra=console=hvc0",
+                "type=11,value=io.systemd.boot.kernel-cmdline-extra=console=ttyS0",
             ),
             *(
                 (
