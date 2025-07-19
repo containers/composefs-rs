@@ -628,7 +628,7 @@ class VirtualMachine:
             ("-serial", "chardev:console"),
             (
                 "-smbios",
-                "type=11,value=io.systemd.boot.kernel-cmdline-extra=console=ttyS0",
+                "type=11,value=io.systemd.boot.kernel-cmdline-extra=earlyprintk=serial,,keep console=ttyS0",
             ),
             *(
                 (
