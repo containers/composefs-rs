@@ -193,10 +193,23 @@ pub fn get_entry<R: Read, ObjectID: FsVerityHashValue>(
             SplitStreamData::Inline(content) => match header.entry_type() {
                 EntryType::GNULongLink => {
                     gnu_longlink.extend(content);
+
+                    // NOTE: We use a custom tar parser since splitstreams are not actual tar archives
+                    // The `tar` crate does have a higher level `path` function that would do this for us.
+                    // See: https://github.com/alexcrichton/tar-rs/blob/a1c3036af48fa02437909112239f0632e4cfcfae/src/header.rs#L1532
+                    if gnu_longlink.last() == Some(&b'\0') {
+                        gnu_longlink.pop();
+                    }
+
                     continue;
                 }
                 EntryType::GNULongName => {
                     gnu_longname.extend(content);
+
+                    if gnu_longname.last() == Some(&b'\0') {
+                        gnu_longname.pop();
+                    }
+
                     continue;
                 }
                 EntryType::XGlobalHeader => {
