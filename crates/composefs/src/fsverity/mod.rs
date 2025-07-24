@@ -275,6 +275,7 @@ mod tests {
         fs::{open, Mode, OFlags},
     };
     use tempfile::{tempfile_in, TempDir};
+    use tokio::{task::JoinSet, time::Instant};
 
     use crate::{test::tempdir, util::proc_self_fd};
 
@@ -388,6 +389,11 @@ mod tests {
     async fn test_verity_forking() {
         const DELAY_MIN: u64 = 0;
         const DELAY_MAX: u64 = 10;
+        // Break if we get 100 successes
+        const SUCCESS_LIMIT: u32 = 100;
+        // Don't run more than 10s by default
+        const TIMEOUT: Duration = Duration::from_secs(10);
+        let start = Instant::now();
 
         let cpus = std::thread::available_parallelism().unwrap();
         // use half of capacity for forking
@@ -425,12 +431,15 @@ mod tests {
             jhs.push(jh);
         }
 
-        let raw_verity_enabler = tokio::task::spawn(async move {
+        let raw_verity_enabler = async move {
             let mut successes = 0;
             let mut failures = 0;
 
             loop {
-                if successes == 100 {
+                if tokio::time::Instant::now().duration_since(start) > TIMEOUT {
+                    break;
+                }
+                if successes == SUCCESS_LIMIT {
                     break;
                 }
 
@@ -448,15 +457,17 @@ mod tests {
             }
 
             (successes, failures)
-        });
-        tokio::pin!(raw_verity_enabler);
+        };
 
-        let retry_verity_enabler = tokio::task::spawn(async move {
+        let retry_verity_enabler = async move {
             let mut successes = 0;
             let mut failures = 0;
 
             loop {
-                if successes == 100 {
+                if tokio::time::Instant::now().duration_since(start) > TIMEOUT {
+                    break;
+                }
+                if successes == SUCCESS_LIMIT {
                     break;
                 }
 
@@ -474,15 +485,17 @@ mod tests {
             }
 
             (successes, failures)
-        });
-        tokio::pin!(retry_verity_enabler);
+        };
 
-        let copy_verity_enabler = tokio::task::spawn(async move {
+        let copy_verity_enabler = async move {
             let mut orig = 0;
             let mut copy = 0;
 
             loop {
-                if orig + copy == 100 {
+                if tokio::time::Instant::now().duration_since(start) > TIMEOUT {
+                    break;
+                }
+                if orig + copy == SUCCESS_LIMIT {
                     break;
                 }
 
@@ -503,28 +516,31 @@ mod tests {
             }
 
             (orig, copy)
-        });
-        tokio::pin!(copy_verity_enabler);
+        };
 
         let ts = tokio::time::Instant::now();
 
-        tokio::join!(
-            async {
-                let (successes, failures) = raw_verity_enabler.as_mut().await.unwrap();
-                let elapsed = ts.elapsed().as_millis();
-                eprintln!("raw verity enabled ({successes} attempts succeeded, {failures} attempts failed) in {elapsed}ms");
-            },
-            async {
-                let (successes, failures) = retry_verity_enabler.as_mut().await.unwrap();
-                let elapsed = ts.elapsed().as_millis();
-                eprintln!("retry verity enabled ({successes} attempts succeeded, {failures} attempts failed) in {elapsed}ms");
-            },
-            async {
-                let (orig, copy) = copy_verity_enabler.as_mut().await.unwrap();
-                let elapsed = ts.elapsed().as_millis();
-                eprintln!("copy verity enabled ({orig} original, {copy} copies) in {elapsed}ms");
-            }
-        );
+        let mut set = JoinSet::new();
+        set.spawn(async move {
+            let (successes, failures) = raw_verity_enabler.await;
+            let elapsed = ts.elapsed().as_millis();
+            eprintln!("raw verity enabled ({successes} attempts succeeded, {failures} attempts failed) in {elapsed}ms");
+        });
+        set.spawn(async move {
+            let (successes, failures) = retry_verity_enabler.await;
+            let elapsed = ts.elapsed().as_millis();
+            eprintln!("retry verity enabled ({successes} attempts succeeded, {failures} attempts failed) in {elapsed}ms");
+        });
+        set.spawn(async move {
+            let (orig, copy) = copy_verity_enabler.await;
+            assert!(orig > 0 || copy > 0);
+            let elapsed = ts.elapsed().as_millis();
+            eprintln!("copy verity enabled ({orig} original, {copy} copies) in {elapsed}ms");
+        });
+
+        while let Some(res) = set.join_next().await {
+            res.unwrap();
+        }
 
         txs.into_iter().for_each(|tx| tx.send(()).unwrap());
         jhs.into_iter().for_each(|jh| jh.join().unwrap());
