@@ -5,6 +5,7 @@ pub mod tar;
 use std::{collections::HashMap, io::Read, sync::Arc};
 
 use anyhow::{bail, ensure, Context, Result};
+use containers_image_proxy::ImageProxyConfig;
 use oci_spec::image::{Descriptor, ImageConfiguration};
 use sha2::{Digest, Sha256};
 
@@ -61,8 +62,9 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     imgref: &str,
     reference: Option<&str>,
+    img_proxy_config: Option<ImageProxyConfig>,
 ) -> Result<(Sha256Digest, ObjectID)> {
-    skopeo::pull(repo, imgref, reference).await
+    skopeo::pull(repo, imgref, reference, img_proxy_config).await
 }
 
 pub fn open_config<ObjectID: FsVerityHashValue>(
