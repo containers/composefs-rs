@@ -22,7 +22,7 @@ case "${os}" in
         ;;
     ubuntu)
         containerfile='Containerfile.ubuntu'
-        cargo build --release
+        cargo build --release --features=pre-6.15
         ;;
     rawhide)
         containerfile='Containerfile.rawhide'
@@ -44,6 +44,7 @@ cp ../../target/release/composefs-setup-root extra/usr/lib/dracut/modules.d/37co
 CFSCTL='./cfsctl --repo tmp/sysroot/composefs'
 
 rm -rf tmp
+rm -rf tmp/efi tmp/sysroot/composefs/images
 mkdir -p tmp/sysroot/composefs
 
 podman build \
@@ -59,7 +60,7 @@ if [ "${FS_VERITY_MODE:-repart}" = "none" ]; then
     CFSCTL="$CFSCTL --insecure"
 fi
 
-${CFSCTL} oci prepare-boot "${BASE_ID}" --bootdir tmp/efi --cmdline console=ttyS0,115200 --entry-id=example --cmdline rw
+${CFSCTL} oci prepare-boot "${BASE_ID}" --bootdir tmp/efi --entry-id=example --cmdline apparmor=0 --cmdline debug --cmdline printk.devkmsg=on --cmdline earlyprintk=serial,keep --cmdline console=ttyS0 --cmdline rw
 
 ../common/install-systemd-boot
 ../common/make-image "${os}-bls-efi.qcow2"

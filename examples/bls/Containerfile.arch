@@ -1,10 +1,7 @@
 FROM archlinux AS base
-COPY extra /
-RUN <<EOF
+RUN --mount=type=cache,target=/var/cache/pacman/pkg \
+    --mount=type=cache,target=/var/lib/pacman/sync <<EOF
     set -eux
-
-    touch /etc/machine-id
-    echo 'root=/dev/vda2' > /etc/kernel/cmdline
 
     pacman -Syu --noconfirm
     pacman -Sy --noconfirm \
@@ -16,11 +13,19 @@ RUN <<EOF
         openssh \
         skopeo \
         strace
+EOF
 
-    kernel-install add "$(ls /usr/lib/modules)" /usr/lib/modules/"$(ls /usr/lib/modules)"/vmlinuz
+# --- Everything above this line should hopefully stay cached ---
+
+COPY cfsctl /usr/bin
+COPY extra /
+RUN <<EOF
+    touch /etc/machine-id
+    echo 'root=/dev/vda2' > /etc/kernel/cmdline
+
+    kernel-install add-all
 
     systemctl enable systemd-networkd systemd-resolved sshd
     passwd -d root
     mkdir /sysroot
 EOF
-COPY cfsctl /usr/bin
