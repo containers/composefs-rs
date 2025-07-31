@@ -13,7 +13,7 @@ version.workspace = true
 [features]
 'pre-6.15' = ['tempfile']
 rhel9 = ['pre-6.15']
-test = []
+test = ["tempfile"]
 
 [dependencies]
 anyhow = { version = "1.0.87", default-features = false }
