@@ -24,7 +24,11 @@ struct ImageOp<ObjectID: FsVerityHashValue> {
 }
 
 impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
-    async fn new(repo: &Arc<Repository<ObjectID>>, imgref: &str) -> Result<Self> {
+    async fn new(
+        repo: &Arc<Repository<ObjectID>>,
+        imgref: &str,
+        img_proxy_config: Option<ImageProxyConfig>,
+    ) -> Result<Self> {
         // See https://github.com/containers/skopeo/issues/2563
         let skopeo_cmd = if imgref.starts_with("containers-storage:") && !geteuid().is_root() {
             let mut cmd = Command::new("podman");
@@ -34,11 +38,24 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             None
         };
 
-        let config = ImageProxyConfig {
-            skopeo_cmd,
-            // auth_anonymous: true, debug: true, insecure_skip_tls_verification: Some(true),
-            ..ImageProxyConfig::default()
+        let config = match img_proxy_config {
+            Some(mut conf) => {
+                if conf.skopeo_cmd.is_none() {
+                    conf.skopeo_cmd = skopeo_cmd;
+                }
+
+                conf
+            }
+
+            None => {
+                ImageProxyConfig {
+                    skopeo_cmd,
+                    // auth_anonymous: true, debug: true, insecure_skip_tls_verification: None,
+                    ..ImageProxyConfig::default()
+                }
+            }
         };
+
         let proxy = containers_image_proxy::ImageProxy::new_with_config(config).await?;
         let img = proxy.open_image(imgref).await.context("Opening image")?;
         let progress = MultiProgress::new();
@@ -195,8 +212,9 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     imgref: &str,
     reference: Option<&str>,
+    img_proxy_config: Option<ImageProxyConfig>,
 ) -> Result<(Sha256Digest, ObjectID)> {
-    let op = Arc::new(ImageOp::new(repo, imgref).await?);
+    let op = Arc::new(ImageOp::new(repo, imgref, img_proxy_config).await?);
     let (sha256, id) = op
         .pull()
         .await
