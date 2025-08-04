@@ -11,6 +11,7 @@ pub mod splitstream;
 pub mod tree;
 pub mod util;
 
+pub mod generic_tree;
 #[cfg(any(test, feature = "test"))]
 pub mod test;
 
