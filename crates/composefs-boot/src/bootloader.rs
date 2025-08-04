@@ -417,3 +417,230 @@ pub fn get_boot_resources<ObjectID: FsVerityHashValue>(
 
     Ok(entries)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_bootloader_entry_file_new() {
+        let content = "title Test Entry\nversion 1.0\nlinux /vmlinuz\ninitrd /initramfs.img\noptions quiet splash\n";
+        let entry = BootLoaderEntryFile::new(content);
+
+        assert_eq!(entry.lines.len(), 5);
+        assert_eq!(entry.lines[0], "title Test Entry");
+        assert_eq!(entry.lines[1], "version 1.0");
+        assert_eq!(entry.lines[2], "linux /vmlinuz");
+        assert_eq!(entry.lines[3], "initrd /initramfs.img");
+        assert_eq!(entry.lines[4], "options quiet splash");
+    }
+
+    #[test]
+    fn test_bootloader_entry_file_new_empty() {
+        let entry = BootLoaderEntryFile::new("");
+        assert_eq!(entry.lines.len(), 0);
+    }
+
+    #[test]
+    fn test_bootloader_entry_file_new_single_line() {
+        let entry = BootLoaderEntryFile::new("title Test");
+        assert_eq!(entry.lines.len(), 1);
+        assert_eq!(entry.lines[0], "title Test");
+    }
+
+    #[test]
+    fn test_bootloader_entry_file_new_trailing_newline() {
+        let content = "title Test\nversion 1.0\n";
+        let entry = BootLoaderEntryFile::new(content);
+        assert_eq!(entry.lines.len(), 2);
+        assert_eq!(entry.lines[0], "title Test");
+        assert_eq!(entry.lines[1], "version 1.0");
+    }
+
+    #[test]
+    fn test_get_value() {
+        let content = "title Test Entry\nversion 1.0\nlinux /vmlinuz\ninitrd /initramfs.img\noptions quiet splash\n";
+        let entry = BootLoaderEntryFile::new(content);
+
+        assert_eq!(entry.get_value("title"), Some("Test Entry"));
+        assert_eq!(entry.get_value("version"), Some("1.0"));
+        assert_eq!(entry.get_value("linux"), Some("/vmlinuz"));
+        assert_eq!(entry.get_value("initrd"), Some("/initramfs.img"));
+        assert_eq!(entry.get_value("options"), Some("quiet splash"));
+        assert_eq!(entry.get_value("nonexistent"), None);
+    }
+
+    #[test]
+    fn test_get_value_whitespace_handling() {
+        let content = "title\t\tTest Entry\nversion   1.0\nlinux\t/vmlinuz\n";
+        let entry = BootLoaderEntryFile::new(content);
+
+        assert_eq!(entry.get_value("title"), Some("Test Entry"));
+        assert_eq!(entry.get_value("version"), Some("1.0"));
+        assert_eq!(entry.get_value("linux"), Some("/vmlinuz"));
+    }
+
+    #[test]
+    fn test_get_value_no_whitespace_after_key() {
+        let content = "titleTest Entry\nversionno_space\n";
+        let entry = BootLoaderEntryFile::new(content);
+
+        assert_eq!(entry.get_value("title"), None);
+        assert_eq!(entry.get_value("version"), None);
+    }
+
+    #[test]
+    fn test_get_values_multiple() {
+        let content = "title Test Entry\ninitrd /initramfs1.img\ninitrd /initramfs2.img\noptions quiet\noptions splash\n";
+        let entry = BootLoaderEntryFile::new(content);
+
+        let initrd_values: Vec<_> = entry.get_values("initrd").collect();
+        assert_eq!(initrd_values, vec!["/initramfs1.img", "/initramfs2.img"]);
+
+        let options_values: Vec<_> = entry.get_values("options").collect();
+        assert_eq!(options_values, vec!["quiet", "splash"]);
+
+        let title_values: Vec<_> = entry.get_values("title").collect();
+        assert_eq!(title_values, vec!["Test Entry"]);
+
+        let nonexistent_values: Vec<_> = entry.get_values("nonexistent").collect();
+        assert_eq!(nonexistent_values, Vec::<&str>::new());
+    }
+
+    #[test]
+    fn test_add_cmdline_new_options_line() {
+        let mut entry = BootLoaderEntryFile::new("title Test Entry\nlinux /vmlinuz\n");
+        entry.add_cmdline("quiet");
+
+        assert_eq!(entry.lines.len(), 3);
+        assert_eq!(entry.lines[2], "options quiet");
+    }
+
+    #[test]
+    fn test_add_cmdline_append_to_existing_options() {
+        let mut entry = BootLoaderEntryFile::new("title Test Entry\noptions splash\n");
+        entry.add_cmdline("quiet");
+
+        assert_eq!(entry.lines.len(), 2);
+        assert_eq!(entry.lines[1], "options splash quiet");
+    }
+
+    #[test]
+    fn test_add_cmdline_replace_existing_key_value() {
+        let mut entry =
+            BootLoaderEntryFile::new("title Test Entry\noptions quiet splash root=/dev/sda1\n");
+        entry.add_cmdline("root=/dev/sda2");
+
+        assert_eq!(entry.lines.len(), 2);
+        assert_eq!(entry.lines[1], "options quiet splash root=/dev/sda2");
+    }
+
+    #[test]
+    fn test_add_cmdline_replace_existing_key_only() {
+        let mut entry = BootLoaderEntryFile::new("title Test Entry\noptions quiet rw splash\n");
+        entry.add_cmdline("rw"); // Same key, should replace itself (no-op in this case)
+
+        assert_eq!(entry.lines.len(), 2);
+        assert_eq!(entry.lines[1], "options quiet rw splash");
+
+        // Test replacing with different key
+        entry.add_cmdline("ro");
+        assert_eq!(entry.lines[1], "options quiet rw splash ro");
+    }
+
+    #[test]
+    fn test_add_cmdline_key_with_equals() {
+        let mut entry = BootLoaderEntryFile::new("title Test Entry\noptions quiet\n");
+        entry.add_cmdline("composefs=abc123");
+
+        assert_eq!(entry.lines.len(), 2);
+        assert_eq!(entry.lines[1], "options quiet composefs=abc123");
+    }
+
+    #[test]
+    fn test_add_cmdline_replace_key_with_equals() {
+        let mut entry =
+            BootLoaderEntryFile::new("title Test Entry\noptions quiet composefs=old123\n");
+        entry.add_cmdline("composefs=new456");
+
+        assert_eq!(entry.lines.len(), 2);
+        assert_eq!(entry.lines[1], "options quiet composefs=new456");
+    }
+
+    #[test]
+    fn test_adjust_cmdline_with_composefs() {
+        let mut entry = BootLoaderEntryFile::new("title Test Entry\nlinux /vmlinuz\n");
+        entry.adjust_cmdline(Some("abc123"), false, &["quiet", "splash"]);
+
+        assert_eq!(entry.lines.len(), 3);
+        assert_eq!(entry.lines[2], "options composefs=abc123 quiet splash");
+    }
+
+    #[test]
+    fn test_adjust_cmdline_with_composefs_insecure() {
+        let mut entry = BootLoaderEntryFile::new("title Test Entry\nlinux /vmlinuz\n");
+        entry.adjust_cmdline(Some("abc123"), true, &[]);
+
+        assert_eq!(entry.lines.len(), 3);
+        // Assuming make_cmdline_composefs adds digest=off for insecure mode
+        assert!(entry.lines[2].contains("abc123"));
+    }
+
+    #[test]
+    fn test_adjust_cmdline_no_composefs() {
+        let mut entry = BootLoaderEntryFile::new("title Test Entry\nlinux /vmlinuz\n");
+        entry.adjust_cmdline(None, false, &["quiet", "splash"]);
+
+        assert_eq!(entry.lines.len(), 3);
+        assert_eq!(entry.lines[2], "options quiet splash");
+    }
+
+    #[test]
+    fn test_adjust_cmdline_existing_options() {
+        let mut entry = BootLoaderEntryFile::new("title Test Entry\noptions root=/dev/sda1\n");
+        entry.adjust_cmdline(Some("abc123"), false, &["quiet"]);
+
+        assert_eq!(entry.lines.len(), 2);
+        assert!(entry.lines[1].contains("root=/dev/sda1"));
+        assert!(entry.lines[1].contains("abc123"));
+        assert!(entry.lines[1].contains("quiet"));
+    }
+
+    #[test]
+    fn test_strip_ble_key_helper() {
+        assert_eq!(
+            strip_ble_key("title Test Entry", "title"),
+            Some("Test Entry")
+        );
+        assert_eq!(
+            strip_ble_key("title\tTest Entry", "title"),
+            Some("Test Entry")
+        );
+        assert_eq!(
+            strip_ble_key("title  Test Entry", "title"),
+            Some("Test Entry")
+        );
+        assert_eq!(strip_ble_key("titleTest Entry", "title"), None);
+        assert_eq!(strip_ble_key("other Test Entry", "title"), None);
+        assert_eq!(strip_ble_key("title", "title"), None); // No whitespace after key
+    }
+
+    #[test]
+    fn test_substr_range_helper() {
+        let parent = "hello world test";
+        let substr = &parent[6..11]; // "world" - actual substring slice
+        let range = substr_range(parent, substr).unwrap();
+        assert_eq!(range, 6..11);
+        assert_eq!(&parent[range], "world");
+
+        // Test with different substring
+        let other_substr = &parent[0..5]; // "hello"
+        let range2 = substr_range(parent, other_substr).unwrap();
+        assert_eq!(range2, 0..5);
+        assert_eq!(&parent[range2], "hello");
+
+        // Test non-substring (separate string with same content)
+        let separate_string = String::from("world");
+        assert_eq!(substr_range(parent, &separate_string), None);
+    }
+}
