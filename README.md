@@ -9,7 +9,7 @@ The main consumables here are:
    repository and the operations that can be performed on it.  See the
    [repository format documentation](doc/repository.md).
 
- - [`cfsctl`](src/bin/cfsctl.rs): a command-line tool for performing operations
+ - [`cfsctl`](crates/cfsctl/src/main.rs): a command-line tool for performing operations
    on the repository via the above APIs.
 
  - (future?) some kind of a system service exposing those APIs to non-root
