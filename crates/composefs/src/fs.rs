@@ -3,7 +3,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     ffi::{CStr, OsStr},
     fs::File,
-    io::Write,
+    io::{Read, Write},
     mem::MaybeUninit,
     os::unix::ffi::OsStrExt,
     path::Path,
@@ -313,6 +313,9 @@ impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
     }
 }
 
+/// Load a filesystem tree from the given path. A repository may
+/// be provided; if it is, then all files found in the filesystem
+/// are copied in.
 pub fn read_filesystem<ObjectID: FsVerityHashValue>(
     dirfd: impl AsFd,
     path: &Path,
@@ -330,6 +333,25 @@ pub fn read_filesystem<ObjectID: FsVerityHashValue>(
         root,
         have_root_stat: stat_root,
     })
+}
+
+/// Read the contents of a file.
+pub fn read_file<ObjectID: FsVerityHashValue>(
+    file: &RegularFile<ObjectID>,
+    repo: &Repository<ObjectID>,
+) -> Result<Box<[u8]>> {
+    match file {
+        RegularFile::Inline(data) => Ok(data.clone()),
+        RegularFile::External(id, size) => {
+            let mut data = Vec::with_capacity(*size as usize);
+            std::fs::File::from(repo.open_object(id)?).read_to_end(&mut data)?;
+            ensure!(
+                *size == data.len() as u64,
+                "File content doesn't have the expected length"
+            );
+            Ok(data.into_boxed_slice())
+        }
+    }
 }
 
 #[cfg(test)]
