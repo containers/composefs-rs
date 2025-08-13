@@ -69,11 +69,13 @@ impl<ObjectID: FsVerityHashValue> Drop for Repository<ObjectID> {
 }
 
 impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
+    /// Return the objects directory.
     pub fn objects_dir(&self) -> ErrnoResult<&OwnedFd> {
         self.objects
             .get_or_try_init(|| ensure_dir_and_openat(&self.repository, "objects", OFlags::PATH))
     }
 
+    /// Open a repository at the target directory and path.
     pub fn open_path(dirfd: impl AsFd, path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
 
@@ -92,12 +94,14 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         })
     }
 
+    /// Open the default user-owned composefs repository.
     pub fn open_user() -> Result<Self> {
         let home = std::env::var("HOME").with_context(|| "$HOME must be set when in user mode")?;
 
         Self::open_path(CWD, PathBuf::from(home).join(".var/lib/composefs"))
     }
 
+    /// Open the default system-global composefs repository.
     pub fn open_system() -> Result<Self> {
         Self::open_path(CWD, PathBuf::from("/sysroot/composefs".to_string()))
     }
@@ -114,6 +118,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         tokio::task::spawn_blocking(move || self_.ensure_object(&data)).await?
     }
 
+    /// Given a blob of data, store it in the repository.
     pub fn ensure_object(&self, data: &[u8]) -> Result<ObjectID> {
         let dirfd = self.objects_dir()?;
         let id: ObjectID = compute_verity(data);
@@ -216,6 +221,10 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(fd)
     }
 
+    /// By default fsverity is required to be enabled on the target
+    /// filesystem. Setting this disables verification of digests
+    /// and an instance of [`Self`] can be used on a filesystem
+    /// without fsverity support.
     pub fn set_insecure(&mut self, insecure: bool) -> &mut Self {
         self.insecure = insecure;
         self
@@ -236,6 +245,8 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         format!("objects/{}", id.to_object_pathname())
     }
 
+    /// Check if the provided splitstream is present in the repository;
+    /// if so, return its fsverity digest.
     pub fn has_stream(&self, sha256: &Sha256Digest) -> Result<Option<ObjectID>> {
         let stream_path = format!("streams/{}", hex::encode(sha256));
 
@@ -260,7 +271,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         }
     }
 
-    /// Basically the same as has_stream() except that it performs expensive verification
+    /// Similar to [`Self::has_stream`] but performs more expensive verification.
     pub fn check_stream(&self, sha256: &Sha256Digest) -> Result<Option<ObjectID>> {
         let stream_path = format!("streams/{}", hex::encode(sha256));
         match self.openat(&stream_path, OFlags::RDONLY) {
@@ -301,6 +312,8 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         }
     }
 
+    /// Write the given splitstream to the repository with the
+    /// provided name.
     pub fn write_stream(
         &self,
         writer: SplitStreamWriter<ObjectID>,
@@ -374,6 +387,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(object_id)
     }
 
+    /// Open a splitstream with the given name.
     pub fn open_stream(
         &self,
         name: &str,
@@ -392,6 +406,8 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         SplitStreamReader::new(file)
     }
 
+    /// Given an object identifier (a digest), return a read-only file descriptor
+    /// for its contents. The fsverity digest is verified (if the repository is not in `insecure` mode).
     pub fn open_object(&self, id: &ObjectID) -> Result<OwnedFd> {
         self.open_with_verity(&Self::format_object_path(id), id)
     }
@@ -412,7 +428,13 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(())
     }
 
-    /// this function is not safe for untrusted users
+    /// Write `data into the repository as an image with the given `name`.
+    ///
+    /// The fsverity digest is returned.
+    ///
+    /// # Integrity
+    ///
+    /// This function is not safe for untrusted users.
     pub fn write_image(&self, name: Option<&str>, data: &[u8]) -> Result<ObjectID> {
         let object_id = self.ensure_object(data)?;
 
@@ -429,7 +451,13 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(object_id)
     }
 
-    /// this function is not safe for untrusted users
+    /// Import the data from the provided read into the repository as an image.
+    ///
+    /// The fsverity digest is returned.
+    ///
+    /// # Integrity
+    ///
+    /// This function is not safe for untrusted users.
     pub fn import_image<R: Read>(&self, name: &str, image: &mut R) -> Result<ObjectID> {
         let mut data = vec![];
         image.read_to_end(&mut data)?;
@@ -460,6 +488,8 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         }
     }
 
+    /// Create a detached mount of an image. This file descriptor can then
+    /// be attached via e.g. `move_mount`.
     pub fn mount(&self, name: &str) -> Result<OwnedFd> {
         let (image, enable_verity) = self.open_image(name)?;
         Ok(composefs_fsmount(
@@ -470,6 +500,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         )?)
     }
 
+    /// Mount the image with the provided digest at the target path.
     pub fn mount_at(&self, name: &str, mountpoint: impl AsRef<Path>) -> Result<()> {
         Ok(mount_at(
             self.mount(name)?,
@@ -540,6 +571,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(())
     }
 
+    /// Open the provided path in the repository.
     fn openat(&self, name: &str, flags: OFlags) -> ErrnoResult<OwnedFd> {
         // Unconditionally add CLOEXEC as we always want it.
         openat(
@@ -599,6 +631,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(objects)
     }
 
+    /// Given an image, return the set of all objects referenced by it.
     pub fn objects_for_image(&self, name: &str) -> Result<HashSet<ObjectID>> {
         let (image, _) = self.open_image(name)?;
         let mut data = vec![];
@@ -606,6 +639,11 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(crate::erofs::reader::collect_objects(&data)?)
     }
 
+    /// Perform a garbage collection operation.
+    ///
+    /// # Locking
+    ///
+    /// An exclusive lock is held for the duration of this operation.
     pub fn gc(&self) -> Result<()> {
         flock(&self.repository, FlockOperation::LockExclusive)?;
 
