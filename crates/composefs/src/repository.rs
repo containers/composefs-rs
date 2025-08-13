@@ -693,7 +693,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(flock(&self.repository, FlockOperation::LockShared)?) // XXX: finally { } ?
     }
 
-    pub fn fsck(&self) -> Result<()> {
-        Ok(())
-    }
+    // fn fsck(&self) -> Result<()> {
+    //     unimplemented!()
+    // }
 }
