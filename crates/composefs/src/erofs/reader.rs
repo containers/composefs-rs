@@ -295,7 +295,7 @@ impl<'img> Image<'img> {
         }
     }
 
-    pub fn inode(&self, id: u64) -> InodeType {
+    pub fn inode(&self, id: u64) -> InodeType<'_> {
         let inode_data = &self.inodes[id as usize * 32..];
         if inode_data[0] & 1 != 0 {
             let header = ExtendedInodeHeader::ref_from_bytes(&inode_data[..64]).unwrap();
@@ -340,7 +340,7 @@ impl<'img> Image<'img> {
         DirectoryBlock::ref_from_bytes(self.block(id)).unwrap()
     }
 
-    pub fn root(&self) -> InodeType {
+    pub fn root(&self) -> InodeType<'_> {
         self.inode(self.sb.root_nid.get() as u64)
     }
 }
@@ -358,7 +358,7 @@ impl InodeXAttrs {
              .0
     }
 
-    pub fn local(&self) -> XAttrIter {
+    pub fn local(&self) -> XAttrIter<'_> {
         XAttrIter {
             data: &self.data[self.header.shared_count as usize * 4..],
         }
@@ -414,7 +414,7 @@ impl DirectoryBlock {
         offset as usize / 12
     }
 
-    pub fn entries(&self) -> DirectoryEntries {
+    pub fn entries(&self) -> DirectoryEntries<'_> {
         DirectoryEntries {
             block: self,
             length: self.n_entries(),

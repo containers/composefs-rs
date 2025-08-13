@@ -30,7 +30,7 @@ impl FsHandle {
 }
 
 impl AsFd for FsHandle {
-    fn as_fd(&self) -> BorrowedFd {
+    fn as_fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
     }
 }
