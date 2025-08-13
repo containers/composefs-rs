@@ -131,7 +131,7 @@ pub enum Item<'p> {
 
 /// Unescape a byte array according to the composefs dump file escaping format,
 /// limiting the maximum possible size.
-fn unescape_limited(s: &str, max: usize) -> Result<Cow<[u8]>> {
+fn unescape_limited(s: &str, max: usize) -> Result<Cow<'_, [u8]>> {
     // If there are no escapes, just return the input unchanged. However,
     // it must also be ASCII to maintain a 1-1 correspondence between byte
     // and character.
@@ -179,13 +179,13 @@ fn unescape_limited(s: &str, max: usize) -> Result<Cow<[u8]>> {
 }
 
 /// Unescape a byte array according to the composefs dump file escaping format.
-fn unescape(s: &str) -> Result<Cow<[u8]>> {
+fn unescape(s: &str) -> Result<Cow<'_, [u8]>> {
     unescape_limited(s, usize::MAX)
 }
 
 /// Unescape a string into a Rust `OsStr` which is really just an alias for a byte array,
 /// but we also impose a constraint that it can not have an embedded NUL byte.
-fn unescape_to_osstr(s: &str) -> Result<Cow<OsStr>> {
+fn unescape_to_osstr(s: &str) -> Result<Cow<'_, OsStr>> {
     let v = unescape(s)?;
     if v.contains(&0u8) {
         anyhow::bail!("Invalid embedded NUL");
@@ -201,7 +201,7 @@ fn unescape_to_osstr(s: &str) -> Result<Cow<OsStr>> {
 /// with a few constraints:
 /// - Cannot contain an embedded NUL
 /// - Cannot be empty, or longer than PATH_MAX
-fn unescape_to_path(s: &str) -> Result<Cow<Path>> {
+fn unescape_to_path(s: &str) -> Result<Cow<'_, Path>> {
     let v = unescape_to_osstr(s).and_then(|v| {
         if v.is_empty() {
             anyhow::bail!("Invalid empty path");
@@ -224,7 +224,7 @@ fn unescape_to_path(s: &str) -> Result<Cow<Path>> {
 /// which in particular removes `.` and extra `//`.
 ///
 /// We also deny uplinks `..` and empty paths.
-fn unescape_to_path_canonical(s: &str) -> Result<Cow<Path>> {
+fn unescape_to_path_canonical(s: &str) -> Result<Cow<'_, Path>> {
     let p = unescape_to_path(s)?;
     let mut components = p.components();
     let mut r = std::path::PathBuf::new();
