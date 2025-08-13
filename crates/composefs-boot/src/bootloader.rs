@@ -1,9 +1,7 @@
 use core::ops::Range;
-use std::{
-    collections::HashMap, ffi::OsStr, fs::File, io::Read, os::unix::ffi::OsStrExt, str::from_utf8,
-};
+use std::{collections::HashMap, ffi::OsStr, os::unix::ffi::OsStrExt, str::from_utf8};
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{bail, Result};
 
 use composefs::{
     fsverity::FsVerityHashValue,
@@ -112,24 +110,6 @@ impl BootLoaderEntryFile {
     }
 }
 
-pub fn read_file<ObjectID: FsVerityHashValue>(
-    file: &RegularFile<ObjectID>,
-    repo: &Repository<ObjectID>,
-) -> Result<Box<[u8]>> {
-    match file {
-        RegularFile::Inline(data) => Ok(data.clone()),
-        RegularFile::External(id, size) => {
-            let mut data = vec![];
-            File::from(repo.open_object(id)?).read_to_end(&mut data)?;
-            ensure!(
-                *size == data.len() as u64,
-                "File content doesn't have the expected length"
-            );
-            Ok(data.into_boxed_slice())
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct Type1Entry<ObjectID: FsVerityHashValue> {
     /// This is the basename of the bootloader entry .conf file
@@ -181,7 +161,7 @@ impl<ObjectID: FsVerityHashValue> Type1Entry<ObjectID> {
         root: &Directory<ObjectID>,
         repo: &Repository<ObjectID>,
     ) -> Result<Self> {
-        let entry = BootLoaderEntryFile::new(from_utf8(&read_file(file, repo)?)?);
+        let entry = BootLoaderEntryFile::new(from_utf8(&composefs::fs::read_file(file, repo)?)?);
 
         let mut files = HashMap::new();
         for key in ["linux", "initrd", "efi"] {

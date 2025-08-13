@@ -8,7 +8,7 @@ use anyhow::{ensure, Result};
 use composefs::{fsverity::FsVerityHashValue, repository::Repository};
 
 use crate::{
-    bootloader::{read_file, BootEntry, Type1Entry, Type2Entry},
+    bootloader::{BootEntry, Type1Entry, Type2Entry},
     cmdline::get_cmdline_composefs,
     uki,
 };
@@ -38,7 +38,7 @@ pub fn write_t1_simple<ObjectID: FsVerityHashValue>(
         let file_path = bootdir.join(pathname.strip_prefix(Path::new("/"))?);
         // SAFETY: what safety? :)
         create_dir_all(file_path.parent().unwrap())?;
-        write(file_path, read_file(file, repo)?)?;
+        write(file_path, composefs::fs::read_file(file, repo)?)?;
     }
 
     // And now the loader entry itself
@@ -59,7 +59,7 @@ pub fn write_t2_simple<ObjectID: FsVerityHashValue>(
     let efi_linux = bootdir.join("EFI/Linux");
     create_dir_all(&efi_linux)?;
     let filename = efi_linux.join(t2.filename.as_ref());
-    let content = read_file(&t2.file, repo)?;
+    let content = composefs::fs::read_file(&t2.file, repo)?;
     let (composefs, _) = get_cmdline_composefs::<ObjectID>(uki::get_cmdline(&content)?)?;
 
     ensure!(
