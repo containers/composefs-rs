@@ -106,7 +106,7 @@ pub fn parse_sha256(string: impl AsRef<str>) -> Result<Sha256Digest> {
     Ok(value)
 }
 
-pub(crate) trait ErrnoFilter<T> {
+pub trait ErrnoFilter<T> {
     fn filter_errno(self, ignored: Errno) -> ErrnoResult<Option<T>>;
 }
 

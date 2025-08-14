@@ -92,6 +92,33 @@ enum OciCommand {
     },
 }
 
+#[cfg(feature = "ostree")]
+#[derive(Debug, Subcommand)]
+enum OstreeCommand {
+    PullLocal {
+        repo_path: PathBuf,
+        ostree_ref: String,
+        name: Option<String>,
+        #[clap(long)]
+        base_name: Option<String>,
+    },
+    Pull {
+        repo_url: String,
+        ostree_ref: String,
+        name: Option<String>,
+        #[clap(long)]
+        base_name: Option<String>,
+    },
+    CreateImage {
+        commit_name: String,
+        #[clap(long)]
+        image_name: Option<String>,
+    },
+    Inspect {
+        commit_name: String,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Take a transaction lock on the repository.
@@ -113,6 +140,12 @@ enum Command {
     Oci {
         #[clap(subcommand)]
         cmd: OciCommand,
+    },
+    /// Commands for dealing with OSTree commits
+    #[cfg(feature = "ostree")]
+    Ostree {
+        #[clap(subcommand)]
+        cmd: OstreeCommand,
     },
     /// Mounts a composefs, possibly enforcing fsverity of the image
     Mount {
@@ -188,7 +221,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Cat { name } => {
-            repo.merge_splitstream(&name, None, &mut std::io::stdout())?;
+            repo.merge_splitstream(&name, None, None, &mut std::io::stdout())?;
         }
         Command::ImportImage { reference } => {
             let image_id = repo.import_image(&reference, &mut std::io::stdin())?;
@@ -309,6 +342,54 @@ async fn main() -> Result<()> {
                 create_dir_all(state.join("var"))?;
                 create_dir_all(state.join("etc/upper"))?;
                 create_dir_all(state.join("etc/work"))?;
+            }
+        },
+        #[cfg(feature = "ostree")]
+        Command::Ostree { cmd: ostree_cmd } => match ostree_cmd {
+            OstreeCommand::PullLocal {
+                ref repo_path,
+                ref ostree_ref,
+                name,
+                base_name,
+            } => {
+                let verity = composefs_ostree::pull_local(
+                    &Arc::new(repo),
+                    repo_path,
+                    ostree_ref,
+                    name.as_deref(),
+                    base_name.as_deref(),
+                )
+                .await?;
+
+                println!("verity {}", verity.to_hex());
+            }
+            OstreeCommand::Pull {
+                ref repo_url,
+                ref ostree_ref,
+                name,
+                base_name,
+            } => {
+                let verity = composefs_ostree::pull(
+                    &Arc::new(repo),
+                    repo_url,
+                    ostree_ref,
+                    name.as_deref(),
+                    base_name.as_deref(),
+                )
+                .await?;
+
+                println!("verity {}", verity.to_hex());
+            }
+            OstreeCommand::CreateImage {
+                ref commit_name,
+                ref image_name,
+            } => {
+                let mut fs = composefs_ostree::create_filesystem(&repo, commit_name)?;
+                let image_id = fs.commit_image(&repo, image_name.as_deref())?;
+                println!("{}", image_id.to_id());
+            }
+            OstreeCommand::Inspect { ref commit_name } => {
+                composefs_ostree::inspect(&repo, commit_name)?;
             }
         },
         Command::ComputeId {
