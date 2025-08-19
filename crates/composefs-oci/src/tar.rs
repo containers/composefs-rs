@@ -198,7 +198,7 @@ pub fn get_entry<R: Read, ObjectID: FsVerityHashValue>(
                     // The `tar` crate does have a higher level `path` function that would do this for us.
                     // See: https://github.com/alexcrichton/tar-rs/blob/a1c3036af48fa02437909112239f0632e4cfcfae/src/header.rs#L1532
                     // Similar operation is performed for GNULongName
-                    gnu_longname.pop_if(|x| *x == b'\0');
+                    gnu_longlink.pop_if(|x| *x == b'\0');
 
                     continue;
                 }
