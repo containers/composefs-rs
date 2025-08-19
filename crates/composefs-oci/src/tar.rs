@@ -284,7 +284,8 @@ pub fn get_entry<R: Read, ObjectID: FsVerityHashValue>(
 mod tests {
     use super::*;
     use composefs::{
-        fsverity::Sha256HashValue, repository::Repository, splitstream::SplitStreamReader,
+        fsverity::Sha256HashValue, generic_tree::LeafContent, repository::Repository,
+        splitstream::SplitStreamReader,
     };
     use std::{io::Cursor, path::Path, sync::Arc};
     use tar::Builder;
@@ -616,6 +617,39 @@ mod tests {
         assert_eq!(entries.len(), 1);
         let abspath = format!("/{very_long_path}");
         assert_eq!(entries[0].path, Path::new(&abspath));
+    }
+
+    #[test]
+    fn test_gnu_longlink() {
+        let very_long_path = format!(
+            "very/long/path/that/exceeds/the/normal/tar/header/limit/{}",
+            "x".repeat(120)
+        );
+
+        // Use append_data to create a tar with a very long filename that triggers GNU extensions
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = Builder::new(&mut tar_data);
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o777);
+            header.set_entry_type(EntryType::Symlink);
+            header.set_size(0);
+            header.set_uid(0);
+            header.set_gid(0);
+            builder
+                .append_link(&mut header, "long-symlink", &very_long_path)
+                .unwrap();
+            builder.finish().unwrap();
+        };
+
+        let entries = read_all_via_splitstream(tar_data).unwrap();
+        assert_eq!(entries.len(), 1);
+        match &entries[0].item {
+            TarItem::Leaf(LeafContent::Symlink(ref target)) => {
+                assert_eq!(&**target, OsStr::new(&very_long_path));
+            }
+            _ => unreachable!(),
+        };
     }
 
     /// Compare a tar::Header with a composefs Stat structure for equality
