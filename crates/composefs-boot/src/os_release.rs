@@ -38,13 +38,14 @@ fn dequote(value: &str) -> Option<String> {
     Some(result)
 }
 
-pub(crate) struct OsReleaseInfo<'a> {
+#[derive(Debug)]
+pub struct OsReleaseInfo<'a> {
     map: HashMap<&'a str, &'a str>,
 }
 
 impl<'a> OsReleaseInfo<'a> {
     /// Parses an /etc/os-release file
-    pub(crate) fn parse(content: &'a str) -> Self {
+    pub fn parse(content: &'a str) -> Self {
         let map = HashMap::from_iter(
             content
                 .lines()
@@ -56,25 +57,25 @@ impl<'a> OsReleaseInfo<'a> {
 
     /// Looks up a key (like "PRETTY_NAME") in the os-release file and returns the properly
     /// dequoted and unescaped value, if one exists.
-    pub(crate) fn get_value(&self, keys: &[&str]) -> Option<String> {
+    pub fn get_value(&self, keys: &[&str]) -> Option<String> {
         keys.iter()
             .find_map(|key| self.map.get(key).and_then(|v| dequote(v)))
     }
 
     /// Returns the value of the PRETTY_NAME, NAME, or ID field, whichever is found first.
-    pub(crate) fn get_pretty_name(&self) -> Option<String> {
+    pub fn get_pretty_name(&self) -> Option<String> {
         self.get_value(&["PRETTY_NAME", "NAME", "ID"])
     }
 
     /// Returns the value of the VERSION_ID or VERSION field, whichever is found first.
-    pub(crate) fn get_version(&self) -> Option<String> {
+    pub fn get_version(&self) -> Option<String> {
         self.get_value(&["VERSION_ID", "VERSION"])
     }
 
     /// Combines get_pretty_name() with get_version() as specified in the Boot Loader
     /// Specification to produce a boot label.  This will return None if we can't find a name, but
     /// failing to find a version isn't fatal.
-    pub(crate) fn get_boot_label(&self) -> Option<String> {
+    pub fn get_boot_label(&self) -> Option<String> {
         let mut result = self.get_pretty_name()?;
         if let Some(version) = self.get_version() {
             result.push_str(&format!(" {version}"));
