@@ -221,6 +221,7 @@ pub enum PEType {
 
 #[derive(Debug)]
 pub struct Type2Entry<ObjectID: FsVerityHashValue> {
+    pub kver: Option<Box<OsStr>>,
     // This is the path (relative to /boot/EFI/Linux) of the file
     pub file_path: PathBuf,
     // The Portable Executable binary
@@ -239,37 +240,41 @@ impl<ObjectID: FsVerityHashValue> Type2Entry<ObjectID> {
         }
     }
 
-    fn recurse_dir(
+    // Find UKI components, the UKI PE binary and other UKI addons,
+    // if any, in the provided directory
+    fn find_uki_components(
         dir: &Directory<ObjectID>,
         entries: &mut Vec<Self>,
         path: &mut PathBuf,
+        kver: &Option<Box<OsStr>>,
     ) -> Result<()> {
         for (filename, inode) in dir.entries() {
             path.push(filename);
 
-            // We also want to collect all UKI extensions
+            // Collect all UKI extensions
+            // Usually we'll find them in the root with directories ending in `.efi.extra.d` for kernel
+            // specific addons. Global addons are found in `loader/addons`
             if let Inode::Directory(dir) = inode {
-                if !filename.as_bytes().ends_with(EFI_ADDON_DIR_EXT.as_bytes()) {
-                    continue;
-                }
-
-                Type2Entry::recurse_dir(dir, entries, path)?;
-                return Ok(());
+                Self::find_uki_components(dir, entries, path, kver)?;
+                path.pop();
+                continue;
             }
 
             if !filename.as_bytes().ends_with(EFI_EXT.as_bytes()) {
+                path.pop();
                 continue;
             }
 
             let Inode::Leaf(leaf) = inode else {
-                bail!("/boot/EFI/Linux/{filename:?} is a directory");
+                bail!("{filename:?} is a directory");
             };
 
             let LeafContent::Regular(file) = &leaf.content else {
-                bail!("/boot/EFI/Linux/{filename:?} is not a regular file");
+                bail!("{filename:?} is not a regular file");
             };
 
             entries.push(Self {
+                kver: kver.clone(),
                 file_path: path.clone(),
                 file: file.clone(),
                 pe_type: if path.components().count() == 1 {
@@ -290,75 +295,11 @@ impl<ObjectID: FsVerityHashValue> Type2Entry<ObjectID> {
 
         match root.get_directory("/boot/EFI/Linux".as_ref()) {
             Ok(entries_dir) => {
-                Type2Entry::recurse_dir(entries_dir, &mut entries, &mut PathBuf::new())?
+                Self::find_uki_components(entries_dir, &mut entries, &mut PathBuf::new(), &None)?
             }
             Err(ImageError::NotFound(..)) => {}
             Err(other) => Err(other)?,
         };
-
-        Ok(entries)
-    }
-}
-
-#[derive(Debug)]
-pub struct UsrLibModulesUki<ObjectID: FsVerityHashValue> {
-    pub kver: Box<OsStr>,
-    pub file_path: PathBuf,
-    pub file: RegularFile<ObjectID>,
-    pub pe_type: PEType,
-}
-
-impl<ObjectID: FsVerityHashValue> UsrLibModulesUki<ObjectID> {
-    fn recurse_dir(
-        dir: &Directory<ObjectID>,
-        entries: &mut Vec<Self>,
-        path: &mut PathBuf,
-        kver: &OsStr,
-    ) -> Result<()> {
-        for (filename, inode) in dir.entries() {
-            path.push(filename);
-
-            // Collect all UKI extensions
-            if let Inode::Directory(dir) = inode {
-                if !filename.as_bytes().ends_with(EFI_ADDON_DIR_EXT.as_bytes()) {
-                    continue;
-                }
-
-                UsrLibModulesUki::recurse_dir(dir, entries, path, kver)?;
-                return Ok(());
-            }
-
-            if !filename.as_bytes().ends_with(EFI_EXT.as_bytes()) {
-                continue;
-            }
-
-            let Inode::Leaf(leaf) = inode else {
-                bail!("/usr/lib/modules/{filename:?} is a directory");
-            };
-
-            let LeafContent::Regular(file) = &leaf.content else {
-                bail!("/usr/lib/modules/{filename:?} is not a regular file");
-            };
-
-            entries.push(Self {
-                kver: Box::from(kver),
-                file_path: path.clone(),
-                file: file.clone(),
-                pe_type: if path.components().count() == 0 {
-                    PEType::Uki
-                } else {
-                    PEType::UkiAddon
-                },
-            });
-
-            path.pop();
-        }
-
-        Ok(())
-    }
-
-    pub fn load_all(root: &Directory<ObjectID>) -> Result<Vec<Self>> {
-        let mut entries = vec![];
 
         match root.get_directory("/usr/lib/modules".as_ref()) {
             Ok(modules_dir) => {
@@ -367,7 +308,12 @@ impl<ObjectID: FsVerityHashValue> UsrLibModulesUki<ObjectID> {
                         continue;
                     };
 
-                    UsrLibModulesUki::recurse_dir(dir, &mut entries, &mut PathBuf::new(), kver)?;
+                    Self::find_uki_components(
+                        dir,
+                        &mut entries,
+                        &mut PathBuf::new(),
+                        &Some(Box::from(kver)),
+                    )?;
                 }
             }
             Err(ImageError::NotFound(..)) => {}
@@ -452,7 +398,6 @@ initrd /{id}/initramfs.img
 pub enum BootEntry<ObjectID: FsVerityHashValue> {
     Type1(Type1Entry<ObjectID>),
     Type2(Type2Entry<ObjectID>),
-    UsrLibModulesUki(UsrLibModulesUki<ObjectID>),
     UsrLibModulesVmLinuz(UsrLibModulesVmlinuz<ObjectID>),
 }
 
@@ -467,9 +412,6 @@ pub fn get_boot_resources<ObjectID: FsVerityHashValue>(
     }
     for e in Type2Entry::load_all(&image.root)? {
         entries.push(BootEntry::Type2(e));
-    }
-    for e in UsrLibModulesUki::load_all(&image.root)? {
-        entries.push(BootEntry::UsrLibModulesUki(e));
     }
     for e in UsrLibModulesVmlinuz::load_all(&image.root)? {
         entries.push(BootEntry::UsrLibModulesVmLinuz(e));

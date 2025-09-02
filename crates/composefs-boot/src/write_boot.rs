@@ -133,7 +133,6 @@ pub fn write_boot_simple<ObjectID: FsVerityHashValue>(
             ensure!(cmdline_extra.is_empty(), "Can't add --cmdline args to UKIs");
             write_t2_simple(t2, boot_partition, root_id, repo)?;
         }
-        BootEntry::UsrLibModulesUki(_entry) => todo!(),
         BootEntry::UsrLibModulesVmLinuz(entry) => {
             let mut t1 = entry.into_type1(entry_id);
             if let Some(name) = entry_id {
