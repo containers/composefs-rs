@@ -58,7 +58,7 @@ pub fn write_t2_simple<ObjectID: FsVerityHashValue>(
 ) -> Result<()> {
     let efi_linux = bootdir.join("EFI/Linux");
     create_dir_all(&efi_linux)?;
-    let filename = efi_linux.join(t2.filename.as_ref());
+    let filename = efi_linux.join(t2.file_path);
     let content = composefs::fs::read_file(&t2.file, repo)?;
     let (composefs, _) = get_cmdline_composefs::<ObjectID>(uki::get_cmdline(&content)?)?;
 

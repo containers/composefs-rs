@@ -1,5 +1,7 @@
 use core::ops::Range;
-use std::{collections::HashMap, ffi::OsStr, os::unix::ffi::OsStrExt, str::from_utf8};
+use std::{
+    collections::HashMap, ffi::OsStr, os::unix::ffi::OsStrExt, path::PathBuf, str::from_utf8,
+};
 
 use anyhow::{bail, Result};
 
@@ -207,16 +209,80 @@ impl<ObjectID: FsVerityHashValue> Type1Entry<ObjectID> {
     }
 }
 
+pub const EFI_EXT: &str = ".efi";
+pub const EFI_ADDON_DIR_EXT: &str = ".efi.extra.d";
+pub const EFI_ADDON_FILE_EXT: &str = ".addon.efi";
+
+#[derive(Debug)]
+pub enum PEType {
+    Uki,
+    UkiAddon,
+}
+
 #[derive(Debug)]
 pub struct Type2Entry<ObjectID: FsVerityHashValue> {
-    // This is the basename of the UKI .efi file
-    pub filename: Box<OsStr>,
+    // This is the path (relative to /boot/EFI/Linux) of the file
+    pub file_path: PathBuf,
+    // The Portable Executable binary
     pub file: RegularFile<ObjectID>,
+    pub pe_type: PEType,
 }
 
 impl<ObjectID: FsVerityHashValue> Type2Entry<ObjectID> {
     pub fn rename(&mut self, name: &str) {
-        self.filename = Box::from(format!("{name}.efi").as_ref());
+        let new_name = format!("{name}.efi");
+
+        if let Some(parent) = self.file_path.parent() {
+            self.file_path = parent.join(new_name);
+        } else {
+            self.file_path = new_name.into();
+        }
+    }
+
+    fn recurse_dir(
+        dir: &Directory<ObjectID>,
+        entries: &mut Vec<Self>,
+        path: &mut PathBuf,
+    ) -> Result<()> {
+        for (filename, inode) in dir.entries() {
+            path.push(filename);
+
+            // We also want to collect all UKI extensions
+            if let Inode::Directory(dir) = inode {
+                if !filename.as_bytes().ends_with(EFI_ADDON_DIR_EXT.as_bytes()) {
+                    continue;
+                }
+
+                Type2Entry::recurse_dir(dir, entries, path)?;
+                return Ok(());
+            }
+
+            if !filename.as_bytes().ends_with(EFI_EXT.as_bytes()) {
+                continue;
+            }
+
+            let Inode::Leaf(leaf) = inode else {
+                bail!("/boot/EFI/Linux/{filename:?} is a directory");
+            };
+
+            let LeafContent::Regular(file) = &leaf.content else {
+                bail!("/boot/EFI/Linux/{filename:?} is not a regular file");
+            };
+
+            entries.push(Self {
+                file_path: path.clone(),
+                file: file.clone(),
+                pe_type: if path.components().count() == 1 {
+                    PEType::Uki
+                } else {
+                    PEType::UkiAddon
+                },
+            });
+
+            path.pop();
+        }
+
+        Ok(())
     }
 
     pub fn load_all(root: &Directory<ObjectID>) -> Result<Vec<Self>> {
@@ -224,24 +290,7 @@ impl<ObjectID: FsVerityHashValue> Type2Entry<ObjectID> {
 
         match root.get_directory("/boot/EFI/Linux".as_ref()) {
             Ok(entries_dir) => {
-                for (filename, inode) in entries_dir.entries() {
-                    if !filename.as_bytes().ends_with(b".efi") {
-                        continue;
-                    }
-
-                    let Inode::Leaf(leaf) = inode else {
-                        bail!("/boot/EFI/Linux/{filename:?} is a directory");
-                    };
-
-                    let LeafContent::Regular(file) = &leaf.content else {
-                        bail!("/boot/EFI/Linux/{filename:?} is not a regular file");
-                    };
-
-                    entries.push(Self {
-                        filename: Box::from(filename),
-                        file: file.clone(),
-                    })
-                }
+                Type2Entry::recurse_dir(entries_dir, &mut entries, &mut PathBuf::new())?
             }
             Err(ImageError::NotFound(..)) => {}
             Err(other) => Err(other)?,
@@ -254,11 +303,60 @@ impl<ObjectID: FsVerityHashValue> Type2Entry<ObjectID> {
 #[derive(Debug)]
 pub struct UsrLibModulesUki<ObjectID: FsVerityHashValue> {
     pub kver: Box<OsStr>,
-    pub filename: Box<OsStr>,
-    pub uki: RegularFile<ObjectID>,
+    pub file_path: PathBuf,
+    pub file: RegularFile<ObjectID>,
+    pub pe_type: PEType,
 }
 
 impl<ObjectID: FsVerityHashValue> UsrLibModulesUki<ObjectID> {
+    fn recurse_dir(
+        dir: &Directory<ObjectID>,
+        entries: &mut Vec<Self>,
+        path: &mut PathBuf,
+        kver: &OsStr,
+    ) -> Result<()> {
+        for (filename, inode) in dir.entries() {
+            path.push(filename);
+
+            // Collect all UKI extensions
+            if let Inode::Directory(dir) = inode {
+                if !filename.as_bytes().ends_with(EFI_ADDON_DIR_EXT.as_bytes()) {
+                    continue;
+                }
+
+                UsrLibModulesUki::recurse_dir(dir, entries, path, kver)?;
+                return Ok(());
+            }
+
+            if !filename.as_bytes().ends_with(EFI_EXT.as_bytes()) {
+                continue;
+            }
+
+            let Inode::Leaf(leaf) = inode else {
+                bail!("/usr/lib/modules/{filename:?} is a directory");
+            };
+
+            let LeafContent::Regular(file) = &leaf.content else {
+                bail!("/usr/lib/modules/{filename:?} is not a regular file");
+            };
+
+            entries.push(Self {
+                kver: Box::from(kver),
+                file_path: path.clone(),
+                file: file.clone(),
+                pe_type: if path.components().count() == 0 {
+                    PEType::Uki
+                } else {
+                    PEType::UkiAddon
+                },
+            });
+
+            path.pop();
+        }
+
+        Ok(())
+    }
+
     pub fn load_all(root: &Directory<ObjectID>) -> Result<Vec<Self>> {
         let mut entries = vec![];
 
@@ -269,25 +367,7 @@ impl<ObjectID: FsVerityHashValue> UsrLibModulesUki<ObjectID> {
                         continue;
                     };
 
-                    for (filename, inode) in dir.entries() {
-                        if !filename.as_bytes().ends_with(b".efi") {
-                            continue;
-                        }
-
-                        let Inode::Leaf(leaf) = inode else {
-                            bail!("/boot/EFI/Linux/{filename:?} is a directory");
-                        };
-
-                        let LeafContent::Regular(file) = &leaf.content else {
-                            bail!("/boot/EFI/Linux/{filename:?} is not a regular file");
-                        };
-
-                        entries.push(Self {
-                            kver: Box::from(kver),
-                            filename: Box::from(filename),
-                            uki: file.clone(),
-                        })
-                    }
+                    UsrLibModulesUki::recurse_dir(dir, &mut entries, &mut PathBuf::new(), kver)?;
                 }
             }
             Err(ImageError::NotFound(..)) => {}
