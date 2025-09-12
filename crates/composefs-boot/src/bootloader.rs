@@ -9,7 +9,7 @@ use composefs::{
     tree::{Directory, FileSystem, ImageError, Inode, LeafContent, RegularFile},
 };
 
-use crate::cmdline::{make_cmdline_composefs, split_cmdline};
+use crate::cmdline::{Cmdline, Parameter};
 
 /// Strips the key (if it matches) plus the following whitespace from a single line in a "Type #1
 /// Boot Loader Specification Entry" file.
@@ -65,30 +65,17 @@ impl BootLoaderEntryFile {
     ///
     /// arg can be something like "composefs=xyz" but it can also be something like "rw".  In
     /// either case, if the argument already existed, it will be replaced.
-    pub fn add_cmdline(&mut self, arg: &str) {
-        let key = match arg.find('=') {
-            Some(pos) => &arg[..=pos], // include the '='
-            None => arg,
-        };
-
+    pub fn add_cmdline(&mut self, arg: &Parameter) {
         // There are three possible paths in this function:
         //   1. options line with key= already in it (replace it)
         //   2. options line with no key= in it (append key=value)
         //   3. no options line (append the entire thing)
         for line in &mut self.lines {
             if let Some(cmdline) = strip_ble_key(line, "options") {
-                let segment = split_cmdline(cmdline).find(|s| s.starts_with(key));
+                let mut cmdline = Cmdline::from(cmdline);
+                cmdline.add_or_modify(arg);
 
-                if let Some(old) = segment {
-                    // 1. Replace existing key
-                    let range = substr_range(line, old).unwrap();
-                    line.replace_range(range, arg);
-                } else {
-                    // 2. Append new argument
-                    line.push(' ');
-                    line.push_str(arg);
-                }
-
+                *line = format!("options {cmdline}");
                 return;
             }
         }
@@ -99,9 +86,21 @@ impl BootLoaderEntryFile {
 
     /// Adjusts the kernel command-line arguments by adding a composefs= parameter (if appropriate)
     /// and adding additional arguments, as requested.
-    pub fn adjust_cmdline(&mut self, composefs: Option<&str>, insecure: bool, extra: &[&str]) {
+    pub fn adjust_cmdline<T: FsVerityHashValue>(
+        &mut self,
+        composefs: Option<&T>,
+        insecure: bool,
+        extra: &[Parameter],
+    ) {
         if let Some(id) = composefs {
-            self.add_cmdline(&make_cmdline_composefs(id, insecure));
+            let id = id.to_hex();
+            let cfs_str = match insecure {
+                true => format!("composefs=?{id}"),
+                false => format!("composefs={id}"),
+            };
+
+            let param = Parameter::parse(&cfs_str).unwrap();
+            self.add_cmdline(&param);
         }
 
         for item in extra {
@@ -400,7 +399,26 @@ pub fn get_boot_resources<ObjectID: FsVerityHashValue>(
 
 #[cfg(test)]
 mod tests {
+    use composefs::fsverity::Sha256HashValue;
+    use zerocopy::FromZeros;
+
     use super::*;
+
+    fn sha256() -> Sha256HashValue {
+        Sha256HashValue::new_zeroed()
+    }
+
+    fn sha256str() -> String {
+        sha256().to_hex()
+    }
+
+    fn param(input: &str) -> Parameter<'_> {
+        Parameter::parse(input).unwrap()
+    }
+
+    fn params<'a>(input: &'a [&'a str]) -> Vec<Parameter<'a>> {
+        input.iter().map(|p| param(*p)).collect()
+    }
 
     #[test]
     fn test_bootloader_entry_file_new() {
@@ -490,7 +508,7 @@ mod tests {
     #[test]
     fn test_add_cmdline_new_options_line() {
         let mut entry = BootLoaderEntryFile::new("title Test Entry\nlinux /vmlinuz\n");
-        entry.add_cmdline("quiet");
+        entry.add_cmdline(&param("quiet"));
 
         assert_eq!(entry.lines.len(), 3);
         assert_eq!(entry.lines[2], "options quiet");
@@ -499,7 +517,7 @@ mod tests {
     #[test]
     fn test_add_cmdline_append_to_existing_options() {
         let mut entry = BootLoaderEntryFile::new("title Test Entry\noptions splash\n");
-        entry.add_cmdline("quiet");
+        entry.add_cmdline(&param("quiet"));
 
         assert_eq!(entry.lines.len(), 2);
         assert_eq!(entry.lines[1], "options splash quiet");
@@ -509,7 +527,7 @@ mod tests {
     fn test_add_cmdline_replace_existing_key_value() {
         let mut entry =
             BootLoaderEntryFile::new("title Test Entry\noptions quiet splash root=/dev/sda1\n");
-        entry.add_cmdline("root=/dev/sda2");
+        entry.add_cmdline(&param("root=/dev/sda2"));
 
         assert_eq!(entry.lines.len(), 2);
         assert_eq!(entry.lines[1], "options quiet splash root=/dev/sda2");
@@ -518,20 +536,20 @@ mod tests {
     #[test]
     fn test_add_cmdline_replace_existing_key_only() {
         let mut entry = BootLoaderEntryFile::new("title Test Entry\noptions quiet rw splash\n");
-        entry.add_cmdline("rw"); // Same key, should replace itself (no-op in this case)
+        entry.add_cmdline(&param("rw")); // Same key, should replace itself (no-op in this case)
 
         assert_eq!(entry.lines.len(), 2);
         assert_eq!(entry.lines[1], "options quiet rw splash");
 
         // Test replacing with different key
-        entry.add_cmdline("ro");
+        entry.add_cmdline(&param("ro"));
         assert_eq!(entry.lines[1], "options quiet rw splash ro");
     }
 
     #[test]
     fn test_add_cmdline_key_with_equals() {
         let mut entry = BootLoaderEntryFile::new("title Test Entry\noptions quiet\n");
-        entry.add_cmdline("composefs=abc123");
+        entry.add_cmdline(&param("composefs=abc123"));
 
         assert_eq!(entry.lines.len(), 2);
         assert_eq!(entry.lines[1], "options quiet composefs=abc123");
@@ -541,7 +559,7 @@ mod tests {
     fn test_add_cmdline_replace_key_with_equals() {
         let mut entry =
             BootLoaderEntryFile::new("title Test Entry\noptions quiet composefs=old123\n");
-        entry.add_cmdline("composefs=new456");
+        entry.add_cmdline(&param("composefs=new456"));
 
         assert_eq!(entry.lines.len(), 2);
         assert_eq!(entry.lines[1], "options quiet composefs=new456");
@@ -550,26 +568,33 @@ mod tests {
     #[test]
     fn test_adjust_cmdline_with_composefs() {
         let mut entry = BootLoaderEntryFile::new("title Test Entry\nlinux /vmlinuz\n");
-        entry.adjust_cmdline(Some("abc123"), false, &["quiet", "splash"]);
+        entry.adjust_cmdline(Some(&sha256()), false, &params(&["quiet", "splash"]));
 
         assert_eq!(entry.lines.len(), 3);
-        assert_eq!(entry.lines[2], "options composefs=abc123 quiet splash");
+        assert_eq!(
+            entry.lines[2],
+            format!("options composefs={} quiet splash", sha256str())
+        );
     }
 
     #[test]
     fn test_adjust_cmdline_with_composefs_insecure() {
         let mut entry = BootLoaderEntryFile::new("title Test Entry\nlinux /vmlinuz\n");
-        entry.adjust_cmdline(Some("abc123"), true, &[]);
+        entry.adjust_cmdline(Some(&sha256()), true, &[]);
 
         assert_eq!(entry.lines.len(), 3);
         // Assuming make_cmdline_composefs adds digest=off for insecure mode
-        assert!(entry.lines[2].contains("abc123"));
+        assert!(entry.lines[2].contains(&sha256str()));
     }
 
     #[test]
     fn test_adjust_cmdline_no_composefs() {
         let mut entry = BootLoaderEntryFile::new("title Test Entry\nlinux /vmlinuz\n");
-        entry.adjust_cmdline(None, false, &["quiet", "splash"]);
+        entry.adjust_cmdline(
+            None::<&Sha256HashValue>,
+            false,
+            &params(&["quiet", "splash"]),
+        );
 
         assert_eq!(entry.lines.len(), 3);
         assert_eq!(entry.lines[2], "options quiet splash");
@@ -578,11 +603,11 @@ mod tests {
     #[test]
     fn test_adjust_cmdline_existing_options() {
         let mut entry = BootLoaderEntryFile::new("title Test Entry\noptions root=/dev/sda1\n");
-        entry.adjust_cmdline(Some("abc123"), false, &["quiet"]);
+        entry.adjust_cmdline(Some(&sha256()), false, &params(&["quiet"]));
 
         assert_eq!(entry.lines.len(), 2);
         assert!(entry.lines[1].contains("root=/dev/sda1"));
-        assert!(entry.lines[1].contains("abc123"));
+        assert!(entry.lines[1].contains(&sha256str()));
         assert!(entry.lines[1].contains("quiet"));
     }
 
