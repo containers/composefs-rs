@@ -71,7 +71,7 @@ pub enum UkiError {
 //   - the error types returned from FromBytes can't be used with `?` because they try to return a
 //     reference to the data, which causes problems with lifetime rules
 //   - it saves us from having to type Err(UkiError::PortableExecutableError) everywhere
-fn get_text_section<'a>(
+pub fn get_text_section<'a>(
     image: &'a [u8],
     section_name: &'static str,
 ) -> Option<Result<&'a str, UkiError>> {
