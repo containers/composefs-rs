@@ -1,44 +1,57 @@
 # composefs-rs
 
-This is a set of experiments exploring ideas around how to structure an on-disk
-[composefs](https://github.com/containers/composefs) repository.
+A Rust implementation of [composefs](https://github.com/containers/composefs) with support for
+creating and managing verified operating system images. This project provides tools and libraries
+for working with composefs repositories and building secure, content-addressed filesystem images.
 
-The main consumables here are:
+Note: it is planned for this project to become the primary reference implementation of composefs,
+replacing the C-based implementation. For more on this, see [this discussion](https://github.com/composefs/composefs/discussions/423).
 
- - a [`Repository`](src/repository.rs) class representing an on-disk composefs
-   repository and the operations that can be performed on it.  See the
-   [repository format documentation](doc/repository.md).
+## Goals
 
- - [`cfsctl`](crates/cfsctl/src/main.rs): a command-line tool for performing operations
-   on the repository via the above APIs.
+Anywhere one wants versioned immutable filesystem trees ("images"), composefs provides
+a lot of compelling advantages. In particular this project aims to be the successor
+to [ostree](https://github.com/ostreedev/ostree/) for example.
 
- - (future?) some kind of a system service exposing those APIs to non-root
-   users in a safe way.
+## Components
 
-The `cfsctl mount` command depends on (currently pre-release) Linux 6.12 for
-support for directly mounting erofs images without creating loopback devices.
+### Core Libraries
 
-The purpose of this is to iterate fast on some new ideas (without worrying
-about breaking existing composefs users) and also as a learning experience (as
-my first real Rust project).
+ - [`composefs`](crates/composefs): Core library for composefs operations including filesystem trees,
+   fs-verity support, and repository management
+ - [`composefs-oci`](crates/composefs-oci): OCI image handling and integration with container registries
+ - [`composefs-boot`](crates/composefs-boot): Boot infrastructure support including UKI (Unified Kernel Image)
+   and BLS (Boot Loader Specification) integration
+ - [`composefs-http`](crates/composefs-http): HTTP support for fetching composefs content
+ - [`composefs-fuse`](crates/composefs-fuse): FUSE filesystem implementation
+ 
+### Command-line Tools
 
-Nothing here is currently expected to be useful to anybody at all, and probably
-never will be.  If these experiments go well, this code will probably end up
-merged in other places.
+ - [`cfsctl`](crates/cfsctl/src/main.rs): Primary CLI tool for managing composefs repositories
+ - [`composefs-setup-root`](crates/composefs-setup-root/src/main.rs): Early boot tool for setting up
+   the root filesystem from a composefs image
+
+### Examples
+
+The [`examples`](examples/) directory contains working demonstrations of building verified OS images:
+
+ - **UKI**: Unified Kernel Image with embedded composefs digest
+ - **BLS**: Traditional kernel/initramfs with Boot Loader Specification entries
+ - **Unified**: Streamlined UKI build using in-container measurement
+ - **Unified-SecureBoot**: UKI with Secure Boot signing support
+
+## Documentation
+
+ - [Repository format](doc/repository.md)
+ - [OCI integration](doc/oci.md)
+ - [Splitstream format](doc/splitstream.md)
+ - [Examples README](examples/README.md)
+
+## Status
+
+This project is under active development. It is still possible that the layout of a composefs
+repository will change for example.
 
 ## License
 
-Licensed under either of
-
- * Apache License, Version 2.0
-   ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
- * MIT license
-   ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
-
-at your option.
-
-## Contribution
-
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
-dual licensed as above, without any additional terms or conditions.
+See [LICENSE-APACHE](LICENSE-APACHE) and [LICENSE-MIT](LICENSE-MIT).
