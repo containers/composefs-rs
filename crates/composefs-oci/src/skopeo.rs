@@ -10,11 +10,12 @@ use oci_spec::image::{Descriptor, ImageConfiguration, ImageManifest, MediaType};
 use rustix::process::geteuid;
 use tokio::{io::AsyncReadExt, sync::Semaphore};
 
-use composefs::{
-    fsverity::FsVerityHashValue, repository::Repository, splitstream::DigestMap, util::Sha256Digest,
-};
+use composefs::{fsverity::FsVerityHashValue, repository::Repository, util::Sha256Digest};
 
 use crate::{sha256_from_descriptor, sha256_from_digest, tar::split_async, ContentAndVerity};
+
+pub const TAR_LAYER_CONTENT_TYPE: u64 = 0x2a037edfcae1ffea;
+pub const OCI_CONFIG_CONTENT_TYPE: u64 = 0x44218c839727a80b;
 
 struct ImageOp<ObjectID: FsVerityHashValue> {
     repo: Arc<Repository<ObjectID>>,
@@ -95,7 +96,9 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             self.progress
                 .println(format!("Fetching layer {}", hex::encode(layer_sha256)))?;
 
-            let mut splitstream = self.repo.create_stream(Some(layer_sha256), None);
+            let mut splitstream = self
+                .repo
+                .create_stream(TAR_LAYER_CONTENT_TYPE, Some(layer_sha256));
             match descriptor.media_type() {
                 MediaType::ImageLayer => {
                     split_async(progress, &mut splitstream).await?;
@@ -172,15 +175,15 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
                 entries.push((layer_sha256, future));
             }
 
-            // Collect the results.
-            let mut config_maps = DigestMap::new();
-            for (layer_sha256, future) in entries {
-                config_maps.insert(&layer_sha256, &future.await??);
-            }
-
             let mut splitstream = self
                 .repo
-                .create_stream(Some(config_sha256), Some(config_maps));
+                .create_stream(OCI_CONFIG_CONTENT_TYPE, Some(config_sha256));
+
+            // Collect the results.
+            for (layer_sha256, future) in entries {
+                splitstream.add_sha256_mapping(&layer_sha256, &future.await??);
+            }
+
             splitstream.write_inline(&raw_config);
             let config_id = self.repo.write_stream(splitstream, None)?;
 
