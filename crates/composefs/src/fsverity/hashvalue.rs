@@ -1,3 +1,9 @@
+//! Hash value types and trait definitions for fs-verity.
+//!
+//! This module defines the FsVerityHashValue trait and concrete implementations
+//! for SHA-256 and SHA-512 hash values, including parsing from hex strings
+//! and object pathnames.
+
 use core::{fmt, hash::Hash};
 
 use hex::FromHexError;

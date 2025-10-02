@@ -1,3 +1,10 @@
+//! Boot entry writing and installation functionality.
+//!
+//! This module provides functions to write boot entries to the filesystem, handling both
+//! Boot Loader Specification Type 1 entries (separate kernel/initrd files) and Type 2
+//! Unified Kernel Images. It manages file placement, directory creation, and command line
+//! argument injection for composefs boot scenarios.
+
 use std::{
     fs::{create_dir_all, write},
     path::Path,

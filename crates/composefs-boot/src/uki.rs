@@ -1,3 +1,10 @@
+//! Unified Kernel Image (UKI) parsing and metadata extraction.
+//!
+//! This module provides functionality to parse PE (Portable Executable) format UKI files
+//! and extract embedded sections like .osrel and .cmdline. It implements the Boot Loader
+//! Specification Type 2 requirements for UKI boot entries, including extraction of boot
+//! labels from os-release information embedded in the UKI binary.
+
 use thiserror::Error;
 use zerocopy::{
     little_endian::{U16, U32},

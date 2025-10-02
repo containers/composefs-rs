@@ -1,3 +1,9 @@
+//! Content-addressable repository for composefs objects.
+//!
+//! This module provides a repository abstraction for storing and retrieving
+//! content-addressed objects, splitstreams, and images with fs-verity
+//! verification and garbage collection support.
+
 use std::{
     collections::HashSet,
     ffi::CStr,

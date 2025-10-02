@@ -1,3 +1,10 @@
+//! Parsing and handling of os-release files.
+//!
+//! This module provides functionality to parse os-release files according to the
+//! freedesktop.org specification. It handles shell-style quoting and variable assignment,
+//! extracting common fields like PRETTY_NAME, VERSION_ID, and ID for use in boot labels.
+//! The `OsReleaseInfo` type provides methods to generate appropriate boot entry titles.
+
 use std::collections::HashMap;
 
 // We could be using 'shlex' for this but we really only need to parse a subset of the spec and

@@ -1,3 +1,9 @@
+//! Split Stream file format implementation.
+//!
+//! This module implements the Split Stream format for efficiently storing
+//! and transferring data with inline content and external object references,
+//! supporting compression and content deduplication.
+
 /* Implementation of the Split Stream file format
  *
  * See doc/splitstream.md

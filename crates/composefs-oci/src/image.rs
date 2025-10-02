@@ -1,3 +1,13 @@
+//! OCI image processing and filesystem construction.
+//!
+//! This module handles the conversion of OCI container image layers into composefs filesystems.
+//! It processes tar entries from container layers, handles overlayfs semantics like whiteouts,
+//! and constructs the final filesystem tree that can be mounted or analyzed.
+//!
+//! The main functionality centers around `create_filesystem()` which takes an OCI image configuration
+//! and builds a complete filesystem by processing all layers in order. The `process_entry()` function
+//! handles individual tar entries and implements overlayfs whiteout semantics for proper layer merging.
+
 use std::{ffi::OsStr, os::unix::ffi::OsStrExt, rc::Rc};
 
 use anyhow::{ensure, Context, Result};

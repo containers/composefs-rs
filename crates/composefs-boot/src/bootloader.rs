@@ -1,3 +1,11 @@
+//! Bootloader entry parsing and manipulation.
+//!
+//! This module provides functionality to parse and manipulate Boot Loader Specification
+//! entries and Unified Kernel Images (UKIs). It supports Type 1 BLS entries with separate
+//! kernel and initrd files, Type 2 UKI files, and traditional vmlinuz/initramfs pairs
+//! from /usr/lib/modules. Key types include `BootLoaderEntryFile` for parsing BLS
+//! configuration files and `BootEntry` enum for representing different boot entry types.
+
 use core::ops::Range;
 use std::{
     collections::HashMap, ffi::OsStr, os::unix::ffi::OsStrExt, path::PathBuf, str::from_utf8,

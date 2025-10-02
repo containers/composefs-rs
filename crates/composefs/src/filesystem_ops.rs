@@ -1,3 +1,9 @@
+//! High-level filesystem operations for composefs trees.
+//!
+//! This module provides convenience methods for common operations on
+//! FileSystem objects, including computing image IDs, committing to
+//! repositories, and generating dumpfiles.
+
 use anyhow::Result;
 
 use crate::{

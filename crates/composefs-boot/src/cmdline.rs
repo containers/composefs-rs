@@ -1,3 +1,10 @@
+//! Kernel command line parsing and manipulation.
+//!
+//! This module provides utilities for parsing and generating kernel command line arguments,
+//! with specific support for composefs parameters. It handles the kernel's simple quoting
+//! mechanism and provides functions to extract and create composefs= arguments with optional
+//! insecure mode indicators.
+
 use anyhow::{Context, Result};
 use composefs::fsverity::FsVerityHashValue;
 

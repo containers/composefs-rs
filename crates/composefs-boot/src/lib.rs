@@ -1,3 +1,10 @@
+//! Boot integration for composefs filesystem images.
+//!
+//! This crate provides functionality to transform composefs filesystem images for boot
+//! scenarios by extracting boot resources, applying SELinux labels, and preparing
+//! bootloader entries. It supports both Boot Loader Specification (Type 1) entries
+//! and Unified Kernel Images (Type 2) for UEFI boot.
+
 #![deny(missing_debug_implementations)]
 
 pub mod bootloader;

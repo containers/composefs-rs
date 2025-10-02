@@ -1,3 +1,9 @@
+//! EROFS image reading and parsing functionality.
+//!
+//! This module provides safe parsing and navigation of EROFS filesystem
+//! images, including inode traversal, directory reading, and object
+//! reference collection for garbage collection.
+
 use core::mem::size_of;
 use std::collections::{BTreeSet, HashSet};
 use std::ops::Range;

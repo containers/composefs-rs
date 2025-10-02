@@ -1,3 +1,9 @@
+//! Reading and writing filesystem trees to/from disk.
+//!
+//! This module provides functionality to read filesystem structures from
+//! disk into composefs tree representations and write them back, including
+//! handling of hardlinks, extended attributes, and repository integration.
+
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap},

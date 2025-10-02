@@ -1,3 +1,9 @@
+//! Compatibility helpers for older Linux kernel mount APIs.
+//!
+//! This module provides fallback implementations for mount operations
+//! on kernels that don't support the modern mount API, including
+//! loopback device setup and temporary mount handling.
+
 use std::{
     io::Result,
     os::fd::{AsFd, BorrowedFd, OwnedFd},

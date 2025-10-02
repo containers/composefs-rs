@@ -1,3 +1,15 @@
+//! OCI container image support for composefs.
+//!
+//! This crate provides functionality for working with OCI (Open Container Initiative) container images
+//! in the context of composefs. It enables importing, extracting, and mounting container images as
+//! composefs filesystems with fs-verity integrity protection.
+//!
+//! Key functionality includes:
+//! - Pulling container images from registries using skopeo
+//! - Converting OCI image layers from tar format to composefs split streams
+//! - Creating mountable filesystems from OCI image configurations
+//! - Sealing containers with fs-verity hashes for integrity verification
+
 pub mod image;
 pub mod skopeo;
 pub mod tar;
