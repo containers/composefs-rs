@@ -1,3 +1,8 @@
+//! Userspace fs-verity digest computation.
+//!
+//! This module implements the fs-verity Merkle tree algorithm in userspace,
+//! allowing computation of fs-verity digests without kernel support.
+
 use core::{cmp::min, mem::size_of};
 
 use sha2::Digest;

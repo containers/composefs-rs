@@ -1,3 +1,9 @@
+//! Utility functions and types used throughout the composefs crate.
+//!
+//! This module provides common functionality including error handling helpers,
+//! I/O utilities for reading data streams, SHA256 digest parsing, and
+//! filesystem operations like atomic symlink replacement.
+
 use rand::{distr::Alphanumeric, Rng};
 use std::{
     io::{Error, ErrorKind, Read, Result},

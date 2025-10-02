@@ -1,3 +1,9 @@
+//! Low-level ioctl interfaces for fs-verity kernel operations.
+//!
+//! This module provides safe wrappers around the Linux fs-verity ioctls
+//! for enabling and measuring fs-verity on files, handling the conversion
+//! between kernel and userspace data structures.
+
 #![allow(unsafe_code)]
 
 use core::mem::size_of;

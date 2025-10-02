@@ -1,3 +1,8 @@
+//! Debug utilities for analyzing EROFS images.
+//!
+//! This module provides tools for inspecting and debugging EROFS filesystem
+//! images, including detailed structure dumping and space usage analysis.
+
 use std::{
     cmp::Ordering,
     collections::BTreeMap,

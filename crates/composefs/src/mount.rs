@@ -1,3 +1,9 @@
+//! Modern Linux mount API support for composefs.
+//!
+//! This module provides functionality to mount composefs images using the
+//! new mount API (fsopen/fsmount) with overlay filesystem support and
+//! fs-verity verification.
+
 use std::{
     io::Result,
     os::fd::{AsFd, BorrowedFd, OwnedFd},

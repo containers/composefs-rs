@@ -1,3 +1,9 @@
+//! EROFS image generation and writing functionality.
+//!
+//! This module provides functionality to generate EROFS filesystem images
+//! from composefs tree structures, handling inode layout, directory blocks,
+//! and metadata serialization.
+
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap},

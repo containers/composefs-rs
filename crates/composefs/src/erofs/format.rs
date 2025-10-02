@@ -1,3 +1,9 @@
+//! EROFS on-disk format definitions and data structures.
+//!
+//! This module defines the binary layout of EROFS filesystem structures
+//! including superblocks, inodes, directory entries, and other metadata
+//! using safe zerocopy-based parsing.
+
 // This is currently implemented using zerocopy but the eventual plan is to do this with safe
 // transmutation.  As such: all of the structures are defined in terms of pure LE integer sizes, we
 // handle the conversion to enum values separately, and we avoid the TryFromBytes trait.

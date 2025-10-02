@@ -1,3 +1,9 @@
+//! Writing composefs dumpfile format from filesystem trees.
+//!
+//! This module provides functionality to serialize filesystem trees into
+//! the composefs dumpfile text format, handling file metadata, extended
+//! attributes, and hardlink tracking.
+
 use std::{
     collections::HashMap,
     ffi::{OsStr, OsString},

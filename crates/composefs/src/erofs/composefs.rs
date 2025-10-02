@@ -1,3 +1,8 @@
+//! Composefs-specific EROFS structures and overlay metadata.
+//!
+//! This module defines EROFS structures specific to composefs usage,
+//! particularly overlay metadata for fs-verity integration.
+
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::fsverity::FsVerityHashValue;

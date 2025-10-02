@@ -1,3 +1,9 @@
+//! FUSE filesystem implementation for composefs trees.
+//!
+//! This crate provides a userspace filesystem implementation that exposes composefs
+//! directory trees through FUSE. It supports read-only access to files, directories,
+//! symlinks, and extended attributes, with data served from a composefs repository.
+
 use std::{
     collections::HashMap,
     ffi::OsStr,

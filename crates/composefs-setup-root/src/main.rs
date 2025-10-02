@@ -1,3 +1,9 @@
+//! Root filesystem setup utility for composefs-based boot systems.
+//!
+//! This utility is designed to run during early boot to mount and configure
+//! the root filesystem using composefs images. It handles overlay mounts for
+//! writable directories, state management, and system integration.
+
 use std::{
     ffi::OsString,
     fmt::Debug,

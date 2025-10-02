@@ -1,3 +1,14 @@
+//! TAR archive processing and split stream conversion.
+//!
+//! This module handles the conversion of tar archives (container image layers) into composefs split streams.
+//! It provides both synchronous and asynchronous tar processing, intelligently deciding whether to store
+//! file content inline in the split stream or externally in the object store based on file size.
+//!
+//! Key components include the `split()` and `split_async()` functions for converting tar streams,
+//! `get_entry()` for reading back tar entries from split streams, and comprehensive support for
+//! tar format features including GNU long names, PAX extensions, and various file types.
+//! The `TarEntry` and `TarItem` types represent processed tar entries in composefs format.
+
 use std::{
     cell::RefCell,
     collections::BTreeMap,

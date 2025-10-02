@@ -1,3 +1,9 @@
+//! HTTP-based download functionality for composefs splitstreams and objects.
+//!
+//! This crate provides an asynchronous downloader that can fetch splitstreams and their
+//! referenced objects from HTTP servers. It handles recursive fetching of nested splitstream
+//! references and verifies content integrity using fsverity checksums.
+
 use std::{
     collections::{HashMap, HashSet},
     fs::File,

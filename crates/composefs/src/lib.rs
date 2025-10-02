@@ -1,3 +1,9 @@
+//! Rust bindings and utilities for working with composefs images and repositories.
+//!
+//! Composefs is a read-only FUSE filesystem that enables efficient sharing
+//! of container filesystem layers by using content-addressable storage
+//! and fs-verity for integrity verification.
+
 pub mod dumpfile;
 pub mod dumpfile_parse;
 pub mod erofs;

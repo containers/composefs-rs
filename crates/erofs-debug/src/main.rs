@@ -1,3 +1,9 @@
+//! Debug utility for analyzing EROFS filesystem images.
+//!
+//! This tool produces detailed, diff-friendly dumps of EROFS images that can be used
+//! to examine the internal structure and identify differences between images.
+//! The output format is deterministic and suitable for automated comparison.
+
 use std::{fs::File, io::Read, path::PathBuf};
 
 use clap::Parser;

@@ -1,3 +1,10 @@
+//! SELinux security context labeling for filesystem trees.
+//!
+//! This module implements SELinux policy parsing and file labeling functionality.
+//! It reads SELinux policy files (file_contexts, file_contexts.subs, etc.) and applies
+//! appropriate security.selinux extended attributes to filesystem nodes. The implementation
+//! uses regex automata for efficient pattern matching against file paths and types.
+
 use std::{
     collections::HashMap,
     ffi::{OsStr, OsString},

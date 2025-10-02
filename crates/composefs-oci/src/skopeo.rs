@@ -1,3 +1,13 @@
+//! Container image pulling and registry interaction via skopeo/containers-image-proxy.
+//!
+//! This module provides functionality to pull container images from various registries and import them
+//! into composefs repositories. It uses the containers-image-proxy library to interface with skopeo
+//! for image operations, handling authentication, transport protocols, and image manifest processing.
+//!
+//! The main entry point is the `pull()` function which downloads an image, processes its layers
+//! asynchronously with parallelism control, and stores them in the composefs repository with proper
+//! fs-verity integration. It supports various image formats and compression types.
+
 use std::{cmp::Reverse, process::Command, thread::available_parallelism};
 
 use std::{iter::zip, sync::Arc};
