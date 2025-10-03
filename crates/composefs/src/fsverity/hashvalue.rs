@@ -8,6 +8,7 @@ use core::{fmt, hash::Hash};
 
 use hex::FromHexError;
 use sha2::{digest::FixedOutputReset, digest::Output, Digest, Sha256, Sha512};
+use std::cmp::Ord;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 pub trait FsVerityHashValue
@@ -18,6 +19,7 @@ where
     Self: Hash + Eq,
     Self: fmt::Debug,
     Self: Send + Sync + Unpin + 'static,
+    Self: PartialOrd + Ord,
 {
     type Digest: Digest + FixedOutputReset + fmt::Debug;
     const ALGORITHM: u8;
@@ -99,7 +101,19 @@ impl fmt::Debug for Sha512HashValue {
     }
 }
 
-#[derive(Clone, Eq, FromBytes, Hash, Immutable, IntoBytes, KnownLayout, PartialEq, Unaligned)]
+#[derive(
+    Clone,
+    Eq,
+    FromBytes,
+    Hash,
+    Immutable,
+    IntoBytes,
+    KnownLayout,
+    PartialEq,
+    Unaligned,
+    PartialOrd,
+    Ord,
+)]
 #[repr(C)]
 pub struct Sha256HashValue([u8; 32]);
 
@@ -116,7 +130,19 @@ impl FsVerityHashValue for Sha256HashValue {
     const ID: &str = "sha256";
 }
 
-#[derive(Clone, Eq, FromBytes, Hash, Immutable, IntoBytes, KnownLayout, PartialEq, Unaligned)]
+#[derive(
+    Clone,
+    Eq,
+    FromBytes,
+    Hash,
+    Immutable,
+    IntoBytes,
+    KnownLayout,
+    PartialEq,
+    Unaligned,
+    PartialOrd,
+    Ord,
+)]
 #[repr(C)]
 pub struct Sha512HashValue([u8; 64]);
 

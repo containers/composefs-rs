@@ -19,6 +19,7 @@ use composefs::{
     tree::{Directory, FileSystem, Inode, Leaf},
 };
 
+use crate::skopeo::{OCI_CONFIG_CONTENT_TYPE, TAR_LAYER_CONTENT_TYPE};
 use crate::tar::{TarEntry, TarItem};
 
 pub fn process_entry<ObjectID: FsVerityHashValue>(
@@ -84,14 +85,19 @@ pub fn create_filesystem<ObjectID: FsVerityHashValue>(
 ) -> Result<FileSystem<ObjectID>> {
     let mut filesystem = FileSystem::default();
 
-    let mut config_stream = repo.open_stream(config_name, config_verity)?;
+    let mut config_stream =
+        repo.open_stream(config_name, config_verity, Some(OCI_CONFIG_CONTENT_TYPE))?;
     let config = ImageConfiguration::from_reader(&mut config_stream)?;
 
     for diff_id in config.rootfs().diff_ids() {
         let layer_sha256 = super::sha256_from_digest(diff_id)?;
         let layer_verity = config_stream.lookup(&layer_sha256)?;
 
-        let mut layer_stream = repo.open_stream(&hex::encode(layer_sha256), Some(layer_verity))?;
+        let mut layer_stream = repo.open_stream(
+            &hex::encode(layer_sha256),
+            Some(layer_verity),
+            Some(TAR_LAYER_CONTENT_TYPE),
+        )?;
         while let Some(entry) = crate::tar::get_entry(&mut layer_stream)? {
             process_entry(&mut filesystem, entry)?;
         }
