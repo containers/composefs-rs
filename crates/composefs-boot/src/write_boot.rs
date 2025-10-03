@@ -9,7 +9,7 @@ use composefs::{fsverity::FsVerityHashValue, repository::Repository};
 
 use crate::{
     bootloader::{BootEntry, Type1Entry, Type2Entry},
-    cmdline::get_cmdline_composefs,
+    cmdline::{get_cmdline_composefs, Parameter},
     uki,
 };
 
@@ -29,8 +29,15 @@ pub fn write_t1_simple<ObjectID: FsVerityHashValue>(
         bootdir.to_path_buf()
     };
 
+    let cmdline_extra = cmdline_extra
+        .iter()
+        .map(|p| {
+            Parameter::parse(*p).ok_or(anyhow::anyhow!("could not parse command line parameter"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     t1.entry
-        .adjust_cmdline(Some(&root_id.to_hex()), insecure, cmdline_extra);
+        .adjust_cmdline(Some(root_id), insecure, &cmdline_extra);
 
     // Write the content before we write the loader entry
     for (filename, file) in &t1.files {
