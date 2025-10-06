@@ -344,7 +344,7 @@ mod tests {
         let mut writer = repo.create_stream(TAR_LAYER_CONTENT_TYPE, None);
 
         split(&mut tar_cursor, &mut writer)?;
-        let object_id = writer.done()?;
+        let (object_id, _) = writer.done()?;
 
         let mut reader: SplitStreamReader<std::fs::File, Sha256HashValue> = SplitStreamReader::new(
             repo.open_object(&object_id)?.into(),
@@ -371,7 +371,7 @@ mod tests {
         let mut writer = repo.create_stream(TAR_LAYER_CONTENT_TYPE, None);
 
         split(&mut tar_cursor, &mut writer).unwrap();
-        let object_id = writer.done().unwrap();
+        let (object_id, _) = writer.done().unwrap();
 
         let mut reader: SplitStreamReader<std::fs::File, Sha256HashValue> = SplitStreamReader::new(
             repo.open_object(&object_id).unwrap().into(),
@@ -400,7 +400,7 @@ mod tests {
         let mut writer = repo.create_stream(TAR_LAYER_CONTENT_TYPE, None);
 
         split(&mut tar_cursor, &mut writer).unwrap();
-        let object_id = writer.done().unwrap();
+        let (object_id, _) = writer.done().unwrap();
 
         let mut reader: SplitStreamReader<std::fs::File, Sha256HashValue> = SplitStreamReader::new(
             repo.open_object(&object_id).unwrap().into(),
@@ -458,7 +458,7 @@ mod tests {
         let mut writer = repo.create_stream(TAR_LAYER_CONTENT_TYPE, None);
 
         split(&mut tar_cursor, &mut writer).unwrap();
-        let object_id = writer.done().unwrap();
+        let (object_id, _) = writer.done().unwrap();
 
         let mut reader: SplitStreamReader<std::fs::File, Sha256HashValue> = SplitStreamReader::new(
             repo.open_object(&object_id).unwrap().into(),
@@ -524,7 +524,7 @@ mod tests {
         let repo = create_test_repository().unwrap();
         let mut writer = repo.create_stream(TAR_LAYER_CONTENT_TYPE, None);
         split(&mut tar_cursor, &mut writer).unwrap();
-        let object_id = writer.done().unwrap();
+        let (object_id, _) = writer.done().unwrap();
 
         // Read back entries and compare with original headers
         let mut reader: SplitStreamReader<std::fs::File, Sha256HashValue> = SplitStreamReader::new(
