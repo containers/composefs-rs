@@ -22,39 +22,50 @@ extremely well.
 
 ## File format
 
-The file format consists of a header, plus a number of data blocks.
+The file format consists of a header, followed by a set of data blocks.
 
-### Mappings
+### Header
 
-The file starts with a single u64 le integer which is the number of mapping
-structures present in the file.  A mapping is a relationship between a file
-identified by its sha256 content hash and the fsverity hash of that same file.
-These entries are encoded simply as the sha256 hash value (32 bytes) plus the
-fsverity hash value (32 bytes) combined together into a single 64 byte record.
-
-For example, if we had a file that mapped `1234..` to `abcd..` and `5678..` to
-`efab..`, the header would look like:
+The header format looks like this, where all fields are little endian:
 
 ```
-     64bit    32 bytes   32 bytes + 32 bytes + 32 bytes
-   +--------+----------+----------+----------+---------+
-   | 2      | 1234     | abcd     | 5678     | efab    |
-   +--------+----------+----------+----------+---------+
+pub const SPLITSTREAM_MAGIC : [u8; 7] = [b'S', b'p', b'l', b't', b'S', b't', b'r'];
+
+struct MappingEntry {
+    pub body: Sha256Digest,
+    pub reference_idx: u64, // index into references table
+}
+
+struct SplitstreamHeader {
+    magic: [u8; 7], // Contains SPLITSTREAM_MAGIC
+    algorithm: u8,  // The fs-verity algorithm used, 1 == sha256, 2 == sha512
+    total_size: u64, // total size of inline chunks and external chunks
+    n_refs: u64,
+    n_mappings: u64,
+    refs: [ObjectID; n_refs]    // sorted
+    mappings: [MappingEntry; n_mappings] // sorted by body
+}
 ```
 
-The mappings in the header are always sorted by their sha256 content hash
-values.
+The table of references are used to allow splitstreams to refer to
+other splitstreams or regular file content, either because it is
+included in the stream, or just indirectly referenced. This is primarily
+used to keep these objects alive during garbage collection.
 
-The mappings serve two purposes:
+Examples of references are:
+ * OCI manifests reference splitstreams for tar layer split streams.
+ * External objects embedded in a splitstream, such as a tar layer
+   splitstream
+ * External objects indirectly references in a splitstream, such as
+   references from an ostree commit splitstream
 
- - in the case of splitstreams which refer to other splitstreams without
-   directly embedding the content of the other stream, this provides a
-   mechanism to find out which other streams are referenced.  This is used for
-   garbage collection.
-
- - for the same usecase, it provides a mechanism to be able to verify the
-   content of the referred splitstream (by checking its fsverity digest) before
-   starting to iterate it
+The mapping table provides a mechanismn to map the sha256 digest of a
+split stream to a fs-verity digest. This allows checking of the target
+fs-verity digest before use. The primary example here is OCI manifests
+which reference the tar layer splitstreams. We could look up such
+streams by the sha256 in the streams/ directory, but then we will not
+have trusted information about what expected fs-verity the layers
+would have.
 
 ### Data blocks
 
@@ -81,6 +92,8 @@ There are two kinds of blocks:
   - "External" blocks (`size == 0`): in this case the length of the data is 32
     bytes.  This is the binary form of a sha256 hash value and is a reference
     to an object in the composefs repository (by its fs-verity digest).
+    Note that these references are *also* in the header, so there is no need
+    to read the entire file to find what objects are referenced.
 
 That's it, really.  There's no header.  The stream is over when there are no
 more blocks.

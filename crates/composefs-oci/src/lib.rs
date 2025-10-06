@@ -28,6 +28,7 @@ use composefs::{
     util::{parse_sha256, Sha256Digest},
 };
 
+use crate::skopeo::{OCI_CONFIG_CONTENT_TYPE, TAR_LAYER_CONTENT_TYPE};
 use crate::tar::get_entry;
 
 type ContentAndVerity<ObjectID> = (Sha256Digest, ObjectID);
@@ -52,14 +53,19 @@ pub fn import_layer<ObjectID: FsVerityHashValue>(
     name: Option<&str>,
     tar_stream: &mut impl Read,
 ) -> Result<ObjectID> {
-    repo.ensure_stream(sha256, |writer| tar::split(tar_stream, writer), name)
+    repo.ensure_stream(
+        sha256,
+        TAR_LAYER_CONTENT_TYPE,
+        |writer| tar::split(tar_stream, writer),
+        name,
+    )
 }
 
 pub fn ls_layer<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     name: &str,
 ) -> Result<()> {
-    let mut split_stream = repo.open_stream(name, None)?;
+    let mut split_stream = repo.open_stream(name, None, Some(TAR_LAYER_CONTENT_TYPE))?;
 
     while let Some(entry) = get_entry(&mut split_stream)? {
         println!("{entry}");
@@ -95,9 +101,9 @@ pub fn open_config<ObjectID: FsVerityHashValue>(
                 .with_context(|| format!("Object {name} is unknown to us"))?
         }
     };
-    let mut stream = repo.open_stream(name, Some(id))?;
+    let mut stream = repo.open_stream(name, Some(id), Some(OCI_CONFIG_CONTENT_TYPE))?;
     let config = ImageConfiguration::from_reader(&mut stream)?;
-    Ok((config, stream.refs))
+    Ok((config, stream.get_mappings()))
 }
 
 fn hash(bytes: &[u8]) -> Sha256Digest {
@@ -118,7 +124,7 @@ pub fn open_config_shallow<ObjectID: FsVerityHashValue>(
             // we need to manually check the content digest
             let expected_hash = parse_sha256(name)
                 .context("Containers must be referred to by sha256 if verity is missing")?;
-            let mut stream = repo.open_stream(name, None)?;
+            let mut stream = repo.open_stream(name, None, Some(OCI_CONFIG_CONTENT_TYPE))?;
             let mut raw_config = vec![];
             stream.read_to_end(&mut raw_config)?;
             ensure!(hash(&raw_config) == expected_hash, "Data integrity issue");
@@ -135,7 +141,8 @@ pub fn write_config<ObjectID: FsVerityHashValue>(
     let json = config.to_string()?;
     let json_bytes = json.as_bytes();
     let sha256 = hash(json_bytes);
-    let mut stream = repo.create_stream(Some(sha256), Some(refs));
+    let mut stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE, Some(sha256));
+    stream.add_sha256_mappings(refs);
     stream.write_inline(json_bytes);
     let id = repo.write_stream(stream, None)?;
     Ok((sha256, id))
@@ -213,7 +220,7 @@ mod test {
         let id = import_layer(&repo, &layer_id, Some("name"), &mut layer.as_slice()).unwrap();
 
         let mut dump = String::new();
-        let mut split_stream = repo.open_stream("refs/name", Some(&id)).unwrap();
+        let mut split_stream = repo.open_stream("refs/name", Some(&id), None).unwrap();
         while let Some(entry) = tar::get_entry(&mut split_stream).unwrap() {
             writeln!(dump, "{entry}").unwrap();
         }
