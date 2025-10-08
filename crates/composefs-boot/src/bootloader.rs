@@ -404,20 +404,15 @@ initrd /{id}/initramfs.img
 
 #[derive(Debug)]
 pub enum BootEntry<ObjectID: FsVerityHashValue> {
-    Type1(Type1Entry<ObjectID>),
     Type2(Type2Entry<ObjectID>),
     UsrLibModulesVmLinuz(UsrLibModulesVmlinuz<ObjectID>),
 }
 
 pub fn get_boot_resources<ObjectID: FsVerityHashValue>(
     image: &FileSystem<ObjectID>,
-    repo: &Repository<ObjectID>,
 ) -> Result<Vec<BootEntry<ObjectID>>> {
     let mut entries = vec![];
 
-    for e in Type1Entry::load_all(&image.root, repo)? {
-        entries.push(BootEntry::Type1(e));
-    }
     for e in Type2Entry::load_all(&image.root)? {
         entries.push(BootEntry::Type2(e));
     }
