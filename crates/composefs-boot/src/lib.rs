@@ -50,7 +50,7 @@ impl<ObjectID: FsVerityHashValue> BootOps<ObjectID> for FileSystem<ObjectID> {
         &mut self,
         repo: &Repository<ObjectID>,
     ) -> Result<Vec<BootEntry<ObjectID>>> {
-        let boot_entries = get_boot_resources(self, repo)?;
+        let boot_entries = get_boot_resources(self)?;
         for d in REQUIRED_TOPLEVEL_TO_EMPTY_DIRS {
             let d = self.root.get_directory_mut(d.as_ref())?;
             d.stat.st_mtim_sec = 0;
