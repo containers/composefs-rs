@@ -174,9 +174,8 @@ impl<'img> ImageVisitor<'img> {
         }
 
         if inode.mode().is_dir() {
-            let inline = inode.inline();
-            if !inline.is_empty() {
-                let inline_block = DirectoryBlock::ref_from_bytes(inode.inline()).unwrap();
+            if let Some(inline) = inode.inline() {
+                let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
                 self.visit_directory_block(inline_block, path);
             }
 
@@ -314,12 +313,10 @@ impl<T: fmt::Debug + InodeHeader> fmt::Debug for Inode<T> {
         //   - directory data: dump the entries
         //   - small inline text string: print it
         //   - otherwise, hexdump
-        let inline = self.inline();
-
-        // No inline data
-        if inline.is_empty() {
+        let Some(inline) = self.inline() else {
+            // No inline data
             return Ok(());
-        }
+        };
 
         // Directory dump
         if self.header.mode().is_dir() {

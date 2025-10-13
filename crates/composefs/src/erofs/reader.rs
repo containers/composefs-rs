@@ -167,7 +167,7 @@ pub trait InodeOps {
     /// Returns the extended attributes section if present
     fn xattrs(&self) -> Option<&InodeXAttrs>;
     /// Returns the inline data portion
-    fn inline(&self) -> &[u8];
+    fn inline(&self) -> Option<&[u8]>;
     /// Returns the range of block IDs used by this inode
     fn blocks(&self, blkszbits: u8) -> Range<u64>;
 }
@@ -202,8 +202,14 @@ impl<Header: InodeHeader> InodeOps for &Inode<Header> {
         }
     }
 
-    fn inline(&self) -> &[u8] {
-        &self.data[self.header.xattr_size()..]
+    fn inline(&self) -> Option<&[u8]> {
+        let data = &self.data[self.header.xattr_size()..];
+
+        if data.is_empty() {
+            return None;
+        }
+
+        Some(data)
     }
 
     fn blocks(&self, blkszbits: u8) -> Range<u64> {
@@ -281,7 +287,7 @@ impl InodeOps for InodeType<'_> {
         }
     }
 
-    fn inline(&self) -> &[u8] {
+    fn inline(&self) -> Option<&[u8]> {
         match self {
             Self::Compact(inode) => inode.inline(),
             Self::Extended(inode) => inode.inline(),
@@ -615,8 +621,10 @@ impl<ObjectID: FsVerityHashValue> ObjectCollector<ObjectID> {
                 self.visit_directory_block(img.directory_block(blkid));
             }
 
-            let tail = DirectoryBlock::ref_from_bytes(inode.inline()).unwrap();
-            self.visit_directory_block(tail);
+            if let Some(inline) = inode.inline() {
+                let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
+                self.visit_directory_block(inline_block);
+            }
         }
 
         Ok(())
@@ -662,8 +670,8 @@ mod tests {
         let mut found_names = Vec::new();
 
         // Read inline entries if present
-        if !inode.inline().is_empty() {
-            let inline_block = DirectoryBlock::ref_from_bytes(inode.inline()).unwrap();
+        if let Some(inline) = inode.inline() {
+            let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
             for entry in inline_block.entries() {
                 let name = std::str::from_utf8(entry.name).unwrap();
                 found_names.push(name.to_string());
@@ -709,8 +717,8 @@ mod tests {
         // Find empty_dir entry
         let root_inode = img.root();
         let mut empty_dir_nid = None;
-        if !root_inode.inline().is_empty() {
-            let inline_block = DirectoryBlock::ref_from_bytes(root_inode.inline()).unwrap();
+        if let Some(inline) = root_inode.inline() {
+            let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
             for entry in inline_block.entries() {
                 if entry.name == b"empty_dir" {
                     empty_dir_nid = Some(entry.nid());
@@ -748,8 +756,8 @@ mod tests {
         // Find dir1
         let root_inode = img.root();
         let mut dir1_nid = None;
-        if !root_inode.inline().is_empty() {
-            let inline_block = DirectoryBlock::ref_from_bytes(root_inode.inline()).unwrap();
+        if let Some(inline) = root_inode.inline() {
+            let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
             for entry in inline_block.entries() {
                 if entry.name == b"dir1" {
                     dir1_nid = Some(entry.nid());
@@ -792,8 +800,8 @@ mod tests {
         // Find bigdir
         let root_inode = img.root();
         let mut bigdir_nid = None;
-        if !root_inode.inline().is_empty() {
-            let inline_block = DirectoryBlock::ref_from_bytes(root_inode.inline()).unwrap();
+        if let Some(inline) = root_inode.inline() {
+            let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
             for entry in inline_block.entries() {
                 if entry.name == b"bigdir" {
                     bigdir_nid = Some(entry.nid());
@@ -845,8 +853,8 @@ mod tests {
         let find_entry = |parent_nid: u64, name: &[u8]| -> u64 {
             let inode = img.inode(parent_nid);
 
-            if !inode.inline().is_empty() {
-                let inline_block = DirectoryBlock::ref_from_bytes(inode.inline()).unwrap();
+            if let Some(inline) = inode.inline() {
+                let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
                 for entry in inline_block.entries() {
                     if entry.name == name {
                         return entry.nid();
@@ -892,8 +900,8 @@ mod tests {
 
         let root_inode = img.root();
         let mut mixed_nid = None;
-        if !root_inode.inline().is_empty() {
-            let inline_block = DirectoryBlock::ref_from_bytes(root_inode.inline()).unwrap();
+        if let Some(inline) = root_inode.inline() {
+            let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
             for entry in inline_block.entries() {
                 if entry.name == b"mixed" {
                     mixed_nid = Some(entry.nid());
@@ -943,7 +951,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Needs https://github.com/containers/composefs-rs/pull/188"]
     fn test_pr188_empty_inline_directory() -> anyhow::Result<()> {
         // Regression test for https://github.com/containers/composefs-rs/pull/188
         //
@@ -1019,8 +1026,8 @@ mod tests {
         let mut entries_map: HashMap<Vec<u8>, u64> = HashMap::new();
         let root_inode = img.root();
 
-        if !root_inode.inline().is_empty() {
-            let inline_block = DirectoryBlock::ref_from_bytes(root_inode.inline()).unwrap();
+        if let Some(inline) = root_inode.inline() {
+            let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
             for entry in inline_block.entries() {
                 entries_map.insert(entry.name.to_vec(), entry.nid());
             }
@@ -1042,6 +1049,6 @@ mod tests {
         assert_eq!(file1_inode.size(), 5);
 
         let inline_data = file1_inode.inline();
-        assert_eq!(inline_data, b"hello");
+        assert_eq!(inline_data, Some(b"hello".as_slice()));
     }
 }
