@@ -574,3 +574,348 @@ pub fn collect_objects<ObjectID: FsVerityHashValue>(image: &[u8]) -> ReadResult<
     }
     Ok(this.objects)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        dumpfile::dumpfile_to_filesystem, erofs::writer::mkfs_erofs, fsverity::Sha256HashValue,
+    };
+    use std::collections::HashMap;
+
+    /// Helper to validate that directory entries can be read correctly
+    fn validate_directory_entries(img: &Image, nid: u64, expected_names: &[&str]) {
+        let inode = img.inode(nid);
+        assert!(inode.mode().is_dir(), "Expected directory inode");
+
+        let mut found_names = Vec::new();
+
+        // Read inline entries if present
+        if !inode.inline().is_empty() {
+            let inline_block = DirectoryBlock::ref_from_bytes(inode.inline()).unwrap();
+            for entry in inline_block.entries() {
+                let name = std::str::from_utf8(entry.name).unwrap();
+                found_names.push(name.to_string());
+            }
+        }
+
+        // Read block entries
+        for blkid in inode.blocks(img.blkszbits) {
+            let block = img.directory_block(blkid);
+            for entry in block.entries() {
+                let name = std::str::from_utf8(entry.name).unwrap();
+                found_names.push(name.to_string());
+            }
+        }
+
+        // Sort for comparison (entries should include . and ..)
+        found_names.sort();
+        let mut expected_sorted: Vec<_> = expected_names.iter().map(|s| s.to_string()).collect();
+        expected_sorted.sort();
+
+        assert_eq!(
+            found_names, expected_sorted,
+            "Directory entries mismatch for nid {}",
+            nid
+        );
+    }
+
+    #[test]
+    fn test_empty_directory() {
+        // Create filesystem with empty directory
+        let dumpfile = r#"/ 4096 40755 2 0 0 0 1000.0 - - -
+/empty_dir 4096 40755 2 0 0 0 1000.0 - - -
+"#;
+
+        let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
+        let image = mkfs_erofs(&fs);
+        let img = Image::open(&image);
+
+        // Root should have . and .. and empty_dir
+        let root_nid = img.sb.root_nid.get() as u64;
+        validate_directory_entries(&img, root_nid, &[".", "..", "empty_dir"]);
+
+        // Find empty_dir entry
+        let root_inode = img.root();
+        let mut empty_dir_nid = None;
+        if !root_inode.inline().is_empty() {
+            let inline_block = DirectoryBlock::ref_from_bytes(root_inode.inline()).unwrap();
+            for entry in inline_block.entries() {
+                if entry.name == b"empty_dir" {
+                    empty_dir_nid = Some(entry.nid());
+                    break;
+                }
+            }
+        }
+        for blkid in root_inode.blocks(img.blkszbits) {
+            let block = img.directory_block(blkid);
+            for entry in block.entries() {
+                if entry.name == b"empty_dir" {
+                    empty_dir_nid = Some(entry.nid());
+                    break;
+                }
+            }
+        }
+
+        let empty_dir_nid = empty_dir_nid.expect("empty_dir not found");
+        validate_directory_entries(&img, empty_dir_nid, &[".", ".."]);
+    }
+
+    #[test]
+    fn test_directory_with_inline_entries() {
+        // Create filesystem with directory that has a few entries (should be inline)
+        let dumpfile = r#"/ 4096 40755 2 0 0 0 1000.0 - - -
+/dir1 4096 40755 2 0 0 0 1000.0 - - -
+/dir1/file1 5 100644 1 0 0 0 1000.0 - hello -
+/dir1/file2 5 100644 1 0 0 0 1000.0 - world -
+"#;
+
+        let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
+        let image = mkfs_erofs(&fs);
+        let img = Image::open(&image);
+
+        // Find dir1
+        let root_inode = img.root();
+        let mut dir1_nid = None;
+        if !root_inode.inline().is_empty() {
+            let inline_block = DirectoryBlock::ref_from_bytes(root_inode.inline()).unwrap();
+            for entry in inline_block.entries() {
+                if entry.name == b"dir1" {
+                    dir1_nid = Some(entry.nid());
+                    break;
+                }
+            }
+        }
+        for blkid in root_inode.blocks(img.blkszbits) {
+            let block = img.directory_block(blkid);
+            for entry in block.entries() {
+                if entry.name == b"dir1" {
+                    dir1_nid = Some(entry.nid());
+                    break;
+                }
+            }
+        }
+
+        let dir1_nid = dir1_nid.expect("dir1 not found");
+        validate_directory_entries(&img, dir1_nid, &[".", "..", "file1", "file2"]);
+    }
+
+    #[test]
+    fn test_directory_with_many_entries() {
+        // Create a directory with many entries to force block storage
+        let mut dumpfile = String::from("/ 4096 40755 2 0 0 0 1000.0 - - -\n");
+        dumpfile.push_str("/bigdir 4096 40755 2 0 0 0 1000.0 - - -\n");
+
+        // Add many files to force directory blocks
+        for i in 0..100 {
+            dumpfile.push_str(&format!(
+                "/bigdir/file{:03} 5 100644 1 0 0 0 1000.0 - hello -\n",
+                i
+            ));
+        }
+
+        let fs = dumpfile_to_filesystem::<Sha256HashValue>(&dumpfile).unwrap();
+        let image = mkfs_erofs(&fs);
+        let img = Image::open(&image);
+
+        // Find bigdir
+        let root_inode = img.root();
+        let mut bigdir_nid = None;
+        if !root_inode.inline().is_empty() {
+            let inline_block = DirectoryBlock::ref_from_bytes(root_inode.inline()).unwrap();
+            for entry in inline_block.entries() {
+                if entry.name == b"bigdir" {
+                    bigdir_nid = Some(entry.nid());
+                    break;
+                }
+            }
+        }
+        for blkid in root_inode.blocks(img.blkszbits) {
+            let block = img.directory_block(blkid);
+            for entry in block.entries() {
+                if entry.name == b"bigdir" {
+                    bigdir_nid = Some(entry.nid());
+                    break;
+                }
+            }
+        }
+
+        let bigdir_nid = bigdir_nid.expect("bigdir not found");
+
+        // Build expected names
+        let mut expected: Vec<String> = vec![".".to_string(), "..".to_string()];
+        for i in 0..100 {
+            expected.push(format!("file{:03}", i));
+        }
+        let expected_refs: Vec<&str> = expected.iter().map(|s| s.as_str()).collect();
+
+        validate_directory_entries(&img, bigdir_nid, &expected_refs);
+    }
+
+    #[test]
+    fn test_nested_directories() {
+        // Test deeply nested directory structure
+        let dumpfile = r#"/ 4096 40755 2 0 0 0 1000.0 - - -
+/a 4096 40755 2 0 0 0 1000.0 - - -
+/a/b 4096 40755 2 0 0 0 1000.0 - - -
+/a/b/c 4096 40755 2 0 0 0 1000.0 - - -
+/a/b/c/file.txt 5 100644 1 0 0 0 1000.0 - hello -
+"#;
+
+        let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
+        let image = mkfs_erofs(&fs);
+        let img = Image::open(&image);
+
+        // Navigate through the structure
+        let root_nid = img.sb.root_nid.get() as u64;
+        validate_directory_entries(&img, root_nid, &[".", "..", "a"]);
+
+        // Helper to find a directory entry by name
+        let find_entry = |parent_nid: u64, name: &[u8]| -> u64 {
+            let inode = img.inode(parent_nid);
+
+            if !inode.inline().is_empty() {
+                let inline_block = DirectoryBlock::ref_from_bytes(inode.inline()).unwrap();
+                for entry in inline_block.entries() {
+                    if entry.name == name {
+                        return entry.nid();
+                    }
+                }
+            }
+
+            for blkid in inode.blocks(img.blkszbits) {
+                let block = img.directory_block(blkid);
+                for entry in block.entries() {
+                    if entry.name == name {
+                        return entry.nid();
+                    }
+                }
+            }
+            panic!("Entry not found: {:?}", std::str::from_utf8(name));
+        };
+
+        let a_nid = find_entry(root_nid, b"a");
+        validate_directory_entries(&img, a_nid, &[".", "..", "b"]);
+
+        let b_nid = find_entry(a_nid, b"b");
+        validate_directory_entries(&img, b_nid, &[".", "..", "c"]);
+
+        let c_nid = find_entry(b_nid, b"c");
+        validate_directory_entries(&img, c_nid, &[".", "..", "file.txt"]);
+    }
+
+    #[test]
+    fn test_mixed_entry_types() {
+        // Test directory with various file types
+        let dumpfile = r#"/ 4096 40755 2 0 0 0 1000.0 - - -
+/mixed 4096 40755 2 0 0 0 1000.0 - - -
+/mixed/regular 10 100644 1 0 0 0 1000.0 - content123 -
+/mixed/symlink 7 120777 1 0 0 0 1000.0 /target - -
+/mixed/fifo 0 10644 1 0 0 0 1000.0 - - -
+/mixed/subdir 4096 40755 2 0 0 0 1000.0 - - -
+"#;
+
+        let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
+        let image = mkfs_erofs(&fs);
+        let img = Image::open(&image);
+
+        let root_inode = img.root();
+        let mut mixed_nid = None;
+        if !root_inode.inline().is_empty() {
+            let inline_block = DirectoryBlock::ref_from_bytes(root_inode.inline()).unwrap();
+            for entry in inline_block.entries() {
+                if entry.name == b"mixed" {
+                    mixed_nid = Some(entry.nid());
+                    break;
+                }
+            }
+        }
+        for blkid in root_inode.blocks(img.blkszbits) {
+            let block = img.directory_block(blkid);
+            for entry in block.entries() {
+                if entry.name == b"mixed" {
+                    mixed_nid = Some(entry.nid());
+                    break;
+                }
+            }
+        }
+
+        let mixed_nid = mixed_nid.expect("mixed not found");
+        validate_directory_entries(
+            &img,
+            mixed_nid,
+            &[".", "..", "regular", "symlink", "fifo", "subdir"],
+        );
+    }
+
+    #[test]
+    fn test_collect_objects_traversal() {
+        // Test that object collection properly traverses all directories
+        let dumpfile = r#"/ 4096 40755 2 0 0 0 1000.0 - - -
+/dir1 4096 40755 2 0 0 0 1000.0 - - -
+/dir1/file1 5 100644 1 0 0 0 1000.0 - hello -
+/dir2 4096 40755 2 0 0 0 1000.0 - - -
+/dir2/subdir 4096 40755 2 0 0 0 1000.0 - - -
+/dir2/subdir/file2 5 100644 1 0 0 0 1000.0 - world -
+"#;
+
+        let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
+        let image = mkfs_erofs(&fs);
+
+        // This should traverse all directories without error
+        let result = collect_objects::<Sha256HashValue>(&image);
+        assert!(
+            result.is_ok(),
+            "Failed to collect objects: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_round_trip_basic() {
+        // Full round-trip: dumpfile -> tree -> erofs -> read back -> validate
+        let dumpfile = r#"/ 4096 40755 2 0 0 0 1000.0 - - -
+/file1 5 100644 1 0 0 0 1000.0 - hello -
+/file2 6 100644 1 0 0 0 1000.0 - world! -
+/dir1 4096 40755 2 0 0 0 1000.0 - - -
+/dir1/nested 8 100644 1 0 0 0 1000.0 - content1 -
+"#;
+
+        let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
+        let image = mkfs_erofs(&fs);
+        let img = Image::open(&image);
+
+        // Verify root entries
+        let root_nid = img.sb.root_nid.get() as u64;
+        validate_directory_entries(&img, root_nid, &[".", "..", "file1", "file2", "dir1"]);
+
+        // Collect all entries and verify structure
+        let mut entries_map: HashMap<Vec<u8>, u64> = HashMap::new();
+        let root_inode = img.root();
+
+        if !root_inode.inline().is_empty() {
+            let inline_block = DirectoryBlock::ref_from_bytes(root_inode.inline()).unwrap();
+            for entry in inline_block.entries() {
+                entries_map.insert(entry.name.to_vec(), entry.nid());
+            }
+        }
+
+        for blkid in root_inode.blocks(img.blkszbits) {
+            let block = img.directory_block(blkid);
+            for entry in block.entries() {
+                entries_map.insert(entry.name.to_vec(), entry.nid());
+            }
+        }
+
+        // Verify we can read file contents
+        let file1_nid = entries_map
+            .get(b"file1".as_slice())
+            .expect("file1 not found");
+        let file1_inode = img.inode(*file1_nid);
+        assert!(!file1_inode.mode().is_dir());
+        assert_eq!(file1_inode.size(), 5);
+
+        let inline_data = file1_inode.inline();
+        assert_eq!(inline_data, b"hello");
+    }
+}
