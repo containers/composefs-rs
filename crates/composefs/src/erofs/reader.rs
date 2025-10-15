@@ -872,6 +872,61 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Needs https://github.com/containers/composefs-rs/pull/188"]
+    fn test_pr188_empty_inline_directory() -> anyhow::Result<()> {
+        // Regression test for https://github.com/containers/composefs-rs/pull/188
+        //
+        // The bug: ObjectCollector::visit_inode at lines 553-554 unconditionally does:
+        //   let tail = DirectoryBlock::ref_from_bytes(inode.inline()).unwrap();
+        //   self.visit_directory_block(tail);
+        //
+        // When inode.inline() is empty, DirectoryBlock::ref_from_bytes succeeds but then
+        // visit_directory_block calls n_entries() which panics trying to read 12 bytes
+        // from an empty slice.
+        //
+        // This test generates an erofs image using C mkcomposefs, which creates directories
+        // with empty inline sections (unlike the Rust implementation which always includes
+        // . and .. entries).
+
+        // Generate a C-generated erofs image using mkcomposefs
+        let dumpfile_content = r#"/ 4096 40755 2 0 0 0 1000.0 - - -
+/empty_dir 4096 40755 2 0 0 0 1000.0 - - -
+"#;
+
+        // Create temporary files for dumpfile and erofs output
+        let temp_dir = tempfile::TempDir::new()?;
+        let temp_dir = temp_dir.path();
+        let dumpfile_path = temp_dir.join("pr188_test.dump");
+        let erofs_path = temp_dir.join("pr188_test.erofs");
+
+        // Write dumpfile
+        std::fs::write(&dumpfile_path, dumpfile_content).expect("Failed to write test dumpfile");
+
+        // Run mkcomposefs to generate erofs image
+        let output = std::process::Command::new("mkcomposefs")
+            .arg("--from-file")
+            .arg(&dumpfile_path)
+            .arg(&erofs_path)
+            .output()
+            .expect("Failed to run mkcomposefs - is it installed?");
+
+        assert!(
+            output.status.success(),
+            "mkcomposefs failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Read the generated erofs image
+        let image = std::fs::read(&erofs_path).expect("Failed to read generated erofs");
+
+        // The C mkcomposefs creates directories with empty inline sections.
+        let r = collect_objects::<Sha256HashValue>(&image).unwrap();
+        assert_eq!(r.len(), 0);
+
+        Ok(())
+    }
+
+    #[test]
     fn test_round_trip_basic() {
         // Full round-trip: dumpfile -> tree -> erofs -> read back -> validate
         let dumpfile = r#"/ 4096 40755 2 0 0 0 1000.0 - - -
