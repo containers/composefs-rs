@@ -87,15 +87,21 @@ jobs:
     - name: Install systemd-ssh-proxy polyfill
       run: sudo cp examples/bls/test-thing.workarounds/systemd-ssh-proxy /usr/lib/systemd
 
-    - name: Setup upterm session for debugging
-      if: failure()
-      uses: owenthereal/action-upterm@v1.3.0
-      with:
-        wait-timeout-minutes: 30
-
     - name: Run example tests
+      id: run_tests
+      continue-on-error: true
       run: |
         export PATH="${HOME}/bin:${PATH}"
         export FS_FORMAT=${{ matrix.example.fsfmt }}
         export FS_VERITY_MODE=${{ matrix.example.verity }}
         examples/test/run ${{ matrix.example.dir }} ${{ matrix.example.os }}
+
+    - name: Setup upterm session for debugging
+      if: steps.run_tests.outcome == 'failure'
+      uses: owenthereal/action-upterm@v1.3.0
+      with:
+        wait-timeout-minutes: 30
+
+    - name: Fail job if tests failed
+      if: steps.run_tests.outcome == 'failure'
+      run: exit 1
