@@ -89,7 +89,7 @@ jobs:
 
     - name: Setup upterm session for debugging
       if: failure()
-      uses: owenthereal/action-upterm@v2
+      uses: owenthereal/action-upterm@v1.3.0
       with:
         wait-timeout-minutes: 30
 
