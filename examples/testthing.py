@@ -657,10 +657,13 @@ class VirtualMachine:
         qemu = None
         try:
             self._print_status("Waiting for guest")
-            qemu = await self._spawn(*args)
-            returncode = await qemu.wait()
+            qemu = await self._spawn(*args, stdout=asyncio.subprocess.PIPE)
+            stdout_data, _ = await qemu.communicate()
+            returncode = qemu.returncode
+            if stdout_data:
+                self._print_verbose(f"QEMU output: {stdout_data.decode()}")
             if not self._shutdown_ok:
-                raise SubprocessError(args, returncode)
+                raise SubprocessError(args, returncode, stdout_data)
         except asyncio.CancelledError:
             logger.debug("qemu task cancelled")
             if qemu is not None:

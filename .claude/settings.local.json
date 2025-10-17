@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo test:*)",
+      "Bash(grep:*)",
+      "Bash(RUST_BACKTRACE=1 cargo test --features \"composefs/pre-6.15\" tar::tests::test_empty_tar)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git rebase:*)",
+      "Bash(git reset:*)",
+      "Bash(git stash:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(cargo:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(find:*)",
+      "Bash(rg:*)"
+    ],
+    "deny": []
+  }
+}
