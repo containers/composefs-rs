@@ -87,6 +87,12 @@ jobs:
     - name: Install systemd-ssh-proxy polyfill
       run: sudo cp examples/bls/test-thing.workarounds/systemd-ssh-proxy /usr/lib/systemd
 
+    - name: Setup upterm session for debugging
+      if: failure()
+      uses: owenthereal/action-upterm@v2
+      with:
+        wait-timeout-minutes: 30
+
     - name: Run example tests
       run: |
         export PATH="${HOME}/bin:${PATH}"
