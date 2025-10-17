@@ -96,11 +96,24 @@ jobs:
         export FS_VERITY_MODE=${{ matrix.example.verity }}
         examples/test/run ${{ matrix.example.dir }} ${{ matrix.example.os }}
 
-    - name: Setup upterm session for debugging
+    - name: Dump console logs on failure
       if: steps.run_tests.outcome == 'failure'
-      uses: owenthereal/action-upterm@v1.3.0
-      with:
-        wait-timeout-minutes: 30
+      run: |
+        echo "=== Console logs from failed VMs ==="
+        find /run/user/$(id -u)/test.thing -name console -type f 2>/dev/null | while read console; do
+          echo "==== Console from $console ===="
+          cat "$console" || true
+          echo ""
+        done
+
+    - name: Check vsock device permissions
+      if: steps.run_tests.outcome == 'failure'
+      run: |
+        echo "=== vsock device status ==="
+        ls -la /dev/vhost-vsock /dev/kvm || true
+        echo ""
+        echo "=== vsock kernel module ==="
+        lsmod | grep vsock || true
 
     - name: Fail job if tests failed
       if: steps.run_tests.outcome == 'failure'
