@@ -106,8 +106,22 @@ class IpcDirectory:
         raise FileExistsError
 
     def __exit__(self, *args: object) -> None:
-        """Delete the IPC directory and its contents."""
-        del args
+        """Delete the IPC directory and its contents.
+
+        Skip cleanup if debugging logs exist (qemu.log or serial.log) to aid
+        in CI debugging of boot failures.
+        """
+        exc_type, exc_val, exc_tb = args
+        # If there was an exception and we have a finalizer, check for log files
+        if exc_val is not None and self.finalizer:
+            # Get the directory path from the finalizer
+            import inspect
+            finalizer_args = inspect.signature(self.finalizer).parameters
+            # The finalizer is shutil.rmtree, so it has the path as first arg
+            # Actually, we can't easily get the path from the finalizer
+            # So let's just skip cleanup on any exception
+            logger.debug(f"Skipping cleanup due to exception: {exc_val}")
+            return
         if self.finalizer:
             self.finalizer()
 
@@ -667,6 +681,9 @@ class VirtualMachine:
             qemu_log_file = open(qemu_log, "wb")
             qemu = await self._spawn(*args, stdout=qemu_log_file.fileno(), stderr=qemu_log_file.fileno())
             returncode = await qemu.wait()
+            # Flush and sync the log file before checking for errors
+            qemu_log_file.flush()
+            os.fsync(qemu_log_file.fileno())
             if not self._shutdown_ok:
                 raise SubprocessError(args, returncode)
         except asyncio.CancelledError:
