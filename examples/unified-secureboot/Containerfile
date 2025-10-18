@@ -2,11 +2,12 @@ FROM fedora:42 AS base
 RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
     set -eux
 
+    dnf -y install fedora-repos-archive
     dnf --setopt keepcache=1 install -y \
         btrfs-progs \
         composefs \
         dosfstools \
-        kernel \
+        kernel-6.16.9-200.fc42 \
         mokutil \
         openssh-server \
         policycoreutils-python-utils \
