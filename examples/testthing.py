@@ -630,8 +630,10 @@ class VirtualMachine:
             ("-device", "virtconsole,chardev=console"),
             (
                 "-smbios",
-                "type=11,value=io.systemd.boot.kernel-cmdline-extra=console=hvc0",
+                "type=11,value=io.systemd.boot.kernel-cmdline-extra=console=hvc0 earlyprintk=serial,ttyS0,115200 debug loglevel=7",
             ),
+            # Add a serial port for early boot messages
+            ("-serial", f"file:{self._ipc}/serial.log"),
             *(
                 (
                     ("-chardev", "stdio,mux=on,signal=off,id=console"),
@@ -655,9 +657,13 @@ class VirtualMachine:
         )
 
         qemu = None
+        qemu_log_file = None
         try:
             self._print_status("Waiting for guest")
-            qemu = await self._spawn(*args)
+            # Capture QEMU's stdout/stderr for debugging
+            qemu_log = self._ipc / "qemu.log"
+            qemu_log_file = open(qemu_log, "wb")
+            qemu = await self._spawn(*args, stdout=qemu_log_file.fileno(), stderr=asyncio.subprocess.STDOUT)
             returncode = await qemu.wait()
             if not self._shutdown_ok:
                 raise SubprocessError(args, returncode)
@@ -675,6 +681,8 @@ class VirtualMachine:
                     await asyncio.shield(qemu.wait())
         finally:
             logger.debug("qemu exited")
+            if qemu_log_file is not None:
+                qemu_log_file.close()
             self._qemu_exited.set()
 
     async def _ssh_control(self) -> None:

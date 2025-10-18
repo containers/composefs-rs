@@ -108,6 +108,18 @@ jobs:
           cat "$console" || true
           echo ""
         done
+        echo "=== QEMU logs from failed VMs ==="
+        find /run/user/$(id -u)/test.thing -name qemu.log -type f 2>/dev/null | while read qemu_log; do
+          echo "==== QEMU log from $qemu_log ===="
+          cat "$qemu_log" || true
+          echo ""
+        done
+        echo "=== Serial logs from failed VMs ==="
+        find /run/user/$(id -u)/test.thing -name serial.log -type f 2>/dev/null | while read serial_log; do
+          echo "==== Serial log from $serial_log ===="
+          cat "$serial_log" || true
+          echo ""
+        done
         echo "=== QMP sockets ==="
         find /run/user/$(id -u)/test.thing -name qmp -type s 2>/dev/null || true
 
