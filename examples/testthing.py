@@ -112,6 +112,7 @@ class IpcDirectory:
         in CI debugging of boot failures.
         """
         exc_type, exc_val, exc_tb = args
+        print(f"IpcDirectory.__exit__: exc_type={exc_type}, exc_val={exc_val}, has_finalizer={self.finalizer is not None}", flush=True)
         # If there was an exception and we have a finalizer, check for log files
         if exc_val is not None and self.finalizer:
             # Get the directory path from the finalizer
@@ -120,8 +121,10 @@ class IpcDirectory:
             # The finalizer is shutil.rmtree, so it has the path as first arg
             # Actually, we can't easily get the path from the finalizer
             # So let's just skip cleanup on any exception
+            print(f"Skipping IpcDirectory cleanup due to exception: {exc_val}", flush=True)
             logger.debug(f"Skipping cleanup due to exception: {exc_val}")
             return
+        print(f"Running IpcDirectory finalizer", flush=True)
         if self.finalizer:
             self.finalizer()
 
