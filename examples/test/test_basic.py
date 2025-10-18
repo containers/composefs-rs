@@ -14,7 +14,7 @@ async def machine() -> AsyncGenerator[testthing.VirtualMachine, None]:
     if not image:
         raise RuntimeError("TEST_IMAGE environment variable must be set")
     with testthing.IpcDirectory() as ipc:
-        async with testthing.VirtualMachine(image=image, ipc=ipc, verbose=True, timeout=120.0) as vm:
+        async with testthing.VirtualMachine(image=image, ipc=ipc, verbose=True) as vm:
             yield vm
 
 
