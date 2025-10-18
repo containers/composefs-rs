@@ -472,6 +472,7 @@ class VirtualMachine:
         *args: str | Path | tuple[str | Path, ...],
         stdin: int | None = None,
         stdout: int | None = None,
+        stderr: int | None = None,
     ) -> asyncio.subprocess.Process:
         """Spawn a process.
 
@@ -517,6 +518,7 @@ class VirtualMachine:
             *itertools.chain(*_normalize_args(*args)),
             stdin=stdin,
             stdout=stdout,
+            stderr=stderr,
             preexec_fn=pr_set_pdeathsig,
         )
 
@@ -663,7 +665,7 @@ class VirtualMachine:
             # Capture QEMU's stdout/stderr for debugging
             qemu_log = self._ipc / "qemu.log"
             qemu_log_file = open(qemu_log, "wb")
-            qemu = await self._spawn(*args, stdout=qemu_log_file.fileno(), stderr=asyncio.subprocess.STDOUT)
+            qemu = await self._spawn(*args, stdout=qemu_log_file.fileno(), stderr=qemu_log_file.fileno())
             returncode = await qemu.wait()
             if not self._shutdown_ok:
                 raise SubprocessError(args, returncode)
