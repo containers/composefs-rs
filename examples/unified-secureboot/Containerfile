@@ -15,9 +15,9 @@ RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
         selinux-policy-targeted \
         skopeo \
         strace \
-        systemd \
-        systemd-boot-unsigned \
-        systemd-ukify \
+        systemd-257.9-2.fc42 \
+        systemd-boot-unsigned-257.9-2.fc42 \
+        systemd-ukify-257.9-2.fc42 \
         util-linux
 EOF
 
