@@ -31,6 +31,7 @@ __version__ = "0.3.1"
 
 import argparse
 import asyncio
+import base64
 import contextlib
 import ctypes
 import functools
@@ -664,9 +665,14 @@ class VirtualMachine:
                 )
             ),
             ("-drive", drive),
-            # Credentials
+            # Credentials - use binary encoding for values with spaces to avoid QEMU parsing issues
             *(
-                ("-smbios", f"type=11,value=io.systemd.credential:{k}={v}")
+                (
+                    "-smbios",
+                    f"type=11,value=io.systemd.credential.binary:{k}={base64.b64encode(v.encode()).decode()}"
+                    if " " in v
+                    else f"type=11,value=io.systemd.credential:{k}={v}",
+                )
                 for k, v in creds.items()
             ),
         )
