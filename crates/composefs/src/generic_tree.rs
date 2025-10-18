@@ -437,32 +437,6 @@ impl<T> FileSystem<T> {
             self.have_root_stat = true;
         }
     }
-
-    /// Normalize all mtimes in the filesystem tree to zero.
-    /// This is used to ensure deterministic digests when comparing filesystem
-    /// representations from different sources (e.g., directory reads vs OCI images).
-    pub fn normalize_mtimes(&mut self) {
-        normalize_mtimes_recursive(&mut self.root);
-    }
-}
-
-/// Recursively normalize mtimes in a directory tree.
-fn normalize_mtimes_recursive<T>(dir: &mut Directory<T>) {
-    dir.stat.st_mtim_sec = 0;
-
-    for inode in dir.entries.values_mut() {
-        match inode {
-            Inode::Directory(ref mut subdir) => {
-                normalize_mtimes_recursive(subdir);
-            }
-            Inode::Leaf(ref mut leaf) => {
-                use std::rc::Rc;
-                if let Some(leaf_mut) = Rc::get_mut(leaf) {
-                    leaf_mut.stat.st_mtim_sec = 0;
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]

@@ -51,30 +51,13 @@ impl<ObjectID: FsVerityHashValue> BootOps<ObjectID> for FileSystem<ObjectID> {
         repo: &Repository<ObjectID>,
     ) -> Result<Vec<BootEntry<ObjectID>>> {
         let boot_entries = get_boot_resources(self, repo)?;
-
-        // Normalize mtimes for the entire filesystem to ensure deterministic digests
-        // when comparing directory-based reads vs OCI-based reads
-        self.normalize_mtimes();
-
         for d in REQUIRED_TOPLEVEL_TO_EMPTY_DIRS {
             let d = self.root.get_directory_mut(d.as_ref())?;
-            // Normalize all stat fields to ensure deterministic digest computation.
-            // These directories will be empty, so their stat should be canonical.
-            d.stat.st_mode = 0o40755; // Directory with standard permissions
-            d.stat.st_uid = 0; // root
-            d.stat.st_gid = 0; // root
             d.stat.st_mtim_sec = 0;
             d.clear();
         }
 
         selabel::selabel(self, repo)?;
-
-        // Clear xattrs on the emptied directories after SELinux relabeling
-        // to ensure deterministic digest computation.
-        for d in REQUIRED_TOPLEVEL_TO_EMPTY_DIRS {
-            let d = self.root.get_directory_mut(d.as_ref())?;
-            d.stat.xattrs.borrow_mut().clear();
-        }
 
         Ok(boot_entries)
     }
