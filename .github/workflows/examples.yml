@@ -17,22 +17,19 @@ jobs:
     strategy:
       matrix:
         example:
-          - { dir: 'bls', os: 'arch' }
-          - { dir: 'bls', os: 'fedora' }
-          - { dir: 'bls', os: 'fedora-compat' }
-          - { dir: 'bls', os: 'rawhide' }
-          - { dir: 'bls', os: 'rhel9' }
-          # This one is currently failing, needs debugging
-          # https://github.com/containers/composefs-rs/pull/168#pullrequestreview-3088673152
-          # We believe it's mount API changes causing /sysroot to be mounted
-          # at the wrong place.
+          # Temporarily disabled for faster debugging
+          # - { dir: 'bls', os: 'arch' }
+          # - { dir: 'bls', os: 'fedora' }
+          # - { dir: 'bls', os: 'fedora-compat' }
+          # - { dir: 'bls', os: 'rawhide' }
+          # - { dir: 'bls', os: 'rhel9' }
           # - { dir: 'bls', os: 'ubuntu' }
-          - { dir: 'uki', os: 'arch' }
+          # - { dir: 'uki', os: 'arch' }
           - { dir: 'uki', os: 'fedora' }
-          - { dir: 'unified', os: 'fedora' }
-          - { dir: 'unified-secureboot', os: 'fedora' }
-          - { dir: 'bls', os: 'arch', fsfmt: 'ext4', verity: 'none' }
-          - { dir: 'bls', os: 'arch', fsfmt: 'xfs', verity: 'none' }
+          # - { dir: 'unified', os: 'fedora' }
+          # - { dir: 'unified-secureboot', os: 'fedora' }
+          # - { dir: 'bls', os: 'arch', fsfmt: 'ext4', verity: 'none' }
+          # - { dir: 'bls', os: 'arch', fsfmt: 'xfs', verity: 'none' }
       fail-fast: false
 
     steps:

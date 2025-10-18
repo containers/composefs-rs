@@ -108,21 +108,17 @@ class IpcDirectory:
     def __exit__(self, *args: object) -> None:
         """Delete the IPC directory and its contents.
 
-        Skip cleanup if debugging logs exist (qemu.log or serial.log) to aid
-        in CI debugging of boot failures.
+        Skip cleanup if there was an exception, to aid in CI debugging.
         """
         exc_type, exc_val, exc_tb = args
         print(f"IpcDirectory.__exit__: exc_type={exc_type}, exc_val={exc_val}, has_finalizer={self.finalizer is not None}", flush=True)
-        # If there was an exception and we have a finalizer, check for log files
+        # If there was an exception, deactivate the finalizer to preserve logs
         if exc_val is not None and self.finalizer:
-            # Get the directory path from the finalizer
-            import inspect
-            finalizer_args = inspect.signature(self.finalizer).parameters
-            # The finalizer is shutil.rmtree, so it has the path as first arg
-            # Actually, we can't easily get the path from the finalizer
-            # So let's just skip cleanup on any exception
-            print(f"Skipping IpcDirectory cleanup due to exception: {exc_val}", flush=True)
+            print(f"Deactivating IpcDirectory finalizer due to exception: {exc_val}", flush=True)
             logger.debug(f"Skipping cleanup due to exception: {exc_val}")
+            # Detach the finalizer so it won't run on garbage collection
+            self.finalizer.detach()
+            self.finalizer = None
             return
         print(f"Running IpcDirectory finalizer", flush=True)
         if self.finalizer:
