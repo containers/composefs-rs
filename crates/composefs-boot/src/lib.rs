@@ -61,8 +61,8 @@ impl<ObjectID: FsVerityHashValue> BootOps<ObjectID> for FileSystem<ObjectID> {
             // Normalize all stat fields to ensure deterministic digest computation.
             // These directories will be empty, so their stat should be canonical.
             d.stat.st_mode = 0o40755; // Directory with standard permissions
-            d.stat.st_uid = 0;        // root
-            d.stat.st_gid = 0;        // root
+            d.stat.st_uid = 0; // root
+            d.stat.st_gid = 0; // root
             d.stat.st_mtim_sec = 0;
             d.clear();
         }
