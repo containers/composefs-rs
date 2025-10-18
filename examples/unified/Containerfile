@@ -42,6 +42,7 @@ RUN --mount=type=bind,from=base,target=/mnt/base <<EOF
 
     mkdir -p /tmp/sysroot/composefs
     COMPOSEFS_FSVERITY="$(cfsctl --repo /tmp/sysroot compute-id --bootable /mnt/base)"
+    echo "DEBUG: Computed bootable composefs digest: ${COMPOSEFS_FSVERITY}"
 
     mkdir -p /etc/kernel /etc/dracut.conf.d
     echo "composefs=${COMPOSEFS_FSVERITY} rw" > /etc/kernel/cmdline
