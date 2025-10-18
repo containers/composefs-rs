@@ -41,8 +41,9 @@ RUN --mount=type=bind,from=base,target=/mnt/base <<EOF
     set -eux
 
     mkdir -p /tmp/sysroot/composefs
-    COMPOSEFS_FSVERITY="$(cfsctl --repo /tmp/sysroot compute-id --bootable /mnt/base)"
-    echo "DEBUG: Computed bootable composefs digest: ${COMPOSEFS_FSVERITY}"
+    # Create a composefs image from base with bootable transformation
+    # This normalizes metadata and produces a deterministic ID
+    COMPOSEFS_FSVERITY="$(cfsctl --repo /tmp/sysroot create-image --bootable --stat-root /mnt/base | sed 's/^sha256://')"
 
     mkdir -p /etc/kernel /etc/dracut.conf.d
     echo "composefs=${COMPOSEFS_FSVERITY} rw" > /etc/kernel/cmdline
