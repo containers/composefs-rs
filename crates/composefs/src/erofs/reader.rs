@@ -416,7 +416,7 @@ impl DirectoryBlock {
         let first = self.get_entry_header(0);
         let offset = first.name_offset.get();
         assert!(offset != 0);
-        assert!(offset % 12 == 0);
+        assert!(offset.is_multiple_of(12));
         offset as usize / 12
     }
 
