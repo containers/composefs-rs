@@ -123,6 +123,25 @@ jobs:
         echo "=== Test vsock connection ==="
         python3 -c "import socket; sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM); print('vsock socket created successfully')" || echo "Failed to create vsock socket"
 
+    - name: Capture test.thing runtime directory
+      if: steps.run_tests.outcome == 'failure'
+      run: |
+        echo "=== test.thing IPC directory contents ==="
+        find /run/user/$(id -u)/test.thing -ls 2>/dev/null || true
+
+    - name: Show build artifacts for debugging
+      if: steps.run_tests.outcome == 'failure'
+      run: |
+        cd examples/${{ matrix.example.dir }}
+        echo "=== Boot directory contents ==="
+        find tmp/efi -ls 2>/dev/null || true
+        echo ""
+        echo "=== Sysroot composefs images ==="
+        ls -lh tmp/sysroot/composefs/images/ 2>/dev/null || true
+        echo ""
+        echo "=== Sysroot state deployments ==="
+        ls -lh tmp/sysroot/state/deploy/ 2>/dev/null || true
+
     - name: Fail job if tests failed
       if: steps.run_tests.outcome == 'failure'
       run: exit 1
