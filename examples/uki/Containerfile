@@ -26,7 +26,7 @@ RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
         composefs \
         dosfstools \
         kernel-6.16.9-200.fc42 \
-        openssh-server-9.8p1-1.fc42 \
+        openssh-server \
         policycoreutils-python-utils \
         selinux-policy-targeted \
         skopeo \
@@ -50,8 +50,6 @@ RUN <<EOF
     checkmodule -M -m -o /etc/composefs_workarounds.mod /etc/composefs_workarounds.te
     semodule_package -o /etc/composefs_workarounds.pp -m /etc/composefs_workarounds.mod
     semodule -i /etc/composefs_workarounds.pp
-    # Disable dontaudit rules to reveal all SELinux denials
-    semodule -DB
 
     passwd -d root
     mkdir /sysroot
