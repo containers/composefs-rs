@@ -41,19 +41,18 @@ CI examples workflow failing for three Fedora jobs (unified, uki, unified-secure
 
 ### Fixes Applied
 
-#### 1. Kernel Command Line (commit 2ba8188)
-**File**: `examples/testthing.py:648`
+#### 1. Kernel Command Line (commit 2ba8188, superseded by commit 5efbd1f)
+**File**: `examples/testthing.py:649`
 
 Removed problematic serial console parameters from SMBIOS kernel cmdline:
 ```python
-# BEFORE
-"type=11,value=io.systemd.boot.kernel-cmdline-extra=console=hvc0 earlyprintk=serial,ttyS0,115200 debug loglevel=7"
-
-# AFTER
-"type=11,value=io.systemd.boot.kernel-cmdline-extra=console=hvc0 debug loglevel=7"
+# CURRENT
+"type=11,value=io.systemd.boot.kernel-cmdline-extra=debug loglevel=7 systemd.journald.forward_to_console=1"
 ```
 
-Rationale: We already have `-serial file:{path}/serial.log` device configured separately, so serial console parameters in kernel cmdline were redundant and causing QEMU parsing errors.
+**However**: These SMBIOS parameters are NOT being applied by the EFI stub. The actual kernel command line only contains parameters baked into the UKI (see "CRITICAL FINDING" above).
+
+Rationale: We have `-serial file:{path}/serial.log` device configured separately, and the UKI has `console=ttyS0,115200n8` baked in.
 
 #### 2. SMBIOS Credentials Base64 Encoding (commit 1ccdee4)
 **File**: `examples/testthing.py:669-677`
@@ -93,7 +92,25 @@ Reference: https://systemd.io/CREDENTIALS/
 - QEMU parameter parsing errors resolved
 - QEMU now starts successfully
 - Serial console logging now captures full boot sequence
-- Console configuration: `console=ttyS0,115200n8` in UKI, SMBIOS only adds `debug loglevel=7`
+- Console configuration: `console=ttyS0,115200n8` in UKI
+
+### ⚠️ CRITICAL FINDING: SMBIOS Kernel Parameters Not Applied
+
+**The EFI stub is NOT reading SMBIOS `io.systemd.boot.kernel-cmdline-extra` parameters.**
+
+Evidence from kernel command line in serial.log:
+```
+Command line: composefs=<digest> rw console=ttyS0,115200n8 systemd.machine_id=<id>
+```
+
+QEMU is invoked with:
+```
+-smbios 'type=11,value=io.systemd.boot.kernel-cmdline-extra=debug loglevel=7 systemd.journald.forward_to_console=1'
+```
+
+But `debug loglevel=7 systemd.journald.forward_to_console=1` is **completely missing** from the actual kernel command line.
+
+**Implication**: We've been assuming debug parameters were active, but they weren't. The kernel is not running with `debug loglevel=7`, and journald is not forwarding to console.
 
 ### ✅ VM Boot Success Confirmed
 - VM boots completely through to multi-user.target
@@ -158,6 +175,12 @@ SSH connection (vsock)      ✗ (broken pipe)
 - vhost-vsock driver updates
 - Network/socket permissions in runner environment
 
+**New hypothesis based on SMBIOS finding**:
+- Since SMBIOS kernel parameters aren't being applied, this failure may have existed all along
+- The tests might have been passing despite this, meaning the failure is unrelated to kernel parameters
+- OR: The tests were relying on systemd-boot to apply SMBIOS parameters, but UKI bypasses systemd-boot
+- Need to verify: Did tests ever actually work with UKI setup, or only with systemd-boot?
+
 ## Package Change Investigation
 
 ### Kernel 6.16.x Known Issues (from web research)
@@ -220,6 +243,21 @@ Multiple Fedora Discussion threads report kernel 6.16.x boot failures:
 **Test fork**: https://github.com/cgwalters/composefs-rs
 
 Latest test runs:
+
+- Run 18631279813 (commit 045f035): Added systemd.journald.forward_to_console=1
+  - **CRITICAL DISCOVERY**: SMBIOS kernel parameters NOT applied by EFI stub
+  - QEMU starts: ✓
+  - VM boots: ✓
+  - sshd starts: ✓
+  - SSH connection: ✗ (broken pipe)
+  - Journal forwarding: ✗ (parameter never reached kernel)
+
+- Run 18631024251 (commit e3c926d): Added SSH verbose logging
+  - SSH debug logs captured to ssh.log
+  - Protocol negotiation succeeds (OpenSSH 9.6 vs 9.9)
+  - Connection breaks after SSH2_MSG_KEXINIT sent
+  - Confirms failure during key exchange phase
+
 - Run 18624189103 (commit 5efbd1f): Fixed baud rate 114800→115200, removed console=hvc0 from SMBIOS
   - QEMU starts: ✓
   - VM boots to kernel: ✓
@@ -228,32 +266,31 @@ Latest test runs:
   - multi-user.target: ✓
   - SSH connection: ✗ (broken pipe on vsock connection)
 
-- Run 18624093309 (commit 4a3e1f9): Wrong baud rate 114800, no console=hvc0
-  - Same results as above
-  - Confirms baud rate fix was cosmetic, not functional
-
-**Key finding**: VM boots completely and all services start, but SSH over vsock fails to connect
+**Key finding**: VM boots completely and all services start, but SSH over vsock fails during key exchange. SMBIOS kernel parameters are NOT being applied.
 
 ## Next Steps
 
 ### High Priority - SSH/vsock Debugging
 
-1. **Add vsock/SSH debug logging**
-   - Add `-device vhost-vsock-pci,id=...,debug=on` or similar QEMU flags
-   - Add verbose SSH logging in testthing.py
-   - Check if vsock device is actually available in guest (`ls /dev/vsock`)
+1. **Fix SMBIOS kernel parameter issue** ⚠️ BLOCKING
+   - Option A: Bake debug parameters into UKI `/etc/kernel/cmdline` (loglevel=7, systemd.journald.forward_to_console=1)
+   - Option B: Investigate why EFI stub not reading SMBIOS (systemd version issue?)
+   - Option C: Switch to systemd-boot instead of direct UKI boot to enable SMBIOS cmdline
+   - **Need to choose approach**: Hardcode in UKI is simplest for debugging
 
-2. **Test with timing delay**
-   - Add sleep/retry logic before SSH connection attempt
-   - Check if sshd needs more time to become ready
+2. **Get guest-side SSH logs**
+   - Once journal forwarding works, capture sshd error messages
+   - Understand why sshd terminates during key exchange
+   - Check for OpenSSH 9.9 specific issues
 
-3. **Pin all packages to Oct 3 versions**
-   - Capture exact package versions from successful Oct 3 build
-   - Pin composefs, openssh-server, btrfs-progs, selinux-policy-targeted
+3. **Test OpenSSH version hypothesis**
+   - Pin openssh-server to Oct 3 version (pre-9.9)
+   - OR force specific key exchange algorithm to avoid negotiation issues
 
-4. **Test locally**
-   - Run the same QEMU command locally to see if issue is runner-specific
-   - Compare local QEMU/kernel versions with GitHub Actions runner
+4. **Local testing** ✅ COMPLETED
+   - Issue reproduces locally (not CI-specific)
+   - Same "Broken pipe" error during key exchange
+   - Confirms this is a general vsock/SSH problem
 
 ### Lower Priority - Alternative Approaches
 
