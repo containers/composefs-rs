@@ -35,18 +35,6 @@ RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
         systemd-boot-unsigned-257.9-2.fc42 \
         systemd-ukify-257.9-2.fc42 \
         util-linux
-
-    # Configure sshd to work with vsock connections (openssh 9.9 workaround)
-    mkdir -p /etc/ssh/sshd_config.d
-    cat > /etc/ssh/sshd_config.d/50-vsock.conf <<'SSHD_EOF'
-UseDNS no
-PermitEmptyPasswords yes
-PermitRootLogin yes
-PubkeyAuthentication yes
-PasswordAuthentication yes
-KbdInteractiveAuthentication no
-LogLevel DEBUG3
-SSHD_EOF
 EOF
 
 # --- Everything above this line should hopefully stay cached ---
@@ -73,7 +61,7 @@ RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
     set -eux
 
     mkdir -p /etc/kernel /etc/dracut.conf.d
-    echo "composefs=${COMPOSEFS_FSVERITY} rw console=ttyS0,115200n8 loglevel=7 systemd.journald.forward_to_console=1" > /etc/kernel/cmdline
+    echo "composefs=${COMPOSEFS_FSVERITY} rw console=ttyS0,115200n8 loglevel=7 systemd.journald.forward_to_console=1 audit=1" > /etc/kernel/cmdline
 
     kernel-install add-all
 EOF

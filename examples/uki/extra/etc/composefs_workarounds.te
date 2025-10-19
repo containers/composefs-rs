@@ -9,7 +9,6 @@ require {
     class file open;
     class file getattr;
     class lnk_file read;
-    class vsock_socket { create connect read write bind listen accept getattr setopt getopt };
 }
 
 # https://bugzilla.redhat.com/show_bug.cgi?id=2374928
@@ -20,5 +19,6 @@ allow sshd_t tmpfs_t:file read;
 # for volatile-root workaround
 allow systemd_gpt_generator_t init_var_run_t:lnk_file read;
 
-# Allow sshd to use vsock sockets for SSH over vsock
-allow sshd_t self:vsock_socket { create connect read write bind listen accept getattr setopt getopt };
+# Make sshd_t permissive to allow vsock SSH connections
+# This allows all operations for sshd_t while keeping SELinux enforcing for other domains
+permissive sshd_t;
