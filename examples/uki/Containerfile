@@ -61,7 +61,7 @@ RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
     set -eux
 
     mkdir -p /etc/kernel /etc/dracut.conf.d
-    echo "composefs=${COMPOSEFS_FSVERITY} rw console=ttyS0,115200n8" > /etc/kernel/cmdline
+    echo "composefs=${COMPOSEFS_FSVERITY} rw console=ttyS0,115200n8 loglevel=7 systemd.journald.forward_to_console=1" > /etc/kernel/cmdline
 
     kernel-install add-all
 EOF
