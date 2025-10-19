@@ -1,4 +1,4 @@
-# CI Failure Investigation - composefs-rs Examples
+you# CI Failure Investigation - composefs-rs Examples
 
 ## Problem Statement
 
@@ -289,21 +289,32 @@ cat /tmp/test.thing/*/qemu.log    # QEMU stdout/stderr
 
 ### Testing in CI (cgwalters fork)
 
+**CRITICAL: ONLY push to cgwalters fork, NEVER push to debug-ci branch or create PRs**
+
+The debug-ci branch has PR #190 open to main composefs-rs repo. Any commits to debug-ci will update that PR and create noise for everyone else.
+
+**ONLY USE THIS WORKFLOW**:
 ```bash
-# Make changes, commit
+# Make changes, commit locally on ANY branch (NOT debug-ci)
 git add -A
 git commit -m "test: Description of change"
 
-# Push to cgwalters fork to trigger workflow
+# Push ONLY to cgwalters fork main branch
 git push -f cgwalters HEAD:main
 
-# Monitor workflow
+# Monitor workflow on cgwalters fork ONLY
 gh run list --repo cgwalters/composefs-rs
 gh run watch <run-id> --repo cgwalters/composefs-rs
 
 # Download artifacts after failure
 gh run download <run-id> --repo cgwalters/composefs-rs
 ```
+
+**DO NOT**:
+- Push to debug-ci branch
+- Push to containers/composefs-rs repo
+- Create or update pull requests
+- Use `git push origin` without being very careful about branch
 
 ### Analyzing Logs
 
