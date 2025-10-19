@@ -711,6 +711,7 @@ class VirtualMachine:
 
     async def _ssh_control(self) -> None:
         ssh = None
+        ssh_log_file = None
         try:
             assert self.ssh_direct_args is not None
 
@@ -718,8 +719,14 @@ class VirtualMachine:
 
             control_socket = self._ipc / "ssh"
 
+            # Open SSH debug log file
+            ssh_log_path = self._ipc / "ssh.log"
+            ssh_log_file = open(ssh_log_path, "wb")
+            logger.debug(f"SSH debug log: {ssh_log_path}")
+
             args = (
                 "ssh",
+                "-vvv",  # verbose debugging
                 *self.ssh_direct_args,
                 ("-N", "-n"),  # no command, stdin disconnected
                 ("-M", "-S", control_socket),  # listen on the control socket
@@ -728,6 +735,7 @@ class VirtualMachine:
                 *args,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
+                stderr=ssh_log_file.fileno(),
             )
 
             # ssh sends EOF after the connection succeeds
@@ -752,6 +760,8 @@ class VirtualMachine:
                 ssh.terminate()
                 await asyncio.shield(ssh.wait())
         finally:
+            if ssh_log_file is not None:
+                ssh_log_file.close()
             # We try to reset our state best as possible here to deal with
             # reboots in the shutdown_ok case: we want the control socket
             # reestablished when the machine comes back.

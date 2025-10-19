@@ -117,6 +117,12 @@ jobs:
           cat "$serial_log" || true
           echo ""
         done
+        echo "=== SSH debug logs from failed VMs ==="
+        find /run/user/$(id -u)/test.thing -name ssh.log -type f 2>/dev/null | while read ssh_log; do
+          echo "==== SSH log from $ssh_log ===="
+          cat "$ssh_log" || true
+          echo ""
+        done
         echo "=== QMP sockets ==="
         find /run/user/$(id -u)/test.thing -name qmp -type s 2>/dev/null || true
 
