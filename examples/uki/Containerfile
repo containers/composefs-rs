@@ -47,9 +47,6 @@ PasswordAuthentication yes
 KbdInteractiveAuthentication no
 LogLevel DEBUG3
 SSHD_EOF
-
-    # Disable SELinux as workaround for openssh 9.9 vsock issue
-    echo "SELINUX=permissive" > /etc/selinux/config
 EOF
 
 # --- Everything above this line should hopefully stay cached ---
