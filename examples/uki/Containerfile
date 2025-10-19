@@ -50,6 +50,8 @@ RUN <<EOF
     checkmodule -M -m -o /etc/composefs_workarounds.mod /etc/composefs_workarounds.te
     semodule_package -o /etc/composefs_workarounds.pp -m /etc/composefs_workarounds.mod
     semodule -i /etc/composefs_workarounds.pp
+    # Disable dontaudit rules to reveal all SELinux denials
+    semodule -DB
 
     passwd -d root
     mkdir /sysroot
