@@ -646,7 +646,7 @@ class VirtualMachine:
             ("-device", "virtconsole,chardev=console"),
             (
                 "-smbios",
-                "type=11,value=io.systemd.boot.kernel-cmdline-extra=debug loglevel=7",
+                "type=11,value=io.systemd.boot.kernel-cmdline-extra=debug loglevel=7 systemd.journald.forward_to_console=1",
             ),
             # Add a serial port for boot messages
             ("-serial", f"file:{self._ipc}/serial.log"),
