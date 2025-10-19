@@ -21,13 +21,12 @@ RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
     echo export DRACUT_NO_XATTR=1 > /etc/dracut.conf.d/no-xattr.conf
 
     dnf -y install fedora-repos-archive
-    # Install openssh-server from archive first (before 9.9 regression)
-    dnf --setopt keepcache=1 --disablerepo='*' --enablerepo='updates-archive' install -y openssh-server
     dnf --setopt keepcache=1 install --allowerasing -y \
         btrfs-progs \
         composefs \
         dosfstools \
         kernel-6.16.9-200.fc42 \
+        openssh-server \
         policycoreutils-python-utils \
         selinux-policy-targeted \
         skopeo \
@@ -36,6 +35,21 @@ RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
         systemd-boot-unsigned-257.9-2.fc42 \
         systemd-ukify-257.9-2.fc42 \
         util-linux
+
+    # Configure sshd to work with vsock connections (openssh 9.9 workaround)
+    mkdir -p /etc/ssh/sshd_config.d
+    cat > /etc/ssh/sshd_config.d/50-vsock.conf <<'SSHD_EOF'
+UseDNS no
+PermitEmptyPasswords yes
+PermitRootLogin yes
+PubkeyAuthentication yes
+PasswordAuthentication yes
+KbdInteractiveAuthentication no
+LogLevel DEBUG3
+SSHD_EOF
+
+    # Disable SELinux as workaround for openssh 9.9 vsock issue
+    echo "SELINUX=permissive" > /etc/selinux/config
 EOF
 
 # --- Everything above this line should hopefully stay cached ---
