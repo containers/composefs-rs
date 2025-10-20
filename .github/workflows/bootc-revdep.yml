@@ -1,0 +1,106 @@
+name: bootc Reverse Dependency CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  LIBVIRT_DEFAULT_URI: "qemu:///session"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-bootc-composefs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout composefs-rs (current branch)
+        uses: actions/checkout@v5
+        with:
+          path: composefs-rs
+
+      - name: Checkout bootc repository
+        uses: actions/checkout@v5
+        with:
+          repository: containers/bootc
+          path: bootc
+
+      - name: Bootc Ubuntu Setup
+        uses: ./bootc/.github/actions/bootc-ubuntu-setup
+        with:
+          libvirt: true
+
+      - name: Patch bootc to use current composefs-rs
+        working-directory: bootc
+        run: |
+          set -xeuo pipefail
+
+          # Copy the entire composefs-rs workspace into bootc directory for the build context
+          # We need the full workspace for proper cargo workspace inheritance
+          cp -r ../composefs-rs ./.composefs-local
+
+          # Add .composefs-local to .dockerignore whitelist (it excludes everything by default with *)
+          echo '!.composefs-local/' >> .dockerignore
+
+          # The composefs-rs crates use workspace inheritance, so we need to add the workspace.package fields
+          # to bootc's Cargo.toml. Insert after the [workspace] section (after members and resolver lines).
+          awk '
+            /^\[workspace\]/ { in_workspace = 1 }
+            in_workspace && /^$/ {
+              print ""
+              print "[workspace.package]"
+              print "edition = \"2021\""
+              print "license = \"MIT OR Apache-2.0\""
+              print "readme = \"README.md\""
+              print "repository = \"https://github.com/containers/composefs-rs\""
+              print "rust-version = \"1.88.0\""
+              print "version = \"0.3.0\""
+              in_workspace = 0
+              next
+            }
+            { print }
+          ' Cargo.toml > Cargo.toml.tmp
+          mv Cargo.toml.tmp Cargo.toml
+
+          # Add [patch."https://github.com/containers/composefs-rs"] to override the git dependency
+          # These paths are relative and will work both on host and in container
+          cat >> Cargo.toml << EOF
+
+          # Patched by CI to test against current composefs-rs
+          [patch."https://github.com/containers/composefs-rs"]
+          composefs = { path = ".composefs-local/crates/composefs" }
+          composefs-boot = { path = ".composefs-local/crates/composefs-boot" }
+          composefs-oci = { path = ".composefs-local/crates/composefs-oci" }
+          EOF
+
+          # Verify the paths exist
+          ls -la .composefs-local/crates/
+
+          cat Cargo.toml
+
+          # Patch the workspace lints to allow missing_docs for composefs-rs crates
+          # bootc has workspace.lints.rust.missing_docs = "deny" but composefs-rs has undocumented items
+          # Change the missing_docs lint from "deny" to "allow" in the workspace lints section
+          sed -i 's/missing_docs = "deny"/missing_docs = "allow"/' Cargo.toml
+
+          # Show the updated lints configuration
+          echo "=== Updated Cargo.toml lints section ==="
+          grep -A5 '\[workspace.lints.rust\]' Cargo.toml || echo "No workspace.lints.rust section found"
+
+          # Update lockfile to use the patched dependencies
+          cargo update -p composefs -p composefs-boot -p composefs-oci
+
+      - name: Build sealed bootc image
+        working-directory: bootc
+        run: just build-sealed
+
+      - name: Run composefs tests
+        working-directory: bootc
+        run: just test-composefs
