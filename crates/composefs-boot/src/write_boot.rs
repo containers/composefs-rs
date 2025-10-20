@@ -20,6 +20,17 @@ use crate::{
     uki,
 };
 
+/// Writes a Type 1 boot entry to the boot directory.
+///
+/// # Arguments
+///
+/// * `t1` - The Type 1 entry to write
+/// * `bootdir` - Path to the boot directory
+/// * `boot_subdir` - Optional subdirectory to prepend to paths
+/// * `root_id` - The composefs root object ID
+/// * `insecure` - Whether to allow optional fs-verity verification
+/// * `cmdline_extra` - Additional kernel command line arguments
+/// * `repo` - The composefs repository
 pub fn write_t1_simple<ObjectID: FsVerityHashValue>(
     mut t1: Type1Entry<ObjectID>,
     bootdir: &Path,
@@ -57,6 +68,16 @@ pub fn write_t1_simple<ObjectID: FsVerityHashValue>(
     Ok(())
 }
 
+/// Writes a Type 2 boot entry (UKI) to the boot directory.
+///
+/// Validates that the UKI's embedded composefs= parameter matches the expected root_id.
+///
+/// # Arguments
+///
+/// * `t2` - The Type 2 entry to write
+/// * `bootdir` - Path to the boot directory
+/// * `root_id` - The expected composefs root object ID
+/// * `repo` - The composefs repository
 pub fn write_t2_simple<ObjectID: FsVerityHashValue>(
     t2: Type2Entry<ObjectID>,
     bootdir: &Path,

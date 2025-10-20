@@ -255,6 +255,19 @@ fn parse_config(file: impl Read) -> Result<Option<String>> {
     Ok(None)
 }
 
+/// Applies SELinux security contexts to all files in a filesystem tree.
+///
+/// Reads the SELinux policy from /etc/selinux/config and corresponding policy files,
+/// then labels all filesystem nodes with appropriate security.selinux extended attributes.
+///
+/// # Arguments
+///
+/// * `fs` - The filesystem to label
+/// * `repo` - The composefs repository
+///
+/// # Returns
+///
+/// Ok(()) if labeling succeeds or if no SELinux policy is found
 pub fn selabel<H: FsVerityHashValue>(fs: &mut FileSystem<H>, repo: &Repository<H>) -> Result<()> {
     // if /etc/selinux/config doesn't exist then it's not an error
     let Some(etc_selinux) = fs.root.get_directory_opt("etc/selinux".as_ref())? else {

@@ -11,6 +11,7 @@ rust-version = "1.88.0"
 version = "0.3.0"
 
 [workspace.lints.rust]
+missing_docs = "deny"
 missing_debug_implementations = "deny"
 unsafe_code = "deny" # https://github.com/containers/composefs-rs/issues/123
 

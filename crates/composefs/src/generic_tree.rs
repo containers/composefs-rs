@@ -11,58 +11,87 @@ use std::{
 
 use thiserror::Error;
 
+/// File metadata similar to `struct stat` from POSIX.
 #[derive(Debug)]
 pub struct Stat {
+    /// File mode and permissions bits.
     pub st_mode: u32,
+    /// User ID of owner.
     pub st_uid: u32,
+    /// Group ID of owner.
     pub st_gid: u32,
+    /// Modification time in seconds since Unix epoch.
     pub st_mtim_sec: i64,
+    /// Extended attributes as key-value pairs.
     pub xattrs: RefCell<BTreeMap<Box<OsStr>, Box<[u8]>>>,
 }
 
+/// Content types for leaf nodes (non-directory files).
 #[derive(Debug)]
 pub enum LeafContent<T> {
+    /// A regular file with content of type `T`.
     Regular(T),
+    /// A block device with the given device number.
     BlockDevice(u64),
+    /// A character device with the given device number.
     CharacterDevice(u64),
+    /// A named pipe (FIFO).
     Fifo,
+    /// A Unix domain socket.
     Socket,
+    /// A symbolic link pointing to the given target path.
     Symlink(Box<OsStr>),
 }
 
+/// A leaf node representing a non-directory file.
 #[derive(Debug)]
 pub struct Leaf<T> {
+    /// Metadata for this leaf node.
     pub stat: Stat,
+    /// The content and type of this leaf node.
     pub content: LeafContent<T>,
 }
 
+/// A directory node containing named entries.
 #[derive(Debug)]
 pub struct Directory<T> {
+    /// Metadata for this directory.
     pub stat: Stat,
+    /// Map of filenames to inodes within this directory.
     pub(crate) entries: BTreeMap<Box<OsStr>, Inode<T>>,
 }
 
+/// A filesystem inode representing either a directory or a leaf node.
 #[derive(Debug)]
 pub enum Inode<T> {
+    /// A directory inode.
     Directory(Box<Directory<T>>),
+    /// A leaf inode (reference-counted to support hardlinks).
     Leaf(Rc<Leaf<T>>),
 }
 
+/// Errors that can occur when working with filesystem images.
 #[derive(Error, Debug)]
 pub enum ImageError {
+    /// The filename contains invalid components (e.g., "..", ".", or Windows prefixes).
     #[error("Invalid filename {0:?}")]
     InvalidFilename(Box<OsStr>),
+    /// The specified directory entry does not exist.
     #[error("Directory entry {0:?} does not exist")]
     NotFound(Box<OsStr>),
+    /// The entry exists but is not a directory when a directory was expected.
     #[error("Directory entry {0:?} is not a subdirectory")]
     NotADirectory(Box<OsStr>),
+    /// The entry is a directory when a non-directory was expected.
     #[error("Directory entry {0:?} is a directory")]
     IsADirectory(Box<OsStr>),
+    /// The entry exists but is not a regular file when a regular file was expected.
     #[error("Directory entry {0:?} is not a regular file")]
     IsNotRegular(Box<OsStr>),
 }
 
 impl<T> Inode<T> {
+    /// Returns a reference to the metadata for this inode.
     pub fn stat(&self) -> &Stat {
         match self {
             Inode::Directory(dir) => &dir.stat,
@@ -88,6 +117,7 @@ impl<T> Default for Directory<T> {
 }
 
 impl<T> Directory<T> {
+    /// Creates a new directory with the given metadata.
     pub fn new(stat: Stat) -> Self {
         Self {
             stat,
@@ -395,6 +425,10 @@ impl<T> Directory<T> {
         self.entries.clear();
     }
 
+    /// Recursively finds the newest modification time in this directory tree.
+    ///
+    /// Returns the maximum modification time among this directory's metadata
+    /// and all files and subdirectories it contains.
     pub fn newest_file(&self) -> i64 {
         let mut newest = self.stat.st_mtim_sec;
         for inode in self.entries.values() {
@@ -410,9 +444,12 @@ impl<T> Directory<T> {
     }
 }
 
+/// A complete filesystem tree with a root directory.
 #[derive(Debug)]
 pub struct FileSystem<T> {
+    /// The root directory of the filesystem.
     pub root: Directory<T>,
+    /// Whether the root directory's metadata has been explicitly set.
     pub have_root_stat: bool,
 }
 
@@ -426,11 +463,18 @@ impl<T> Default for FileSystem<T> {
 }
 
 impl<T> FileSystem<T> {
+    /// Sets the metadata for the root directory.
+    ///
+    /// Marks the root directory's stat as explicitly set.
     pub fn set_root_stat(&mut self, stat: Stat) {
         self.have_root_stat = true;
         self.root.stat = stat;
     }
 
+    /// Ensures the root directory has valid metadata.
+    ///
+    /// If the root stat hasn't been explicitly set, this computes it by finding
+    /// the newest modification time in the entire filesystem tree.
     pub fn ensure_root_stat(&mut self) {
         if !self.have_root_stat {
             self.root.stat.st_mtim_sec = self.root.newest_file();

@@ -91,6 +91,10 @@ fn write_entry(
     Ok(())
 }
 
+/// Writes a directory entry to the dumpfile format.
+///
+/// Writes the metadata for a directory including path, permissions, ownership,
+/// timestamps, and extended attributes.
 pub fn write_directory(
     writer: &mut impl fmt::Write,
     path: &Path,
@@ -111,6 +115,10 @@ pub fn write_directory(
     )
 }
 
+/// Writes a leaf node (non-directory) entry to the dumpfile format.
+///
+/// Handles all types of leaf nodes including regular files (inline and external),
+/// device files, symlinks, sockets, and FIFOs.
 pub fn write_leaf(
     writer: &mut impl fmt::Write,
     path: &Path,
@@ -206,6 +214,10 @@ pub fn write_leaf(
     }
 }
 
+/// Writes a hardlink entry to the dumpfile format.
+///
+/// Creates a special entry that links the given path to an existing target path
+/// that was already written to the dumpfile.
 pub fn write_hardlink(writer: &mut impl fmt::Write, path: &Path, target: &OsStr) -> fmt::Result {
     write_escaped(writer, path.as_os_str().as_bytes())?;
     write!(writer, " 0 @120000 - - - - 0.0 ")?;
@@ -286,6 +298,10 @@ impl<'a, W: Write, ObjectID: FsVerityHashValue> DumpfileWriter<'a, W, ObjectID> 
     }
 }
 
+/// Writes a complete filesystem tree to the composefs dumpfile format.
+///
+/// Serializes the entire filesystem structure including all directories, files,
+/// metadata, and handles hardlink tracking automatically.
 pub fn write_dumpfile(
     writer: &mut impl Write,
     fs: &FileSystem<impl FsVerityHashValue>,

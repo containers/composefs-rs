@@ -1,3 +1,5 @@
+//! Tests
+
 use std::{
     ffi::OsString,
     fs::{create_dir_all, File},
@@ -24,10 +26,12 @@ static TMPDIR: Lazy<OsString> = Lazy::new(|| {
     }
 });
 
+/// Allocate a temporary directory
 pub fn tempdir() -> TempDir {
     TempDir::with_prefix_in("composefs-test-", TMPDIR.as_os_str()).unwrap()
 }
 
-pub fn tempfile() -> File {
+/// Allocate a temporary file
+pub(crate) fn tempfile() -> File {
     tempfile_in(TMPDIR.as_os_str()).unwrap()
 }

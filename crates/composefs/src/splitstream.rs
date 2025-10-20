@@ -25,15 +25,20 @@ use crate::{
     util::{read_exactish, Sha256Digest},
 };
 
+/// A single entry in the digest map, mapping content SHA256 hash to fs-verity object ID.
 #[derive(Debug, FromBytes, Immutable, IntoBytes, KnownLayout)]
 #[repr(C)]
 pub struct DigestMapEntry<ObjectID: FsVerityHashValue> {
+    /// SHA256 hash of the content body
     pub body: Sha256Digest,
+    /// fs-verity object identifier
     pub verity: ObjectID,
 }
 
+/// A map of content digests to object IDs, maintained in sorted order for binary search.
 #[derive(Debug)]
 pub struct DigestMap<ObjectID: FsVerityHashValue> {
+    /// Vector of digest map entries, kept sorted by body hash
     pub map: Vec<DigestMapEntry<ObjectID>>,
 }
 
@@ -44,10 +49,14 @@ impl<ObjectID: FsVerityHashValue> Default for DigestMap<ObjectID> {
 }
 
 impl<ObjectID: FsVerityHashValue> DigestMap<ObjectID> {
+    /// Creates a new empty digest map.
     pub fn new() -> Self {
         DigestMap { map: vec![] }
     }
 
+    /// Looks up an object ID by its content SHA256 hash.
+    ///
+    /// Returns the object ID if found, or None if not present in the map.
     pub fn lookup(&self, body: &Sha256Digest) -> Option<&ObjectID> {
         match self.map.binary_search_by_key(body, |e| e.body) {
             Ok(idx) => Some(&self.map[idx].verity),
@@ -55,6 +64,9 @@ impl<ObjectID: FsVerityHashValue> DigestMap<ObjectID> {
         }
     }
 
+    /// Inserts a new digest mapping, maintaining sorted order.
+    ///
+    /// If the body hash already exists, asserts that the verity ID matches.
     pub fn insert(&mut self, body: &Sha256Digest, verity: &ObjectID) {
         match self.map.binary_search_by_key(body, |e| e.body) {
             Ok(idx) => assert_eq!(self.map[idx].verity, *verity), // or else, bad things...
@@ -69,10 +81,12 @@ impl<ObjectID: FsVerityHashValue> DigestMap<ObjectID> {
     }
 }
 
+/// Writer for creating split stream format files with inline content and external object references.
 pub struct SplitStreamWriter<ObjectID: FsVerityHashValue> {
     repo: Arc<Repository<ObjectID>>,
     inline_content: Vec<u8>,
     writer: Encoder<'static, Vec<u8>>,
+    /// Optional SHA256 hasher and expected digest for validation
     pub sha256: Option<(Sha256, Sha256Digest)>,
 }
 
@@ -88,6 +102,10 @@ impl<ObjectID: FsVerityHashValue> std::fmt::Debug for SplitStreamWriter<ObjectID
 }
 
 impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
+    /// Creates a new split stream writer.
+    ///
+    /// The writer is initialized with optional digest map references and an optional
+    /// expected SHA256 hash for validation when the stream is finalized.
     pub fn new(
         repo: &Arc<Repository<ObjectID>>,
         refs: Option<DigestMap<ObjectID>>,
@@ -152,6 +170,10 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
         Self::write_fragment(&mut self.writer, 0, reference.as_bytes())
     }
 
+    /// Writes data as an external object reference with optional padding.
+    ///
+    /// The data is stored in the repository and a reference is written to the stream.
+    /// Any padding bytes are stored inline after the reference.
     pub fn write_external(&mut self, data: &[u8], padding: Vec<u8>) -> Result<()> {
         if let Some((ref mut sha256, ..)) = self.sha256 {
             sha256.update(data);
@@ -161,6 +183,10 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
         self.write_reference(&id, padding)
     }
 
+    /// Asynchronously writes data as an external object reference with optional padding.
+    ///
+    /// The data is stored in the repository asynchronously and a reference is written to the stream.
+    /// Any padding bytes are stored inline after the reference.
     pub async fn write_external_async(&mut self, data: Vec<u8>, padding: Vec<u8>) -> Result<()> {
         if let Some((ref mut sha256, ..)) = self.sha256 {
             sha256.update(&data);
@@ -170,6 +196,10 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
         self.write_reference(&id, padding)
     }
 
+    /// Finalizes the split stream and returns its object ID.
+    ///
+    /// Flushes any remaining inline content, validates the SHA256 hash if provided,
+    /// and stores the compressed stream in the repository.
     pub fn done(mut self) -> Result<ObjectID> {
         self.flush_inline(vec![])?;
 
@@ -183,15 +213,19 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
     }
 }
 
+/// Data fragment from a split stream, either inline content or an external object reference.
 #[derive(Debug)]
 pub enum SplitStreamData<ObjectID: FsVerityHashValue> {
+    /// Inline content stored directly in the stream
     Inline(Box<[u8]>),
+    /// Reference to an external object
     External(ObjectID),
 }
 
-// utility class to help read splitstreams
+/// Reader for parsing split stream format files with inline content and external object references.
 pub struct SplitStreamReader<R: Read, ObjectID: FsVerityHashValue> {
     decoder: Decoder<'static, BufReader<R>>,
+    /// Digest map containing content hash to object ID mappings
     pub refs: DigestMap<ObjectID>,
     inline_bytes: usize,
 }
@@ -232,6 +266,9 @@ enum ChunkType<ObjectID: FsVerityHashValue> {
 }
 
 impl<R: Read, ObjectID: FsVerityHashValue> SplitStreamReader<R, ObjectID> {
+    /// Creates a new split stream reader from the provided reader.
+    ///
+    /// Reads the digest map header from the stream during initialization.
     pub fn new(reader: R) -> Result<Self> {
         let mut decoder = Decoder::new(reader)?;
 
@@ -310,6 +347,11 @@ impl<R: Read, ObjectID: FsVerityHashValue> SplitStreamReader<R, ObjectID> {
         Ok(())
     }
 
+    /// Reads an exact amount of data, which may be inline or external.
+    ///
+    /// The stored_size is the size as recorded in the stream (including any padding),
+    /// while actual_size is the actual content size without padding.
+    /// Returns either inline content or an external object reference.
     pub fn read_exact(
         &mut self,
         actual_size: usize,
@@ -330,6 +372,10 @@ impl<R: Read, ObjectID: FsVerityHashValue> SplitStreamReader<R, ObjectID> {
         }
     }
 
+    /// Concatenates the entire split stream content to the output writer.
+    ///
+    /// Inline content is written directly, while external references are resolved
+    /// using the provided load_data callback function.
     pub fn cat(
         &mut self,
         output: &mut impl Write,
@@ -352,6 +398,9 @@ impl<R: Read, ObjectID: FsVerityHashValue> SplitStreamReader<R, ObjectID> {
         }
     }
 
+    /// Traverses the split stream and calls the callback for each object reference.
+    ///
+    /// This includes both references from the digest map and external references in the stream.
     pub fn get_object_refs(&mut self, mut callback: impl FnMut(&ObjectID)) -> Result<()> {
         let mut buffer = vec![];
 
@@ -373,12 +422,16 @@ impl<R: Read, ObjectID: FsVerityHashValue> SplitStreamReader<R, ObjectID> {
         }
     }
 
+    /// Calls the callback for each content hash in the digest map.
     pub fn get_stream_refs(&mut self, mut callback: impl FnMut(&Sha256Digest)) {
         for entry in &self.refs.map {
             callback(&entry.body);
         }
     }
 
+    /// Looks up an object ID by content hash in the digest map.
+    ///
+    /// Returns an error if the reference is not found.
     pub fn lookup(&self, body: &Sha256Digest) -> Result<&ObjectID> {
         match self.refs.lookup(body) {
             Some(id) => Ok(id),

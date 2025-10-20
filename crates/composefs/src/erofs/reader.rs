@@ -20,17 +20,25 @@ use super::{
 };
 use crate::fsverity::FsVerityHashValue;
 
+/// Rounds up a value to the nearest multiple of `to`
 pub fn round_up(n: usize, to: usize) -> usize {
     (n + to - 1) & !(to - 1)
 }
 
+/// Common interface for accessing inode header fields across different layouts
 pub trait InodeHeader {
+    /// Returns the data layout method used by this inode
     fn data_layout(&self) -> DataLayout;
+    /// Returns the extended attribute inode count
     fn xattr_icount(&self) -> u16;
+    /// Returns the file mode
     fn mode(&self) -> ModeField;
+    /// Returns the file size in bytes
     fn size(&self) -> u64;
+    /// Returns the union field value (block address, device number, etc.)
     fn u(&self) -> u32;
 
+    /// Calculates the number of additional bytes after the header
     fn additional_bytes(&self, blkszbits: u8) -> usize {
         let block_size = 1 << blkszbits;
         self.xattr_size()
@@ -41,6 +49,7 @@ pub trait InodeHeader {
             }
     }
 
+    /// Calculates the size of the extended attributes section
     fn xattr_size(&self) -> usize {
         match self.xattr_icount() {
             0 => 0,
@@ -93,55 +102,73 @@ impl InodeHeader for CompactInodeHeader {
     }
 }
 
+/// Extended attribute entry with header and variable-length data
 #[repr(C)]
 #[derive(FromBytes, Immutable, KnownLayout)]
 pub struct XAttr {
+    /// Extended attribute header
     pub header: XAttrHeader,
+    /// Variable-length data containing name suffix and value
     pub data: [u8],
 }
 
+/// Inode structure with header and variable-length data
 #[repr(C)]
 #[derive(FromBytes, Immutable, KnownLayout)]
 pub struct Inode<Header: InodeHeader> {
+    /// Inode header (compact or extended)
     pub header: Header,
+    /// Variable-length data containing xattrs and inline content
     pub data: [u8],
 }
 
+/// Extended attributes section of an inode
 #[repr(C)]
 #[derive(Debug, FromBytes, Immutable, KnownLayout)]
 pub struct InodeXAttrs {
+    /// Extended attributes header
     pub header: InodeXAttrHeader,
+    /// Variable-length data containing shared xattr refs and local xattrs
     pub data: [u8],
 }
 
 impl XAttrHeader {
+    /// Calculates the total size of this xattr including padding
     pub fn calculate_n_elems(&self) -> usize {
         round_up(self.name_len as usize + self.value_size.get() as usize, 4)
     }
 }
 
 impl XAttr {
+    /// Parses an xattr from a byte slice, returning the xattr and remaining bytes
     pub fn from_prefix(data: &[u8]) -> (&XAttr, &[u8]) {
         let header = XAttrHeader::ref_from_bytes(&data[..4]).unwrap();
         Self::ref_from_prefix_with_elems(data, header.calculate_n_elems()).unwrap()
     }
 
+    /// Returns the attribute name suffix
     pub fn suffix(&self) -> &[u8] {
         &self.data[..self.header.name_len as usize]
     }
 
+    /// Returns the attribute value
     pub fn value(&self) -> &[u8] {
         &self.data[self.header.name_len as usize..][..self.header.value_size.get() as usize]
     }
 
+    /// Returns the padding bytes after the value
     pub fn padding(&self) -> &[u8] {
         &self.data[self.header.name_len as usize + self.header.value_size.get() as usize..]
     }
 }
 
+/// Operations on inode data
 pub trait InodeOps {
+    /// Returns the extended attributes section if present
     fn xattrs(&self) -> Option<&InodeXAttrs>;
+    /// Returns the inline data portion
     fn inline(&self) -> &[u8];
+    /// Returns the range of block IDs used by this inode
     fn blocks(&self, blkszbits: u8) -> Range<u64>;
 }
 
@@ -200,9 +227,12 @@ impl<Header: InodeHeader> InodeOps for &Inode<Header> {
 
 // this lets us avoid returning Box<dyn InodeOp> from Image.inode()
 // but ... wow.
+/// Inode type enum allowing static dispatch for different header layouts
 #[derive(Debug)]
 pub enum InodeType<'img> {
+    /// Compact inode with 32-byte header
     Compact(&'img Inode<CompactInodeHeader>),
+    /// Extended inode with 64-byte header
     Extended(&'img Inode<ExtendedInodeHeader>),
 }
 
@@ -266,18 +296,27 @@ impl InodeOps for InodeType<'_> {
     }
 }
 
+/// Parsed EROFS image with references to key structures
 #[derive(Debug)]
 pub struct Image<'i> {
+    /// Raw image bytes
     pub image: &'i [u8],
+    /// Composefs header
     pub header: &'i ComposefsHeader,
+    /// Block size in bits
     pub blkszbits: u8,
+    /// Block size in bytes
     pub block_size: usize,
+    /// Superblock
     pub sb: &'i Superblock,
+    /// Inode metadata region
     pub inodes: &'i [u8],
+    /// Extended attributes region
     pub xattrs: &'i [u8],
 }
 
 impl<'img> Image<'img> {
+    /// Opens an EROFS image from raw bytes
     pub fn open(image: &'img [u8]) -> Self {
         let header = ComposefsHeader::ref_from_prefix(image)
             .expect("header err")
@@ -301,6 +340,7 @@ impl<'img> Image<'img> {
         }
     }
 
+    /// Returns an inode by its ID
     pub fn inode(&self, id: u64) -> InodeType<'_> {
         let inode_data = &self.inodes[id as usize * 32..];
         if inode_data[0] & 1 != 0 {
@@ -326,6 +366,7 @@ impl<'img> Image<'img> {
         }
     }
 
+    /// Returns a shared extended attribute by its ID
     pub fn shared_xattr(&self, id: u32) -> &XAttr {
         let xattr_data = &self.xattrs[id as usize * 4..];
         let header = XAttrHeader::ref_from_bytes(&xattr_data[..4]).unwrap();
@@ -334,18 +375,22 @@ impl<'img> Image<'img> {
             .0
     }
 
+    /// Returns a data block by its ID
     pub fn block(&self, id: u64) -> &[u8] {
         &self.image[id as usize * self.block_size..][..self.block_size]
     }
 
+    /// Returns a data block by its ID as a DataBlock reference
     pub fn data_block(&self, id: u64) -> &DataBlock {
         DataBlock::ref_from_bytes(self.block(id)).unwrap()
     }
 
+    /// Returns a directory block by its ID
     pub fn directory_block(&self, id: u64) -> &DirectoryBlock {
         DirectoryBlock::ref_from_bytes(self.block(id)).unwrap()
     }
 
+    /// Returns the root directory inode
     pub fn root(&self) -> InodeType<'_> {
         self.inode(self.sb.root_nid.get() as u64)
     }
@@ -357,6 +402,7 @@ impl<'img> Image<'img> {
 struct Array<T>([T]);
 
 impl InodeXAttrs {
+    /// Returns the array of shared xattr IDs
     pub fn shared(&self) -> &[U32] {
         &Array::ref_from_prefix_with_elems(&self.data, self.header.shared_count as usize)
             .unwrap()
@@ -364,6 +410,7 @@ impl InodeXAttrs {
              .0
     }
 
+    /// Returns an iterator over local (non-shared) xattrs
     pub fn local(&self) -> XAttrIter<'_> {
         XAttrIter {
             data: &self.data[self.header.shared_count as usize * 4..],
@@ -371,6 +418,7 @@ impl InodeXAttrs {
     }
 }
 
+/// Iterator over local extended attributes
 #[derive(Debug)]
 pub struct XAttrIter<'img> {
     data: &'img [u8],
@@ -390,21 +438,25 @@ impl<'img> Iterator for XAttrIter<'img> {
     }
 }
 
+/// Data block containing file content
 #[repr(C)]
 #[derive(FromBytes, Immutable, KnownLayout)]
 pub struct DataBlock(pub [u8]);
 
+/// Directory block containing directory entries
 #[repr(C)]
 #[derive(FromBytes, Immutable, KnownLayout)]
 pub struct DirectoryBlock(pub [u8]);
 
 impl DirectoryBlock {
+    /// Returns the directory entry header at the given index
     pub fn get_entry_header(&self, n: usize) -> &DirectoryEntryHeader {
         let entry_data = &self.0
             [n * size_of::<DirectoryEntryHeader>()..(n + 1) * size_of::<DirectoryEntryHeader>()];
         DirectoryEntryHeader::ref_from_bytes(entry_data).unwrap()
     }
 
+    /// Returns all directory entry headers as a slice
     pub fn get_entry_headers(&self) -> &[DirectoryEntryHeader] {
         &Array::ref_from_prefix_with_elems(&self.0, self.n_entries())
             .unwrap()
@@ -412,6 +464,7 @@ impl DirectoryBlock {
              .0
     }
 
+    /// Returns the number of entries in this directory block
     pub fn n_entries(&self) -> usize {
         let first = self.get_entry_header(0);
         let offset = first.name_offset.get();
@@ -420,6 +473,7 @@ impl DirectoryBlock {
         offset as usize / 12
     }
 
+    /// Returns an iterator over directory entries
     pub fn entries(&self) -> DirectoryEntries<'_> {
         DirectoryEntries {
             block: self,
@@ -430,9 +484,12 @@ impl DirectoryBlock {
 }
 
 // High-level iterator interface
+/// A single directory entry with header and name
 #[derive(Debug)]
 pub struct DirectoryEntry<'a> {
+    /// Directory entry header
     pub header: &'a DirectoryEntryHeader,
+    /// Entry name
     pub name: &'a [u8],
 }
 
@@ -442,6 +499,7 @@ impl DirectoryEntry<'_> {
     }
 }
 
+/// Iterator over directory entries in a directory block
 #[derive(Debug)]
 pub struct DirectoryEntries<'d> {
     block: &'d DirectoryBlock,
@@ -475,22 +533,29 @@ impl<'d> Iterator for DirectoryEntries<'d> {
     }
 }
 
+/// Errors that can occur when reading EROFS images
 #[derive(Error, Debug)]
 pub enum ErofsReaderError {
+    /// Directory has multiple hard links (not allowed)
     #[error("Hardlinked directories detected")]
     DirectoryHardlinks,
+    /// Directory nesting exceeds maximum depth
     #[error("Maximum directory depth exceeded")]
     DepthExceeded,
+    /// The '.' entry is invalid
     #[error("Invalid '.' entry in directory")]
     InvalidSelfReference,
+    /// The '..' entry is invalid
     #[error("Invalid '..' entry in directory")]
     InvalidParentReference,
+    /// File type in directory entry doesn't match inode
     #[error("File type in dirent doesn't match type in inode")]
     FileTypeMismatch,
 }
 
 type ReadResult<T> = Result<T, ErofsReaderError>;
 
+/// Collects object references from an EROFS image for garbage collection
 #[derive(Debug)]
 pub struct ObjectCollector<ObjectID: FsVerityHashValue> {
     visited_nids: HashSet<u64>,
@@ -558,6 +623,12 @@ impl<ObjectID: FsVerityHashValue> ObjectCollector<ObjectID> {
     }
 }
 
+/// Collects all object references from an EROFS image
+///
+/// This function walks the directory tree and extracts fsverity object IDs
+/// from overlay.metacopy xattrs for garbage collection purposes.
+///
+/// Returns a set of all referenced object IDs.
 pub fn collect_objects<ObjectID: FsVerityHashValue>(image: &[u8]) -> ReadResult<HashSet<ObjectID>> {
     let img = Image::open(image);
     let mut this = ObjectCollector {

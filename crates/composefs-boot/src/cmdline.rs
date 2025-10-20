@@ -35,6 +35,16 @@ pub fn get_cmdline_value<'a>(cmdline: &'a str, prefix: &str) -> Option<&'a str> 
     split_cmdline(cmdline).find_map(|item| item.strip_prefix(prefix))
 }
 
+/// Extracts and parses the composefs= parameter from a kernel command line.
+///
+/// # Arguments
+///
+/// * `cmdline` - The kernel command line string
+///
+/// # Returns
+///
+/// A tuple of (hash, insecure_flag) where the hash is the composefs object ID
+/// and insecure_flag indicates whether the '?' prefix was present (making verification optional)
 pub fn get_cmdline_composefs<ObjectID: FsVerityHashValue>(
     cmdline: &str,
 ) -> Result<(ObjectID, bool)> {
@@ -46,6 +56,16 @@ pub fn get_cmdline_composefs<ObjectID: FsVerityHashValue>(
     }
 }
 
+/// Creates a composefs= kernel command line argument.
+///
+/// # Arguments
+///
+/// * `id` - The composefs object ID as a hex string
+/// * `insecure` - If true, prepends '?' to make fs-verity verification optional
+///
+/// # Returns
+///
+/// A string like "composefs=abc123" or "composefs=?abc123" (if insecure)
 pub fn make_cmdline_composefs(id: &str, insecure: bool) -> String {
     match insecure {
         true => format!("composefs=?{id}"),

@@ -45,6 +45,10 @@ fn dequote(value: &str) -> Option<String> {
     Some(result)
 }
 
+/// Parsed os-release file information.
+///
+/// Contains key-value pairs from an os-release file with methods to extract
+/// common fields like PRETTY_NAME and VERSION_ID.
 #[derive(Debug)]
 pub struct OsReleaseInfo<'a> {
     map: HashMap<&'a str, &'a str>,

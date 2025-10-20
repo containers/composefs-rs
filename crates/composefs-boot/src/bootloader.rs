@@ -49,24 +49,56 @@ fn substr_range(parent: &str, substr: &str) -> Option<Range<usize>> {
     }
 }
 
+/// Represents a parsed Boot Loader Specification entry file.
+///
+/// Contains the lines of a BLS .conf file and provides methods to query and modify
+/// entries like kernel paths, initrd files, and command-line options.
 #[derive(Debug)]
 pub struct BootLoaderEntryFile {
+    /// Lines from the bootloader entry configuration file
     pub lines: Vec<String>,
 }
 
 impl BootLoaderEntryFile {
+    /// Creates a new bootloader entry file by parsing the content.
+    ///
+    /// # Arguments
+    ///
+    /// * `content` - The text content of the BLS entry file
+    ///
+    /// # Returns
+    ///
+    /// A new `BootLoaderEntryFile` with lines split on newlines
     pub fn new(content: &str) -> Self {
         Self {
             lines: content.split_terminator('\n').map(String::from).collect(),
         }
     }
 
+    /// Returns an iterator over all values for a given key in the entry file.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to search for (e.g., "initrd", "options")
+    ///
+    /// # Returns
+    ///
+    /// An iterator yielding the value portion of each matching line
     pub fn get_values<'a>(&'a self, key: &'a str) -> impl Iterator<Item = &'a str> + 'a {
         self.lines
             .iter()
             .filter_map(|line| strip_ble_key(line, key))
     }
 
+    /// Returns the first value for a given key in the entry file.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to search for (e.g., "linux", "title")
+    ///
+    /// # Returns
+    ///
+    /// The value portion of the first matching line, or None if not found
     pub fn get_value(&self, key: &str) -> Option<&str> {
         self.lines.iter().find_map(|line| strip_ble_key(line, key))
     }
@@ -120,20 +152,31 @@ impl BootLoaderEntryFile {
     }
 }
 
+/// Represents a Boot Loader Specification Type 1 entry.
+///
+/// Type 1 entries have separate kernel and initrd files referenced from a .conf file.
+/// This structure contains both the parsed configuration and the actual file objects.
 #[derive(Debug)]
 pub struct Type1Entry<ObjectID: FsVerityHashValue> {
-    /// This is the basename of the bootloader entry .conf file
+    /// The basename of the bootloader entry .conf file
     pub filename: Box<OsStr>,
+    /// The parsed bootloader entry configuration
     pub entry: BootLoaderEntryFile,
+    /// Map of file paths to their corresponding file objects (kernel, initrd, etc.)
     pub files: HashMap<Box<str>, RegularFile<ObjectID>>,
 }
 
 impl<ObjectID: FsVerityHashValue> Type1Entry<ObjectID> {
-    // Relocates boot resources.
-    //
-    // This is a bit of a strange operation: for each file mentioned in the bootloader entry, move
-    // the file into the given 'entry_id' pathname and rename the entry file itself to
-    // "{entry_id}.conf".
+    /// Relocates boot resources to a new entry ID directory.
+    ///
+    /// This moves all referenced files (kernel, initrd, etc.) into a directory named after
+    /// the entry_id and updates the entry configuration to match. The entry file itself is
+    /// renamed to "{entry_id}.conf".
+    ///
+    /// # Arguments
+    ///
+    /// * `boot_subdir` - Optional subdirectory to prepend to paths in the entry file
+    /// * `entry_id` - The new entry identifier to use for the directory and filename
     pub fn relocate(&mut self, boot_subdir: Option<&str>, entry_id: &str) {
         self.filename = Box::from(format!("{entry_id}.conf").as_ref());
         for line in &mut self.entry.lines {
@@ -165,6 +208,21 @@ impl<ObjectID: FsVerityHashValue> Type1Entry<ObjectID> {
         }
     }
 
+    /// Loads a Type 1 boot entry from a BLS .conf file.
+    ///
+    /// Parses the configuration file and loads all referenced boot resources (kernel, initrd, etc.)
+    /// from the filesystem.
+    ///
+    /// # Arguments
+    ///
+    /// * `filename` - Name of the .conf file
+    /// * `file` - The configuration file object
+    /// * `root` - Root directory of the filesystem
+    /// * `repo` - The composefs repository
+    ///
+    /// # Returns
+    ///
+    /// A fully loaded Type1Entry with all referenced files
     pub fn load(
         filename: &OsStr,
         file: &RegularFile<ObjectID>,
@@ -188,6 +246,16 @@ impl<ObjectID: FsVerityHashValue> Type1Entry<ObjectID> {
         })
     }
 
+    /// Loads all Type 1 boot entries from /boot/loader/entries.
+    ///
+    /// # Arguments
+    ///
+    /// * `root` - Root directory of the filesystem
+    /// * `repo` - The composefs repository
+    ///
+    /// # Returns
+    ///
+    /// A vector of all Type1Entry objects found in /boot/loader/entries
     pub fn load_all(root: &Directory<ObjectID>, repo: &Repository<ObjectID>) -> Result<Vec<Self>> {
         let mut entries = vec![];
 
@@ -217,27 +285,44 @@ impl<ObjectID: FsVerityHashValue> Type1Entry<ObjectID> {
     }
 }
 
+/// File extension for EFI executables
 pub const EFI_EXT: &str = ".efi";
+/// Directory extension for UKI addon directories
 pub const EFI_ADDON_DIR_EXT: &str = ".efi.extra.d";
+/// File extension for UKI addon files
 pub const EFI_ADDON_FILE_EXT: &str = ".addon.efi";
 
+/// Type of Portable Executable (PE) file for boot.
 #[derive(Debug)]
 pub enum PEType {
+    /// A Unified Kernel Image
     Uki,
+    /// A UKI addon extension
     UkiAddon,
 }
 
+/// Represents a Boot Loader Specification Type 2 entry (Unified Kernel Image).
+///
+/// Type 2 entries are UKI files that bundle the kernel, initrd, and other components
+/// into a single EFI executable.
 #[derive(Debug)]
 pub struct Type2Entry<ObjectID: FsVerityHashValue> {
+    /// Kernel version string, if found in /usr/lib/modules
     pub kver: Option<Box<OsStr>>,
-    // This is the path (relative to /boot/EFI/Linux) of the file
+    /// Path to the file (relative to /boot/EFI/Linux)
     pub file_path: PathBuf,
-    // The Portable Executable binary
+    /// The Portable Executable binary
     pub file: RegularFile<ObjectID>,
+    /// Type of PE file (UKI or UKI addon)
     pub pe_type: PEType,
 }
 
 impl<ObjectID: FsVerityHashValue> Type2Entry<ObjectID> {
+    /// Renames the UKI file to a new name.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - New base name (without .efi extension)
     pub fn rename(&mut self, name: &str) {
         let new_name = format!("{name}.efi");
 
@@ -298,6 +383,15 @@ impl<ObjectID: FsVerityHashValue> Type2Entry<ObjectID> {
         Ok(())
     }
 
+    /// Loads all Type 2 boot entries from /boot/EFI/Linux and /usr/lib/modules.
+    ///
+    /// # Arguments
+    ///
+    /// * `root` - Root directory of the filesystem
+    ///
+    /// # Returns
+    ///
+    /// A vector of all Type2Entry objects found
     pub fn load_all(root: &Directory<ObjectID>) -> Result<Vec<Self>> {
         let mut entries = vec![];
 
@@ -332,15 +426,32 @@ impl<ObjectID: FsVerityHashValue> Type2Entry<ObjectID> {
     }
 }
 
+/// Represents a traditional vmlinuz/initramfs pair from /usr/lib/modules.
+///
+/// This is for kernels found in /usr/lib/modules/{kver}/ that have a vmlinuz
+/// and optionally an initramfs.img file.
 #[derive(Debug)]
 pub struct UsrLibModulesVmlinuz<ObjectID: FsVerityHashValue> {
+    /// Kernel version string (directory name in /usr/lib/modules)
     pub kver: Box<str>,
+    /// The kernel image file
     pub vmlinuz: RegularFile<ObjectID>,
+    /// Optional initramfs image
     pub initramfs: Option<RegularFile<ObjectID>>,
+    /// Optional os-release file from /usr/lib/os-release
     pub os_release: Option<RegularFile<ObjectID>>,
 }
 
 impl<ObjectID: FsVerityHashValue> UsrLibModulesVmlinuz<ObjectID> {
+    /// Converts this vmlinuz entry into a Type 1 BLS entry.
+    ///
+    /// # Arguments
+    ///
+    /// * `entry_id` - Optional entry ID to use; defaults to kernel version
+    ///
+    /// # Returns
+    ///
+    /// A Type1Entry with generated BLS configuration
     pub fn into_type1(self, entry_id: Option<&str>) -> Type1Entry<ObjectID> {
         let id = entry_id.unwrap_or(&self.kver);
 
@@ -370,6 +481,15 @@ initrd /{id}/initramfs.img
         }
     }
 
+    /// Loads all vmlinuz entries from /usr/lib/modules.
+    ///
+    /// # Arguments
+    ///
+    /// * `root` - Root directory of the filesystem
+    ///
+    /// # Returns
+    ///
+    /// A vector of all UsrLibModulesVmlinuz entries found
     pub fn load_all(root: &Directory<ObjectID>) -> Result<Vec<Self>> {
         let mut entries = vec![];
 
@@ -402,13 +522,34 @@ initrd /{id}/initramfs.img
     }
 }
 
+/// Represents any type of boot entry found in the filesystem.
+///
+/// This enum unifies the three types of boot entries that can be discovered:
+/// Type 1 BLS entries, Type 2 UKIs, and traditional vmlinuz/initramfs pairs.
 #[derive(Debug)]
 pub enum BootEntry<ObjectID: FsVerityHashValue> {
+    /// Boot Loader Specification Type 1 entry
     Type1(Type1Entry<ObjectID>),
+    /// Boot Loader Specification Type 2 entry (UKI)
     Type2(Type2Entry<ObjectID>),
+    /// Traditional vmlinuz from /usr/lib/modules
     UsrLibModulesVmLinuz(UsrLibModulesVmlinuz<ObjectID>),
 }
 
+/// Extracts all boot resources from a filesystem image.
+///
+/// Scans the filesystem for all types of boot entries: Type 1 BLS entries in
+/// /boot/loader/entries, Type 2 UKIs in /boot/EFI/Linux, and traditional vmlinuz
+/// files in /usr/lib/modules.
+///
+/// # Arguments
+///
+/// * `image` - The filesystem to scan
+/// * `repo` - The composefs repository
+///
+/// # Returns
+///
+/// A vector containing all boot entries found in the filesystem
 pub fn get_boot_resources<ObjectID: FsVerityHashValue>(
     image: &FileSystem<ObjectID>,
     repo: &Repository<ObjectID>,

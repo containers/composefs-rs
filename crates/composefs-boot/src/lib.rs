@@ -38,7 +38,23 @@ use crate::bootloader::{get_boot_resources, BootEntry};
 /// here we can just ignore it.
 const REQUIRED_TOPLEVEL_TO_EMPTY_DIRS: &[&str] = &["boot", "sysroot"];
 
+/// Trait for transforming filesystem images for boot scenarios.
+///
+/// This trait provides functionality to prepare composefs filesystem images for booting by
+/// extracting boot resources and applying necessary transformations like SELinux labeling.
 pub trait BootOps<ObjectID: FsVerityHashValue> {
+    /// Transforms a filesystem image for boot by extracting boot entries and applying SELinux labels.
+    ///
+    /// This method extracts boot resources from the filesystem, empties required top-level
+    /// directories (/boot, /sysroot), and applies SELinux security contexts.
+    ///
+    /// # Arguments
+    ///
+    /// * `repo` - The composefs repository containing filesystem objects
+    ///
+    /// # Returns
+    ///
+    /// A vector of boot entries extracted from the filesystem (Type 1 BLS entries, Type 2 UKIs, etc.)
     fn transform_for_boot(
         &mut self,
         repo: &Repository<ObjectID>,

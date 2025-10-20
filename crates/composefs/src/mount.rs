@@ -22,12 +22,27 @@ use crate::{
     util::proc_self_fd,
 };
 
+/// A handle to a filesystem context created via the modern mount API.
+///
+/// This represents an open filesystem context (created by `fsopen()`) that can be
+/// configured and then mounted. The handle automatically reads and prints any
+/// error messages from the kernel when dropped.
 #[derive(Debug)]
 pub struct FsHandle {
+    /// The file descriptor for the filesystem context.
     pub fd: OwnedFd,
 }
 
 impl FsHandle {
+    /// Opens a new filesystem context for the specified filesystem type.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name of the filesystem type (e.g., "erofs", "overlay")
+    ///
+    /// # Returns
+    ///
+    /// Returns a new `FsHandle` that can be configured and mounted.
     pub fn open(name: &str) -> Result<FsHandle> {
         Ok(FsHandle {
             fd: fsopen(name, FsOpenFlags::FSOPEN_CLOEXEC)?,
@@ -54,6 +69,17 @@ impl Drop for FsHandle {
     }
 }
 
+/// Moves a mounted filesystem to a target location.
+///
+/// # Arguments
+///
+/// * `fs_fd` - File descriptor for the mounted filesystem (from `fsmount()`)
+/// * `dirfd` - Directory file descriptor for the target mount point
+/// * `path` - Path relative to `dirfd` where the filesystem should be mounted
+///
+/// # Returns
+///
+/// Returns `Ok(())` on success, or an error if the mount operation fails.
 pub fn mount_at(
     fs_fd: impl AsFd,
     dirfd: impl AsFd,
@@ -68,6 +94,19 @@ pub fn mount_at(
     )
 }
 
+/// Mounts an erofs image file.
+///
+/// Creates a read-only erofs mount from the provided image file descriptor.
+/// On older kernels, this may involve creating a loopback device.
+///
+/// # Arguments
+///
+/// * `image` - File descriptor for the erofs image file
+///
+/// # Returns
+///
+/// Returns a file descriptor for the mounted filesystem, which can be used with
+/// `mount_at()` or other mount operations.
 pub fn erofs_mount(image: OwnedFd) -> Result<OwnedFd> {
     let image = make_erofs_mountable(image)?;
     let erofs = FsHandle::open("erofs")?;
@@ -81,6 +120,23 @@ pub fn erofs_mount(image: OwnedFd) -> Result<OwnedFd> {
     )?)
 }
 
+/// Creates a composefs mount using overlayfs with an erofs image and base directory.
+///
+/// This mounts a composefs image by creating an overlayfs that layers the erofs image
+/// (as the lower layer) over a base directory (as the data layer). The overlayfs is
+/// configured with metacopy and redirect_dir enabled for composefs functionality.
+///
+/// # Arguments
+///
+/// * `image` - File descriptor for the composefs erofs image
+/// * `name` - Name for the mount source (appears as "composefs:{name}")
+/// * `basedir` - File descriptor for the base directory containing the actual file data
+/// * `enable_verity` - Whether to require fs-verity verification for all files
+///
+/// # Returns
+///
+/// Returns a file descriptor for the mounted composefs filesystem, which can be used
+/// with `mount_at()` to attach it to a mount point.
 pub fn composefs_fsmount(
     image: OwnedFd,
     name: &str,

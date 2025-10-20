@@ -27,27 +27,44 @@ use crate::util::proc_self_fd;
 /// Measuring fsverity failed.
 #[derive(Error, Debug)] // can't derive PartialEq because of std::io::Error
 pub enum MeasureVerityError {
+    /// I/O operation failed.
     #[error("{0}")]
     Io(#[from] Error),
+    /// fs-verity is not enabled on the file.
     #[error("fs-verity is not enabled on file")]
     VerityMissing,
-    #[error("fs-verity is not support by filesystem")]
+    /// The filesystem does not support fs-verity.
+    #[error("fs-verity is not supported by filesystem")]
     FilesystemNotSupported,
+    /// The hash algorithm does not match the expected algorithm.
     #[error("Expected algorithm {expected}, found {found}")]
-    InvalidDigestAlgorithm { expected: u16, found: u16 },
+    InvalidDigestAlgorithm {
+        /// The expected algorithm identifier.
+        expected: u16,
+        /// The actual algorithm identifier found.
+        found: u16,
+    },
+    /// The digest size does not match the expected size.
     #[error("Expected digest size {expected}")]
-    InvalidDigestSize { expected: u16 },
+    InvalidDigestSize {
+        /// The expected digest size in bytes.
+        expected: u16,
+    },
 }
 
 /// Enabling fsverity failed.
 #[derive(Error, Debug)]
 pub enum EnableVerityError {
+    /// I/O operation failed.
     #[error("{0}")]
     Io(#[from] Error),
+    /// The filesystem does not support fs-verity.
     #[error("Filesystem does not support fs-verity")]
     FilesystemNotSupported,
+    /// fs-verity is already enabled on the file.
     #[error("fs-verity is already enabled on file")]
     AlreadyEnabled,
+    /// The file has an open writable file descriptor.
     #[error("File is opened for writing")]
     FileOpenedForWrite,
 }
@@ -55,10 +72,17 @@ pub enum EnableVerityError {
 /// A verity comparison failed.
 #[derive(Error, Debug)]
 pub enum CompareVerityError {
+    /// Failed to measure the fs-verity digest.
     #[error("failed to read verity")]
     Measure(#[from] MeasureVerityError),
+    /// The measured digest does not match the expected digest.
     #[error("Expected digest {expected} but found {found}")]
-    DigestMismatch { expected: String, found: String },
+    DigestMismatch {
+        /// The expected digest as a hex string.
+        expected: String,
+        /// The actual digest found as a hex string.
+        found: String,
+    },
 }
 
 /// Compute the fs-verity digest for a given block of data, in userspace.
