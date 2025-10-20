@@ -60,6 +60,12 @@ fn ensure_dir_and_openat(dirfd: impl AsFd, filename: &str, flags: OFlags) -> Err
     }
 }
 
+/// A content-addressable repository for composefs objects.
+///
+/// Stores content-addressed objects, splitstreams, and images with fsverity
+/// verification. Objects are stored by their fsverity digest, streams by SHA256
+/// content hash, and both support named references for persistence across
+/// garbage collection.
 #[derive(Debug)]
 pub struct Repository<ObjectID: FsVerityHashValue> {
     repository: OwnedFd,
@@ -119,6 +125,10 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         })
     }
 
+    /// Asynchronously ensures an object exists in the repository.
+    ///
+    /// Same as `ensure_object` but runs the operation on a blocking thread pool
+    /// to avoid blocking async tasks. Returns the fsverity digest of the object.
     pub async fn ensure_object_async(self: &Arc<Self>, data: Vec<u8>) -> Result<ObjectID> {
         let self_ = Arc::clone(self);
         tokio::task::spawn_blocking(move || self_.ensure_object(&data)).await?
@@ -418,6 +428,11 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         self.open_with_verity(&Self::format_object_path(id), id)
     }
 
+    /// Merges a splitstream into a single continuous stream.
+    ///
+    /// Opens the named splitstream, resolves all object references, and writes
+    /// the complete merged content to the provided writer. Optionally verifies
+    /// the splitstream's fsverity digest matches the expected value.
     pub fn merge_splitstream(
         &self,
         name: &str,
@@ -515,6 +530,11 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         )?)
     }
 
+    /// Creates a relative symlink within the repository.
+    ///
+    /// Computes the correct relative path from the symlink location to the target,
+    /// creating any necessary intermediate directories. Atomically replaces any
+    /// existing symlink at the specified name.
     pub fn symlink(&self, name: impl AsRef<Path>, target: impl AsRef<Path>) -> ErrnoResult<()> {
         let name = name.as_ref();
 

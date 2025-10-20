@@ -21,6 +21,13 @@ use composefs::{
 
 use crate::tar::{TarEntry, TarItem};
 
+/// Processes a single tar entry and adds it to the filesystem.
+///
+/// Handles various tar entry types (regular files, directories, symlinks, hardlinks, devices, fifos)
+/// and implements overlayfs whiteout semantics for proper layer merging. Files named `.wh.<name>`
+/// delete the corresponding file, and `.wh..wh.opq` marks a directory as opaque (clearing all contents).
+///
+/// Returns an error if the entry cannot be processed or added to the filesystem.
 pub fn process_entry<ObjectID: FsVerityHashValue>(
     filesystem: &mut FileSystem<ObjectID>,
     entry: TarEntry<ObjectID>,

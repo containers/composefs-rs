@@ -1,3 +1,5 @@
+//! Tests for mkfs
+
 use std::{
     cell::RefCell,
     collections::BTreeMap,

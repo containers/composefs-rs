@@ -398,6 +398,9 @@ fn addto<T: Clone + Eq + Ord>(map: &mut BTreeMap<T, usize>, key: &T, count: usiz
     }
 }
 
+/// Dumps unassigned or padding regions in the image
+///
+/// Distinguishes between zero-filled padding and unknown content.
 pub fn dump_unassigned(
     output: &mut impl std::io::Write,
     offset: usize,
@@ -421,6 +424,10 @@ pub fn dump_unassigned(
     Ok(())
 }
 
+/// Dumps a detailed debug view of an EROFS image
+///
+/// Walks the entire image structure, outputting formatted information about
+/// all inodes, blocks, xattrs, and padding. Also produces space usage statistics.
 pub fn debug_img(output: &mut impl std::io::Write, data: &[u8]) -> Result<()> {
     let image = Image::open(data);
     let visited = ImageVisitor::visit_image(&image);

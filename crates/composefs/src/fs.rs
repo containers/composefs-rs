@@ -135,7 +135,11 @@ fn write_directory_contents<ObjectID: FsVerityHashValue>(
     Ok(())
 }
 
-// NB: hardlinks not supported
+/// Writes a directory tree from composefs representation to a filesystem path.
+///
+/// Reconstructs the filesystem structure at the specified output directory,
+/// creating directories, files, symlinks, and device nodes as needed. External
+/// file content is read from the repository. Note that hardlinks are not supported.
 pub fn write_to_path<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     dir: &Directory<ObjectID>,
@@ -145,6 +149,10 @@ pub fn write_to_path<ObjectID: FsVerityHashValue>(
     write_directory_contents(dir, &fd, repo)
 }
 
+/// Helper for reading filesystem trees from disk into composefs representation.
+///
+/// Tracks hardlinks via inode numbers and handles integration with repositories
+/// for storing large file content.
 #[derive(Debug)]
 pub struct FilesystemReader<'repo, ObjectID: FsVerityHashValue> {
     repo: Option<&'repo Repository<ObjectID>>,
@@ -268,6 +276,11 @@ impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
         }
     }
 
+    /// Reads a directory from disk into composefs representation.
+    ///
+    /// Recursively reads directory contents, tracking hardlinks and optionally
+    /// reading the directory's own metadata. Large files are stored in the repository
+    /// if one was provided.
     pub fn read_directory(
         &mut self,
         dirfd: impl AsFd,

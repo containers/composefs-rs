@@ -18,7 +18,7 @@ use std::{
 /// either be a freshly-created mount or a O_PATH file descriptor.  On 6.15 kernels this can be
 /// done by directly calling `fsconfig_set_fd()`.  On pre-6.15 kernels, it needs to be done by
 /// reopening the file descriptor `O_RDONLY` and calling `fsconfig_set_fd()` because `O_PATH` fds
-/// are rejecdted.  On very old kernels this needs to be done by way of `fsconfig_set_string()` and
+/// are rejected.  On very old kernels this needs to be done by way of `fsconfig_set_string()` and
 /// `/proc/self/fd/`.
 #[cfg(not(feature = "pre-6.15"))]
 pub fn overlayfs_set_fd(fs_fd: BorrowedFd, key: &str, fd: BorrowedFd) -> rustix::io::Result<()> {
@@ -62,6 +62,10 @@ pub fn prepare_mount(mnt_fd: OwnedFd) -> Result<impl AsFd> {
 }
 
 // Now: support for pre-6.15 kernels
+/// Sets one of the "dir" mount options on an overlayfs to the given file descriptor.
+///
+/// On pre-6.15 kernels, this implementation reopens O_PATH file descriptors as O_RDONLY
+/// before passing them to `fsconfig_set_fd()` because O_PATH fds are rejected by the kernel.
 #[cfg(feature = "pre-6.15")]
 #[cfg(not(feature = "rhel9"))]
 pub fn overlayfs_set_fd(fs_fd: BorrowedFd, key: &str, fd: BorrowedFd) -> rustix::io::Result<()> {
@@ -82,12 +86,20 @@ pub fn overlayfs_set_fd(fs_fd: BorrowedFd, key: &str, fd: BorrowedFd) -> rustix:
     )
 }
 
-// Required for rhel9: can't set fds directly
+/// Sets one of the "dir" mount options on an overlayfs to the given file descriptor.
+///
+/// On RHEL9 kernels, file descriptors cannot be set directly, so this implementation
+/// uses `fsconfig_set_string()` with a `/proc/self/fd/` path instead.
 #[cfg(feature = "rhel9")]
 pub fn overlayfs_set_fd(fs_fd: BorrowedFd, key: &str, fd: BorrowedFd) -> rustix::io::Result<()> {
-    rustix::mount::fsconfig_set_string(fs_fd, key, crate::util::proc_self_fd(&fd))
+    rustix::mount::fsconfig_set_string(fs_fd, key, crate::util::proc_self_fd(fd))
 }
 
+/// Sets the "lowerdir+" and "datadir+" mount options of an overlayfs mount to the provided file
+/// descriptors.
+///
+/// On RHEL9 kernels, this constructs a `lowerdir` string using `/proc/self/fd/` paths and
+/// sets it via `fsconfig_set_string()` because file descriptors cannot be set directly.
 #[cfg(feature = "rhel9")]
 pub fn overlayfs_set_lower_and_data_fds(
     fs_fd: impl AsFd,
@@ -106,11 +118,20 @@ pub fn overlayfs_set_lower_and_data_fds(
     rustix::mount::fsconfig_set_string(fs_fd.as_fd(), "lowerdir", arg)
 }
 
+/// Prepares a mounted filesystem for further use.
+///
+/// On pre-6.15 kernels, this mounts the filesystem to a temporary directory and returns
+/// an O_PATH file descriptor to it. The temporary mount is automatically cleaned up when
+/// the returned value is dropped.
 #[cfg(feature = "pre-6.15")]
 pub fn prepare_mount(mnt_fd: OwnedFd) -> Result<impl AsFd> {
     tmpmount::TmpMount::mount(mnt_fd)
 }
 
+/// Prepares an open erofs image file for mounting.
+///
+/// On RHEL9 kernels (before 6.12), this creates a loopback device because erofs
+/// cannot directly mount files on these older kernels.
 #[cfg(feature = "rhel9")]
 pub fn make_erofs_mountable(image: OwnedFd) -> Result<OwnedFd> {
     loopback::loopify(image)

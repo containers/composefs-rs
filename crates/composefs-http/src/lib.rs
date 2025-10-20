@@ -237,6 +237,30 @@ impl<ObjectID: FsVerityHashValue> Downloader<ObjectID> {
     }
 }
 
+/// Downloads a composefs splitstream and all its dependencies from an HTTP server.
+///
+/// This function fetches a named splitstream from the specified HTTP URL, recursively
+/// downloads all referenced splitstreams and objects, and verifies their integrity using
+/// fsverity checksums. Downloaded objects are stored in the provided repository.
+///
+/// # Parameters
+///
+/// * `url` - The base HTTP URL where the splitstream repository is hosted
+/// * `name` - The name of the splitstream to download (located under `streams/` on the server)
+/// * `repo` - The repository where downloaded objects will be stored
+///
+/// # Returns
+///
+/// Returns a tuple containing the SHA-256 digest of the splitstream's content and its
+/// fsverity object ID.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The HTTP request fails or returns a non-success status
+/// - Downloaded objects have mismatched fsverity checksums
+/// - Splitstream references contain inconsistent content hashes
+/// - Any I/O operation fails during object storage
 pub async fn download<ObjectID: FsVerityHashValue>(
     url: &str,
     name: &str,

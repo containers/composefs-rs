@@ -61,18 +61,29 @@ struct SectionHeader {
     characteristics: U32,
 }
 
+/// Errors that can occur when parsing UKI files.
 #[derive(Debug, Error, PartialEq)]
 pub enum UkiError {
+    /// The file is not a valid Portable Executable (PE/EFI) format
     #[error("UKI is not valid EFI executable")]
     PortableExecutableError,
+    /// A required PE section is missing from the UKI
     #[error("UKI doesn't contain a '{0}' section")]
     MissingSection(&'static str),
+    /// A PE section contains invalid UTF-8
     #[error("UKI section '{0}' is not UTF-8")]
     UnicodeError(&'static str),
+    /// The .osrel section lacks name information
     #[error("No name information found in .osrel section")]
     NoName,
 }
 
+/// Extracts a text section from a UKI PE file by name.
+///
+/// Parses the PE file format to locate and extract the contents of a named
+/// text section (e.g., ".osrel", ".cmdline"). Returns None if the PE format
+/// is invalid, Some(Ok) with the text content if found and valid UTF-8, or
+/// Some(Err) with the specific error.
 // We use `None` as a way to say `Err(UkiError::PortableExecutableError)` for two reasons:
 //   - .get(..) returns Option<> and using `?` with that is extremely convenient
 //   - the error types returned from FromBytes can't be used with `?` because they try to return a

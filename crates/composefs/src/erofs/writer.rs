@@ -694,6 +694,13 @@ impl Output for FirstPass {
     }
 }
 
+/// Creates an EROFS filesystem image from a composefs tree
+///
+/// This function performs a two-pass generation:
+/// 1. First pass determines the layout and sizes of all structures
+/// 2. Second pass writes the actual image data
+///
+/// Returns the complete EROFS image as a byte array.
 pub fn mkfs_erofs<ObjectID: FsVerityHashValue>(fs: &tree::FileSystem<ObjectID>) -> Box<[u8]> {
     // Create the intermediate representation: flattened inodes and shared xattrs
     let mut inodes = InodeCollector::collect(fs);

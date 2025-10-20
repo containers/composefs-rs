@@ -10,6 +10,10 @@ use hex::FromHexError;
 use sha2::{digest::FixedOutputReset, digest::Output, Digest, Sha256, Sha512};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
+/// Trait for fs-verity hash value types supporting SHA-256 and SHA-512.
+///
+/// This trait defines the interface for hash values used in fs-verity operations,
+/// including serialization to/from hex strings and object store pathnames.
 pub trait FsVerityHashValue
 where
     Self: Clone,
@@ -19,17 +23,40 @@ where
     Self: fmt::Debug,
     Self: Send + Sync + Unpin + 'static,
 {
+    /// The underlying hash digest algorithm type.
     type Digest: Digest + FixedOutputReset + fmt::Debug;
+    /// The fs-verity algorithm identifier (1 for SHA-256, 2 for SHA-512).
     const ALGORITHM: u8;
+    /// An empty hash value with all bytes set to zero.
     const EMPTY: Self;
+    /// The algorithm identifier string ("sha256" or "sha512").
     const ID: &str;
 
+    /// Parse a hash value from a hexadecimal string.
+    ///
+    /// # Arguments
+    /// * `hex` - A hexadecimal string representation of the hash
+    ///
+    /// # Returns
+    /// The parsed hash value, or an error if the input is invalid.
     fn from_hex(hex: impl AsRef<[u8]>) -> Result<Self, FromHexError> {
         let mut value = Self::EMPTY;
         hex::decode_to_slice(hex.as_ref(), value.as_mut_bytes())?;
         Ok(value)
     }
 
+    /// Parse a hash value from an object store directory number and basename.
+    ///
+    /// Object stores typically use a two-level hierarchy where the first byte
+    /// of the hash determines the directory name and the remaining bytes form
+    /// the basename.
+    ///
+    /// # Arguments
+    /// * `dirnum` - The directory number (first byte of the hash)
+    /// * `basename` - The hexadecimal basename (remaining bytes)
+    ///
+    /// # Returns
+    /// The parsed hash value, or an error if the input is invalid.
     fn from_object_dir_and_basename(
         dirnum: u8,
         basename: impl AsRef<[u8]>,
@@ -45,6 +72,16 @@ where
         Ok(result)
     }
 
+    /// Parse a hash value from a full object pathname.
+    ///
+    /// Parses a pathname in the format "xx/yyyyyy" where "xxyyyyyy" is the
+    /// full hexadecimal hash. The prefix before the two-level hierarchy is ignored.
+    ///
+    /// # Arguments
+    /// * `pathname` - The object pathname (e.g., "ab/cdef1234...")
+    ///
+    /// # Returns
+    /// The parsed hash value, or an error if the input is invalid.
     fn from_object_pathname(pathname: impl AsRef<[u8]>) -> Result<Self, FromHexError> {
         // We want to the trailing part of "....../xx/yyyyyy" where xxyyyyyy is our hex length
         let min_size = 2 * size_of::<Self>() + 1;
@@ -66,6 +103,13 @@ where
         Ok(result)
     }
 
+    /// Convert the hash value to an object pathname.
+    ///
+    /// Formats the hash as "xx/yyyyyy" where xx is the first byte in hex
+    /// and yyyyyy is the remaining bytes in hex.
+    ///
+    /// # Returns
+    /// A string in object pathname format.
     fn to_object_pathname(&self) -> String {
         format!(
             "{:02x}/{}",
@@ -74,14 +118,28 @@ where
         )
     }
 
+    /// Convert the hash value to an object directory name.
+    ///
+    /// Returns just the first byte of the hash as a two-character hex string.
+    ///
+    /// # Returns
+    /// A string representing the directory name.
     fn to_object_dir(&self) -> String {
         format!("{:02x}", self.as_bytes()[0])
     }
 
+    /// Convert the hash value to a hexadecimal string.
+    ///
+    /// # Returns
+    /// The full hash as a hex string.
     fn to_hex(&self) -> String {
         hex::encode(self.as_bytes())
     }
 
+    /// Convert the hash value to an identifier string with algorithm prefix.
+    ///
+    /// # Returns
+    /// A string in the format "algorithm:hexhash" (e.g., "sha256:abc123...").
     fn to_id(&self) -> String {
         format!("{}:{}", Self::ID, self.to_hex())
     }
@@ -99,6 +157,9 @@ impl fmt::Debug for Sha512HashValue {
     }
 }
 
+/// A SHA-256 hash value for fs-verity operations.
+///
+/// This is a 32-byte hash value using the SHA-256 algorithm.
 #[derive(Clone, Eq, FromBytes, Hash, Immutable, IntoBytes, KnownLayout, PartialEq, Unaligned)]
 #[repr(C)]
 pub struct Sha256HashValue([u8; 32]);
@@ -116,6 +177,9 @@ impl FsVerityHashValue for Sha256HashValue {
     const ID: &str = "sha256";
 }
 
+/// A SHA-512 hash value for fs-verity operations.
+///
+/// This is a 64-byte hash value using the SHA-512 algorithm.
 #[derive(Clone, Eq, FromBytes, Hash, Immutable, IntoBytes, KnownLayout, PartialEq, Unaligned)]
 #[repr(C)]
 pub struct Sha512HashValue([u8; 64]);

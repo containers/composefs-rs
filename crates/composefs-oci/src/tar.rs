@@ -84,6 +84,13 @@ pub fn split(
     Ok(())
 }
 
+/// Asynchronously splits a tar archive into a composefs split stream.
+///
+/// Similar to `split()` but processes the tar stream asynchronously. Files larger than
+/// `INLINE_CONTENT_MAX` are stored externally in the object store, while smaller files
+/// and metadata are stored inline in the split stream.
+///
+/// Returns an error if the tar stream is malformed or if writing to the split stream fails.
 pub async fn split_async(
     mut tar_stream: impl AsyncRead + Unpin,
     writer: &mut SplitStreamWriter<impl FsVerityHashValue>,
@@ -114,17 +121,31 @@ pub async fn split_async(
     Ok(())
 }
 
+/// Represents the content type of a tar entry.
+///
+/// Tar entries can be directories, regular files/symlinks/devices (leaf nodes), or hardlinks
+/// to existing files. This enum captures the different types of content that can appear in a tar archive.
 #[derive(Debug)]
 pub enum TarItem<ObjectID: FsVerityHashValue> {
+    /// A directory entry.
     Directory,
+    /// A leaf node (regular file, symlink, device, or fifo).
     Leaf(LeafContent<ObjectID>),
+    /// A hardlink pointing to another path.
     Hardlink(OsString),
 }
 
+/// Represents a complete tar entry extracted from a split stream.
+///
+/// Contains the full metadata and content for a single file or directory from a tar archive,
+/// including its path, stat information (permissions, ownership, timestamps), and the actual content.
 #[derive(Debug)]
 pub struct TarEntry<ObjectID: FsVerityHashValue> {
+    /// The absolute path of the entry in the filesystem.
     pub path: PathBuf,
+    /// File metadata (mode, uid, gid, mtime, xattrs).
     pub stat: Stat,
+    /// The content or type of this entry.
     pub item: TarItem<ObjectID>,
 }
 
@@ -171,6 +192,13 @@ fn symlink_target_from_tar(pax: Option<Box<[u8]>>, gnu: Vec<u8>, short: &[u8]) -
     }
 }
 
+/// Reads and parses the next tar entry from a split stream.
+///
+/// Decodes tar headers and data from a composefs split stream, handling both inline and
+/// external content storage. Supports GNU long name/link extensions, PAX headers, and
+/// extended attributes. Returns `None` when the end of the archive is reached.
+///
+/// Returns the parsed tar entry, or `None` if the end of the stream is reached.
 pub fn get_entry<R: Read, ObjectID: FsVerityHashValue>(
     reader: &mut SplitStreamReader<R, ObjectID>,
 ) -> Result<Option<TarEntry<ObjectID>>> {

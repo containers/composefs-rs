@@ -46,6 +46,12 @@ pub(crate) fn sha256_from_digest(digest: &str) -> Result<Sha256Digest> {
     }
 }
 
+/// Imports a container layer from a tar stream into the repository.
+///
+/// Converts the tar stream into a composefs split stream format and stores it in the repository.
+/// If a name is provided, creates a reference to the imported layer for easier access.
+///
+/// Returns the fs-verity hash value of the stored split stream.
 pub fn import_layer<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     sha256: &Sha256Digest,
@@ -55,6 +61,10 @@ pub fn import_layer<ObjectID: FsVerityHashValue>(
     repo.ensure_stream(sha256, |writer| tar::split(tar_stream, writer), name)
 }
 
+/// Lists the contents of a container layer stored in the repository.
+///
+/// Reads the split stream for the named layer and prints each tar entry to stdout
+/// in composefs dumpfile format.
 pub fn ls_layer<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     name: &str,
@@ -79,6 +89,16 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
     skopeo::pull(repo, imgref, reference, img_proxy_config).await
 }
 
+/// Opens and parses a container configuration, following all layer references.
+///
+/// Reads the OCI image configuration from the repository and returns both the parsed
+/// configuration and a digest map containing fs-verity hashes for all referenced layers.
+/// This performs a "deep" open that validates all layer references exist.
+///
+/// If verity is provided, it's used directly. Otherwise, the name must be a sha256 digest
+/// and the corresponding verity hash will be looked up (which is more expensive).
+///
+/// Returns the parsed image configuration and the digest map of layer references.
 pub fn open_config<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     name: &str,
@@ -106,6 +126,15 @@ fn hash(bytes: &[u8]) -> Sha256Digest {
     context.finalize().into()
 }
 
+/// Opens and parses a container configuration without following layer references.
+///
+/// Reads only the OCI image configuration itself from the repository without validating
+/// that all referenced layers exist. This is faster than `open_config` when you only need
+/// the configuration metadata.
+///
+/// If verity is not provided, manually verifies the content digest matches the expected hash.
+///
+/// Returns the parsed image configuration.
 pub fn open_config_shallow<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     name: &str,
@@ -127,6 +156,12 @@ pub fn open_config_shallow<ObjectID: FsVerityHashValue>(
     }
 }
 
+/// Writes a container configuration to the repository.
+///
+/// Serializes the image configuration to JSON and stores it as a split stream with the
+/// provided layer reference map. The configuration is stored inline since it's typically small.
+///
+/// Returns a tuple of (sha256 content hash, fs-verity hash value).
 pub fn write_config<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     config: &ImageConfiguration,
@@ -141,6 +176,13 @@ pub fn write_config<ObjectID: FsVerityHashValue>(
     Ok((sha256, id))
 }
 
+/// Seals a container by computing its filesystem fs-verity hash and adding it to the config.
+///
+/// Creates the complete filesystem from all layers, computes its fs-verity hash, and stores
+/// this hash in the container config labels under "containers.composefs.fsverity". This allows
+/// the container to be mounted with integrity protection.
+///
+/// Returns a tuple of (sha256 content hash, fs-verity hash value) for the updated configuration.
 pub fn seal<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     config_name: &str,
@@ -156,6 +198,13 @@ pub fn seal<ObjectID: FsVerityHashValue>(
     write_config(repo, &config, refs)
 }
 
+/// Mounts a sealed container filesystem at the specified mountpoint.
+///
+/// Reads the container configuration to extract the fs-verity hash from the
+/// "containers.composefs.fsverity" label, then mounts the corresponding filesystem.
+/// The container must have been previously sealed using `seal()`.
+///
+/// Returns an error if the container is not sealed or if mounting fails.
 pub fn mount<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     name: &str,

@@ -6,19 +6,37 @@ use crate::fsverity::FsVerityHashValue;
 
 pub use crate::generic_tree::{self, ImageError, Stat};
 
+/// Represents a regular file's content storage strategy in composefs.
+///
+/// Files can be stored inline for small content or externally referenced
+/// for larger files using fsverity hashing.
 #[derive(Debug, Clone)]
 pub enum RegularFile<ObjectID: FsVerityHashValue> {
+    /// File content stored inline as raw bytes.
     Inline(Box<[u8]>),
+    /// File stored externally, referenced by fsverity hash and size.
+    ///
+    /// The tuple contains (fsverity hash, file size in bytes).
     External(ObjectID, u64),
 }
 
 // Re-export generic types. Note that we don't need to re-write
 // the generic constraint T: FsVerityHashValue here because it will
 // be transitively enforced.
+
+/// Content of a leaf node in the filesystem tree, specialized for composefs regular files.
 pub type LeafContent<T> = generic_tree::LeafContent<RegularFile<T>>;
+
+/// A leaf node in the filesystem tree (file, symlink, or device), specialized for composefs regular files.
 pub type Leaf<T> = generic_tree::Leaf<RegularFile<T>>;
+
+/// A directory in the filesystem tree, specialized for composefs regular files.
 pub type Directory<T> = generic_tree::Directory<RegularFile<T>>;
+
+/// An inode representing either a directory or a leaf node, specialized for composefs regular files.
 pub type Inode<T> = generic_tree::Inode<RegularFile<T>>;
+
+/// A complete filesystem tree, specialized for composefs regular files.
 pub type FileSystem<T> = generic_tree::FileSystem<RegularFile<T>>;
 
 #[cfg(test)]
