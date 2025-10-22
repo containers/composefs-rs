@@ -194,7 +194,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Cat { name } => {
-            repo.merge_splitstream(&name, None, &mut std::io::stdout())?;
+            repo.merge_splitstream(&name, None, None, &mut std::io::stdout())?;
         }
         Command::ImportImage { reference } => {
             let image_id = repo.import_image(&reference, &mut std::io::stdin())?;
