@@ -137,21 +137,19 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
         Ok(writer.write_all(data)?)
     }
 
-    /// flush any buffered inline data, taking new_value as the new value of the buffer
-    fn flush_inline(&mut self, new_value: Vec<u8>) -> Result<()> {
+    fn flush_inline(&mut self) -> Result<()> {
         if !self.inline_content.is_empty() {
             Self::write_fragment(
                 &mut self.writer,
                 self.inline_content.len(),
                 &self.inline_content,
             )?;
-            self.inline_content = new_value;
+            self.inline_content.clear();
         }
         Ok(())
     }
 
-    /// really, "add inline content to the buffer"
-    /// you need to call .flush_inline() later
+    /// Write inline data to the stream.
     pub fn write_inline(&mut self, data: &[u8]) {
         if let Some((ref mut sha256, ..)) = self.sha256 {
             sha256.update(data);
@@ -159,41 +157,34 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
         self.inline_content.extend(data);
     }
 
-    /// write a reference to external data to the stream.  If the external data had padding in the
-    /// stream which is not stored in the object then pass it here as well and it will be stored
-    /// inline after the reference.
-    fn write_reference(&mut self, reference: &ObjectID, padding: Vec<u8>) -> Result<()> {
-        // Flush the inline data before we store the external reference.  Any padding from the
-        // external data becomes the start of a new inline block.
-        self.flush_inline(padding)?;
+    // common part of .write_external() and .write_external_async()
+    fn write_reference(&mut self, id: ObjectID) -> Result<()> {
+        // Flush any buffered inline data before we store the external reference.
+        self.flush_inline()?;
 
-        Self::write_fragment(&mut self.writer, 0, reference.as_bytes())
+        Self::write_fragment(&mut self.writer, 0, id.as_bytes())
     }
 
-    /// Writes data as an external object reference with optional padding.
+    /// Write externally-split data to the stream.
     ///
     /// The data is stored in the repository and a reference is written to the stream.
-    /// Any padding bytes are stored inline after the reference.
-    pub fn write_external(&mut self, data: &[u8], padding: Vec<u8>) -> Result<()> {
+    pub fn write_external(&mut self, data: &[u8]) -> Result<()> {
         if let Some((ref mut sha256, ..)) = self.sha256 {
             sha256.update(data);
-            sha256.update(&padding);
         }
         let id = self.repo.ensure_object(data)?;
-        self.write_reference(&id, padding)
+        self.write_reference(id)
     }
 
-    /// Asynchronously writes data as an external object reference with optional padding.
+    /// Asynchronously write externally-split data to the stream.
     ///
     /// The data is stored in the repository asynchronously and a reference is written to the stream.
-    /// Any padding bytes are stored inline after the reference.
-    pub async fn write_external_async(&mut self, data: Vec<u8>, padding: Vec<u8>) -> Result<()> {
+    pub async fn write_external_async(&mut self, data: Vec<u8>) -> Result<()> {
         if let Some((ref mut sha256, ..)) = self.sha256 {
             sha256.update(&data);
-            sha256.update(&padding);
         }
         let id = self.repo.ensure_object_async(data).await?;
-        self.write_reference(&id, padding)
+        self.write_reference(id)
     }
 
     /// Finalizes the split stream and returns its object ID.
@@ -201,7 +192,7 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
     /// Flushes any remaining inline content, validates the SHA256 hash if provided,
     /// and stores the compressed stream in the repository.
     pub fn done(mut self) -> Result<ObjectID> {
-        self.flush_inline(vec![])?;
+        self.flush_inline()?;
 
         if let Some((context, expected)) = self.sha256 {
             if Into::<Sha256Digest>::into(context.finalize()) != expected {

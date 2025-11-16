@@ -73,9 +73,9 @@ pub fn split(
         tar_stream.read_exact(&mut buffer)?;
 
         if header.entry_type() == EntryType::Regular && actual_size > INLINE_CONTENT_MAX {
-            // non-empty regular file: store the data in the object store
-            let padding = buffer.split_off(actual_size);
-            writer.write_external(&buffer, padding)?;
+            // non-empty regular file: store the data external and the trailing padding inline
+            writer.write_external(&buffer[..actual_size])?;
+            writer.write_inline(&buffer[actual_size..]);
         } else {
             // else: store the data inline in the split stream
             writer.write_inline(&buffer);
@@ -112,7 +112,8 @@ pub async fn split_async(
         if header.entry_type() == EntryType::Regular && actual_size > INLINE_CONTENT_MAX {
             // non-empty regular file: store the data in the object store
             let padding = buffer.split_off(actual_size);
-            writer.write_external_async(buffer, padding).await?;
+            writer.write_external_async(buffer).await?;
+            writer.write_inline(&padding);
         } else {
             // else: store the data inline in the split stream
             writer.write_inline(&buffer);
