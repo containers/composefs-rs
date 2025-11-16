@@ -198,14 +198,20 @@ fn symlink_target_from_tar(pax: Option<Box<[u8]>>, gnu: Vec<u8>, short: &[u8]) -
 pub fn get_entry<R: Read, ObjectID: FsVerityHashValue>(
     reader: &mut SplitStreamReader<R, ObjectID>,
 ) -> Result<Option<TarEntry<ObjectID>>> {
+    // We don't have a way to drive the standard tar crate that lets us feed it random bits of
+    // header data while continuing to handle the external references as references.  That means we
+    // have to do the header interpretation ourselves, including handling of PAX/GNU extensions for
+    // xattrs and long filenames.
+    //
+    // We try to use as much of the tar crate as possible to help us with this.
     let mut gnu_longlink: Vec<u8> = vec![];
     let mut gnu_longname: Vec<u8> = vec![];
     let mut pax_longlink: Option<Box<[u8]>> = None;
     let mut pax_longname: Option<Box<[u8]>> = None;
     let mut xattrs = BTreeMap::new();
 
+    let mut buf = [0u8; 512];
     loop {
-        let mut buf = [0u8; 512];
         if !reader.read_inline_exact(&mut buf)? || buf == [0u8; 512] {
             return Ok(None);
         }
@@ -229,11 +235,6 @@ pub fn get_entry<R: Read, ObjectID: FsVerityHashValue>(
             SplitStreamData::Inline(content) => match header.entry_type() {
                 EntryType::GNULongLink => {
                     gnu_longlink.extend(content);
-
-                    // NOTE: We use a custom tar parser since splitstreams are not actual tar archives
-                    // The `tar` crate does have a higher level `path` function that would do this for us.
-                    // See: https://github.com/alexcrichton/tar-rs/blob/a1c3036af48fa02437909112239f0632e4cfcfae/src/header.rs#L1532
-                    // Similar operation is performed for GNULongName
                     gnu_longlink.pop_if(|x| *x == b'\0');
 
                     continue;
