@@ -173,11 +173,7 @@ fn path_from_tar(pax: Option<Box<[u8]>>, gnu: Vec<u8>, short: &[u8]) -> PathBuf 
     }
 
     // Drop trailing '/' characters in case of directories.
-    // https://github.com/rust-lang/rust/issues/122741
-    // path.pop_if(|x| x == &b'/');
-    if path.last() == Some(&b'/') {
-        path.pop(); // this is Vec<u8>, so that's a single char.
-    }
+    path.pop_if(|x| x == &b'/');
 
     PathBuf::from(OsString::from_vec(path))
 }
