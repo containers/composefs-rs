@@ -696,26 +696,22 @@ mod tests {
         assert_eq!(
             header.mode().unwrap(),
             stat.st_mode,
-            "{}: mode mismatch",
-            msg_prefix
+            "{msg_prefix}: mode mismatch"
         );
         assert_eq!(
             header.uid().unwrap() as u32,
             stat.st_uid,
-            "{}: uid mismatch",
-            msg_prefix
+            "{msg_prefix}: uid mismatch"
         );
         assert_eq!(
             header.gid().unwrap() as u32,
             stat.st_gid,
-            "{}: gid mismatch",
-            msg_prefix
+            "{msg_prefix}: gid mismatch"
         );
         assert_eq!(
             header.mtime().unwrap() as i64,
             stat.st_mtim_sec,
-            "{}: mtime mismatch",
-            msg_prefix
+            "{msg_prefix}: mtime mismatch"
         );
     }
 }

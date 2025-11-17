@@ -694,8 +694,7 @@ mod tests {
 
         assert_eq!(
             found_names, expected_sorted,
-            "Directory entries mismatch for nid {}",
-            nid
+            "Directory entries mismatch for nid {nid}"
         );
     }
 
@@ -788,8 +787,7 @@ mod tests {
         // Add many files to force directory blocks
         for i in 0..100 {
             dumpfile.push_str(&format!(
-                "/bigdir/file{:03} 5 100644 1 0 0 0 1000.0 - hello -\n",
-                i
+                "/bigdir/file{i:03} 5 100644 1 0 0 0 1000.0 - hello -\n"
             ));
         }
 
@@ -824,7 +822,7 @@ mod tests {
         // Build expected names
         let mut expected: Vec<String> = vec![".".to_string(), "..".to_string()];
         for i in 0..100 {
-            expected.push(format!("file{:03}", i));
+            expected.push(format!("file{i:03}"));
         }
         let expected_refs: Vec<&str> = expected.iter().map(|s| s.as_str()).collect();
 

@@ -311,7 +311,7 @@ mod tests {
 
     use super::*;
 
-    static TEMPDIR: Lazy<TempDir> = Lazy::new(|| tempdir());
+    static TEMPDIR: Lazy<TempDir> = Lazy::new(tempdir);
     static TD_FD: Lazy<File> = Lazy::new(|| File::open(TEMPDIR.path()).unwrap());
 
     fn tempfile() -> File {
