@@ -7,7 +7,6 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
-    io::Read,
     sync::Arc,
 };
 
@@ -19,10 +18,7 @@ use sha2::{Digest, Sha256};
 use tokio::task::JoinSet;
 
 use composefs::{
-    fsverity::FsVerityHashValue,
-    repository::Repository,
-    splitstream::{DigestMapEntry, SplitStreamReader},
-    util::Sha256Digest,
+    fsverity::FsVerityHashValue, repository::Repository, splitstream::SplitStreamReader,
 };
 
 struct Downloader<ObjectID: FsVerityHashValue> {
@@ -66,17 +62,11 @@ impl<ObjectID: FsVerityHashValue> Downloader<ObjectID> {
         }
     }
 
-    fn open_splitstream(&self, id: &ObjectID) -> Result<SplitStreamReader<File, ObjectID>> {
-        SplitStreamReader::new(File::from(self.repo.open_object(id)?))
+    fn open_splitstream(&self, id: &ObjectID) -> Result<SplitStreamReader<ObjectID>> {
+        SplitStreamReader::new(File::from(self.repo.open_object(id)?), None)
     }
 
-    fn read_object(&self, id: &ObjectID) -> Result<Vec<u8>> {
-        let mut data = vec![];
-        File::from(self.repo.open_object(id)?).read_to_end(&mut data)?;
-        Ok(data)
-    }
-
-    async fn ensure_stream(self: &Arc<Self>, name: &str) -> Result<(Sha256Digest, ObjectID)> {
+    async fn ensure_stream(self: &Arc<Self>, name: &str) -> Result<(String, ObjectID)> {
         let progress = ProgressBar::new(2); // the first object gets "ensured" twice
         progress.set_style(
             ProgressStyle::with_template(
@@ -113,8 +103,8 @@ impl<ObjectID: FsVerityHashValue> Downloader<ObjectID> {
 
             // this part is fast: it only touches the header
             let mut reader = self.open_splitstream(&id)?;
-            for DigestMapEntry { verity, body } in &reader.refs.map {
-                match splitstreams.insert(verity.clone(), Some(*body)) {
+            for (body, verity) in reader.iter_named_refs() {
+                match splitstreams.insert(verity.clone(), Some(body.to_string())) {
                     // This is the (normal) case if we encounter a splitstream we didn't see yet...
                     None => {
                         splitstreams_todo.push(verity.clone());
@@ -125,7 +115,7 @@ impl<ObjectID: FsVerityHashValue> Downloader<ObjectID> {
                     // verify the SHA-256 content hashes later (after we get all the objects) so we
                     // need to make sure that all referents of this stream agree on what that is.
                     Some(Some(previous)) => {
-                        if previous != *body {
+                        if previous != body {
                             bail!(
                                 "Splitstream with verity {verity:?} has different body hashes {} and {}",
                                 hex::encode(previous),
@@ -208,8 +198,8 @@ impl<ObjectID: FsVerityHashValue> Downloader<ObjectID> {
         for (id, expected_checksum) in splitstreams {
             let mut reader = self.open_splitstream(&id)?;
             let mut context = Sha256::new();
-            reader.cat(&mut context, |id| self.read_object(id))?;
-            let measured_checksum: Sha256Digest = context.finalize().into();
+            reader.cat(&self.repo, &mut context)?;
+            let measured_checksum = format!("sha256:{}", hex::encode(context.finalize()));
 
             if let Some(expected) = expected_checksum {
                 if measured_checksum != expected {
@@ -265,7 +255,7 @@ pub async fn download<ObjectID: FsVerityHashValue>(
     url: &str,
     name: &str,
     repo: Arc<Repository<ObjectID>>,
-) -> Result<(Sha256Digest, ObjectID)> {
+) -> Result<(String, ObjectID)> {
     let downloader = Arc::new(Downloader {
         client: Client::new(),
         repo,

@@ -52,9 +52,9 @@ podman build \
     -f "${containerfile}" \
     .
 
-BASE_ID="$(sed s/sha256:// tmp/base.iid)"
+BASE_ID="$(cat tmp/base.iid)"
 
-${CFSCTL} oci pull containers-storage:${BASE_ID}
+${CFSCTL} oci pull "containers-storage:${BASE_ID}"
 
 if [ "${FS_VERITY_MODE:-repart}" = "none" ]; then
     CFSCTL="$CFSCTL --insecure"

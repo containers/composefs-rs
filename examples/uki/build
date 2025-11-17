@@ -39,7 +39,7 @@ ${PODMAN_BUILD} \
     -f "${containerfile}" \
     .
 
-BASE_ID="$(sed s/sha256:// tmp/base.iid)"
+BASE_ID="$(cat tmp/base.iid)"
 ${CFSCTL} oci pull containers-storage:"${BASE_ID}"
 BASE_IMAGE_FSVERITY="$(${CFSCTL} oci compute-id --bootable "${BASE_ID}")"
 
@@ -51,7 +51,7 @@ ${PODMAN_BUILD} \
     -f "${containerfile}" \
     .
 
-FINAL_ID="$(sed s/sha256:// tmp/final.iid)"
+FINAL_ID="$(cat tmp/final.iid)"
 ${CFSCTL} oci pull containers-storage:"${FINAL_ID}"
 ${CFSCTL} oci prepare-boot "${FINAL_ID}" --bootdir tmp/efi
 
