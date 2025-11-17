@@ -328,20 +328,12 @@ impl<'k> Xattr<'k> {
         let key = unescape_to_osstr(key)?;
         let keylen = key.as_bytes().len();
         if keylen > XATTR_NAME_MAX {
-            anyhow::bail!(
-                "xattr name too long; max={} found={}",
-                XATTR_NAME_MAX,
-                keylen
-            );
+            anyhow::bail!("xattr name too long; max={XATTR_NAME_MAX} found={keylen}");
         }
         let value = unescape(value)?;
         let valuelen = value.len();
         if valuelen > XATTR_SIZE_MAX {
-            anyhow::bail!(
-                "xattr value too long; max={} found={}",
-                XATTR_SIZE_MAX,
-                keylen
-            );
+            anyhow::bail!("xattr value too long; max={XATTR_SIZE_MAX} found={keylen}");
         }
         Ok(Self { key, value })
     }
@@ -440,7 +432,7 @@ impl<'p> Entry<'p> {
                         unescape_to_path(payload.ok_or_else(|| anyhow!("Missing payload"))?)?;
                     let targetlen = target.as_os_str().as_bytes().len();
                     if targetlen > PATH_MAX as usize {
-                        anyhow::bail!("Target length too large {}", targetlen);
+                        anyhow::bail!("Target length too large {targetlen}");
                     }
                     Item::Symlink { nlink, target }
                 }

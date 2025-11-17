@@ -339,7 +339,7 @@ pub fn add_entry_to_filesystem<ObjectID: FsVerityHashValue>(
     let parent = path.parent().unwrap_or_else(|| Path::new("/"));
     let filename = path
         .file_name()
-        .ok_or_else(|| anyhow::anyhow!("Path has no filename: {:?}", path))?;
+        .ok_or_else(|| anyhow::anyhow!("Path has no filename: {path:?}"))?;
 
     // Get or create parent directory
     let parent_dir = if parent == Path::new("/") {
@@ -347,7 +347,7 @@ pub fn add_entry_to_filesystem<ObjectID: FsVerityHashValue>(
     } else {
         fs.root
             .get_directory_mut(parent.as_os_str())
-            .with_context(|| format!("Parent directory not found: {:?}", parent))?
+            .with_context(|| format!("Parent directory not found: {parent:?}"))?
     };
 
     // Convert the entry to an inode
@@ -360,7 +360,7 @@ pub fn add_entry_to_filesystem<ObjectID: FsVerityHashValue>(
             // Look up the target in our hardlinks map and clone the Rc
             let target_leaf = hardlinks
                 .get(target.as_ref())
-                .ok_or_else(|| anyhow::anyhow!("Hardlink target not found: {:?}", target))?
+                .ok_or_else(|| anyhow::anyhow!("Hardlink target not found: {target:?}"))?
                 .clone();
             Inode::Leaf(target_leaf)
         }
@@ -456,8 +456,8 @@ pub fn dumpfile_to_filesystem<ObjectID: FsVerityHashValue>(
         if line.trim().is_empty() {
             continue;
         }
-        let entry = Entry::parse(line)
-            .with_context(|| format!("Failed to parse dumpfile line: {}", line))?;
+        let entry =
+            Entry::parse(line).with_context(|| format!("Failed to parse dumpfile line: {line}"))?;
         add_entry_to_filesystem(&mut fs, entry, &mut hardlinks)?;
     }
 

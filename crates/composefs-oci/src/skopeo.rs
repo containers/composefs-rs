@@ -116,7 +116,7 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
                 MediaType::ImageLayerZstd => {
                     split_async(ZstdDecoder::new(progress), &mut splitstream).await?;
                 }
-                other => bail!("Unsupported layer media type {:?}", other),
+                other => bail!("Unsupported layer media type {other:?}"),
             };
             let layer_id = self.repo.write_stream(splitstream, None)?;
 
