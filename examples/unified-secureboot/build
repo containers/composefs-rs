@@ -47,7 +47,7 @@ podman build \
     --secret=id=cert,src=secureboot/db.crt \
     .
 
-IMAGE_ID="$(sed s/sha256:// tmp/iid)"
+IMAGE_ID="$(cat tmp/iid)"
 ${CFSCTL} oci pull containers-storage:"${IMAGE_ID}"
 ${CFSCTL} oci prepare-boot "${IMAGE_ID}" --bootdir tmp/efi
 

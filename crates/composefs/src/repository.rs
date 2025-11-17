@@ -18,12 +18,11 @@ use anyhow::{bail, ensure, Context, Result};
 use once_cell::sync::OnceCell;
 use rustix::{
     fs::{
-        fdatasync, flock, linkat, mkdirat, open, openat, readlinkat, AtFlags, Dir, FileType,
-        FlockOperation, Mode, OFlags, CWD,
+        fdatasync, flock, linkat, mkdirat, open, openat, readlinkat, statat, AtFlags, Dir,
+        FileType, FlockOperation, Mode, OFlags, CWD,
     },
     io::{Errno, Result as ErrnoResult},
 };
-use sha2::{Digest, Sha256};
 
 use crate::{
     fsverity::{
@@ -31,8 +30,8 @@ use crate::{
         CompareVerityError, EnableVerityError, FsVerityHashValue, MeasureVerityError,
     },
     mount::{composefs_fsmount, mount_at},
-    splitstream::{DigestMap, SplitStreamReader, SplitStreamWriter},
-    util::{proc_self_fd, replace_symlinkat, ErrnoFilter, Sha256Digest},
+    splitstream::{SplitStreamReader, SplitStreamWriter},
+    util::{proc_self_fd, replace_symlinkat, ErrnoFilter},
 };
 
 /// Call openat() on the named subdirectory of "dirfd", possibly creating it first.
@@ -249,32 +248,25 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// Creates a SplitStreamWriter for writing a split stream.
     /// You should write the data to the returned object and then pass it to .store_stream() to
     /// store the result.
-    pub fn create_stream(
-        self: &Arc<Self>,
-        sha256: Option<Sha256Digest>,
-        maps: Option<DigestMap<ObjectID>>,
-    ) -> SplitStreamWriter<ObjectID> {
-        SplitStreamWriter::new(self, maps, sha256)
+    pub fn create_stream(self: &Arc<Self>, content_type: u64) -> SplitStreamWriter<ObjectID> {
+        SplitStreamWriter::new(self, content_type)
     }
 
     fn format_object_path(id: &ObjectID) -> String {
         format!("objects/{}", id.to_object_pathname())
     }
 
+    fn format_stream_path(content_identifier: &str) -> String {
+        format!("streams/{content_identifier}")
+    }
+
     /// Check if the provided splitstream is present in the repository;
     /// if so, return its fsverity digest.
-    pub fn has_stream(&self, sha256: &Sha256Digest) -> Result<Option<ObjectID>> {
-        let stream_path = format!("streams/{}", hex::encode(sha256));
+    pub fn has_stream(&self, content_identifier: &str) -> Result<Option<ObjectID>> {
+        let stream_path = Self::format_stream_path(content_identifier);
 
         match readlinkat(&self.repository, &stream_path, []) {
             Ok(target) => {
-                // NB: This is kinda unsafe: we depend that the symlink didn't get corrupted
-                // we could also measure the verity of the destination object, but it doesn't
-                // improve anything, since we don't know if it was the original one.
-                //
-                // One thing we *could* do here is to iterate the entire file and verify the sha256
-                // content hash.  That would allow us to reestablish a solid link between
-                // content-sha256 and verity digest.
                 let bytes = target.as_bytes();
                 ensure!(
                     bytes.starts_with(b"../"),
@@ -287,58 +279,15 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         }
     }
 
-    /// Similar to [`Self::has_stream`] but performs more expensive verification.
-    pub fn check_stream(&self, sha256: &Sha256Digest) -> Result<Option<ObjectID>> {
-        let stream_path = format!("streams/{}", hex::encode(sha256));
-        match self.openat(&stream_path, OFlags::RDONLY) {
-            Ok(stream) => {
-                let path = readlinkat(&self.repository, stream_path, [])?;
-                let measured_verity = match measure_verity(&stream) {
-                    Ok(found) => found,
-                    Err(
-                        MeasureVerityError::VerityMissing
-                        | MeasureVerityError::FilesystemNotSupported,
-                    ) if self.insecure => FsVerityHashValue::from_object_pathname(path.to_bytes())?,
-                    Err(other) => Err(other)?,
-                };
-                let mut context = Sha256::new();
-                let mut split_stream = SplitStreamReader::new(File::from(stream))?;
-
-                // check the verity of all linked streams
-                for entry in &split_stream.refs.map {
-                    if self.check_stream(&entry.body)?.as_ref() != Some(&entry.verity) {
-                        bail!("reference mismatch");
-                    }
-                }
-
-                // check this stream
-                split_stream.cat(&mut context, |id| -> Result<Vec<u8>> {
-                    let mut data = vec![];
-                    File::from(self.open_object(id)?).read_to_end(&mut data)?;
-                    Ok(data)
-                })?;
-                if *sha256 != Into::<[u8; 32]>::into(context.finalize()) {
-                    bail!("Content didn't match!");
-                }
-
-                Ok(Some(measured_verity))
-            }
-            Err(Errno::NOENT) => Ok(None),
-            Err(err) => Err(err)?,
-        }
-    }
-
     /// Write the given splitstream to the repository with the
-    /// provided name.
+    /// provided content identifier and optional reference name.
     pub fn write_stream(
         &self,
         writer: SplitStreamWriter<ObjectID>,
+        content_identifier: &str,
         reference: Option<&str>,
     ) -> Result<ObjectID> {
-        let Some((.., ref sha256)) = writer.sha256 else {
-            bail!("Writer doesn't have sha256 enabled");
-        };
-        let stream_path = format!("streams/{}", hex::encode(sha256));
+        let stream_path = Self::format_stream_path(content_identifier);
         let object_id = writer.done()?;
         let object_path = Self::format_object_path(&object_id);
         self.symlink(&stream_path, &object_path)?;
@@ -351,22 +300,33 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(object_id)
     }
 
+    /// Check if a splitstream with a given name exists in the "refs" in the repository.
+    pub fn has_named_stream(&self, name: &str) -> Result<bool> {
+        let stream_path = format!("streams/refs/{name}");
+
+        Ok(statat(&self.repository, &stream_path, AtFlags::empty())
+            .filter_errno(Errno::NOENT)
+            .context("Looking for stream {name} in repository")?
+            .map(|s| FileType::from_raw_mode(s.st_mode).is_symlink())
+            .unwrap_or(false))
+    }
+
     /// Assign the given name to a stream.  The stream must already exist.  After this operation it
     /// will be possible to refer to the stream by its new name 'refs/{name}'.
-    pub fn name_stream(&self, sha256: Sha256Digest, name: &str) -> Result<()> {
-        let stream_path = format!("streams/{}", hex::encode(sha256));
+    pub fn name_stream(&self, content_identifier: &str, name: &str) -> Result<()> {
+        let stream_path = Self::format_stream_path(content_identifier);
         let reference_path = format!("streams/refs/{name}");
         self.symlink(&reference_path, &stream_path)?;
         Ok(())
     }
 
-    /// Ensures that the stream with a given SHA256 digest exists in the repository.
+    /// Ensures that the stream with a given content identifier digest exists in the repository.
     ///
-    /// This tries to find the stream by the `sha256` digest of its contents.  If the stream is
-    /// already in the repository, the object ID (fs-verity digest) is read from the symlink.  If
-    /// the stream is not already in the repository, a `SplitStreamWriter` is created and passed to
-    /// `callback`.  On return, the object ID of the stream will be calculated and it will be
-    /// written to disk (if it wasn't already created by someone else in the meantime).
+    /// This tries to find the stream by the content identifier.  If the stream is already in the
+    /// repository, the object ID (fs-verity digest) is read from the symlink.  If the stream is
+    /// not already in the repository, a `SplitStreamWriter` is created and passed to `callback`.
+    /// On return, the object ID of the stream will be calculated and it will be written to disk
+    /// (if it wasn't already created by someone else in the meantime).
     ///
     /// In both cases, if `reference` is provided, it is used to provide a fixed name for the
     /// object.  Any object that doesn't have a fixed reference to it is subject to garbage
@@ -376,22 +336,19 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// ID will be used when referring to the stream from other linked streams.
     pub fn ensure_stream(
         self: &Arc<Self>,
-        sha256: &Sha256Digest,
+        content_identifier: &str,
+        content_type: u64,
         callback: impl FnOnce(&mut SplitStreamWriter<ObjectID>) -> Result<()>,
         reference: Option<&str>,
     ) -> Result<ObjectID> {
-        let stream_path = format!("streams/{}", hex::encode(sha256));
+        let stream_path = Self::format_stream_path(content_identifier);
 
-        let object_id = match self.has_stream(sha256)? {
+        let object_id = match self.has_stream(content_identifier)? {
             Some(id) => id,
             None => {
-                let mut writer = self.create_stream(Some(*sha256), None);
+                let mut writer = self.create_stream(content_type);
                 callback(&mut writer)?;
-                let object_id = writer.done()?;
-
-                let object_path = Self::format_object_path(&object_id);
-                self.symlink(&stream_path, &object_path)?;
-                object_id
+                self.write_stream(writer, content_identifier, reference)?
             }
         };
 
@@ -406,26 +363,33 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// Open a splitstream with the given name.
     pub fn open_stream(
         &self,
-        name: &str,
+        content_identifier: &str,
         verity: Option<&ObjectID>,
-    ) -> Result<SplitStreamReader<File, ObjectID>> {
-        let filename = format!("streams/{name}");
-
+        expected_content_type: Option<u64>,
+    ) -> Result<SplitStreamReader<ObjectID>> {
         let file = File::from(if let Some(verity_hash) = verity {
-            self.open_with_verity(&filename, verity_hash)
-                .with_context(|| format!("Opening ref 'streams/{name}'"))?
+            self.open_object(verity_hash)
+                .with_context(|| format!("Opening object '{verity_hash:?}'"))?
         } else {
+            let filename = Self::format_stream_path(content_identifier);
             self.openat(&filename, OFlags::RDONLY)
-                .with_context(|| format!("Opening ref 'streams/{name}'"))?
+                .with_context(|| format!("Opening ref '{filename}'"))?
         });
 
-        SplitStreamReader::new(file)
+        SplitStreamReader::new(file, expected_content_type)
     }
 
     /// Given an object identifier (a digest), return a read-only file descriptor
     /// for its contents. The fsverity digest is verified (if the repository is not in `insecure` mode).
     pub fn open_object(&self, id: &ObjectID) -> Result<OwnedFd> {
         self.open_with_verity(&Self::format_object_path(id), id)
+    }
+
+    /// Read the contents of an object into a Vec
+    pub fn read_object(&self, id: &ObjectID) -> Result<Vec<u8>> {
+        let mut data = vec![];
+        File::from(self.open_object(id)?).read_to_end(&mut data)?;
+        Ok(data)
     }
 
     /// Merges a splitstream into a single continuous stream.
@@ -435,18 +399,14 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// the splitstream's fsverity digest matches the expected value.
     pub fn merge_splitstream(
         &self,
-        name: &str,
+        content_identifier: &str,
         verity: Option<&ObjectID>,
-        stream: &mut impl Write,
+        expected_content_type: Option<u64>,
+        output: &mut impl Write,
     ) -> Result<()> {
-        let mut split_stream = self.open_stream(name, verity)?;
-        split_stream.cat(stream, |id| -> Result<Vec<u8>> {
-            let mut data = vec![];
-            File::from(self.open_object(id)?).read_to_end(&mut data)?;
-            Ok(data)
-        })?;
-
-        Ok(())
+        let mut split_stream =
+            self.open_stream(content_identifier, verity, expected_content_type)?;
+        split_stream.cat(self, output)
     }
 
     /// Write `data into the repository as an image with the given `name`.
@@ -681,16 +641,18 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             objects.extend(self.objects_for_image(&object.to_hex())?);
         }
 
+        /* TODO
         for object in self.gc_category("streams")? {
             println!("{object:?} lives as a stream");
             objects.insert(object.clone());
 
-            let mut split_stream = self.open_stream(&object.to_hex(), None)?;
+            let mut split_stream = self.open_stream(&object.to_hex(), None, None)?;
             split_stream.get_object_refs(|id| {
                 println!("   with {id:?}");
                 objects.insert(id.clone());
             })?;
         }
+        */
 
         for first_byte in 0x0..=0xff {
             let dirfd = match self.openat(

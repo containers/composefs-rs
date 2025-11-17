@@ -11,7 +11,7 @@
 use std::{ffi::OsStr, os::unix::ffi::OsStrExt, rc::Rc};
 
 use anyhow::{ensure, Context, Result};
-use oci_spec::image::ImageConfiguration;
+use sha2::{Digest, Sha256};
 
 use composefs::{
     fsverity::FsVerityHashValue,
@@ -19,6 +19,7 @@ use composefs::{
     tree::{Directory, FileSystem, Inode, Leaf},
 };
 
+use crate::skopeo::TAR_LAYER_CONTENT_TYPE;
 use crate::tar::{TarEntry, TarItem};
 
 /// Processes a single tar entry and adds it to the filesystem.
@@ -84,6 +85,10 @@ pub fn process_entry<ObjectID: FsVerityHashValue>(
 
 /// Creates a filesystem from the given OCI container.  No special transformations are performed to
 /// make the filesystem bootable.
+///
+/// If `config_verity` is given it is used to get the OCI config splitstream by its fs-verity ID
+/// and the entire process is substantially faster.  If it is not given, the config and layers will
+/// be hashed to ensure that they match their claimed blob IDs.
 pub fn create_filesystem<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     config_name: &str,
@@ -91,14 +96,27 @@ pub fn create_filesystem<ObjectID: FsVerityHashValue>(
 ) -> Result<FileSystem<ObjectID>> {
     let mut filesystem = FileSystem::default();
 
-    let mut config_stream = repo.open_stream(config_name, config_verity)?;
-    let config = ImageConfiguration::from_reader(&mut config_stream)?;
+    let (config, map) = crate::open_config(repo, config_name, config_verity)?;
 
     for diff_id in config.rootfs().diff_ids() {
-        let layer_sha256 = super::sha256_from_digest(diff_id)?;
-        let layer_verity = config_stream.lookup(&layer_sha256)?;
+        let layer_verity = map
+            .get(diff_id.as_str())
+            .context("OCI config splitstream missing named ref to layer {diff_id}")?;
 
-        let mut layer_stream = repo.open_stream(&hex::encode(layer_sha256), Some(layer_verity))?;
+        if config_verity.is_none() {
+            // We don't have any proof that the named references in the config splitstream are
+            // trustworthy. We have no choice but to perform expensive validation of the layer
+            // stream.
+            let mut layer_stream =
+                repo.open_stream("", Some(layer_verity), Some(TAR_LAYER_CONTENT_TYPE))?;
+            let mut context = Sha256::new();
+            layer_stream.cat(repo, &mut context)?;
+            let content_hash = format!("sha256:{}", hex::encode(context.finalize()));
+            ensure!(content_hash == *diff_id, "Layer has incorrect checksum");
+        }
+
+        let mut layer_stream =
+            repo.open_stream("", Some(layer_verity), Some(TAR_LAYER_CONTENT_TYPE))?;
         while let Some(entry) = crate::tar::get_entry(&mut layer_stream)? {
             process_entry(&mut filesystem, entry)?;
         }

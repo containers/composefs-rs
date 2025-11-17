@@ -20,11 +20,13 @@ use oci_spec::image::{Descriptor, ImageConfiguration, ImageManifest, MediaType};
 use rustix::process::geteuid;
 use tokio::{io::AsyncReadExt, sync::Semaphore};
 
-use composefs::{
-    fsverity::FsVerityHashValue, repository::Repository, splitstream::DigestMap, util::Sha256Digest,
-};
+use composefs::{fsverity::FsVerityHashValue, repository::Repository};
 
-use crate::{sha256_from_descriptor, sha256_from_digest, tar::split_async, ContentAndVerity};
+use crate::{config_identifier, layer_identifier, tar::split_async, ContentAndVerity};
+
+// Content type identifiers stored as ASCII in the splitstream file
+pub(crate) const TAR_LAYER_CONTENT_TYPE: u64 = u64::from_le_bytes(*b"ocilayer");
+pub(crate) const OCI_CONFIG_CONTENT_TYPE: u64 = u64::from_le_bytes(*b"ociconfg");
 
 struct ImageOp<ObjectID: FsVerityHashValue> {
     repo: Arc<Repository<ObjectID>>,
@@ -84,18 +86,15 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
         })
     }
 
-    pub async fn ensure_layer(
-        &self,
-        layer_sha256: Sha256Digest,
-        descriptor: &Descriptor,
-    ) -> Result<ObjectID> {
+    pub async fn ensure_layer(&self, diff_id: &str, descriptor: &Descriptor) -> Result<ObjectID> {
         // We need to use the per_manifest descriptor to download the compressed layer but it gets
         // stored in the repository via the per_config descriptor.  Our return value is the
         // fsverity digest for the corresponding splitstream.
+        let content_id = layer_identifier(diff_id);
 
-        if let Some(layer_id) = self.repo.check_stream(&layer_sha256)? {
+        if let Some(layer_id) = self.repo.has_stream(&content_id)? {
             self.progress
-                .println(format!("Already have layer {}", hex::encode(layer_sha256)))?;
+                .println(format!("Already have layer {diff_id}"))?;
             Ok(layer_id)
         } else {
             // Otherwise, we need to fetch it...
@@ -109,10 +108,9 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
                 .unwrap()
                 .progress_chars("##-"));
             let progress = bar.wrap_async_read(blob_reader);
-            self.progress
-                .println(format!("Fetching layer {}", hex::encode(layer_sha256)))?;
+            self.progress.println(format!("Fetching layer {diff_id}"))?;
 
-            let mut splitstream = self.repo.create_stream(Some(layer_sha256), None);
+            let mut splitstream = self.repo.create_stream(TAR_LAYER_CONTENT_TYPE);
             match descriptor.media_type() {
                 MediaType::ImageLayer => {
                     split_async(progress, &mut splitstream).await?;
@@ -125,15 +123,13 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
                 }
                 other => bail!("Unsupported layer media type {other:?}"),
             };
-            let layer_id = self.repo.write_stream(splitstream, None)?;
 
-            // We intentionally explicitly ignore this, even though we're supposed to check it.
-            // See https://github.com/containers/containers-image-proxy-rs/issues/80 for discussion
-            // about why.  Note: we only care about the uncompressed layer tar, and we checksum it
-            // ourselves.
-            drop(driver);
+            // skopeo is doing data checksums for us to make sure the content we received is equal
+            // to the claimed diff_id. We trust it, but we need to check it by awaiting the driver.
+            driver.await?;
 
-            Ok(layer_id)
+            // Now we know that the content is what we expected.  Write it.
+            self.repo.write_stream(splitstream, &content_id, None)
         }
     }
 
@@ -142,20 +138,20 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
         manifest_layers: &[Descriptor],
         descriptor: &Descriptor,
     ) -> Result<ContentAndVerity<ObjectID>> {
-        let config_sha256 = sha256_from_descriptor(descriptor)?;
-        if let Some(config_id) = self.repo.check_stream(&config_sha256)? {
+        let config_digest: &str = descriptor.digest().as_ref();
+        let content_id = config_identifier(config_digest);
+
+        if let Some(config_id) = self.repo.has_stream(&content_id)? {
             // We already got this config?  Nice.
-            self.progress.println(format!(
-                "Already have container config {}",
-                hex::encode(config_sha256)
-            ))?;
-            Ok((config_sha256, config_id))
+            self.progress
+                .println(format!("Already have container config {config_digest}"))?;
+            Ok((config_digest.to_string(), config_id))
         } else {
             // We need to add the config to the repo.  We need to parse the config and make sure we
             // have all of the layers first.
             //
             self.progress
-                .println(format!("Fetching config {}", hex::encode(config_sha256)))?;
+                .println(format!("Fetching config {config_digest}"))?;
 
             let (mut config, driver) = self.proxy.get_descriptor(&self.img, descriptor).await?;
             let config = async move {
@@ -178,30 +174,29 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             let sem = Arc::new(Semaphore::new(threads.into()));
             let mut entries = vec![];
             for (mld, diff_id) in layers {
+                let diff_id_ = diff_id.clone();
                 let self_ = Arc::clone(self);
                 let permit = Arc::clone(&sem).acquire_owned().await?;
-                let layer_sha256 = sha256_from_digest(diff_id)?;
                 let descriptor = mld.clone();
                 let future = tokio::spawn(async move {
                     let _permit = permit;
-                    self_.ensure_layer(layer_sha256, &descriptor).await
+                    self_.ensure_layer(&diff_id_, &descriptor).await
                 });
-                entries.push((layer_sha256, future));
+                entries.push((diff_id, future));
             }
+
+            let mut splitstream = self.repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
 
             // Collect the results.
-            let mut config_maps = DigestMap::new();
-            for (layer_sha256, future) in entries {
-                config_maps.insert(&layer_sha256, &future.await??);
+            for (diff_id, future) in entries {
+                splitstream.add_named_stream_ref(diff_id, &future.await??);
             }
 
-            let mut splitstream = self
-                .repo
-                .create_stream(Some(config_sha256), Some(config_maps));
+            // NB: We trust that skopeo has verified that raw_config has the correct digest
             splitstream.write_inline(&raw_config);
-            let config_id = self.repo.write_stream(splitstream, None)?;
 
-            Ok((config_sha256, config_id))
+            let config_id = self.repo.write_stream(splitstream, &content_id, None)?;
+            Ok((content_id, config_id))
         }
     }
 
@@ -230,7 +225,7 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
     imgref: &str,
     reference: Option<&str>,
     img_proxy_config: Option<ImageProxyConfig>,
-) -> Result<(Sha256Digest, ObjectID)> {
+) -> Result<(String, ObjectID)> {
     let op = Arc::new(ImageOp::new(repo, imgref, img_proxy_config).await?);
     let (sha256, id) = op
         .pull()
@@ -238,7 +233,7 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
         .with_context(|| format!("Unable to pull container image {imgref}"))?;
 
     if let Some(name) = reference {
-        repo.name_stream(sha256, name)?;
+        repo.name_stream(&sha256, name)?;
     }
     Ok((sha256, id))
 }

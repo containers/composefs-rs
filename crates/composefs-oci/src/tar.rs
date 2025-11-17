@@ -196,8 +196,8 @@ fn symlink_target_from_tar(pax: Option<Box<[u8]>>, gnu: Vec<u8>, short: &[u8]) -
 /// extended attributes. Returns `None` when the end of the archive is reached.
 ///
 /// Returns the parsed tar entry, or `None` if the end of the stream is reached.
-pub fn get_entry<R: Read, ObjectID: FsVerityHashValue>(
-    reader: &mut SplitStreamReader<R, ObjectID>,
+pub fn get_entry<ObjectID: FsVerityHashValue>(
+    reader: &mut SplitStreamReader<ObjectID>,
 ) -> Result<Option<TarEntry<ObjectID>>> {
     // We don't have a way to drive the standard tar crate that lets us feed it random bits of
     // header data while continuing to handle the external references as references.  That means we
@@ -320,6 +320,8 @@ pub fn get_entry<R: Read, ObjectID: FsVerityHashValue>(
 
 #[cfg(test)]
 mod tests {
+    use crate::TAR_LAYER_CONTENT_TYPE;
+
     use super::*;
     use composefs::{
         fsverity::Sha256HashValue, generic_tree::LeafContent, repository::Repository,
@@ -376,13 +378,15 @@ mod tests {
     fn read_all_via_splitstream(tar_data: Vec<u8>) -> Result<Vec<TarEntry<Sha256HashValue>>> {
         let mut tar_cursor = Cursor::new(tar_data);
         let repo = create_test_repository()?;
-        let mut writer = repo.create_stream(None, None);
+        let mut writer = repo.create_stream(TAR_LAYER_CONTENT_TYPE);
 
         split(&mut tar_cursor, &mut writer)?;
         let object_id = writer.done()?;
 
-        let mut reader: SplitStreamReader<std::fs::File, Sha256HashValue> =
-            SplitStreamReader::new(repo.open_object(&object_id)?.into())?;
+        let mut reader: SplitStreamReader<Sha256HashValue> = SplitStreamReader::new(
+            repo.open_object(&object_id)?.into(),
+            Some(TAR_LAYER_CONTENT_TYPE),
+        )?;
 
         let mut entries = Vec::new();
         while let Some(entry) = get_entry(&mut reader)? {
@@ -401,13 +405,16 @@ mod tests {
 
         let mut tar_cursor = Cursor::new(tar_data);
         let repo = create_test_repository().unwrap();
-        let mut writer = repo.create_stream(None, None);
+        let mut writer = repo.create_stream(TAR_LAYER_CONTENT_TYPE);
 
         split(&mut tar_cursor, &mut writer).unwrap();
         let object_id = writer.done().unwrap();
 
-        let mut reader: SplitStreamReader<std::fs::File, Sha256HashValue> =
-            SplitStreamReader::new(repo.open_object(&object_id).unwrap().into()).unwrap();
+        let mut reader: SplitStreamReader<Sha256HashValue> = SplitStreamReader::new(
+            repo.open_object(&object_id).unwrap().into(),
+            Some(TAR_LAYER_CONTENT_TYPE),
+        )
+        .unwrap();
         assert!(get_entry(&mut reader).unwrap().is_none());
     }
 
@@ -427,13 +434,16 @@ mod tests {
 
         let mut tar_cursor = Cursor::new(tar_data);
         let repo = create_test_repository().unwrap();
-        let mut writer = repo.create_stream(None, None);
+        let mut writer = repo.create_stream(TAR_LAYER_CONTENT_TYPE);
 
         split(&mut tar_cursor, &mut writer).unwrap();
         let object_id = writer.done().unwrap();
 
-        let mut reader: SplitStreamReader<std::fs::File, Sha256HashValue> =
-            SplitStreamReader::new(repo.open_object(&object_id).unwrap().into()).unwrap();
+        let mut reader: SplitStreamReader<Sha256HashValue> = SplitStreamReader::new(
+            repo.open_object(&object_id).unwrap().into(),
+            Some(TAR_LAYER_CONTENT_TYPE),
+        )
+        .unwrap();
 
         // Should have exactly one entry
         let entry = get_entry(&mut reader)
@@ -482,13 +492,16 @@ mod tests {
 
         let mut tar_cursor = Cursor::new(tar_data);
         let repo = create_test_repository().unwrap();
-        let mut writer = repo.create_stream(None, None);
+        let mut writer = repo.create_stream(TAR_LAYER_CONTENT_TYPE);
 
         split(&mut tar_cursor, &mut writer).unwrap();
         let object_id = writer.done().unwrap();
 
-        let mut reader: SplitStreamReader<std::fs::File, Sha256HashValue> =
-            SplitStreamReader::new(repo.open_object(&object_id).unwrap().into()).unwrap();
+        let mut reader: SplitStreamReader<Sha256HashValue> = SplitStreamReader::new(
+            repo.open_object(&object_id).unwrap().into(),
+            Some(TAR_LAYER_CONTENT_TYPE),
+        )
+        .unwrap();
         let mut entries = Vec::new();
 
         while let Some(entry) = get_entry(&mut reader).unwrap() {
@@ -546,13 +559,16 @@ mod tests {
         // Split the tar
         let mut tar_cursor = Cursor::new(original_tar.clone());
         let repo = create_test_repository().unwrap();
-        let mut writer = repo.create_stream(None, None);
+        let mut writer = repo.create_stream(TAR_LAYER_CONTENT_TYPE);
         split(&mut tar_cursor, &mut writer).unwrap();
         let object_id = writer.done().unwrap();
 
         // Read back entries and compare with original headers
-        let mut reader: SplitStreamReader<std::fs::File, Sha256HashValue> =
-            SplitStreamReader::new(repo.open_object(&object_id).unwrap().into()).unwrap();
+        let mut reader: SplitStreamReader<Sha256HashValue> = SplitStreamReader::new(
+            repo.open_object(&object_id).unwrap().into(),
+            Some(TAR_LAYER_CONTENT_TYPE),
+        )
+        .unwrap();
         let mut entries = Vec::new();
 
         while let Some(entry) = get_entry(&mut reader).unwrap() {

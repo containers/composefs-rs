@@ -18,32 +18,22 @@ use std::{collections::HashMap, io::Read, sync::Arc};
 
 use anyhow::{bail, ensure, Context, Result};
 use containers_image_proxy::ImageProxyConfig;
-use oci_spec::image::{Descriptor, ImageConfiguration};
+use oci_spec::image::ImageConfiguration;
 use sha2::{Digest, Sha256};
 
-use composefs::{
-    fsverity::FsVerityHashValue,
-    repository::Repository,
-    splitstream::DigestMap,
-    util::{parse_sha256, Sha256Digest},
-};
+use composefs::{fsverity::FsVerityHashValue, repository::Repository};
 
+use crate::skopeo::{OCI_CONFIG_CONTENT_TYPE, TAR_LAYER_CONTENT_TYPE};
 use crate::tar::get_entry;
 
-type ContentAndVerity<ObjectID> = (Sha256Digest, ObjectID);
+type ContentAndVerity<ObjectID> = (String, ObjectID);
 
-pub(crate) fn sha256_from_descriptor(descriptor: &Descriptor) -> Result<Sha256Digest> {
-    let Some(digest) = descriptor.as_digest_sha256() else {
-        bail!("Descriptor in oci config is not sha256");
-    };
-    Ok(parse_sha256(digest)?)
+fn layer_identifier(diff_id: &str) -> String {
+    format!("oci-layer-{diff_id}")
 }
 
-pub(crate) fn sha256_from_digest(digest: &str) -> Result<Sha256Digest> {
-    match digest.strip_prefix("sha256:") {
-        Some(rest) => Ok(parse_sha256(rest)?),
-        None => bail!("Manifest has non-sha256 digest"),
-    }
+fn config_identifier(config: &str) -> String {
+    format!("oci-config-{config}")
 }
 
 /// Imports a container layer from a tar stream into the repository.
@@ -54,11 +44,16 @@ pub(crate) fn sha256_from_digest(digest: &str) -> Result<Sha256Digest> {
 /// Returns the fs-verity hash value of the stored split stream.
 pub fn import_layer<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
-    sha256: &Sha256Digest,
+    diff_id: &str,
     name: Option<&str>,
     tar_stream: &mut impl Read,
 ) -> Result<ObjectID> {
-    repo.ensure_stream(sha256, |writer| tar::split(tar_stream, writer), name)
+    repo.ensure_stream(
+        &layer_identifier(diff_id),
+        TAR_LAYER_CONTENT_TYPE,
+        |writer| tar::split(tar_stream, writer),
+        name,
+    )
 }
 
 /// Lists the contents of a container layer stored in the repository.
@@ -67,9 +62,13 @@ pub fn import_layer<ObjectID: FsVerityHashValue>(
 /// in composefs dumpfile format.
 pub fn ls_layer<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
-    name: &str,
+    diff_id: &str,
 ) -> Result<()> {
-    let mut split_stream = repo.open_stream(name, None)?;
+    let mut split_stream = repo.open_stream(
+        &layer_identifier(diff_id),
+        None,
+        Some(TAR_LAYER_CONTENT_TYPE),
+    )?;
 
     while let Some(entry) = get_entry(&mut split_stream)? {
         println!("{entry}");
@@ -85,75 +84,52 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
     imgref: &str,
     reference: Option<&str>,
     img_proxy_config: Option<ImageProxyConfig>,
-) -> Result<(Sha256Digest, ObjectID)> {
+) -> Result<(String, ObjectID)> {
     skopeo::pull(repo, imgref, reference, img_proxy_config).await
 }
 
-/// Opens and parses a container configuration, following all layer references.
+fn hash(bytes: &[u8]) -> String {
+    let mut context = Sha256::new();
+    context.update(bytes);
+    format!("sha256:{}", hex::encode(context.finalize()))
+}
+
+/// Opens and parses a container configuration.
 ///
 /// Reads the OCI image configuration from the repository and returns both the parsed
 /// configuration and a digest map containing fs-verity hashes for all referenced layers.
-/// This performs a "deep" open that validates all layer references exist.
 ///
 /// If verity is provided, it's used directly. Otherwise, the name must be a sha256 digest
-/// and the corresponding verity hash will be looked up (which is more expensive).
+/// and the corresponding verity hash will be looked up (which is more expensive) and the content
+/// will be hashed and compared to the provided digest.
 ///
-/// Returns the parsed image configuration and the digest map of layer references.
+/// Returns the parsed image configuration and the map of layer references.
+///
+/// Note: if the verity value is known and trusted then the layer fs-verity values can also be
+/// trusted.  If not, then you can use the layer map to find objects that are ostensibly the layers
+/// in question, but you'll have to verity their content hashes yourself.
 pub fn open_config<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
-    name: &str,
+    config_digest: &str,
     verity: Option<&ObjectID>,
-) -> Result<(ImageConfiguration, DigestMap<ObjectID>)> {
-    let id = match verity {
-        Some(id) => id,
-        None => {
-            // take the expensive route
-            let sha256 = parse_sha256(name)
-                .context("Containers must be referred to by sha256 if verity is missing")?;
-            &repo
-                .check_stream(&sha256)?
-                .with_context(|| format!("Object {name} is unknown to us"))?
-        }
+) -> Result<(ImageConfiguration, HashMap<Box<str>, ObjectID>)> {
+    let mut stream = repo.open_stream(
+        &config_identifier(config_digest),
+        verity,
+        Some(OCI_CONFIG_CONTENT_TYPE),
+    )?;
+
+    let config = if verity.is_none() {
+        // No verity means we need to verify the content hash
+        let mut data = vec![];
+        stream.read_to_end(&mut data)?;
+        ensure!(config_digest == hash(&data), "Data integrity issue");
+        ImageConfiguration::from_reader(&data[..])?
+    } else {
+        ImageConfiguration::from_reader(&mut stream)?
     };
-    let mut stream = repo.open_stream(name, Some(id))?;
-    let config = ImageConfiguration::from_reader(&mut stream)?;
-    Ok((config, stream.refs))
-}
 
-fn hash(bytes: &[u8]) -> Sha256Digest {
-    let mut context = Sha256::new();
-    context.update(bytes);
-    context.finalize().into()
-}
-
-/// Opens and parses a container configuration without following layer references.
-///
-/// Reads only the OCI image configuration itself from the repository without validating
-/// that all referenced layers exist. This is faster than `open_config` when you only need
-/// the configuration metadata.
-///
-/// If verity is not provided, manually verifies the content digest matches the expected hash.
-///
-/// Returns the parsed image configuration.
-pub fn open_config_shallow<ObjectID: FsVerityHashValue>(
-    repo: &Repository<ObjectID>,
-    name: &str,
-    verity: Option<&ObjectID>,
-) -> Result<ImageConfiguration> {
-    match verity {
-        // with verity deep opens are just as fast as shallow ones
-        Some(id) => Ok(open_config(repo, name, Some(id))?.0),
-        None => {
-            // we need to manually check the content digest
-            let expected_hash = parse_sha256(name)
-                .context("Containers must be referred to by sha256 if verity is missing")?;
-            let mut stream = repo.open_stream(name, None)?;
-            let mut raw_config = vec![];
-            stream.read_to_end(&mut raw_config)?;
-            ensure!(hash(&raw_config) == expected_hash, "Data integrity issue");
-            Ok(ImageConfiguration::from_reader(&mut raw_config.as_slice())?)
-        }
-    }
+    Ok((config, stream.into_named_refs()))
 }
 
 /// Writes a container configuration to the repository.
@@ -165,15 +141,18 @@ pub fn open_config_shallow<ObjectID: FsVerityHashValue>(
 pub fn write_config<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     config: &ImageConfiguration,
-    refs: DigestMap<ObjectID>,
+    refs: HashMap<Box<str>, ObjectID>,
 ) -> Result<ContentAndVerity<ObjectID>> {
     let json = config.to_string()?;
     let json_bytes = json.as_bytes();
-    let sha256 = hash(json_bytes);
-    let mut stream = repo.create_stream(Some(sha256), Some(refs));
+    let config_digest = hash(json_bytes);
+    let mut stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+    for (name, value) in &refs {
+        stream.add_named_stream_ref(name, value)
+    }
     stream.write_inline(json_bytes);
-    let id = repo.write_stream(stream, None)?;
-    Ok((sha256, id))
+    let id = repo.write_stream(stream, &config_identifier(&config_digest), None)?;
+    Ok((config_digest, id))
 }
 
 /// Seals a container by computing its filesystem fs-verity hash and adding it to the config.
@@ -211,7 +190,7 @@ pub fn mount<ObjectID: FsVerityHashValue>(
     mountpoint: &str,
     verity: Option<&ObjectID>,
 ) -> Result<()> {
-    let config = open_config_shallow(repo, name, verity)?;
+    let (config, _map) = open_config(repo, name, verity)?;
     let Some(id) = config.get_config_annotation("containers.composefs.fsverity") else {
         bail!("Can only mount sealed containers");
     };
@@ -255,14 +234,14 @@ mod test {
         let layer = example_layer();
         let mut context = Sha256::new();
         context.update(&layer);
-        let layer_id: [u8; 32] = context.finalize().into();
+        let layer_id = format!("sha256:{}", hex::encode(context.finalize()));
 
         let repo_dir = tempdir();
         let repo = Arc::new(Repository::<Sha256HashValue>::open_path(CWD, &repo_dir).unwrap());
         let id = import_layer(&repo, &layer_id, Some("name"), &mut layer.as_slice()).unwrap();
 
         let mut dump = String::new();
-        let mut split_stream = repo.open_stream("refs/name", Some(&id)).unwrap();
+        let mut split_stream = repo.open_stream("refs/name", Some(&id), None).unwrap();
         while let Some(entry) = tar::get_entry(&mut split_stream).unwrap() {
             writeln!(dump, "{entry}").unwrap();
         }

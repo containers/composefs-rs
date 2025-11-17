@@ -48,7 +48,7 @@ pub struct App {
 enum OciCommand {
     /// Stores a tar file as a splitstream in the repository.
     ImportLayer {
-        sha256: String,
+        digest: String,
         name: Option<String>,
     },
     /// Lists the contents of a tar stream
@@ -105,7 +105,7 @@ enum Command {
     Transaction,
     /// Reconstitutes a split stream and writes it to stdout
     Cat {
-        /// the name of the stream to cat, either a sha256 digest or prefixed with 'ref/'
+        /// the name of the stream to cat, either a content identifier or prefixed with 'ref/'
         name: String,
     },
     /// Perform garbage collection
@@ -122,7 +122,7 @@ enum Command {
     },
     /// Mounts a composefs, possibly enforcing fsverity of the image
     Mount {
-        /// the name of the image to mount, either a sha256 digest or prefixed with 'ref/'
+        /// the name of the image to mount, either an fs-verity hash or prefixed with 'ref/'
         name: String,
         /// the mountpoint
         mountpoint: String,
@@ -194,7 +194,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Cat { name } => {
-            repo.merge_splitstream(&name, None, &mut std::io::stdout())?;
+            repo.merge_splitstream(&name, None, None, &mut std::io::stdout())?;
         }
         Command::ImportImage { reference } => {
             let image_id = repo.import_image(&reference, &mut std::io::stdin())?;
@@ -202,10 +202,10 @@ async fn main() -> Result<()> {
         }
         #[cfg(feature = "oci")]
         Command::Oci { cmd: oci_cmd } => match oci_cmd {
-            OciCommand::ImportLayer { name, sha256 } => {
+            OciCommand::ImportLayer { name, digest } => {
                 let object_id = composefs_oci::import_layer(
                     &Arc::new(repo),
-                    &composefs::util::parse_sha256(sha256)?,
+                    &digest,
                     name.as_deref(),
                     &mut std::io::stdin(),
                 )?;
@@ -253,10 +253,10 @@ async fn main() -> Result<()> {
                 println!("{}", image_id.to_id());
             }
             OciCommand::Pull { ref image, name } => {
-                let (sha256, verity) =
+                let (digest, verity) =
                     composefs_oci::pull(&Arc::new(repo), image, name.as_deref(), None).await?;
 
-                println!("sha256 {}", hex::encode(sha256));
+                println!("config {digest}");
                 println!("verity {}", verity.to_hex());
             }
             OciCommand::Seal {
@@ -264,9 +264,9 @@ async fn main() -> Result<()> {
                 ref config_verity,
             } => {
                 let verity = verity_opt(config_verity)?;
-                let (sha256, verity) =
+                let (digest, verity) =
                     composefs_oci::seal(&Arc::new(repo), config_name, verity.as_ref())?;
-                println!("sha256 {}", hex::encode(sha256));
+                println!("config {digest}");
                 println!("verity {}", verity.to_id());
             }
             OciCommand::Mount {
@@ -367,8 +367,8 @@ async fn main() -> Result<()> {
         }
         #[cfg(feature = "http")]
         Command::Fetch { url, name } => {
-            let (sha256, verity) = composefs_http::download(&url, &name, Arc::new(repo)).await?;
-            println!("sha256 {}", hex::encode(sha256));
+            let (digest, verity) = composefs_http::download(&url, &name, Arc::new(repo)).await?;
+            println!("content {digest}");
             println!("verity {}", verity.to_hex());
         }
     }
