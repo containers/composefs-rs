@@ -18,8 +18,8 @@ use anyhow::{bail, ensure, Context, Result};
 use once_cell::sync::OnceCell;
 use rustix::{
     fs::{
-        fdatasync, flock, linkat, mkdirat, open, openat, readlinkat, statat, AtFlags, Dir,
-        FileType, FlockOperation, Mode, OFlags, CWD,
+        flock, linkat, mkdirat, open, openat, readlinkat, statat, syncfs, AtFlags, Dir, FileType,
+        FlockOperation, Mode, OFlags, CWD,
     },
     io::{Errno, Result as ErrnoResult},
 };
@@ -128,12 +128,18 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     ///
     /// Same as `ensure_object` but runs the operation on a blocking thread pool
     /// to avoid blocking async tasks. Returns the fsverity digest of the object.
+    ///
+    /// For performance reasons, this function does *not* call fsync() or similar.  After you're
+    /// done with everything, call `Repository::sync_async()`.
     pub async fn ensure_object_async(self: &Arc<Self>, data: Vec<u8>) -> Result<ObjectID> {
         let self_ = Arc::clone(self);
         tokio::task::spawn_blocking(move || self_.ensure_object(&data)).await?
     }
 
     /// Given a blob of data, store it in the repository.
+    ///
+    /// For performance reasons, this function does *not* call fsync() or similar.  After you're
+    /// done with everything, call `Repository::sync()`.
     pub fn ensure_object(&self, data: &[u8]) -> Result<ObjectID> {
         let dirfd = self.objects_dir()?;
         let id: ObjectID = compute_verity(data);
@@ -179,14 +185,15 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         let fd = ensure_dir_and_openat(dirfd, &id.to_object_dir(), OFlags::RDWR | OFlags::TMPFILE)?;
         let mut file = File::from(fd);
         file.write_all(data)?;
-        fdatasync(&file)?;
-
         // We can't enable verity with an open writable fd, so re-open and close the old one.
         let ro_fd = open(
             proc_self_fd(&file),
             OFlags::RDONLY | OFlags::CLOEXEC,
             Mode::empty(),
         )?;
+        // NB: We should do fdatasync() or fsync() here, but doing this for each file forces the
+        // creation of a massive number of journal commits and is a performance disaster.  We need
+        // to coordinate this at a higher level.  See .write_stream().
         drop(file);
 
         let ro_fd = match enable_verity_maybe_copy::<ObjectID>(dirfd, ro_fd.as_fd()) {
@@ -279,16 +286,36 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         }
     }
 
-    /// Write the given splitstream to the repository with the
-    /// provided content identifier and optional reference name.
+    /// Write the given splitstream to the repository with the provided content identifier and
+    /// optional reference name.
+    ///
+    /// This call contains an internal barrier that guarantees that, in event of a crash, either:
+    ///  - the named stream (by `content_identifier`) will not be available; or
+    ///  - the stream and all of its linked data will be available
+    ///
+    /// In other words: it will not be possible to boot a system which contained a stream named
+    /// `content_identifier` but is missing linked streams or objects from that stream.
     pub fn write_stream(
         &self,
         writer: SplitStreamWriter<ObjectID>,
         content_identifier: &str,
         reference: Option<&str>,
     ) -> Result<ObjectID> {
-        let stream_path = Self::format_stream_path(content_identifier);
         let object_id = writer.done()?;
+
+        // Right now we have:
+        //   - all of the linked external objects and streams; and
+        //   - the binary data of this splitstream itself
+        //
+        // in the filesystem but but not yet guaranteed to be synced to disk.  This is OK because
+        // nobody knows that the binary data of the splitstream is a splitstream yet: it could just
+        // as well be a random data file contained in an OS image or something.
+        //
+        // We need to make sure that all of that makes it to the disk before the splitstream is
+        // visible as a splitstream.
+        self.sync()?;
+
+        let stream_path = Self::format_stream_path(content_identifier);
         let object_path = Self::format_object_path(&object_id);
         self.symlink(&stream_path, &object_path)?;
 
@@ -623,6 +650,24 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         let mut data = vec![];
         std::fs::File::from(image).read_to_end(&mut data)?;
         Ok(crate::erofs::reader::collect_objects(&data)?)
+    }
+
+    /// Makes sure all content is written to the repository.
+    ///
+    /// This is currently just syncfs() on the repository's root directory because we don't have
+    /// any better options at present.  This blocks until the data is written out.
+    pub fn sync(&self) -> Result<()> {
+        syncfs(&self.repository)?;
+        Ok(())
+    }
+
+    /// Makes sure all content is written to the repository.
+    ///
+    /// This is currently just syncfs() on the repository's root directory because we don't have
+    /// any better options at present.  This won't return until the data is written out.
+    pub async fn sync_async(self: &Arc<Self>) -> Result<()> {
+        let self_ = Arc::clone(self);
+        tokio::task::spawn_blocking(move || self_.sync()).await?
     }
 
     /// Perform a garbage collection operation.
