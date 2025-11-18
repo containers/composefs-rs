@@ -48,6 +48,13 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             None
         };
 
+        // See https://github.com/containers/skopeo/issues/2750
+        let imgref = if let Some(hash) = imgref.strip_prefix("containers-storage:sha256:") {
+            &format!("containers-storage:{hash}") // yay temporary lifetime extension!
+        } else {
+            imgref
+        };
+
         let config = match img_proxy_config {
             Some(mut conf) => {
                 if conf.skopeo_cmd.is_none() {
