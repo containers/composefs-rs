@@ -20,6 +20,7 @@ composefs = { version = "0.3.0", path = "crates/composefs", default-features = f
 composefs-oci = { version = "0.3.0", path = "crates/composefs-oci", default-features = false }
 composefs-boot = { version = "0.3.0", path = "crates/composefs-boot", default-features = false }
 composefs-http = { version = "0.3.0", path = "crates/composefs-http", default-features = false }
+composefs-ostree = { version = "0.3.0", path = "crates/composefs-ostree", default-features = false }
 
 [profile.dev.package.sha2]
 # this is *really* slow otherwise
