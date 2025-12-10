@@ -78,21 +78,55 @@ pub enum UkiError {
     NoName,
 }
 
-/// Extracts a text section from a UKI PE file by name.
+/// Extracts a text section from a UKI PE file by name and validates it as UTF-8.
 ///
-/// Parses the PE file format to locate and extract the contents of a named
-/// text section (e.g., ".osrel", ".cmdline"). Returns None if the PE format
-/// is invalid, Some(Ok) with the text content if found and valid UTF-8, or
-/// Some(Err) with the specific error.
+/// This is a convenience wrapper around [`get_section`] that additionally validates
+/// the section contents as valid UTF-8 text.
+///
+/// # Arguments
+///
+/// * `image` - The complete UKI image as a byte slice
+/// * `section_name` - Name of the PE section to extract (e.g., ".osrel", ".cmdline")
+///
+/// # Returns
+///
+/// * `Ok(&str)` - If the section is found and contains valid UTF-8
+/// * `Err(UkiError)` - If the PE is invalid, section is missing or the section contains invalid UTF-8
+pub fn get_text_section<'a>(
+    image: &'a [u8],
+    section_name: &'static str,
+) -> Result<&'a str, UkiError> {
+    let bytes = get_section(image, section_name).ok_or(UkiError::PortableExecutableError)??;
+    std::str::from_utf8(bytes).or(Err(UkiError::UnicodeError(section_name)))
+}
+
+/// Extracts a raw section from a UKI PE file by name.
+///
+/// Parses the PE file format to locate and extract the raw bytes of a named
+/// section (e.g., ".osrel", ".cmdline"). This function returns the section
+/// contents as raw bytes without any UTF-8 validation.
+///
+/// # Arguments
+///
+/// * `image` - The complete UKI image as a byte slice
+/// * `section_name` - Name of the PE section to extract (must be ≤ 8 characters)
+///
+/// # Returns
+///
+/// * `None` - If the PE format is invalid or cannot be parsed
+/// * `Some(Ok(&[u8]))` - If the section is found, containing the raw section data
+/// * `Some(Err(UkiError::MissingSection))` - If the section is not found in the PE file
+///
+/// # Implementation Notes
 // We use `None` as a way to say `Err(UkiError::PortableExecutableError)` for two reasons:
 //   - .get(..) returns Option<> and using `?` with that is extremely convenient
 //   - the error types returned from FromBytes can't be used with `?` because they try to return a
 //     reference to the data, which causes problems with lifetime rules
 //   - it saves us from having to type Err(UkiError::PortableExecutableError) everywhere
-pub fn get_text_section<'a>(
+pub fn get_section<'a>(
     image: &'a [u8],
     section_name: &'static str,
-) -> Option<Result<&'a str, UkiError>> {
+) -> Option<Result<&'a [u8], UkiError>> {
     // Turn the section_name ".osrel" into a section_key b".osrel\0\0".
     // This will panic if section_name.len() > 8, which is what we want.
     let mut section_key = [0u8; 8];
@@ -120,7 +154,7 @@ pub fn get_text_section<'a>(
             let bytes = image
                 .get(section.pointer_to_raw_data.get() as usize..)?
                 .get(..section.virtual_size.get() as usize)?;
-            return Some(std::str::from_utf8(bytes).or(Err(UkiError::UnicodeError(section_name))));
+            return Some(Ok(bytes));
         }
     }
 
@@ -149,7 +183,7 @@ pub fn get_text_section<'a>(
 /// If we couldn't parse the PE file or couldn't find an ".osrel" section then an error will be
 /// returned.
 pub fn get_boot_label(image: &[u8]) -> Result<String, UkiError> {
-    let osrel = get_text_section(image, ".osrel").ok_or(UkiError::PortableExecutableError)??;
+    let osrel = get_text_section(image, ".osrel")?;
     OsReleaseInfo::parse(osrel)
         .get_boot_label()
         .ok_or(UkiError::NoName)
@@ -157,7 +191,7 @@ pub fn get_boot_label(image: &[u8]) -> Result<String, UkiError> {
 
 /// Gets the contents of the .cmdline section of a UKI.
 pub fn get_cmdline(image: &[u8]) -> Result<&str, UkiError> {
-    get_text_section(image, ".cmdline").ok_or(UkiError::PortableExecutableError)?
+    get_text_section(image, ".cmdline")
 }
 
 #[cfg(test)]
