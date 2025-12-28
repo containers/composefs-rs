@@ -20,7 +20,7 @@ rhel9 = ['composefs/rhel9']
 [dependencies]
 anyhow = { version = "1.0.87", default-features = false }
 fn-error-context = "0.2"
-clap = { version = "4.0.1", default-features = false, features = ["std", "help", "usage", "derive"] }
+clap = { version = "4.5.0", default-features = false, features = ["std", "help", "usage", "derive", "wrap_help"] }
 composefs = { workspace = true }
 composefs-boot = { workspace = true }
 composefs-oci = { workspace = true, optional = true }
