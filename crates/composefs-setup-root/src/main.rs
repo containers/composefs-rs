@@ -14,6 +14,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use hex::FromHexError;
 use rustix::{
     fs::{major, minor, mkdirat, openat, stat, symlink, Mode, OFlags, CWD},
     io::Errno,
@@ -25,7 +26,7 @@ use rustix::{
 use serde::Deserialize;
 
 use composefs::{
-    fsverity::{FsVerityHashValue, Sha256HashValue},
+    fsverity::{FsVerityHashValue, Sha256HashValue, Sha512HashValue},
     mount::{mount_at, FsHandle},
     mountcompat::{overlayfs_set_fd, overlayfs_set_lower_and_data_fds, prepare_mount},
     repository::Repository,
@@ -222,6 +223,21 @@ fn gpt_workaround() -> Result<()> {
     Ok(())
 }
 
+// Try parse cmdline with sha512 digest address first, if failed with invalid length, parse again with legacy sha256 digest address
+fn parse_image_address(cmdline: &str) -> Result<(String, bool)> {
+    match get_cmdline_composefs::<Sha512HashValue>(cmdline) {
+        Ok((id, insecure)) => Ok((id.to_hex(), insecure)),
+        Err(e) => {
+            if let Some(FromHexError::InvalidStringLength) = e.downcast_ref::<FromHexError>() {
+                let (id, insecure) = get_cmdline_composefs::<Sha256HashValue>(cmdline)?;
+                Ok((id.to_hex(), insecure))
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
 fn setup_root(args: Args) -> Result<()> {
     let config = match std::fs::read_to_string(args.config) {
         Ok(text) => toml::from_str(&text)?,
@@ -236,11 +252,12 @@ fn setup_root(args: Args) -> Result<()> {
         Some(cmdline) => cmdline,
         None => &std::fs::read_to_string("/proc/cmdline")?,
     };
-    let (image, insecure) = get_cmdline_composefs::<Sha256HashValue>(cmdline)?;
+
+    let (image_addr, insecure) = parse_image_address(cmdline)?;
 
     let new_root = match args.root_fs {
         Some(path) => open_root_fs(&path).context("Failed to clone specified root fs")?,
-        None => mount_composefs_image(&sysroot, &image.to_hex(), insecure)?,
+        None => mount_composefs_image(&sysroot, &image_addr, insecure)?,
     };
 
     // we need to clone this before the next step to make sure we get the old one
@@ -263,7 +280,7 @@ fn setup_root(args: Args) -> Result<()> {
     }
 
     // etc + var
-    let state = open_dir(open_dir(&sysroot, "state/deploy")?, image.to_hex())?;
+    let state = open_dir(open_dir(&sysroot, "state/deploy")?, &image_addr)?;
     mount_subdir(&new_root, &state, "etc", config.etc, MountType::Overlay)?;
     mount_subdir(&new_root, &state, "var", config.var, MountType::Bind)?;
 
@@ -290,11 +307,24 @@ mod test {
     fn test_parse() {
         let failing = ["", "foo", "composefs", "composefs=foo"];
         for case in failing {
-            assert!(get_cmdline_composefs::<Sha256HashValue>(case).is_err());
+            assert!(parse_image_address(case).is_err())
         }
-        let digest = "8b7df143d91c716ecfa5fc1730022f6b421b05cedee8fd52b1fc65a96030ad52";
+        let digest_legacy = "8b7df143d91c716ecfa5fc1730022f6b421b05cedee8fd52b1fc65a96030ad52";
+        let cmdline_legacy = &format!("composefs={digest_legacy}");
+        let (digest_cmdline_legacy, _) =
+            get_cmdline_composefs::<Sha256HashValue>(cmdline_legacy).unwrap();
+        similar_asserts::assert_eq!(
+            digest_cmdline_legacy,
+            Sha256HashValue::from_hex(digest_legacy).unwrap()
+        );
+        let (parsed_addr_legacy, _) = parse_image_address(cmdline_legacy).unwrap();
+        assert_eq!(digest_legacy, parsed_addr_legacy);
+
+        let digest = "6f06b5e82420abec546d6e6d3ddd612c50cfa9b707c129345b7ec16f456b92fe35df68999b042e1a6a70dfe75f2fed8cf9f67afd0bf08d2374678d75e2f65a02";
         let cmdline = &format!("composefs={digest}");
-        let (digest_cmdline, _) = get_cmdline_composefs::<Sha256HashValue>(cmdline).unwrap();
-        similar_asserts::assert_eq!(digest_cmdline, Sha256HashValue::from_hex(digest).unwrap());
+        let (digest_cmdline, _) = get_cmdline_composefs::<Sha512HashValue>(cmdline).unwrap();
+        similar_asserts::assert_eq!(digest_cmdline, Sha512HashValue::from_hex(digest).unwrap());
+        let (parsed_addr, _) = parse_image_address(cmdline).unwrap();
+        assert_eq!(digest, parsed_addr);
     }
 }

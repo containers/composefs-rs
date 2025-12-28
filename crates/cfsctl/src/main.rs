@@ -11,14 +11,14 @@ use std::{
 };
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use rustix::fs::CWD;
 
 use composefs_boot::{write_boot, BootOps};
 
 use composefs::{
-    fsverity::{FsVerityHashValue, Sha256HashValue},
+    fsverity::{FsVerityHashValue, Sha256HashValue, Sha512HashValue},
     repository::Repository,
 };
 
@@ -33,6 +33,10 @@ pub struct App {
     #[clap(long, group = "repopath")]
     system: bool,
 
+    /// What hash digest type to use for composefs repo
+    #[clap(long, value_enum, default_value_t = HashType::Sha512)]
+    hash: HashType,
+
     /// Sets the repository to insecure before running any operation and
     /// prepend '?' to the composefs kernel command line when writing
     /// boot entry.
@@ -41,6 +45,13 @@ pub struct App {
 
     #[clap(subcommand)]
     cmd: Command,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum, Default)]
+enum HashType {
+    Sha256,
+    #[default]
+    Sha512,
 }
 
 #[cfg(feature = "oci")]
@@ -159,20 +170,21 @@ enum Command {
     },
 }
 
-fn verity_opt(opt: &Option<String>) -> Result<Option<Sha256HashValue>> {
+fn verity_opt<ObjectID>(opt: &Option<String>) -> Result<Option<ObjectID>>
+where
+    ObjectID: FsVerityHashValue,
+{
     Ok(match opt {
         Some(value) => Some(FsVerityHashValue::from_hex(value)?),
         None => None,
     })
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    env_logger::init();
-
-    let args = App::parse();
-
-    let mut repo: Repository<Sha256HashValue> = (if let Some(path) = &args.repo {
+fn open_repo<ObjectID>(args: &App) -> Result<Repository<ObjectID>>
+where
+    ObjectID: FsVerityHashValue,
+{
+    let mut repo = (if let Some(path) = &args.repo {
         Repository::open_path(CWD, path)
     } else if args.system {
         Repository::open_system()
@@ -186,6 +198,25 @@ async fn main() -> Result<()> {
 
     repo.set_insecure(args.insecure);
 
+    Ok(repo)
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    env_logger::init();
+
+    let args = App::parse();
+
+    match args.hash {
+        HashType::Sha256 => run_cmd_with_repo(open_repo::<Sha256HashValue>(&args)?, args).await,
+        HashType::Sha512 => run_cmd_with_repo(open_repo::<Sha512HashValue>(&args)?, args).await,
+    }
+}
+
+async fn run_cmd_with_repo<ObjectID>(repo: Repository<ObjectID>, args: App) -> Result<()>
+where
+    ObjectID: FsVerityHashValue,
+{
     match args.cmd {
         Command::Transaction => {
             // just wait for ^C

@@ -41,7 +41,7 @@ esac
 
 cp ../../target/release/cfsctl .
 cp ../../target/release/composefs-setup-root extra/usr/lib/dracut/modules.d/37composefs/
-CFSCTL='./cfsctl --repo tmp/sysroot/composefs'
+CFSCTL='./cfsctl --repo tmp/sysroot/composefs --hash sha256'
 
 rm -rf tmp
 rm -rf tmp/efi tmp/sysroot/composefs/images
