@@ -135,7 +135,17 @@ enum Command {
         name: String,
     },
     /// Perform garbage collection
-    GC,
+    GC {
+        // digest of root images for gc operations
+        #[clap(long, short = 'i')]
+        root_images: Vec<String>,
+        // digest of root streams for gc operations
+        #[clap(long, short = 's')]
+        root_streams: Vec<String>,
+        /// Preview what would be deleted without actually deleting
+        #[clap(long, short = 'n')]
+        dry_run: bool,
+    },
     /// Imports a composefs image (unsafe!)
     ImportImage { reference: String },
     /// Commands for dealing with OCI layers
@@ -402,8 +412,12 @@ where
                 println!("{}", object.to_id());
             }
         }
-        Command::GC => {
-            repo.gc()?;
+        Command::GC {
+            root_images,
+            root_streams,
+            dry_run,
+        } => {
+            repo.gc(&root_images, &root_streams, dry_run)?;
         }
         #[cfg(feature = "http")]
         Command::Fetch { url, name } => {
