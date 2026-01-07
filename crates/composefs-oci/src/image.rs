@@ -69,8 +69,8 @@ pub fn process_entry<ObjectID: FsVerityHashValue>(
 
     let bytes = filename.as_bytes();
     if let Some(whiteout) = bytes.strip_prefix(b".wh.") {
-        if whiteout == b".wh.opq" {
-            // complete name is '.wh..wh.opq'
+        if whiteout == b".wh..opq" {
+            // complete name is '.wh..wh..opq'
             dir.clear();
         } else {
             dir.remove(OsStr::from_bytes(whiteout));
@@ -184,7 +184,7 @@ mod test {
 
         // try some whiteouts
         process_entry(&mut fs, file_entry(".wh.a"))?; // entire dir
-        process_entry(&mut fs, file_entry("/b/.wh..wh.opq"))?; // opaque dir
+        process_entry(&mut fs, file_entry("/b/.wh..wh..opq"))?; // opaque dir
         process_entry(&mut fs, file_entry("/c/.wh.c"))?; // single file
         assert_files(&fs, &["/", "/b", "/c", "/c/a"])?;
 
