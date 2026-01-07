@@ -68,7 +68,7 @@ pub fn split(
 
         // read the corresponding data, if there is any
         let actual_size = header.entry_size()? as usize;
-        let storage_size = (actual_size + 511) & !511;
+        let storage_size = actual_size.next_multiple_of(512);
         let mut buffer = vec![0u8; storage_size];
         tar_stream.read_exact(&mut buffer)?;
 
@@ -105,7 +105,7 @@ pub async fn split_async(
 
         // read the corresponding data, if there is any
         let actual_size = header.entry_size()? as usize;
-        let storage_size = (actual_size + 511) & !511;
+        let storage_size = actual_size.next_multiple_of(512);
         let mut buffer = vec![0u8; storage_size];
         tar_stream.read_exact(&mut buffer).await?;
 
@@ -217,8 +217,9 @@ pub fn get_entry<R: Read, ObjectID: FsVerityHashValue>(
         let header = tar::Header::from_byte_slice(&buf);
 
         let size = header.entry_size()?;
+        let stored_size = size.next_multiple_of(512);
 
-        let item = match reader.read_exact(size as usize, ((size + 511) & !511) as usize)? {
+        let item = match reader.read_exact(size as usize, stored_size as usize)? {
             SplitStreamData::External(id) => match header.entry_type() {
                 EntryType::Regular | EntryType::Continuous => {
                     ensure!(
