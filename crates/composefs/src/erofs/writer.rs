@@ -83,7 +83,7 @@ struct DirEnt<'a> {
 struct Directory<'a> {
     blocks: Box<[Box<[DirEnt<'a>]>]>,
     inline: Box<[DirEnt<'a>]>,
-    size: usize,
+    size: u64,
     nlink: usize,
 }
 
@@ -160,7 +160,7 @@ impl<'a> Directory<'a> {
         let mut blocks = vec![];
         let mut rest = vec![];
 
-        let mut n_bytes = 0;
+        let mut n_bytes = 0u64;
         let mut nlink = 0;
 
         trace!("Directory with {} items", entries.len());
@@ -168,7 +168,9 @@ impl<'a> Directory<'a> {
         // The content of the directory is fixed at this point so we may as well split it into
         // blocks.  This lets us avoid measuring and re-measuring.
         for entry in entries.into_iter() {
-            let entry_size = size_of::<format::DirectoryEntryHeader>() + entry.name.len();
+            let entry_size: u64 = (size_of::<format::DirectoryEntryHeader>() + entry.name.len())
+                .try_into()
+                .unwrap();
             assert!(entry_size <= 4096);
 
             trace!("    {:?}", entry.file_type);
@@ -204,7 +206,8 @@ impl<'a> Directory<'a> {
             rest.len()
         );
 
-        let size = format::BLOCK_SIZE * blocks.len() + n_bytes;
+        let block_size: u64 = format::BLOCK_SIZE.into();
+        let size = block_size * blocks.len() as u64 + n_bytes;
         Self {
             blocks: blocks.into_boxed_slice(),
             inline: rest.into_boxed_slice(),
@@ -250,10 +253,11 @@ impl<'a> Directory<'a> {
     }
 
     fn write_blocks(&self, output: &mut impl Output) {
+        let block_size: usize = format::BLOCK_SIZE.into();
         for block in &self.blocks {
-            assert_eq!(output.len() % format::BLOCK_SIZE, 0);
+            assert_eq!(output.len() % block_size, 0);
             self.write_block(output, block);
-            output.pad(format::BLOCK_SIZE);
+            output.pad(block_size);
         }
     }
 
@@ -265,7 +269,7 @@ impl<'a> Directory<'a> {
         } else {
             (format::DataLayout::FlatInline, 0)
         };
-        (layout, u, self.size as u64, self.nlink)
+        (layout, u, self.size, self.nlink)
     }
 }
 
@@ -335,15 +339,21 @@ impl<ObjectID: FsVerityHashValue> Inode<'_, ObjectID> {
         // We need to make sure the inline part doesn't overlap a block boundary
         output.pad(32);
         if matches!(layout, format::DataLayout::FlatInline) {
-            let inode_and_xattr_size = size_of::<format::ExtendedInodeHeader>() + xattr_size;
-            let inline_start = output.len() + inode_and_xattr_size;
+            let block_size = u64::from(format::BLOCK_SIZE);
+            let inode_and_xattr_size: u64 = (size_of::<format::ExtendedInodeHeader>() + xattr_size)
+                .try_into()
+                .unwrap();
+            let inline_start: u64 = output.len().try_into().unwrap();
+            let inline_start = inline_start + inode_and_xattr_size;
             let end_of_metadata = inline_start - 1;
-            let inline_end = inline_start + (size as usize % format::BLOCK_SIZE);
-            if end_of_metadata / format::BLOCK_SIZE != inline_end / format::BLOCK_SIZE {
+            let inline_end = inline_start + (size % block_size);
+            if end_of_metadata / block_size != inline_end / block_size {
                 // If we proceed, then we'll violate the rule about crossing block boundaries.
                 // The easiest thing to do is to add padding so that the inline data starts close
                 // to the start of a fresh block boundary, while ensuring inode alignment.
-                let pad = vec![0; 4096 - end_of_metadata % 4096];
+                // pad_size is always < block_size (4096), so fits in usize
+                let pad_size = (block_size - end_of_metadata % block_size) as usize;
+                let pad = vec![0; pad_size];
                 trace!("added pad {}", pad.len());
                 output.write(&pad);
                 output.pad(32);
@@ -593,7 +603,7 @@ fn write_erofs(
         feature_compat: format::FEATURE_COMPAT_MTIME | format::FEATURE_COMPAT_XATTR_FILTER,
         root_nid: (output.get_nid(0) as u16).into(),
         inos: (inodes.len() as u64).into(),
-        blocks: ((output.get(Offset::End, 0) / format::BLOCK_SIZE) as u32).into(),
+        blocks: ((output.get(Offset::End, 0) / usize::from(format::BLOCK_SIZE)) as u32).into(),
         ..Default::default()
     });
 

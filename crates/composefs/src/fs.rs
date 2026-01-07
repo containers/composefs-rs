@@ -16,7 +16,7 @@ use std::{
     rc::Rc,
 };
 
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context as _, Result};
 use rustix::{
     buffer::spare_capacity,
     fd::{AsFd, OwnedFd},
@@ -103,8 +103,10 @@ fn write_leaf<ObjectID: FsVerityHashValue>(
         }
         LeafContent::Regular(RegularFile::External(ref id, size)) => {
             let object = repo.open_object(id)?;
-            // TODO: make this better.  At least needs to be EINTR-safe.  Could even do reflink in some cases...
-            let mut buffer = vec![MaybeUninit::uninit(); *size as usize];
+            // TODO: make this better.  At least needs to be EINTR-safe.  Could even do reflink in some cases.
+            // Regardless we shouldn't read the whole file into memory.
+            let size = (*size).try_into().context("size overflow")?;
+            let mut buffer = vec![MaybeUninit::uninit(); size];
             let (data, _) = read(object, &mut buffer)?;
             set_file_contents(dirfd, name, &leaf.stat, data)?;
         }
@@ -213,7 +215,8 @@ impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
         let content = match FileType::from_raw_mode(buf.st_mode) {
             FileType::Directory | FileType::Unknown => unreachable!(),
             FileType::RegularFile => {
-                let mut buffer = Vec::with_capacity(buf.st_size as usize);
+                let size = buf.st_size.try_into().context("size overflow")?;
+                let mut buffer = Vec::with_capacity(size);
                 if buf.st_size > 0 {
                     read(fd, spare_capacity(&mut buffer))?;
                 }
@@ -362,7 +365,8 @@ pub fn read_file<ObjectID: FsVerityHashValue>(
     match file {
         RegularFile::Inline(data) => Ok(data.clone()),
         RegularFile::External(id, size) => {
-            let mut data = Vec::with_capacity(*size as usize);
+            let capacity: usize = (*size).try_into().context("file too large for memory")?;
+            let mut data = Vec::with_capacity(capacity);
             std::fs::File::from(repo.open_object(id)?).read_to_end(&mut data)?;
             ensure!(
                 *size == data.len() as u64,

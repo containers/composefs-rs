@@ -18,7 +18,7 @@ use zerocopy::{
 /// Number of bits used for block size (12 = 4096 bytes)
 pub const BLOCK_BITS: u8 = 12;
 /// Size of a block in bytes (4096)
-pub const BLOCK_SIZE: usize = 1 << BLOCK_BITS;
+pub const BLOCK_SIZE: u16 = 1 << BLOCK_BITS;
 
 /// Errors that can occur when parsing EROFS format structures
 #[derive(Debug)]
