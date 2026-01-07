@@ -35,6 +35,18 @@ use crate::{
     util::{proc_self_fd, replace_symlinkat, ErrnoFilter, Sha256Digest},
 };
 
+/// Trait for content-addressed object storage.
+///
+/// This trait abstracts the storage of content-addressed objects, allowing
+/// different implementations for production (filesystem-based with fs-verity)
+/// and testing (in-memory).
+pub trait ObjectStore<ObjectID: FsVerityHashValue>: std::fmt::Debug + Send + Sync {
+    /// Store data and return its content-addressed ID (fs-verity digest).
+    ///
+    /// If the object already exists, returns the existing ID without re-storing.
+    fn ensure_object(&self, data: &[u8]) -> Result<ObjectID>;
+}
+
 /// Call openat() on the named subdirectory of "dirfd", possibly creating it first.
 ///
 /// We assume that the directory will probably exist (ie: we try the open first), and on ENOENT, we
@@ -253,7 +265,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         self: &Arc<Self>,
         sha256: Option<Sha256Digest>,
         maps: Option<DigestMap<ObjectID>>,
-    ) -> SplitStreamWriter<ObjectID> {
+    ) -> SplitStreamWriter<ObjectID, Self> {
         SplitStreamWriter::new(self, maps, sha256)
     }
 
@@ -332,7 +344,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// provided name.
     pub fn write_stream(
         &self,
-        writer: SplitStreamWriter<ObjectID>,
+        writer: SplitStreamWriter<ObjectID, Self>,
         reference: Option<&str>,
     ) -> Result<ObjectID> {
         let Some((.., ref sha256)) = writer.sha256 else {
@@ -377,7 +389,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     pub fn ensure_stream(
         self: &Arc<Self>,
         sha256: &Sha256Digest,
-        callback: impl FnOnce(&mut SplitStreamWriter<ObjectID>) -> Result<()>,
+        callback: impl FnOnce(&mut SplitStreamWriter<ObjectID, Self>) -> Result<()>,
         reference: Option<&str>,
     ) -> Result<ObjectID> {
         let stream_path = format!("streams/{}", hex::encode(sha256));
@@ -722,4 +734,10 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     // fn fsck(&self) -> Result<()> {
     //     unimplemented!()
     // }
+}
+
+impl<ObjectID: FsVerityHashValue> ObjectStore<ObjectID> for Repository<ObjectID> {
+    fn ensure_object(&self, data: &[u8]) -> Result<ObjectID> {
+        Repository::ensure_object(self, data)
+    }
 }

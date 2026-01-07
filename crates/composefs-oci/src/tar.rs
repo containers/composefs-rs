@@ -27,6 +27,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use composefs::{
     dumpfile,
     fsverity::FsVerityHashValue,
+    repository::ObjectStore,
     splitstream::{SplitStreamData, SplitStreamReader, SplitStreamWriter},
     tree::{LeafContent, RegularFile, Stat},
     util::{read_exactish, read_exactish_async},
@@ -54,9 +55,9 @@ async fn read_header_async(reader: &mut (impl AsyncRead + Unpin)) -> Result<Opti
 /// Splits the tar file from tar_stream into a Split Stream.  The store_data function is
 /// responsible for ensuring that "external data" is in the composefs repository and returns the
 /// fsverity hash value of that data.
-pub fn split(
+pub fn split<ObjectID: FsVerityHashValue, S: ObjectStore<ObjectID>>(
     tar_stream: &mut impl Read,
-    writer: &mut SplitStreamWriter<impl FsVerityHashValue>,
+    writer: &mut SplitStreamWriter<ObjectID, S>,
 ) -> Result<()> {
     while let Some(header) = read_header(tar_stream)? {
         // the header always gets stored as inline data
@@ -91,9 +92,9 @@ pub fn split(
 /// and metadata are stored inline in the split stream.
 ///
 /// Returns an error if the tar stream is malformed or if writing to the split stream fails.
-pub async fn split_async(
+pub async fn split_async<ObjectID: FsVerityHashValue>(
     mut tar_stream: impl AsyncRead + Unpin,
-    writer: &mut SplitStreamWriter<impl FsVerityHashValue>,
+    writer: &mut SplitStreamWriter<ObjectID, composefs::repository::Repository<ObjectID>>,
 ) -> Result<()> {
     while let Some(header) = read_header_async(&mut tar_stream).await? {
         // the header always gets stored as inline data

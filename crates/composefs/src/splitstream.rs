@@ -21,7 +21,7 @@ use zstd::stream::{read::Decoder, write::Encoder};
 
 use crate::{
     fsverity::FsVerityHashValue,
-    repository::Repository,
+    repository::ObjectStore,
     util::{read_exactish, Sha256Digest},
 };
 
@@ -82,32 +82,35 @@ impl<ObjectID: FsVerityHashValue> DigestMap<ObjectID> {
 }
 
 /// Writer for creating split stream format files with inline content and external object references.
-pub struct SplitStreamWriter<ObjectID: FsVerityHashValue> {
-    repo: Arc<Repository<ObjectID>>,
+pub struct SplitStreamWriter<ObjectID: FsVerityHashValue, S: ObjectStore<ObjectID>> {
+    store: Arc<S>,
     inline_content: Vec<u8>,
     writer: Encoder<'static, Vec<u8>>,
     /// Optional SHA256 hasher and expected digest for validation
     pub sha256: Option<(Sha256, Sha256Digest)>,
+    _marker: std::marker::PhantomData<ObjectID>,
 }
 
-impl<ObjectID: FsVerityHashValue> std::fmt::Debug for SplitStreamWriter<ObjectID> {
+impl<ObjectID: FsVerityHashValue, S: ObjectStore<ObjectID>> std::fmt::Debug
+    for SplitStreamWriter<ObjectID, S>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // writer doesn't impl Debug
         f.debug_struct("SplitStreamWriter")
-            .field("repo", &self.repo)
+            .field("store", &self.store)
             .field("inline_content", &self.inline_content)
             .field("sha256", &self.sha256)
             .finish()
     }
 }
 
-impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
-    /// Creates a new split stream writer.
+impl<ObjectID: FsVerityHashValue, S: ObjectStore<ObjectID>> SplitStreamWriter<ObjectID, S> {
+    /// Creates a new split stream writer with a custom object store.
     ///
     /// The writer is initialized with optional digest map references and an optional
     /// expected SHA256 hash for validation when the stream is finalized.
-    pub fn new(
-        repo: &Arc<Repository<ObjectID>>,
+    pub fn new_with_store(
+        store: &Arc<S>,
         refs: Option<DigestMap<ObjectID>>,
         sha256: Option<Sha256Digest>,
     ) -> Self {
@@ -125,10 +128,11 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
         }
 
         Self {
-            repo: Arc::clone(repo),
+            store: Arc::clone(store),
             inline_content: vec![],
             writer,
             sha256: sha256.map(|x| (Sha256::new(), x)),
+            _marker: std::marker::PhantomData,
         }
     }
 
@@ -172,15 +176,51 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
 
     /// Writes data as an external object reference with optional padding.
     ///
-    /// The data is stored in the repository and a reference is written to the stream.
+    /// The data is stored in the object store and a reference is written to the stream.
     /// Any padding bytes are stored inline after the reference.
     pub fn write_external(&mut self, data: &[u8], padding: Vec<u8>) -> Result<()> {
         if let Some((ref mut sha256, ..)) = self.sha256 {
             sha256.update(data);
             sha256.update(&padding);
         }
-        let id = self.repo.ensure_object(data)?;
+        let id = self.store.ensure_object(data)?;
         self.write_reference(&id, padding)
+    }
+
+    /// Finalizes the split stream and returns its object ID.
+    ///
+    /// Flushes any remaining inline content, validates the SHA256 hash if provided,
+    /// and stores the compressed stream in the object store.
+    pub fn done(mut self) -> Result<ObjectID> {
+        self.flush_inline(vec![])?;
+
+        if let Some((context, expected)) = self.sha256 {
+            if Into::<Sha256Digest>::into(context.finalize()) != expected {
+                bail!("Content doesn't have expected SHA256 hash value!");
+            }
+        }
+
+        self.store.ensure_object(&self.writer.finish()?)
+    }
+}
+
+/// Convenience type alias for SplitStreamWriter using the filesystem-based Repository.
+pub type RepositorySplitStreamWriter<ObjectID> =
+    SplitStreamWriter<ObjectID, crate::repository::Repository<ObjectID>>;
+
+impl<ObjectID: FsVerityHashValue>
+    SplitStreamWriter<ObjectID, crate::repository::Repository<ObjectID>>
+{
+    /// Creates a new split stream writer with a Repository.
+    ///
+    /// The writer is initialized with optional digest map references and an optional
+    /// expected SHA256 hash for validation when the stream is finalized.
+    pub fn new(
+        repo: &Arc<crate::repository::Repository<ObjectID>>,
+        refs: Option<DigestMap<ObjectID>>,
+        sha256: Option<Sha256Digest>,
+    ) -> Self {
+        Self::new_with_store(repo, refs, sha256)
     }
 
     /// Asynchronously writes data as an external object reference with optional padding.
@@ -192,24 +232,8 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
             sha256.update(&data);
             sha256.update(&padding);
         }
-        let id = self.repo.ensure_object_async(data).await?;
+        let id = self.store.ensure_object_async(data).await?;
         self.write_reference(&id, padding)
-    }
-
-    /// Finalizes the split stream and returns its object ID.
-    ///
-    /// Flushes any remaining inline content, validates the SHA256 hash if provided,
-    /// and stores the compressed stream in the repository.
-    pub fn done(mut self) -> Result<ObjectID> {
-        self.flush_inline(vec![])?;
-
-        if let Some((context, expected)) = self.sha256 {
-            if Into::<Sha256Digest>::into(context.finalize()) != expected {
-                bail!("Content doesn't have expected SHA256 hash value!");
-            }
-        }
-
-        self.repo.ensure_object(&self.writer.finish()?)
     }
 }
 
@@ -459,7 +483,48 @@ impl<F: Read, ObjectID: FsVerityHashValue> Read for SplitStreamReader<F, ObjectI
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fsverity::{compute_verity, Sha256HashValue};
+    use std::collections::HashMap;
     use std::io::Cursor;
+    use std::sync::RwLock;
+
+    /// In-memory object store for testing splitstream operations.
+    ///
+    /// This implementation stores objects in a HashMap, computing fs-verity
+    /// digests in userspace without requiring filesystem support.
+    #[derive(Debug, Default)]
+    struct InMemoryObjectStore {
+        objects: RwLock<HashMap<Sha256HashValue, Vec<u8>>>,
+    }
+
+    impl InMemoryObjectStore {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        /// Retrieve an object by ID (for use with SplitStreamReader::cat)
+        fn get(&self, id: &Sha256HashValue) -> Option<Vec<u8>> {
+            self.objects.read().unwrap().get(id).cloned()
+        }
+
+        /// Return the number of objects stored
+        #[allow(dead_code)]
+        fn len(&self) -> usize {
+            self.objects.read().unwrap().len()
+        }
+    }
+
+    impl ObjectStore<Sha256HashValue> for InMemoryObjectStore {
+        fn ensure_object(&self, data: &[u8]) -> Result<Sha256HashValue> {
+            let id: Sha256HashValue = compute_verity(data);
+            self.objects
+                .write()
+                .unwrap()
+                .entry(id.clone())
+                .or_insert_with(|| data.to_vec());
+            Ok(id)
+        }
+    }
 
     #[test]
     fn test_read_into_vec() -> Result<()> {
@@ -508,6 +573,268 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(vec.len(), 2);
         assert_eq!(vec, vec![1, 2]);
+
+        Ok(())
+    }
+
+    /// Generate deterministic test data of a given size.
+    /// Uses a simple pattern that's easy to verify but non-trivial.
+    fn generate_test_data(size: usize, seed: u8) -> Vec<u8> {
+        (0..size)
+            .map(|i| ((i as u8).wrapping_add(seed)).wrapping_mul(17))
+            .collect()
+    }
+
+    /// Helper to write a splitstream and read it back, verifying exact roundtrip.
+    fn roundtrip_cat(
+        store: &Arc<InMemoryObjectStore>,
+        stream_id: &Sha256HashValue,
+    ) -> Result<Vec<u8>> {
+        let stream_data = store.get(stream_id).expect("stream should be stored");
+        let mut reader = SplitStreamReader::<_, Sha256HashValue>::new(Cursor::new(stream_data))?;
+        let mut output = Vec::new();
+        reader.cat(&mut output, |id| {
+            store
+                .get(id)
+                .ok_or_else(|| anyhow::anyhow!("Object not found: {:?}", id))
+        })?;
+        Ok(output)
+    }
+
+    #[test]
+    fn test_splitstream_inline_only() -> Result<()> {
+        let store = Arc::new(InMemoryObjectStore::new());
+
+        // Use non-trivial inline content (under typical thresholds)
+        let inline1 = generate_test_data(32, 0xAB);
+        let inline2 = generate_test_data(48, 0xCD);
+
+        let mut writer = SplitStreamWriter::new_with_store(&store, None, None);
+        writer.write_inline(&inline1);
+        writer.write_inline(&inline2);
+        let stream_id = writer.done()?;
+
+        let output = roundtrip_cat(&store, &stream_id)?;
+
+        let mut expected = inline1.clone();
+        expected.extend(&inline2);
+        assert_eq!(output, expected, "inline-only roundtrip must be exact");
+        Ok(())
+    }
+
+    #[test]
+    fn test_splitstream_large_external() -> Result<()> {
+        let store = Arc::new(InMemoryObjectStore::new());
+
+        // Simulate realistic file content: 128KB of data (like a compressed image or binary)
+        let large_content = generate_test_data(128 * 1024, 0x42);
+
+        let mut writer = SplitStreamWriter::new_with_store(&store, None, None);
+        writer.write_external(&large_content, vec![])?;
+        let stream_id = writer.done()?;
+
+        let output = roundtrip_cat(&store, &stream_id)?;
+
+        assert_eq!(output.len(), large_content.len());
+        assert_eq!(
+            output, large_content,
+            "large external content must roundtrip exactly"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_splitstream_mixed_content() -> Result<()> {
+        let store = Arc::new(InMemoryObjectStore::new());
+
+        // Simulate a tar-like structure: header (inline) + file content (external) + padding
+        let header = generate_test_data(512, 0x01); // tar header size
+        let file_content = generate_test_data(64 * 1024, 0x02); // 64KB file
+        let padding = vec![0u8; 512 - (file_content.len() % 512)]; // tar padding to 512-byte boundary
+        let trailer = generate_test_data(1024, 0x03); // end-of-archive blocks
+
+        let mut writer = SplitStreamWriter::new_with_store(&store, None, None);
+        writer.write_inline(&header);
+        writer.write_external(&file_content, padding.clone())?;
+        writer.write_inline(&trailer);
+        let stream_id = writer.done()?;
+
+        let output = roundtrip_cat(&store, &stream_id)?;
+
+        // Build expected output
+        let mut expected = header.clone();
+        expected.extend(&file_content);
+        expected.extend(&padding);
+        expected.extend(&trailer);
+
+        assert_eq!(output.len(), expected.len());
+        assert_eq!(output, expected, "mixed content must roundtrip exactly");
+        Ok(())
+    }
+
+    #[test]
+    fn test_splitstream_multiple_large_externals() -> Result<()> {
+        let store = Arc::new(InMemoryObjectStore::new());
+
+        // Multiple files of varying sizes (simulating different file types)
+        let file1 = generate_test_data(32 * 1024, 0x10); // 32KB
+        let file2 = generate_test_data(256 * 1024, 0x20); // 256KB
+        let file3 = generate_test_data(8 * 1024, 0x30); // 8KB
+        let separator = generate_test_data(64, 0xFF); // metadata between files
+
+        let mut writer = SplitStreamWriter::new_with_store(&store, None, None);
+        writer.write_external(&file1, vec![])?;
+        writer.write_inline(&separator);
+        writer.write_external(&file2, vec![])?;
+        writer.write_inline(&separator);
+        writer.write_external(&file3, vec![])?;
+        let stream_id = writer.done()?;
+
+        // 3 unique external objects + 1 stream object
+        assert_eq!(store.len(), 4);
+
+        let output = roundtrip_cat(&store, &stream_id)?;
+
+        let mut expected = file1.clone();
+        expected.extend(&separator);
+        expected.extend(&file2);
+        expected.extend(&separator);
+        expected.extend(&file3);
+
+        assert_eq!(output.len(), expected.len());
+        assert_eq!(
+            output, expected,
+            "multiple large externals must roundtrip exactly"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_splitstream_deduplication() -> Result<()> {
+        let store = Arc::new(InMemoryObjectStore::new());
+
+        // Realistic deduplication scenario: same 64KB chunk appearing multiple times
+        // (e.g., identical layers in container images)
+        let repeated_chunk = generate_test_data(64 * 1024, 0xDE);
+        let unique_chunk = generate_test_data(32 * 1024, 0xAD);
+
+        let mut writer = SplitStreamWriter::new_with_store(&store, None, None);
+        writer.write_external(&repeated_chunk, vec![])?;
+        writer.write_external(&unique_chunk, vec![])?;
+        writer.write_external(&repeated_chunk, vec![])?; // duplicate
+        writer.write_external(&repeated_chunk, vec![])?; // another duplicate
+        let stream_id = writer.done()?;
+
+        // Only 3 objects: 2 unique data chunks + the stream itself
+        assert_eq!(store.len(), 3, "duplicates should be deduplicated");
+
+        let output = roundtrip_cat(&store, &stream_id)?;
+
+        let mut expected = repeated_chunk.clone();
+        expected.extend(&unique_chunk);
+        expected.extend(&repeated_chunk);
+        expected.extend(&repeated_chunk);
+
+        assert_eq!(output.len(), expected.len());
+        assert_eq!(
+            output, expected,
+            "deduplicated content must still roundtrip exactly"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_splitstream_with_padding() -> Result<()> {
+        let store = Arc::new(InMemoryObjectStore::new());
+
+        // Simulate tar file structure where files are padded to 512-byte boundaries
+        let header = generate_test_data(512, 0x01);
+        let file_content = generate_test_data(1000, 0x02); // not aligned to 512
+        let padding_size = 512 - (file_content.len() % 512); // 24 bytes of padding
+        let padding = vec![0u8; padding_size];
+
+        let mut writer = SplitStreamWriter::new_with_store(&store, None, None);
+        writer.write_inline(&header);
+        writer.write_external(&file_content, padding.clone())?;
+        let stream_id = writer.done()?;
+
+        let output = roundtrip_cat(&store, &stream_id)?;
+
+        let mut expected = header.clone();
+        expected.extend(&file_content);
+        expected.extend(&padding);
+
+        assert_eq!(output.len(), expected.len());
+        assert_eq!(
+            output, expected,
+            "content with padding must roundtrip exactly"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_splitstream_get_object_refs() -> Result<()> {
+        let store = Arc::new(InMemoryObjectStore::new());
+
+        // Use distinctly sized chunks so we can verify the right objects are referenced
+        let chunk1 = generate_test_data(16 * 1024, 0x11);
+        let chunk2 = generate_test_data(24 * 1024, 0x22);
+        let inline_data = generate_test_data(128, 0x33);
+
+        let mut writer = SplitStreamWriter::new_with_store(&store, None, None);
+        writer.write_inline(&inline_data);
+        writer.write_external(&chunk1, vec![])?;
+        writer.write_external(&chunk2, vec![])?;
+        let stream_id = writer.done()?;
+
+        let stream_data = store.get(&stream_id).expect("stream should be stored");
+        let mut reader = SplitStreamReader::<_, Sha256HashValue>::new(Cursor::new(stream_data))?;
+
+        let mut refs = Vec::new();
+        reader.get_object_refs(|id| refs.push(id.clone()))?;
+
+        // Should have 2 external references
+        assert_eq!(refs.len(), 2);
+
+        // Verify both references point to valid objects with correct content
+        let obj1 = store.get(&refs[0]).expect("first ref should exist");
+        let obj2 = store.get(&refs[1]).expect("second ref should exist");
+
+        assert_eq!(
+            obj1, chunk1,
+            "first external reference must match original data"
+        );
+        assert_eq!(
+            obj2, chunk2,
+            "second external reference must match original data"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_splitstream_boundary_sizes() -> Result<()> {
+        // Test with sizes around common boundaries (4KB page, 64KB chunk)
+        let sizes = [4095, 4096, 4097, 65535, 65536, 65537];
+
+        for size in sizes {
+            let store = Arc::new(InMemoryObjectStore::new());
+            let data = generate_test_data(size, size as u8);
+
+            let mut writer = SplitStreamWriter::new_with_store(&store, None, None);
+            writer.write_external(&data, vec![])?;
+            let stream_id = writer.done()?;
+
+            let output = roundtrip_cat(&store, &stream_id)?;
+
+            assert_eq!(
+                output.len(),
+                data.len(),
+                "size {} must roundtrip with correct length",
+                size
+            );
+            assert_eq!(output, data, "size {} must roundtrip exactly", size);
+        }
 
         Ok(())
     }
