@@ -29,13 +29,22 @@ jobs:
       - name: Checkout bootc repository
         uses: actions/checkout@v5
         with:
-          repository: containers/bootc
+          repository: bootc-dev/bootc
+          # Use the PR that updates bootc to the current composefs-rs API.
+          # Once merged, change this back to 'main' or a release tag.
+          ref: refs/pull/1791/head
           path: bootc
 
       - name: Bootc Ubuntu Setup
         uses: ./bootc/.github/actions/bootc-ubuntu-setup
         with:
           libvirt: true
+
+      - name: Install tmt
+        run: |
+          sudo apt-get install -y pipx
+          pipx install tmt[provision]
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Patch bootc to use current composefs-rs
         working-directory: bootc
