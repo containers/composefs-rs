@@ -677,7 +677,11 @@ impl<ObjectID: FsVerityHashValue> Read for SplitStreamReader<ObjectID> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fsverity::{compute_verity, Sha256HashValue};
+    use crate::test::tempdir;
+    use rustix::fs::{mkdirat, Mode, CWD};
     use std::io::Cursor;
+    use std::path::Path;
 
     #[test]
     fn test_read_into_vec() -> Result<()> {
@@ -726,6 +730,345 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(vec.len(), 2);
         assert_eq!(vec, vec![1, 2]);
+
+        Ok(())
+    }
+
+    /// Create a test repository in insecure mode (no fs-verity required).
+    fn create_test_repo(path: &Path) -> Result<Arc<Repository<Sha256HashValue>>> {
+        mkdirat(CWD, path, Mode::from_raw_mode(0o755))?;
+        let mut repo = Repository::open_path(CWD, path)?;
+        repo.set_insecure(true);
+        Ok(Arc::new(repo))
+    }
+
+    /// Generate deterministic test data of a given size.
+    fn generate_test_data(size: usize, seed: u8) -> Vec<u8> {
+        (0..size)
+            .map(|i| ((i as u8).wrapping_add(seed)).wrapping_mul(17))
+            .collect()
+    }
+
+    #[test]
+    fn test_splitstream_inline_only() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let inline1 = generate_test_data(32, 0xAB);
+        let inline2 = generate_test_data(48, 0xCD);
+
+        let mut writer = repo.create_stream(0);
+        writer.write_inline(&inline1);
+        writer.write_inline(&inline2);
+        let stream_id = repo.write_stream(writer, "test-inline", None)?;
+
+        // Read it back via cat()
+        let mut reader = repo.open_stream("test-inline", Some(&stream_id), None)?;
+        let mut output = Vec::new();
+        reader.cat(&repo, &mut output)?;
+
+        let mut expected = inline1.clone();
+        expected.extend(&inline2);
+        assert_eq!(output, expected, "inline-only roundtrip must be exact");
+        Ok(())
+    }
+
+    #[test]
+    fn test_splitstream_large_external() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        // 128KB of data
+        let large_content = generate_test_data(128 * 1024, 0x42);
+
+        // Compute expected fs-verity digest for this content
+        let expected_digest: Sha256HashValue = compute_verity(&large_content);
+
+        let mut writer = repo.create_stream(0);
+        writer.write_external(&large_content)?;
+        let stream_id = repo.write_stream(writer, "test-external", None)?;
+
+        // Verify the object reference matches the expected digest
+        let mut reader = repo.open_stream("test-external", Some(&stream_id), None)?;
+        let mut refs = Vec::new();
+        reader.get_object_refs(|id| refs.push(id.clone()))?;
+        assert_eq!(refs.len(), 1);
+        assert_eq!(
+            refs[0], expected_digest,
+            "external object must have correct fs-verity digest"
+        );
+
+        // Verify roundtrip
+        let mut reader = repo.open_stream("test-external", Some(&stream_id), None)?;
+        let mut output = Vec::new();
+        reader.cat(&repo, &mut output)?;
+
+        assert_eq!(output.len(), large_content.len());
+        assert_eq!(
+            output, large_content,
+            "large external content must roundtrip exactly"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_splitstream_mixed_content() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        // Simulate a tar-like structure: header (inline) + file content (external) + trailer
+        let header = generate_test_data(512, 0x01);
+        let file_content = generate_test_data(64 * 1024, 0x02);
+        let trailer = generate_test_data(1024, 0x03);
+
+        // Compute expected digest for the external content
+        let expected_digest: Sha256HashValue = compute_verity(&file_content);
+
+        let mut writer = repo.create_stream(0);
+        writer.write_inline(&header);
+        writer.write_external(&file_content)?;
+        writer.write_inline(&trailer);
+        let stream_id = repo.write_stream(writer, "test-mixed", None)?;
+
+        // Verify the external object has the correct digest
+        let mut reader = repo.open_stream("test-mixed", Some(&stream_id), None)?;
+        let mut refs = Vec::new();
+        reader.get_object_refs(|id| refs.push(id.clone()))?;
+        assert_eq!(refs.len(), 1);
+        assert_eq!(
+            refs[0], expected_digest,
+            "external object must have correct fs-verity digest"
+        );
+
+        // Verify roundtrip
+        let mut reader = repo.open_stream("test-mixed", Some(&stream_id), None)?;
+        let mut output = Vec::new();
+        reader.cat(&repo, &mut output)?;
+
+        let mut expected = header.clone();
+        expected.extend(&file_content);
+        expected.extend(&trailer);
+
+        assert_eq!(output.len(), expected.len());
+        assert_eq!(output, expected, "mixed content must roundtrip exactly");
+        Ok(())
+    }
+
+    #[test]
+    fn test_splitstream_multiple_externals() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let file1 = generate_test_data(32 * 1024, 0x10);
+        let file2 = generate_test_data(256 * 1024, 0x20);
+        let file3 = generate_test_data(8 * 1024, 0x30);
+        let separator = generate_test_data(64, 0xFF);
+
+        // Compute expected digests
+        let expected_digest1: Sha256HashValue = compute_verity(&file1);
+        let expected_digest2: Sha256HashValue = compute_verity(&file2);
+        let expected_digest3: Sha256HashValue = compute_verity(&file3);
+
+        let mut writer = repo.create_stream(0);
+        writer.write_external(&file1)?;
+        writer.write_inline(&separator);
+        writer.write_external(&file2)?;
+        writer.write_inline(&separator);
+        writer.write_external(&file3)?;
+        let stream_id = repo.write_stream(writer, "test-multi", None)?;
+
+        // Verify the object references have correct digests
+        let mut reader = repo.open_stream("test-multi", Some(&stream_id), None)?;
+        let mut refs = Vec::new();
+        reader.get_object_refs(|id| refs.push(id.clone()))?;
+        assert_eq!(refs.len(), 3);
+        assert_eq!(refs[0], expected_digest1, "file1 digest mismatch");
+        assert_eq!(refs[1], expected_digest2, "file2 digest mismatch");
+        assert_eq!(refs[2], expected_digest3, "file3 digest mismatch");
+
+        // Verify roundtrip
+        let mut reader = repo.open_stream("test-multi", Some(&stream_id), None)?;
+        let mut output = Vec::new();
+        reader.cat(&repo, &mut output)?;
+
+        let mut expected = file1.clone();
+        expected.extend(&separator);
+        expected.extend(&file2);
+        expected.extend(&separator);
+        expected.extend(&file3);
+
+        assert_eq!(output.len(), expected.len());
+        assert_eq!(
+            output, expected,
+            "multiple externals must roundtrip exactly"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_splitstream_deduplication() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        // Same chunk appearing multiple times should be deduplicated
+        let repeated_chunk = generate_test_data(64 * 1024, 0xDE);
+        let unique_chunk = generate_test_data(32 * 1024, 0xAD);
+
+        // Compute expected digests
+        let repeated_digest: Sha256HashValue = compute_verity(&repeated_chunk);
+        let unique_digest: Sha256HashValue = compute_verity(&unique_chunk);
+
+        let mut writer = repo.create_stream(0);
+        writer.write_external(&repeated_chunk)?;
+        writer.write_external(&unique_chunk)?;
+        writer.write_external(&repeated_chunk)?; // duplicate
+        writer.write_external(&repeated_chunk)?; // another duplicate
+        let stream_id = repo.write_stream(writer, "test-dedup", None)?;
+
+        // Verify deduplication: only 2 unique objects should be referenced
+        let mut reader = repo.open_stream("test-dedup", Some(&stream_id), None)?;
+        let mut refs = Vec::new();
+        reader.get_object_refs(|id| refs.push(id.clone()))?;
+        assert_eq!(refs.len(), 2, "should only have 2 unique object refs");
+        assert_eq!(
+            refs[0], repeated_digest,
+            "first ref should be repeated chunk"
+        );
+        assert_eq!(refs[1], unique_digest, "second ref should be unique chunk");
+
+        // Verify roundtrip still works
+        let mut reader = repo.open_stream("test-dedup", Some(&stream_id), None)?;
+        let mut output = Vec::new();
+        reader.cat(&repo, &mut output)?;
+
+        let mut expected = repeated_chunk.clone();
+        expected.extend(&unique_chunk);
+        expected.extend(&repeated_chunk);
+        expected.extend(&repeated_chunk);
+
+        assert_eq!(output.len(), expected.len());
+        assert_eq!(
+            output, expected,
+            "deduplicated content must still roundtrip exactly"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_splitstream_get_object_refs() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let chunk1 = generate_test_data(16 * 1024, 0x11);
+        let chunk2 = generate_test_data(24 * 1024, 0x22);
+        let inline_data = generate_test_data(128, 0x33);
+
+        // Compute expected digests
+        let expected_digest1: Sha256HashValue = compute_verity(&chunk1);
+        let expected_digest2: Sha256HashValue = compute_verity(&chunk2);
+
+        let mut writer = repo.create_stream(0);
+        writer.write_inline(&inline_data);
+        writer.write_external(&chunk1)?;
+        writer.write_external(&chunk2)?;
+        let stream_id = repo.write_stream(writer, "test-refs", None)?;
+
+        let mut reader = repo.open_stream("test-refs", Some(&stream_id), None)?;
+
+        let mut refs = Vec::new();
+        reader.get_object_refs(|id| refs.push(id.clone()))?;
+
+        // Should have 2 external references with correct digests
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0], expected_digest1, "chunk1 digest mismatch");
+        assert_eq!(refs[1], expected_digest2, "chunk2 digest mismatch");
+
+        // Verify content can be read back via the digests
+        let obj1 = repo.read_object(&refs[0])?;
+        let obj2 = repo.read_object(&refs[1])?;
+
+        assert_eq!(obj1, chunk1, "first external reference must match");
+        assert_eq!(obj2, chunk2, "second external reference must match");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_splitstream_boundary_sizes() -> Result<()> {
+        // Test with sizes around common boundaries (4KB page, 64KB chunk)
+        let sizes = [4095, 4096, 4097, 65535, 65536, 65537];
+
+        for size in sizes {
+            let tmp = tempdir();
+            let repo = create_test_repo(&tmp.path().join("repo"))?;
+            let data = generate_test_data(size, size as u8);
+
+            // Compute expected digest
+            let expected_digest: Sha256HashValue = compute_verity(&data);
+
+            let mut writer = repo.create_stream(0);
+            writer.write_external(&data)?;
+            let stream_id = repo.write_stream(writer, "test-boundary", None)?;
+
+            // Verify the digest
+            let mut reader = repo.open_stream("test-boundary", Some(&stream_id), None)?;
+            let mut refs = Vec::new();
+            reader.get_object_refs(|id| refs.push(id.clone()))?;
+            assert_eq!(refs.len(), 1);
+            assert_eq!(
+                refs[0], expected_digest,
+                "size {} must have correct digest",
+                size
+            );
+
+            // Verify roundtrip
+            let mut reader = repo.open_stream("test-boundary", Some(&stream_id), None)?;
+            let mut output = Vec::new();
+            reader.cat(&repo, &mut output)?;
+
+            assert_eq!(
+                output.len(),
+                data.len(),
+                "size {} must roundtrip with correct length",
+                size
+            );
+            assert_eq!(output, data, "size {} must roundtrip exactly", size);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_splitstream_content_type() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+        let content_type = 0xDEADBEEF_u64;
+
+        let mut writer = repo.create_stream(content_type);
+        writer.write_inline(b"test data");
+        let stream_id = repo.write_stream(writer, "test-ctype", None)?;
+
+        let reader = repo.open_stream("test-ctype", Some(&stream_id), Some(content_type))?;
+        assert_eq!(reader.content_type, content_type);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_splitstream_total_size_tracking() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let inline_data = generate_test_data(100, 0x01);
+        let external_data = generate_test_data(1000, 0x02);
+
+        let mut writer = repo.create_stream(0);
+        writer.write_inline(&inline_data);
+        writer.write_external(&external_data)?;
+        let stream_id = repo.write_stream(writer, "test-size", None)?;
+
+        let reader = repo.open_stream("test-size", Some(&stream_id), None)?;
+        assert_eq!(reader.total_size, 1100, "total size should be tracked");
 
         Ok(())
     }
