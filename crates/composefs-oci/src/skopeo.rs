@@ -196,7 +196,7 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             splitstream.write_inline(&raw_config);
 
             let config_id = self.repo.write_stream(splitstream, &content_id, None)?;
-            Ok((content_id, config_id))
+            Ok((config_digest.to_string(), config_id))
         }
     }
 
