@@ -284,12 +284,7 @@ impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
     /// Recursively reads directory contents, tracking hardlinks and optionally
     /// reading the directory's own metadata. Large files are stored in the repository
     /// if one was provided.
-    pub fn read_directory(
-        &mut self,
-        dirfd: impl AsFd,
-        name: &OsStr,
-        stat_self: bool,
-    ) -> Result<Directory<ObjectID>> {
+    fn read_directory(&mut self, dirfd: impl AsFd, name: &OsStr) -> Result<Directory<ObjectID>> {
         let fd = openat(
             dirfd,
             name,
@@ -297,12 +292,8 @@ impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
             Mode::empty(),
         )?;
 
-        let mut directory = if stat_self {
-            let (_, stat) = Self::stat(&fd, FileType::Directory)?;
-            Directory::new(stat)
-        } else {
-            Directory::default()
-        };
+        let (_, stat) = Self::stat(&fd, FileType::Directory)?;
+        let mut directory = Directory::new(stat);
 
         for item in Dir::read_from(&fd)? {
             let entry = item?;
@@ -326,7 +317,7 @@ impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
         ifmt: FileType,
     ) -> Result<Inode<ObjectID>> {
         if ifmt == FileType::Directory {
-            let dir = self.read_directory(dirfd, name, true)?;
+            let dir = self.read_directory(dirfd, name)?;
             Ok(Inode::Directory(Box::new(dir)))
         } else {
             let leaf = self.read_leaf(dirfd, name, ifmt)?;
@@ -342,19 +333,34 @@ pub fn read_filesystem<ObjectID: FsVerityHashValue>(
     dirfd: impl AsFd,
     path: &Path,
     repo: Option<&Repository<ObjectID>>,
-    stat_root: bool,
 ) -> Result<FileSystem<ObjectID>> {
     let mut reader = FilesystemReader {
         repo,
         inodes: HashMap::new(),
     };
 
-    let root = reader.read_directory(dirfd, path.as_os_str(), stat_root)?;
+    let root = reader.read_directory(dirfd, path.as_os_str())?;
 
-    Ok(FileSystem {
-        root,
-        have_root_stat: stat_root,
-    })
+    Ok(FileSystem { root })
+}
+
+/// Load a container root filesystem from the given path.
+///
+/// This is a convenience wrapper around [`read_filesystem`] that also copies
+/// metadata from `/usr` to the root directory. This is the recommended way to
+/// read a container filesystem because OCI container runtimes don't preserve
+/// root directory metadata from layer tars, making it non-deterministic.
+///
+/// By copying `/usr` metadata to root, we ensure consistent composefs digests
+/// between build-time and install-time.
+pub fn read_container_root<ObjectID: FsVerityHashValue>(
+    dirfd: impl AsFd,
+    path: &Path,
+    repo: Option<&Repository<ObjectID>>,
+) -> Result<FileSystem<ObjectID>> {
+    let mut fs = read_filesystem(dirfd, path, repo)?;
+    fs.copy_root_metadata_from_usr()?;
+    Ok(fs)
 }
 
 /// Read the contents of a file.

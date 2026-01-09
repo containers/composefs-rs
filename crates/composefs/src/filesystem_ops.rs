@@ -17,33 +17,38 @@ use crate::{
 impl<ObjectID: FsVerityHashValue> FileSystem<ObjectID> {
     /// Commits this filesystem as an EROFS image to the repository.
     ///
-    /// Ensures the root directory stat is computed, generates an EROFS filesystem image,
-    /// and writes it to the repository with the optional name. Returns the fsverity digest
-    /// of the committed image.
+    /// Generates an EROFS filesystem image and writes it to the repository
+    /// with the optional name. Returns the fsverity digest of the committed image.
+    ///
+    /// Note: Callers should ensure root metadata is set before calling this,
+    /// typically via `copy_root_metadata_from_usr()` or `set_root_stat()`.
     pub fn commit_image(
-        &mut self,
+        &self,
         repository: &Repository<ObjectID>,
         image_name: Option<&str>,
     ) -> Result<ObjectID> {
-        self.ensure_root_stat();
         repository.write_image(image_name, &mkfs_erofs(self))
     }
 
     /// Computes the fsverity digest for this filesystem as an EROFS image.
     ///
-    /// Ensures the root directory stat is computed, generates the EROFS image,
-    /// and returns its fsverity digest without writing to a repository.
-    pub fn compute_image_id(&mut self) -> ObjectID {
-        self.ensure_root_stat();
+    /// Generates the EROFS image and returns its fsverity digest without
+    /// writing to a repository.
+    ///
+    /// Note: Callers should ensure root metadata is set before calling this,
+    /// typically via `copy_root_metadata_from_usr()` or `set_root_stat()`.
+    pub fn compute_image_id(&self) -> ObjectID {
         compute_verity(&mkfs_erofs(self))
     }
 
     /// Prints this filesystem in dumpfile format to stdout.
     ///
-    /// Ensures the root directory stat is computed and serializes the entire
-    /// filesystem tree to stdout in composefs dumpfile text format.
-    pub fn print_dumpfile(&mut self) -> Result<()> {
-        self.ensure_root_stat();
+    /// Serializes the entire filesystem tree to stdout in composefs dumpfile
+    /// text format.
+    ///
+    /// Note: Callers should ensure root metadata is set before calling this,
+    /// typically via `copy_root_metadata_from_usr()` or `set_root_stat()`.
+    pub fn print_dumpfile(&self) -> Result<()> {
         write_dumpfile(&mut std::io::stdout(), self)
     }
 }

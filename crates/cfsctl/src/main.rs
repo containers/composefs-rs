@@ -109,6 +109,19 @@ enum OciCommand {
     },
 }
 
+/// Common options for reading a filesystem from a path
+#[derive(Debug, Parser)]
+struct FsReadOptions {
+    /// The path to the filesystem
+    path: PathBuf,
+    /// Transform the filesystem for boot (SELinux labels, empty /boot and /sysroot)
+    #[clap(long)]
+    bootable: bool,
+    /// Don't copy /usr metadata to root directory (use if root already has well-defined metadata)
+    #[clap(long)]
+    no_propagate_usr_to_root: bool,
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Take a transaction lock on the repository.
@@ -122,9 +135,7 @@ enum Command {
     /// Perform garbage collection
     GC,
     /// Imports a composefs image (unsafe!)
-    ImportImage {
-        reference: String,
-    },
+    ImportImage { reference: String },
     /// Commands for dealing with OCI layers
     #[cfg(feature = "oci")]
     Oci {
@@ -138,36 +149,26 @@ enum Command {
         /// the mountpoint
         mountpoint: String,
     },
+    /// Creates a composefs image from a filesystem
     CreateImage {
-        path: PathBuf,
-        #[clap(long)]
-        bootable: bool,
-        #[clap(long)]
-        stat_root: bool,
+        #[clap(flatten)]
+        fs_opts: FsReadOptions,
         image_name: Option<String>,
     },
+    /// Computes the composefs image ID for a filesystem
     ComputeId {
-        path: PathBuf,
-        #[clap(long)]
-        bootable: bool,
-        #[clap(long)]
-        stat_root: bool,
+        #[clap(flatten)]
+        fs_opts: FsReadOptions,
     },
+    /// Outputs the composefs dumpfile format for a filesystem
     CreateDumpfile {
-        path: PathBuf,
-        #[clap(long)]
-        bootable: bool,
-        #[clap(long)]
-        stat_root: bool,
+        #[clap(flatten)]
+        fs_opts: FsReadOptions,
     },
-    ImageObjects {
-        name: String,
-    },
+    /// Lists all object IDs referenced by an image
+    ImageObjects { name: String },
     #[cfg(feature = "http")]
-    Fetch {
-        url: String,
-        name: String,
-    },
+    Fetch { url: String, name: String },
 }
 
 fn verity_opt<ObjectID>(opt: &Option<String>) -> Result<Option<ObjectID>>
@@ -250,7 +251,7 @@ where
                 ref config_verity,
             } => {
                 let verity = verity_opt(config_verity)?;
-                let mut fs =
+                let fs =
                     composefs_oci::image::create_filesystem(&repo, config_name, verity.as_ref())?;
                 fs.print_dumpfile()?;
             }
@@ -348,38 +349,40 @@ where
                 create_dir_all(state.join("etc/work"))?;
             }
         },
-        Command::ComputeId {
-            ref path,
-            bootable,
-            stat_root,
-        } => {
-            let mut fs = composefs::fs::read_filesystem(CWD, path, Some(&repo), stat_root)?;
-            if bootable {
+        Command::ComputeId { fs_opts } => {
+            let mut fs = if fs_opts.no_propagate_usr_to_root {
+                composefs::fs::read_filesystem(CWD, &fs_opts.path, Some(&repo))?
+            } else {
+                composefs::fs::read_container_root(CWD, &fs_opts.path, Some(&repo))?
+            };
+            if fs_opts.bootable {
                 fs.transform_for_boot(&repo)?;
             }
             let id = fs.compute_image_id();
             println!("{}", id.to_hex());
         }
         Command::CreateImage {
-            ref path,
-            bootable,
-            stat_root,
+            fs_opts,
             ref image_name,
         } => {
-            let mut fs = composefs::fs::read_filesystem(CWD, path, Some(&repo), stat_root)?;
-            if bootable {
+            let mut fs = if fs_opts.no_propagate_usr_to_root {
+                composefs::fs::read_filesystem(CWD, &fs_opts.path, Some(&repo))?
+            } else {
+                composefs::fs::read_container_root(CWD, &fs_opts.path, Some(&repo))?
+            };
+            if fs_opts.bootable {
                 fs.transform_for_boot(&repo)?;
             }
             let id = fs.commit_image(&repo, image_name.as_deref())?;
             println!("{}", id.to_id());
         }
-        Command::CreateDumpfile {
-            ref path,
-            bootable,
-            stat_root,
-        } => {
-            let mut fs = composefs::fs::read_filesystem(CWD, path, Some(&repo), stat_root)?;
-            if bootable {
+        Command::CreateDumpfile { fs_opts } => {
+            let mut fs = if fs_opts.no_propagate_usr_to_root {
+                composefs::fs::read_filesystem(CWD, &fs_opts.path, Some(&repo))?
+            } else {
+                composefs::fs::read_container_root(CWD, &fs_opts.path, Some(&repo))?
+            };
+            if fs_opts.bootable {
                 fs.transform_for_boot(&repo)?;
             }
             fs.print_dumpfile()?;

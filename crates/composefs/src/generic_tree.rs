@@ -104,6 +104,11 @@ impl<T> Inode<T> {
 impl<T> Default for Directory<T> {
     fn default() -> Self {
         Self {
+            // Default root metadata matches what Podman's containers/storage uses
+            // when extracting OCI layer tars: root:root, mode 0555, epoch mtime.
+            // This is a fallback; callers should use copy_root_metadata_from_usr()
+            // or set_root_stat() to set proper metadata before computing digests.
+            // NOTE: If changing this, also update doc/oci.md.
             stat: Stat {
                 st_uid: 0,
                 st_gid: 0,
@@ -190,7 +195,7 @@ impl<T> Directory<T> {
             dir = match component {
                 Component::RootDir => dir,
                 Component::Prefix(..) | Component::CurDir | Component::ParentDir => {
-                    return Err(ImageError::InvalidFilename(pathname.into()))
+                    return Err(ImageError::InvalidFilename(pathname.into()));
                 }
                 Component::Normal(filename) => match dir.entries.get(filename) {
                     Some(Inode::Directory(subdir)) => subdir,
@@ -214,7 +219,7 @@ impl<T> Directory<T> {
             dir = match component {
                 Component::RootDir => dir,
                 Component::Prefix(..) | Component::CurDir | Component::ParentDir => {
-                    return Err(ImageError::InvalidFilename(pathname.into()))
+                    return Err(ImageError::InvalidFilename(pathname.into()));
                 }
                 Component::Normal(filename) => match dir.entries.get_mut(filename) {
                     Some(Inode::Directory(subdir)) => subdir,
@@ -449,37 +454,60 @@ impl<T> Directory<T> {
 pub struct FileSystem<T> {
     /// The root directory of the filesystem.
     pub root: Directory<T>,
-    /// Whether the root directory's metadata has been explicitly set.
-    pub have_root_stat: bool,
 }
 
 impl<T> Default for FileSystem<T> {
     fn default() -> Self {
         Self {
             root: Directory::default(),
-            have_root_stat: false,
         }
     }
 }
 
 impl<T> FileSystem<T> {
     /// Sets the metadata for the root directory.
-    ///
-    /// Marks the root directory's stat as explicitly set.
     pub fn set_root_stat(&mut self, stat: Stat) {
-        self.have_root_stat = true;
         self.root.stat = stat;
     }
 
-    /// Ensures the root directory has valid metadata.
+    /// Copies metadata from `/usr` to the root directory.
     ///
-    /// If the root stat hasn't been explicitly set, this computes it by finding
-    /// the newest modification time in the entire filesystem tree.
-    pub fn ensure_root_stat(&mut self) {
-        if !self.have_root_stat {
-            self.root.stat.st_mtim_sec = self.root.newest_file();
-            self.have_root_stat = true;
-        }
+    /// OCI container layer tars often don't include a root directory entry,
+    /// and when they do, container runtimes typically ignore it. This makes
+    /// root metadata non-deterministic. This method provides a way to derive
+    /// consistent root metadata by copying it from `/usr`, which is always
+    /// present in standard filesystem layouts.
+    ///
+    /// The copied metadata includes:
+    /// - Mode (permissions)
+    /// - Modification time
+    /// - User ID (uid)
+    /// - Group ID (gid)
+    /// - Extended attributes (xattrs)
+    ///
+    /// NOTE: If changing this behavior, also update `doc/oci.md`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `/usr` does not exist or is not a directory.
+    pub fn copy_root_metadata_from_usr(&mut self) -> Result<(), ImageError> {
+        let usr = self.root.get_directory(OsStr::new("usr"))?;
+
+        // Copy values to local variables to avoid borrow conflicts
+        let st_mode = usr.stat.st_mode;
+        let st_uid = usr.stat.st_uid;
+        let st_gid = usr.stat.st_gid;
+        let st_mtim_sec = usr.stat.st_mtim_sec;
+        let xattrs = usr.stat.xattrs.clone();
+
+        // Apply copied metadata to root
+        self.root.stat.st_mode = st_mode;
+        self.root.stat.st_uid = st_uid;
+        self.root.stat.st_gid = st_gid;
+        self.root.stat.st_mtim_sec = st_mtim_sec;
+        self.root.stat.xattrs = xattrs;
+
+        Ok(())
     }
 
     /// Applies a function to every [`Stat`] in the filesystem tree.
@@ -799,5 +827,53 @@ mod tests {
         assert_eq!(inode_types.len(), 3);
         assert_eq!(inode_types.iter().filter(|&&t| t == "dir").count(), 1);
         assert_eq!(inode_types.iter().filter(|&&t| t == "leaf").count(), 2);
+    }
+
+    #[test]
+    fn test_copy_root_metadata_from_usr() {
+        let mut fs = FileSystem::<FileContents>::default();
+
+        // Create /usr with specific metadata
+        let usr_stat = Stat {
+            st_mode: 0o755,
+            st_uid: 42,
+            st_gid: 43,
+            st_mtim_sec: 1234567890,
+            xattrs: RefCell::new(BTreeMap::from([(
+                Box::from(OsStr::new("security.selinux")),
+                Box::from(b"system_u:object_r:usr_t:s0".as_slice()),
+            )])),
+        };
+        let usr_dir = Directory {
+            stat: usr_stat,
+            entries: BTreeMap::new(),
+        };
+        fs.root.entries.insert(
+            Box::from(OsStr::new("usr")),
+            Inode::Directory(Box::new(usr_dir)),
+        );
+
+        fs.copy_root_metadata_from_usr().unwrap();
+
+        assert_eq!(fs.root.stat.st_mode, 0o755);
+        assert_eq!(fs.root.stat.st_uid, 42);
+        assert_eq!(fs.root.stat.st_gid, 43);
+        assert_eq!(fs.root.stat.st_mtim_sec, 1234567890);
+        assert!(fs
+            .root
+            .stat
+            .xattrs
+            .borrow()
+            .contains_key(OsStr::new("security.selinux")));
+    }
+
+    #[test]
+    fn test_copy_root_metadata_from_usr_missing() {
+        let mut fs = FileSystem::<FileContents>::default();
+
+        match fs.copy_root_metadata_from_usr() {
+            Err(ImageError::NotFound(name)) => assert_eq!(name.to_str().unwrap(), "usr"),
+            other => panic!("Expected NotFound error, got {:?}", other),
+        }
     }
 }

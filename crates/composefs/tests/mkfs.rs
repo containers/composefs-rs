@@ -19,8 +19,7 @@ use composefs::{
     tree::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
 };
 
-fn debug_fs(mut fs: FileSystem<impl FsVerityHashValue>) -> String {
-    fs.ensure_root_stat();
+fn debug_fs(fs: FileSystem<impl FsVerityHashValue>) -> String {
     let image = mkfs_erofs(&fs);
     let mut output = vec![];
     debug_img(&mut output, &image).unwrap();
@@ -93,7 +92,6 @@ fn foreach_case(f: fn(&FileSystem<Sha256HashValue>)) {
     for case in [empty, simple] {
         let mut fs = FileSystem::default();
         case(&mut fs);
-        fs.ensure_root_stat();
         f(&fs);
     }
 }

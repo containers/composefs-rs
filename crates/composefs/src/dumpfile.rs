@@ -461,7 +461,6 @@ pub fn dumpfile_to_filesystem<ObjectID: FsVerityHashValue>(
         add_entry_to_filesystem(&mut fs, entry, &mut hardlinks)?;
     }
 
-    fs.ensure_root_stat();
     Ok(fs)
 }
 
@@ -479,9 +478,6 @@ mod tests {
     #[test]
     fn test_simple_dumpfile_conversion() -> Result<()> {
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(SIMPLE_DUMP)?;
-
-        // Check root exists
-        assert!(fs.have_root_stat);
 
         // Check files exist
         assert!(fs.root.lookup(OsStr::new("empty_file")).is_some());
