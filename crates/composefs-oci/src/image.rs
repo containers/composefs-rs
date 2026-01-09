@@ -86,6 +86,12 @@ pub fn process_entry<ObjectID: FsVerityHashValue>(
 /// Creates a filesystem from the given OCI container.  No special transformations are performed to
 /// make the filesystem bootable.
 ///
+/// OCI container layer tars often don't include a root directory entry, and when they do,
+/// container runtimes typically ignore it (using hardcoded defaults instead). This makes
+/// root metadata non-deterministic. To ensure consistent digests, this function copies
+/// root metadata from `/usr` after processing all layers.
+/// See: <https://github.com/containers/storage/pull/743>
+///
 /// If `config_verity` is given it is used to get the OCI config splitstream by its fs-verity ID
 /// and the entire process is substantially faster.  If it is not given, the config and layers will
 /// be hashed to ensure that they match their claimed blob IDs.
@@ -121,6 +127,10 @@ pub fn create_filesystem<ObjectID: FsVerityHashValue>(
             process_entry(&mut filesystem, entry)?;
         }
     }
+
+    // Copy root metadata from /usr to ensure consistent digests across different
+    // container runtimes and tar implementations.
+    filesystem.copy_root_metadata_from_usr()?;
 
     Ok(filesystem)
 }

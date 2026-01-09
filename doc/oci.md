@@ -32,22 +32,23 @@ mtime) for the directory.
 
 # The root inode
 
-The root inode (/) is a difficult case because it doesn't always appear in the
-layer tarballs.  We need to make some arbitrary decisions about the metadata.
+The root inode (/) is a difficult case because OCI container layer tars often
+don't include a root directory entry, and when they do, container runtimes
+(Podman, Docker) ignore it and use hardcoded defaults.  For example, Podman's
+[containers/storage](https://github.com/containers/storage) uses root:root
+ownership, mode `0555`, and epoch (0) mtime when extracting layers, but
+Docker uses `0755`. In general, the metadata for `/` is not defined.
 
-Here's what we do:
+Because composefs requires (has a goal of providing) precise cryptographically
+verifiable filesystem trees, we solve this for OCI by copying the metadata from `/usr`
+to the root directory.  The rationale is that `/usr` is always present in
+standard filesystem layouts and must be defined explicitly in the OCI layers.
 
- - if any layer tarball contains an empty for '/' then we'd like to use it.
-   The code for this doesn't exist yet, but it seems reasonable as a principle.
-   In case the `/` entry were to appear in multiple layers, we'd use the
-   most-derived layer in which it is present (as per the logic in the previous
-   section).
- - otherwise:
-   - we assume that the root directory is owned by root:root and has `a+rx`
-     permissions (ie: `0555`).  This matches the behaviour of podman.  Note in
-     particular: podman uses `0555`, not `0755`: the root directory is not
-     (nominally) writable by the root user.
-   - the mtime of the root directory is taken to be equal to the most recent
-     file in the entire system, that is: the highest numerical value of any
-     mtime on any inode.  The rationale is that this is usually a very good
-     proxy for "when was the (most-derived) container image created".
+This is implemented via the `copy_root_metadata_from_usr()` method and the
+`read_container_root()` convenience function.
+
+When building a filesystem from OCI layers programmatically, use
+`Stat::uninitialized()` to create the initial `FileSystem`.  This placeholder
+has mode `0` (obviously invalid) to make it clear that the root metadata should
+be set before computing digests - typically by calling
+`copy_root_metadata_from_usr()` after processing all layers.
