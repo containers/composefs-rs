@@ -8,6 +8,8 @@ mod digest;
 mod hashvalue;
 mod ioctl;
 
+pub use digest::FsVerityHasher;
+
 use std::{
     fs::File,
     io::{Error, Seek},

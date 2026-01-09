@@ -18,7 +18,10 @@ use containers_image_proxy::{ImageProxy, ImageProxyConfig, OpenedImage};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use oci_spec::image::{Descriptor, ImageConfiguration, ImageManifest, MediaType};
 use rustix::process::geteuid;
-use tokio::{io::AsyncReadExt, sync::Semaphore};
+use tokio::{
+    io::{AsyncReadExt, BufReader},
+    sync::Semaphore,
+};
 
 use composefs::{fsverity::FsVerityHashValue, repository::Repository};
 
@@ -110,16 +113,30 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             let progress = bar.wrap_async_read(blob_reader);
             self.progress.println(format!("Fetching layer {diff_id}"))?;
 
-            let mut splitstream = self.repo.create_stream(TAR_LAYER_CONTENT_TYPE);
-            match descriptor.media_type() {
+            let object_id = match descriptor.media_type() {
                 MediaType::ImageLayer => {
-                    split_async(progress, &mut splitstream).await?;
+                    split_async(
+                        BufReader::new(progress),
+                        self.repo.clone(),
+                        TAR_LAYER_CONTENT_TYPE,
+                    )
+                    .await?
                 }
                 MediaType::ImageLayerGzip => {
-                    split_async(GzipDecoder::new(progress), &mut splitstream).await?;
+                    split_async(
+                        BufReader::new(GzipDecoder::new(BufReader::new(progress))),
+                        self.repo.clone(),
+                        TAR_LAYER_CONTENT_TYPE,
+                    )
+                    .await?
                 }
                 MediaType::ImageLayerZstd => {
-                    split_async(ZstdDecoder::new(progress), &mut splitstream).await?;
+                    split_async(
+                        BufReader::new(ZstdDecoder::new(BufReader::new(progress))),
+                        self.repo.clone(),
+                        TAR_LAYER_CONTENT_TYPE,
+                    )
+                    .await?
                 }
                 other => bail!("Unsupported layer media type {other:?}"),
             };
@@ -128,8 +145,12 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             // to the claimed diff_id. We trust it, but we need to check it by awaiting the driver.
             driver.await?;
 
-            // Now we know that the content is what we expected.  Write it.
-            self.repo.write_stream(splitstream, &content_id, None)
+            // Sync and register the stream with its content identifier
+            self.repo
+                .register_stream(&object_id, &content_id, None)
+                .await?;
+
+            Ok(object_id)
         }
     }
 

@@ -14,20 +14,27 @@ use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
     fmt,
+    fs::File,
     io::Read,
     os::unix::prelude::{OsStrExt, OsStringExt},
     path::PathBuf,
+    sync::Arc,
 };
 
 use anyhow::{bail, ensure, Result};
+use bytes::Bytes;
 use rustix::fs::makedev;
 use tar::{EntryType, Header, PaxExtensions};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::{
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt},
+    sync::mpsc,
+};
 
 use composefs::{
     dumpfile,
     fsverity::FsVerityHashValue,
-    splitstream::{SplitStreamData, SplitStreamReader, SplitStreamWriter},
+    repository::Repository,
+    splitstream::{SplitStreamBuilder, SplitStreamData, SplitStreamReader, SplitStreamWriter},
     tree::{LeafContent, RegularFile, Stat},
     util::{read_exactish, read_exactish_async},
     INLINE_CONTENT_MAX,
@@ -84,42 +91,133 @@ pub fn split(
     Ok(())
 }
 
+/// Receive data from channel, write to tmpfile, compute verity, and store object.
+///
+/// This runs in a blocking task to avoid blocking the async runtime.
+fn receive_and_finalize_object<ObjectID: FsVerityHashValue>(
+    rx: mpsc::Receiver<Bytes>,
+    size: u64,
+    repo: &Repository<ObjectID>,
+) -> Result<ObjectID> {
+    use std::io::Write;
+
+    // Create tmpfile in the blocking context
+    let tmpfile_fd = repo.create_object_tmpfile()?;
+    let mut tmpfile = std::io::BufWriter::new(File::from(tmpfile_fd));
+
+    // Receive chunks and write to tmpfile
+    let mut rx = rx;
+    while let Some(chunk) = rx.blocking_recv() {
+        tmpfile.write_all(&chunk)?;
+    }
+
+    // Flush and get the File back
+    let tmpfile = tmpfile.into_inner()?;
+
+    // Finalize: enable verity, get digest, link into objects/
+    repo.finalize_object_tmpfile(tmpfile, size)
+}
+
 /// Asynchronously splits a tar archive into a composefs split stream.
 ///
-/// Similar to `split()` but processes the tar stream asynchronously. Files larger than
-/// `INLINE_CONTENT_MAX` are stored externally in the object store, while smaller files
-/// and metadata are stored inline in the split stream.
+/// Similar to `split()` but processes the tar stream asynchronously with parallel
+/// object storage. Large files are streamed to O_TMPFILE via a channel, and their
+/// fs-verity digests are computed in background blocking tasks. This avoids blocking
+/// the async runtime while allowing multiple files to be processed concurrently.
 ///
-/// Returns an error if the tar stream is malformed or if writing to the split stream fails.
-pub async fn split_async(
-    mut tar_stream: impl AsyncRead + Unpin,
-    writer: &mut SplitStreamWriter<impl FsVerityHashValue>,
-) -> Result<()> {
+/// Concurrency is limited to `available_parallelism()` to avoid overwhelming the
+/// system with too many concurrent I/O operations.
+///
+/// Files larger than `INLINE_CONTENT_MAX` are stored externally in the object store,
+/// while smaller files and metadata are stored inline in the split stream.
+///
+/// # Arguments
+/// * `tar_stream` - The async buffered tar stream to read from
+/// * `repo` - The repository for creating tmpfiles and storing objects
+/// * `content_type` - The content type identifier for the splitstream
+///
+/// Returns the fs-verity object ID of the stored splitstream.
+pub async fn split_async<ObjectID: FsVerityHashValue>(
+    mut tar_stream: impl AsyncBufRead + Unpin,
+    repo: Arc<Repository<ObjectID>>,
+    content_type: u64,
+) -> Result<ObjectID> {
+    // Use the repository's shared semaphore to limit concurrent object storage
+    let semaphore = repo.write_semaphore();
+
+    let mut builder = SplitStreamBuilder::new(repo.clone(), content_type);
+
     while let Some(header) = read_header_async(&mut tar_stream).await? {
-        // the header always gets stored as inline data
-        writer.write_inline(header.as_bytes());
+        // The header always gets stored as inline data
+        builder.push_inline(header.as_bytes());
 
         if header.as_bytes() == &[0u8; 512] {
             continue;
         }
 
-        // read the corresponding data, if there is any
+        // Read the corresponding data, if there is any
         let actual_size = header.entry_size()? as usize;
         let storage_size = actual_size.next_multiple_of(512);
-        let mut buffer = vec![0u8; storage_size];
-        tar_stream.read_exact(&mut buffer).await?;
 
         if header.entry_type() == EntryType::Regular && actual_size > INLINE_CONTENT_MAX {
-            // non-empty regular file: store the data in the object store
-            let padding = buffer.split_off(actual_size);
-            writer.write_external_async(buffer).await?;
-            writer.write_inline(&padding);
+            // Large file: stream to O_TMPFILE via channel to avoid blocking async runtime
+
+            // Acquire permit before starting
+            let permit = semaphore.clone().acquire_owned().await?;
+
+            // Create a channel for streaming data to the blocking task.
+            // Buffer a few chunks to allow async/blocking to run concurrently.
+            let (tx, rx) = mpsc::channel::<Bytes>(4);
+
+            // Spawn blocking task that receives data, writes to tmpfile, computes verity
+            let repo_clone = repo.clone();
+            let handle = tokio::task::spawn_blocking(move || {
+                let result = receive_and_finalize_object(rx, actual_size as u64, &repo_clone);
+                drop(permit); // Release permit when done
+                result
+            });
+
+            // Send data chunks to the blocking task using fill_buf to avoid extra copies
+            let mut remaining = actual_size;
+            while remaining > 0 {
+                let chunk = tar_stream.fill_buf().await?;
+                if chunk.is_empty() {
+                    bail!("unexpected EOF reading tar entry");
+                }
+                let chunk_size = std::cmp::min(remaining, chunk.len());
+                // If send fails, the receiver dropped (task panicked/errored)
+                if tx
+                    .send(Bytes::copy_from_slice(&chunk[..chunk_size]))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tar_stream.consume(chunk_size);
+                remaining -= chunk_size;
+            }
+            drop(tx); // Close channel to signal EOF
+
+            // Push external entry to builder (will be resolved at finish())
+            builder.push_external(handle, actual_size as u64);
+
+            // Read and push padding inline (must come after external ref)
+            let padding_size = storage_size - actual_size;
+            if padding_size > 0 {
+                let mut padding = vec![0u8; padding_size];
+                tar_stream.read_exact(&mut padding).await?;
+                builder.push_inline(&padding);
+            }
         } else {
-            // else: store the data inline in the split stream
-            writer.write_inline(&buffer);
+            // Small file or non-regular entry: buffer and write inline
+            let mut buffer = vec![0u8; storage_size];
+            tar_stream.read_exact(&mut buffer).await?;
+            builder.push_inline(&buffer);
         }
     }
-    Ok(())
+
+    // Finalize: await all handles, build stream, store it
+    builder.finish().await
 }
 
 /// Represents the content type of a tar entry.
@@ -789,9 +887,7 @@ mod tests {
 
             let start = Instant::now();
             rt.block_on(async {
-                let mut writer = repo.create_stream(TAR_LAYER_CONTENT_TYPE);
-                split_async(&tar_data_clone[..], &mut writer).await?;
-                writer.done()
+                split_async(&tar_data_clone[..], repo, TAR_LAYER_CONTENT_TYPE).await
             })
             .unwrap();
             let elapsed = start.elapsed();
@@ -807,5 +903,151 @@ mod tests {
             avg,
             (tar_size as f64 / (1024.0 * 1024.0)) / avg.as_secs_f64()
         );
+    }
+
+    /// Test that split_async produces correct output for mixed content.
+    #[tokio::test]
+    async fn test_split_streaming_roundtrip() {
+        // Create a tar with a mix of small (inline) and large (external) files
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = Builder::new(&mut tar_data);
+
+            // Small file (should be inline)
+            let small_content = b"Small file content";
+            append_file(&mut builder, "small.txt", small_content).unwrap();
+
+            // Large file (should be external/streamed)
+            let large_content = vec![b'L'; INLINE_CONTENT_MAX + 100];
+            append_file(&mut builder, "large.txt", &large_content).unwrap();
+
+            // Another small file
+            let small2_content = b"Another small file";
+            append_file(&mut builder, "small2.txt", small2_content).unwrap();
+
+            builder.finish().unwrap();
+        }
+
+        let repo = create_test_repository().unwrap();
+
+        // Use split_async which returns the object_id directly
+        let object_id = split_async(&tar_data[..], repo.clone(), TAR_LAYER_CONTENT_TYPE)
+            .await
+            .unwrap();
+
+        // Read back and verify
+        let mut reader: SplitStreamReader<Sha256HashValue> = SplitStreamReader::new(
+            repo.open_object(&object_id).unwrap().into(),
+            Some(TAR_LAYER_CONTENT_TYPE),
+        )
+        .unwrap();
+
+        let mut entries = Vec::new();
+        while let Some(entry) = get_entry(&mut reader).unwrap() {
+            entries.push(entry);
+        }
+
+        assert_eq!(entries.len(), 3, "Should have 3 entries");
+
+        // Verify small file (inline)
+        assert_eq!(entries[0].path, PathBuf::from("/small.txt"));
+        if let TarItem::Leaf(LeafContent::Regular(RegularFile::Inline(ref content))) =
+            entries[0].item
+        {
+            assert_eq!(content.as_ref(), b"Small file content");
+        } else {
+            panic!("Expected inline regular file for small.txt");
+        }
+
+        // Verify large file (external)
+        assert_eq!(entries[1].path, PathBuf::from("/large.txt"));
+        if let TarItem::Leaf(LeafContent::Regular(RegularFile::External(ref id, size))) =
+            entries[1].item
+        {
+            assert_eq!(size, (INLINE_CONTENT_MAX + 100) as u64);
+            // Verify the external content matches
+            let mut external_data = Vec::new();
+            std::fs::File::from(repo.open_object(id).unwrap())
+                .read_to_end(&mut external_data)
+                .unwrap();
+            let expected_content = vec![b'L'; INLINE_CONTENT_MAX + 100];
+            assert_eq!(
+                external_data, expected_content,
+                "External file content should match"
+            );
+        } else {
+            panic!("Expected external regular file for large.txt");
+        }
+
+        // Verify second small file (inline)
+        assert_eq!(entries[2].path, PathBuf::from("/small2.txt"));
+        if let TarItem::Leaf(LeafContent::Regular(RegularFile::Inline(ref content))) =
+            entries[2].item
+        {
+            assert_eq!(content.as_ref(), b"Another small file");
+        } else {
+            panic!("Expected inline regular file for small2.txt");
+        }
+    }
+
+    /// Test split_async with multiple large files.
+    #[tokio::test]
+    async fn test_split_streaming_multiple_large_files() {
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = Builder::new(&mut tar_data);
+
+            // Three large files to test parallel streaming
+            for i in 0..3 {
+                let content = vec![(i + 0x41) as u8; INLINE_CONTENT_MAX + 1000]; // 'A', 'B', 'C'
+                let filename = format!("file{}.bin", i);
+                append_file(&mut builder, &filename, &content).unwrap();
+            }
+
+            builder.finish().unwrap();
+        }
+
+        let repo = create_test_repository().unwrap();
+
+        let object_id = split_async(&tar_data[..], repo.clone(), TAR_LAYER_CONTENT_TYPE)
+            .await
+            .unwrap();
+
+        // Read back and verify
+        let mut reader: SplitStreamReader<Sha256HashValue> = SplitStreamReader::new(
+            repo.open_object(&object_id).unwrap().into(),
+            Some(TAR_LAYER_CONTENT_TYPE),
+        )
+        .unwrap();
+
+        let mut entries = Vec::new();
+        while let Some(entry) = get_entry(&mut reader).unwrap() {
+            entries.push(entry);
+        }
+
+        assert_eq!(entries.len(), 3, "Should have 3 entries");
+
+        for (i, entry) in entries.iter().enumerate() {
+            let expected_path = format!("/file{}.bin", i);
+            assert_eq!(entry.path, PathBuf::from(&expected_path));
+
+            if let TarItem::Leaf(LeafContent::Regular(RegularFile::External(ref id, size))) =
+                entry.item
+            {
+                assert_eq!(size, (INLINE_CONTENT_MAX + 1000) as u64);
+                let mut external_data = Vec::new();
+                std::fs::File::from(repo.open_object(id).unwrap())
+                    .read_to_end(&mut external_data)
+                    .unwrap();
+                let expected_content = vec![(i + 0x41) as u8; INLINE_CONTENT_MAX + 1000];
+                assert_eq!(
+                    external_data, expected_content,
+                    "External file {} content should match",
+                    i
+                );
+            } else {
+                panic!("Expected external regular file for file{}.bin", i);
+            }
+        }
     }
 }

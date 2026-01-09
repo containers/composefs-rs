@@ -25,6 +25,7 @@ use rustix::{
     buffer::spare_capacity,
     io::{pread, read},
 };
+use tokio::task::JoinHandle;
 use zerocopy::{
     little_endian::{I64, U16, U64},
     FromBytes, Immutable, IntoBytes, KnownLayout,
@@ -108,6 +109,15 @@ struct UniqueVec<T: Clone + Hash + Eq> {
     index: HashMap<T, usize>,
 }
 
+impl<T: Clone + Hash + Eq + std::fmt::Debug> std::fmt::Debug for UniqueVec<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UniqueVec")
+            .field("items", &self.items)
+            .field("index", &self.index)
+            .finish()
+    }
+}
+
 impl<T: Clone + Hash + Eq + IntoBytes + Immutable> UniqueVec<T> {
     fn as_bytes(&self) -> &[u8] {
         self.items.as_bytes()
@@ -134,6 +144,191 @@ impl<T: Clone + Hash + Eq> UniqueVec<T> {
             idx
         })
     }
+
+    /// Get an item by its index.
+    fn get_by_index(&self, idx: usize) -> Option<&T> {
+        self.items.get(idx)
+    }
+}
+
+/// An entry in the split stream being built.
+///
+/// Used by `SplitStreamBuilder` to collect entries before serialization.
+pub enum SplitStreamEntry<ObjectID: FsVerityHashValue> {
+    /// Inline data (headers, small files, padding)
+    Inline(Vec<u8>),
+    /// External reference - will be resolved to ObjectID when the handle completes
+    External {
+        /// Background task that will return the ObjectID
+        handle: JoinHandle<Result<ObjectID>>,
+        /// Size of the external object in bytes
+        size: u64,
+    },
+}
+
+impl<ObjectID: FsVerityHashValue> std::fmt::Debug for SplitStreamEntry<ObjectID> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SplitStreamEntry::Inline(data) => {
+                f.debug_struct("Inline").field("len", &data.len()).finish()
+            }
+            SplitStreamEntry::External { size, .. } => f
+                .debug_struct("External")
+                .field("size", size)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+/// Builder for constructing a split stream with parallel object storage.
+///
+/// This builder collects entries (inline data and pending external object handles),
+/// then serializes them all at once when `finish()` is called. This approach:
+/// - Allows all external handles to be awaited in parallel
+/// - Enables proper deduplication of ObjectIDs
+/// - Writes the stream in one clean pass after all IDs are known
+///
+/// # Example
+/// ```ignore
+/// let mut builder = SplitStreamBuilder::new(repo.clone(), content_type);
+/// builder.push_inline(header_bytes);
+/// builder.push_external(storage_handle, file_size);
+/// builder.push_inline(padding);
+/// let object_id = builder.finish().await?;
+/// ```
+pub struct SplitStreamBuilder<ObjectID: FsVerityHashValue> {
+    repo: Arc<Repository<ObjectID>>,
+    entries: Vec<SplitStreamEntry<ObjectID>>,
+    total_external_size: u64,
+    content_type: u64,
+    stream_refs: UniqueVec<ObjectID>,
+    named_refs: BTreeMap<Box<str>, usize>,
+}
+
+impl<ObjectID: FsVerityHashValue> std::fmt::Debug for SplitStreamBuilder<ObjectID> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SplitStreamBuilder")
+            .field("repo", &self.repo)
+            .field("entries", &self.entries)
+            .field("total_external_size", &self.total_external_size)
+            .field("content_type", &self.content_type)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<ObjectID: FsVerityHashValue> SplitStreamBuilder<ObjectID> {
+    /// Create a new split stream builder.
+    pub fn new(repo: Arc<Repository<ObjectID>>, content_type: u64) -> Self {
+        Self {
+            repo,
+            entries: Vec::new(),
+            total_external_size: 0,
+            content_type,
+            stream_refs: UniqueVec::new(),
+            named_refs: Default::default(),
+        }
+    }
+
+    /// Append inline data to the stream.
+    ///
+    /// Adjacent inline data will be coalesced to avoid fragmentation.
+    pub fn push_inline(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        // Coalesce with the previous inline entry if possible
+        if let Some(SplitStreamEntry::Inline(ref mut existing)) = self.entries.last_mut() {
+            existing.extend_from_slice(data);
+        } else {
+            self.entries.push(SplitStreamEntry::Inline(data.to_vec()));
+        }
+    }
+
+    /// Append an external object being stored in background.
+    ///
+    /// The handle should resolve to the ObjectID when the storage completes.
+    pub fn push_external(&mut self, handle: JoinHandle<Result<ObjectID>>, size: u64) {
+        self.total_external_size += size;
+        self.entries
+            .push(SplitStreamEntry::External { handle, size });
+    }
+
+    /// Add an externally-referenced stream with the given name.
+    ///
+    /// The name has no meaning beyond the scope of this file: it is meant to be used to link to
+    /// associated data when reading the file back again. For example, for OCI config files, this
+    /// might refer to a layer splitstream via its DiffId.
+    pub fn add_named_stream_ref(&mut self, name: &str, verity: &ObjectID) {
+        let idx = self.stream_refs.ensure(verity);
+        self.named_refs.insert(Box::from(name), idx);
+    }
+
+    /// Finalize: await all handles, build the splitstream, store it.
+    ///
+    /// This method:
+    /// 1. Awaits all external handles to get ObjectIDs
+    /// 2. Builds a UniqueVec<ObjectID> for deduplication
+    /// 3. Creates a SplitStreamWriter and replays all entries
+    /// 4. Stores the final splitstream in the repository
+    ///
+    /// Returns the fs-verity object ID of the stored splitstream.
+    pub async fn finish(self) -> Result<ObjectID> {
+        // First pass: await all handles to collect ObjectIDs
+        // We need to preserve the order of entries, so we process them in sequence
+        let mut resolved_entries: Vec<ResolvedEntry<ObjectID>> =
+            Vec::with_capacity(self.entries.len());
+
+        for entry in self.entries {
+            match entry {
+                SplitStreamEntry::Inline(data) => {
+                    resolved_entries.push(ResolvedEntry::Inline(data));
+                }
+                SplitStreamEntry::External { handle, size } => {
+                    let id = handle.await??;
+                    resolved_entries.push(ResolvedEntry::External { id, size });
+                }
+            }
+        }
+
+        // Second pass: build the splitstream using SplitStreamWriter
+        // This gives us proper deduplication through UniqueVec
+        let mut writer = SplitStreamWriter::new(&self.repo, self.content_type);
+
+        // Copy over stream refs and named refs
+        for (name, idx) in &self.named_refs {
+            let verity = self
+                .stream_refs
+                .get_by_index(*idx)
+                .expect("named ref index out of bounds");
+            writer.add_named_stream_ref(name, verity);
+        }
+
+        // Replay all entries
+        // Note: write_inline tracks total_size internally, but write_reference doesn't,
+        // so we manually add the external size to the writer's total_size.
+        for entry in resolved_entries {
+            match entry {
+                ResolvedEntry::Inline(data) => {
+                    writer.write_inline(&data);
+                }
+                ResolvedEntry::External { id, size } => {
+                    // Add size before writing reference (write_reference doesn't track size)
+                    writer.add_external_size(size);
+                    writer.write_reference(id)?;
+                }
+            }
+        }
+
+        // Finalize and store
+        tokio::task::spawn_blocking(move || writer.done()).await?
+    }
+}
+
+/// Internal type for resolved entries after awaiting handles.
+#[derive(Debug)]
+enum ResolvedEntry<ObjectID: FsVerityHashValue> {
+    Inline(Vec<u8>),
+    External { id: ObjectID, size: u64 },
 }
 
 /// Writer for creating split stream format files with inline content and external object references.
@@ -232,8 +427,21 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
         self.inline_buffer.extend(data);
     }
 
-    // common part of .write_external() and .write_external_async()
-    fn write_reference(&mut self, id: ObjectID) -> Result<()> {
+    /// Add to the total external size tracked by this writer.
+    ///
+    /// This is used by `SplitStreamBuilder` when replaying external entries,
+    /// since `write_reference` doesn't track size on its own.
+    pub fn add_external_size(&mut self, size: u64) {
+        self.total_size += size;
+    }
+
+    /// Write a reference to an external object that has already been stored.
+    ///
+    /// This is the common implementation for `.write_external()` and `.write_external_async()`,
+    /// and is also used by `SplitStreamBuilder` when replaying resolved entries.
+    ///
+    /// Note: This does NOT add to total_size - the caller must do that if needed.
+    pub fn write_reference(&mut self, id: ObjectID) -> Result<()> {
         // Flush any buffered inline data before we store the external reference.
         self.flush_inline()?;
 
@@ -256,6 +464,7 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
     /// Asynchronously write externally-split data to the stream.
     ///
     /// The data is stored in the repository asynchronously and a reference is written to the stream.
+    /// This method awaits the storage operation before returning.
     pub async fn write_external_async(&mut self, data: Vec<u8>) -> Result<()> {
         self.total_size += data.len() as u64;
         let id = self.repo.ensure_object_async(data).await?;
@@ -356,6 +565,16 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
 
         // Store the Vec<u8> into the repository
         self.repo.ensure_object(&buf)
+    }
+
+    /// Finalizes the split stream asynchronously.
+    ///
+    /// This is an async-friendly version of `done()` that runs the final
+    /// object storage on a blocking thread pool.
+    ///
+    /// Returns the fs-verity object ID of the stored splitstream.
+    pub async fn done_async(self) -> Result<ObjectID> {
+        tokio::task::spawn_blocking(move || self.done()).await?
     }
 }
 

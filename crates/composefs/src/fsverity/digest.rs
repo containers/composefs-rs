@@ -35,28 +35,47 @@ impl<H: FsVerityHashValue, const LG_BLKSZ: u8> FsVerityLayer<H, LG_BLKSZ> {
     }
 }
 
+/// Incremental fs-verity digest computation.
+///
+/// This hasher allows computing fs-verity digests incrementally by feeding
+/// data in chunks. The data must be provided in block-aligned chunks (4KB by default)
+/// except for the final chunk which may be smaller.
+///
+/// # Example
+/// ```ignore
+/// use composefs::fsverity::{FsVerityHasher, Sha256HashValue};
+///
+/// let mut hasher = FsVerityHasher::<Sha256HashValue>::new();
+/// hasher.write_all(b"hello world");
+/// let digest = hasher.digest();
+/// ```
 #[derive(Debug)]
-pub(super) struct FsVerityHasher<H: FsVerityHashValue, const LG_BLKSZ: u8 = 12> {
+pub struct FsVerityHasher<H: FsVerityHashValue, const LG_BLKSZ: u8 = 12> {
     layers: Vec<FsVerityLayer<H, LG_BLKSZ>>,
     value: Option<H>,
     n_bytes: u64,
 }
 
 impl<H: FsVerityHashValue, const LG_BLKSZ: u8> FsVerityHasher<H, LG_BLKSZ> {
-    pub(super) fn hash(buffer: &[u8]) -> H {
+    /// The block size in bytes used for fs-verity Merkle tree computation.
+    pub const BLOCK_SIZE: usize = 1 << LG_BLKSZ;
+
+    /// Hash a complete buffer and return the fs-verity digest.
+    pub fn hash(buffer: &[u8]) -> H {
         let mut hasher = Self::new();
 
         let mut start = 0;
         while start < buffer.len() {
-            let end = min(start + (1 << LG_BLKSZ), buffer.len());
-            hasher.add_data(&buffer[start..end]);
+            let end = min(start + Self::BLOCK_SIZE, buffer.len());
+            hasher.add_block(&buffer[start..end]);
             start = end;
         }
 
         hasher.digest()
     }
 
-    fn new() -> Self {
+    /// Create a new incremental fs-verity hasher.
+    pub fn new() -> Self {
         Self {
             layers: vec![],
             value: None,
@@ -64,7 +83,11 @@ impl<H: FsVerityHashValue, const LG_BLKSZ: u8> FsVerityHasher<H, LG_BLKSZ> {
         }
     }
 
-    fn add_data(&mut self, data: &[u8]) {
+    /// Add a block of data to the hasher.
+    ///
+    /// For correct results, data should be provided in block-sized chunks (4KB)
+    /// except for the final chunk which may be smaller.
+    pub fn add_block(&mut self, data: &[u8]) {
         if let Some(value) = self.value.take() {
             // We had a complete value, but now we're adding new data.
             // This means that we need to add a new hash layer...
@@ -118,7 +141,10 @@ impl<H: FsVerityHashValue, const LG_BLKSZ: u8> FsVerityHasher<H, LG_BLKSZ> {
         }
     }
 
-    fn digest(&mut self) -> H {
+    /// Finalize and return the fs-verity digest.
+    ///
+    /// This consumes any remaining partial data and computes the final digest.
+    pub fn digest(&mut self) -> H {
         /*
         let mut root_hash = [0u8; 64];
         let result = self.root_hash();
@@ -153,6 +179,12 @@ impl<H: FsVerityHashValue, const LG_BLKSZ: u8> FsVerityHasher<H, LG_BLKSZ> {
         context.update([0; 32]); /* salt */
         context.update([0; 144]); /* reserved */
         context.finalize().into()
+    }
+}
+
+impl<H: FsVerityHashValue, const LG_BLKSZ: u8> Default for FsVerityHasher<H, LG_BLKSZ> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

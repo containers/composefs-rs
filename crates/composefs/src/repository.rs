@@ -12,7 +12,10 @@ use std::{
     os::fd::{AsFd, OwnedFd},
     path::{Path, PathBuf},
     sync::Arc,
+    thread::available_parallelism,
 };
+
+use tokio::sync::Semaphore;
 
 use anyhow::{bail, ensure, Context, Result};
 use once_cell::sync::OnceCell;
@@ -27,7 +30,8 @@ use rustix::{
 use crate::{
     fsverity::{
         compute_verity, enable_verity_maybe_copy, ensure_verity_equal, measure_verity,
-        CompareVerityError, EnableVerityError, FsVerityHashValue, MeasureVerityError,
+        CompareVerityError, EnableVerityError, FsVerityHashValue, FsVerityHasher,
+        MeasureVerityError,
     },
     mount::{composefs_fsmount, mount_at},
     splitstream::{SplitStreamReader, SplitStreamWriter},
@@ -65,12 +69,22 @@ fn ensure_dir_and_openat(dirfd: impl AsFd, filename: &str, flags: OFlags) -> Err
 /// verification. Objects are stored by their fsverity digest, streams by SHA256
 /// content hash, and both support named references for persistence across
 /// garbage collection.
-#[derive(Debug)]
 pub struct Repository<ObjectID: FsVerityHashValue> {
     repository: OwnedFd,
     objects: OnceCell<OwnedFd>,
+    write_semaphore: OnceCell<Arc<Semaphore>>,
     insecure: bool,
     _data: std::marker::PhantomData<ObjectID>,
+}
+
+impl<ObjectID: FsVerityHashValue> std::fmt::Debug for Repository<ObjectID> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Repository")
+            .field("repository", &self.repository)
+            .field("objects", &self.objects)
+            .field("insecure", &self.insecure)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<ObjectID: FsVerityHashValue> Drop for Repository<ObjectID> {
@@ -84,6 +98,20 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     pub fn objects_dir(&self) -> ErrnoResult<&OwnedFd> {
         self.objects
             .get_or_try_init(|| ensure_dir_and_openat(&self.repository, "objects", OFlags::PATH))
+    }
+
+    /// Return a shared semaphore for limiting concurrent object writes.
+    ///
+    /// This semaphore is lazily initialized with `available_parallelism()` permits,
+    /// and shared across all operations on this repository. Use this to limit
+    /// concurrent I/O when processing multiple files or layers in parallel.
+    pub fn write_semaphore(&self) -> Arc<Semaphore> {
+        self.write_semaphore
+            .get_or_init(|| {
+                let max_concurrent = available_parallelism().map(|n| n.get()).unwrap_or(4);
+                Arc::new(Semaphore::new(max_concurrent))
+            })
+            .clone()
     }
 
     /// Open a repository at the target directory and path.
@@ -100,6 +128,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(Self {
             repository,
             objects: OnceCell::new(),
+            write_semaphore: OnceCell::new(),
             insecure: false,
             _data: std::marker::PhantomData,
         })
@@ -136,14 +165,141 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         tokio::task::spawn_blocking(move || self_.ensure_object(&data)).await?
     }
 
-    /// Given a blob of data, store it in the repository.
+    /// Create an O_TMPFILE in the objects directory for streaming writes.
     ///
-    /// For performance reasons, this function does *not* call fsync() or similar.  After you're
-    /// done with everything, call `Repository::sync()`.
-    pub fn ensure_object(&self, data: &[u8]) -> Result<ObjectID> {
-        let dirfd = self.objects_dir()?;
-        let id: ObjectID = compute_verity(data);
+    /// Returns the file descriptor for writing. The caller should write data to this fd,
+    /// then call `spawn_finalize_object_tmpfile()` to compute the verity digest,
+    /// enable fs-verity, and link the file into the objects directory.
+    pub fn create_object_tmpfile(&self) -> Result<OwnedFd> {
+        let objects_dir = self.objects_dir()?;
+        let fd = openat(
+            objects_dir,
+            ".",
+            OFlags::RDWR | OFlags::TMPFILE | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o644),
+        )?;
+        Ok(fd)
+    }
 
+    /// Spawn a background task that finalizes a tmpfile as an object.
+    ///
+    /// The task computes the fs-verity digest by reading the file, enables verity,
+    /// and links the file into the objects directory.
+    ///
+    /// Returns a handle that resolves to the ObjectID (fs-verity digest).
+    ///
+    /// # Arguments
+    /// * `tmpfile_fd` - The O_TMPFILE file descriptor with data already written
+    /// * `size` - The exact size in bytes of the data written to the tmpfile
+    pub fn spawn_finalize_object_tmpfile(
+        self: &Arc<Self>,
+        tmpfile_fd: OwnedFd,
+        size: u64,
+    ) -> tokio::task::JoinHandle<Result<ObjectID>> {
+        let self_ = Arc::clone(self);
+        tokio::task::spawn_blocking(move || self_.finalize_object_tmpfile(tmpfile_fd.into(), size))
+    }
+
+    /// Finalize a tmpfile as an object.
+    ///
+    /// This method should be called from a blocking context (e.g., `spawn_blocking`)
+    /// as it performs synchronous I/O operations.
+    ///
+    /// This method:
+    /// 1. Re-opens the file as read-only
+    /// 2. Enables fs-verity on the file (kernel computes digest)
+    /// 3. Reads the digest from the kernel
+    /// 4. Checks if object already exists (deduplication)
+    /// 5. Links the file into the objects directory
+    ///
+    /// By letting the kernel compute the digest during verity enable, we avoid
+    /// reading the file an extra time in userspace.
+    pub fn finalize_object_tmpfile(&self, file: File, size: u64) -> Result<ObjectID> {
+        // Re-open as read-only via /proc/self/fd (required for verity enable)
+        let fd_path = proc_self_fd(&file);
+        let ro_fd = open(&*fd_path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())?;
+
+        // Must close writable fd before enabling verity
+        drop(file);
+
+        // Get objects_dir early since we may need it for verity copy
+        let objects_dir = self.objects_dir()?;
+
+        // Enable verity - the kernel reads the file and computes the digest.
+        // Use enable_verity_maybe_copy to handle the case where forked processes
+        // have inherited writable fds to this file.
+        let (ro_fd, verity_enabled) =
+            match enable_verity_maybe_copy::<ObjectID>(objects_dir, ro_fd.as_fd()) {
+                Ok(None) => (ro_fd, true),
+                Ok(Some(new_fd)) => (new_fd, true),
+                Err(EnableVerityError::FilesystemNotSupported) if self.insecure => (ro_fd, false),
+                Err(EnableVerityError::AlreadyEnabled) => (ro_fd, true),
+                Err(other) => return Err(other).context("Enabling verity on tmpfile")?,
+            };
+
+        // Get the digest - either from kernel (fast) or compute in userspace (fallback)
+        let id: ObjectID = if verity_enabled {
+            measure_verity(&ro_fd).context("Measuring verity digest")?
+        } else {
+            // Insecure mode: compute digest in userspace from ro_fd
+            let mut reader = std::io::BufReader::new(File::from(ro_fd.try_clone()?));
+            Self::compute_verity_digest(&mut reader)?
+        };
+
+        // Check if object already exists
+        let path = id.to_object_pathname();
+
+        match statat(objects_dir, &path, AtFlags::empty()) {
+            Ok(stat) if stat.st_size as u64 == size => {
+                // Object already exists with correct size, skip storage
+                return Ok(id);
+            }
+            _ => {}
+        }
+
+        // Ensure parent directory exists
+        let parent_dir = id.to_object_dir();
+        let _ = mkdirat(objects_dir, &parent_dir, Mode::from_raw_mode(0o755));
+
+        // Link the file into the objects directory
+        match linkat(
+            CWD,
+            proc_self_fd(&ro_fd),
+            objects_dir,
+            &path,
+            AtFlags::SYMLINK_FOLLOW,
+        ) {
+            Ok(()) => Ok(id),
+            Err(Errno::EXIST) => Ok(id), // Race: another task created it
+            Err(e) => Err(e).context("Linking tmpfile into objects directory")?,
+        }
+    }
+
+    /// Compute fs-verity digest in userspace by reading from a buffered source.
+    /// Used as fallback when kernel verity is not available (insecure mode).
+    fn compute_verity_digest(reader: &mut impl std::io::BufRead) -> Result<ObjectID> {
+        let mut hasher = FsVerityHasher::<ObjectID>::new();
+
+        loop {
+            let buf = reader.fill_buf()?;
+            if buf.is_empty() {
+                break;
+            }
+            // add_block expects at most one block at a time
+            let chunk_size = buf.len().min(FsVerityHasher::<ObjectID>::BLOCK_SIZE);
+            hasher.add_block(&buf[..chunk_size]);
+            reader.consume(chunk_size);
+        }
+
+        Ok(hasher.digest())
+    }
+
+    /// Store an object with a pre-computed fs-verity ID.
+    ///
+    /// This is an internal helper that stores data assuming the caller has already
+    /// computed the correct fs-verity digest. The digest is verified after storage.
+    fn store_object_with_id(&self, data: &[u8], id: &ObjectID) -> Result<()> {
+        let dirfd = self.objects_dir()?;
         let path = id.to_object_pathname();
 
         // the usual case is that the file will already exist
@@ -156,14 +312,14 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             Ok(fd) => {
                 // measure the existing file to ensure that it's correct
                 // TODO: try to replace file if it's broken?
-                match ensure_verity_equal(&fd, &id) {
+                match ensure_verity_equal(&fd, id) {
                     Ok(()) => {}
                     Err(CompareVerityError::Measure(MeasureVerityError::VerityMissing))
                         if self.insecure =>
                     {
                         match enable_verity_maybe_copy::<ObjectID>(dirfd, fd.as_fd()) {
-                            Ok(Some(fd)) => ensure_verity_equal(&fd, &id)?,
-                            Ok(None) => ensure_verity_equal(&fd, &id)?,
+                            Ok(Some(fd)) => ensure_verity_equal(&fd, id)?,
+                            Ok(None) => ensure_verity_equal(&fd, id)?,
                             Err(other) => Err(other)?,
                         }
                     }
@@ -172,7 +328,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                     )) if self.insecure => {}
                     Err(other) => Err(other)?,
                 }
-                return Ok(id);
+                return Ok(());
             }
             Err(Errno::NOENT) => {
                 // in this case we'll create the file
@@ -199,7 +355,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         let ro_fd = match enable_verity_maybe_copy::<ObjectID>(dirfd, ro_fd.as_fd()) {
             Ok(maybe_fd) => {
                 let ro_fd = maybe_fd.unwrap_or(ro_fd);
-                match ensure_verity_equal(&ro_fd, &id) {
+                match ensure_verity_equal(&ro_fd, id) {
                     Ok(()) => ro_fd,
                     Err(CompareVerityError::Measure(
                         MeasureVerityError::VerityMissing
@@ -228,6 +384,16 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             }
         }
 
+        Ok(())
+    }
+
+    /// Given a blob of data, store it in the repository.
+    ///
+    /// For performance reasons, this function does *not* call fsync() or similar.  After you're
+    /// done with everything, call `Repository::sync()`.
+    pub fn ensure_object(&self, data: &[u8]) -> Result<ObjectID> {
+        let id: ObjectID = compute_verity(data);
+        self.store_object_with_id(data, &id)?;
         Ok(id)
     }
 
@@ -314,6 +480,61 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         // We need to make sure that all of that makes it to the disk before the splitstream is
         // visible as a splitstream.
         self.sync()?;
+
+        let stream_path = Self::format_stream_path(content_identifier);
+        let object_path = Self::format_object_path(&object_id);
+        self.symlink(&stream_path, &object_path)?;
+
+        if let Some(name) = reference {
+            let reference_path = format!("streams/refs/{name}");
+            self.symlink(&reference_path, &stream_path)?;
+        }
+
+        Ok(object_id)
+    }
+
+    /// Register an already-stored object as a named stream.
+    ///
+    /// This is useful when using `SplitStreamBuilder` which stores the splitstream
+    /// directly via `finish()`. After calling `finish()`, call this method to
+    /// sync all data to disk and create the stream symlink.
+    ///
+    /// This method ensures atomicity: the stream symlink is only created after
+    /// all objects have been synced to disk.
+    pub async fn register_stream(
+        self: &Arc<Self>,
+        object_id: &ObjectID,
+        content_identifier: &str,
+        reference: Option<&str>,
+    ) -> Result<()> {
+        self.sync_async().await?;
+
+        let stream_path = Self::format_stream_path(content_identifier);
+        let object_path = Self::format_object_path(object_id);
+        self.symlink(&stream_path, &object_path)?;
+
+        if let Some(name) = reference {
+            let reference_path = format!("streams/refs/{name}");
+            self.symlink(&reference_path, &stream_path)?;
+        }
+
+        Ok(())
+    }
+
+    /// Async version of `write_stream` for use with parallel object storage.
+    ///
+    /// This method awaits any pending parallel object storage tasks before
+    /// finalizing the stream. Use this when you've called `write_external_parallel()`
+    /// on the writer.
+    pub async fn write_stream_async(
+        self: &Arc<Self>,
+        writer: SplitStreamWriter<ObjectID>,
+        content_identifier: &str,
+        reference: Option<&str>,
+    ) -> Result<ObjectID> {
+        let object_id = writer.done_async().await?;
+
+        self.sync_async().await?;
 
         let stream_path = Self::format_stream_path(content_identifier);
         let object_path = Self::format_object_path(&object_id);
