@@ -729,4 +729,83 @@ mod tests {
             "{msg_prefix}: mtime mismatch"
         );
     }
+
+    /// Benchmark for tar split processing via Repository API.
+    ///
+    /// Run with: cargo test --release --lib -p composefs-oci bench_tar_split -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_tar_split() {
+        use std::time::Instant;
+
+        // Configuration: 10000 files of 200KB each = 2GB total
+        const NUM_FILES: usize = 10000;
+        const FILE_SIZE: usize = 200 * 1024; // 200KB
+        const ITERATIONS: usize = 3;
+
+        println!("\n=== Tar Split Benchmark ===");
+        println!(
+            "Configuration: {} files of {}KB each, {} iterations",
+            NUM_FILES,
+            FILE_SIZE / 1024,
+            ITERATIONS
+        );
+
+        // Generate deterministic test data
+        fn generate_test_data(size: usize, seed: u8) -> Vec<u8> {
+            (0..size)
+                .map(|i| ((i as u8).wrapping_add(seed)).wrapping_mul(17))
+                .collect()
+        }
+
+        // Build a tar archive in memory with many large files
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = Builder::new(&mut tar_data);
+            for i in 0..NUM_FILES {
+                let content = generate_test_data(FILE_SIZE, i as u8);
+                let filename = format!("file_{:04}.bin", i);
+                append_file(&mut builder, &filename, &content).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+
+        let tar_size = tar_data.len();
+        println!(
+            "Tar archive size: {} bytes ({:.2} MB)",
+            tar_size,
+            tar_size as f64 / (1024.0 * 1024.0)
+        );
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut times = Vec::with_capacity(ITERATIONS);
+        for i in 0..ITERATIONS {
+            let repo = create_test_repository().unwrap();
+            let tar_data_clone = tar_data.clone();
+
+            let start = Instant::now();
+            rt.block_on(async {
+                let mut writer = repo.create_stream(TAR_LAYER_CONTENT_TYPE);
+                split_async(&tar_data_clone[..], &mut writer).await?;
+                writer.done()
+            })
+            .unwrap();
+            let elapsed = start.elapsed();
+            times.push(elapsed);
+            println!("Iteration {}: {:?}", i + 1, elapsed);
+        }
+
+        let total: std::time::Duration = times.iter().sum();
+        let avg = total / ITERATIONS as u32;
+        println!("\n=== Summary ===");
+        println!(
+            "Average: {:?}  ({:.2} MB/s)",
+            avg,
+            (tar_size as f64 / (1024.0 * 1024.0)) / avg.as_secs_f64()
+        );
+    }
 }
