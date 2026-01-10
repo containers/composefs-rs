@@ -73,9 +73,20 @@ mod tests {
         })
     }
 
+    // Helper for default stat in tests
+    fn default_stat() -> Stat {
+        Stat {
+            st_mode: 0o755,
+            st_uid: 0,
+            st_gid: 0,
+            st_mtim_sec: 0,
+            xattrs: RefCell::new(BTreeMap::new()),
+        }
+    }
+
     #[test]
     fn test_insert_and_get_leaf() {
-        let mut dir = Directory::<Sha256HashValue>::default();
+        let mut dir = Directory::<Sha256HashValue>::new(default_stat());
         let leaf = new_leaf_file(10);
         dir.insert(OsStr::new("file.txt"), Inode::Leaf(Rc::clone(&leaf)));
         assert_eq!(dir.entries.len(), 1);
@@ -92,7 +103,7 @@ mod tests {
 
     #[test]
     fn test_insert_and_get_directory() {
-        let mut dir = Directory::<Sha256HashValue>::default();
+        let mut dir = Directory::<Sha256HashValue>::new(default_stat());
         let sub_dir_inode = new_dir_inode(20);
         dir.insert(OsStr::new("subdir"), sub_dir_inode);
         assert_eq!(dir.entries.len(), 1);

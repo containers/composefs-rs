@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use composefs::{
     fsverity::FsVerityHashValue,
     repository::Repository,
-    tree::{Directory, FileSystem, Inode, Leaf},
+    tree::{Directory, FileSystem, Inode, Leaf, Stat},
 };
 
 use crate::skopeo::TAR_LAYER_CONTENT_TYPE;
@@ -100,7 +100,7 @@ pub fn create_filesystem<ObjectID: FsVerityHashValue>(
     config_name: &str,
     config_verity: Option<&ObjectID>,
 ) -> Result<FileSystem<ObjectID>> {
-    let mut filesystem = FileSystem::default();
+    let mut filesystem = FileSystem::new(Stat::uninitialized());
 
     let (config, map) = crate::open_config(repo, config_name, config_verity)?;
 
@@ -188,7 +188,7 @@ mod test {
 
     #[test]
     fn test_process_entry() -> Result<()> {
-        let mut fs = FileSystem::<Sha256HashValue>::default();
+        let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
 
         // both with and without leading slash should be supported
         process_entry(&mut fs, dir_entry("/a"))?;
