@@ -19,6 +19,16 @@ use composefs::{
     tree::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
 };
 
+fn default_stat() -> Stat {
+    Stat {
+        st_mode: 0o755,
+        st_uid: 0,
+        st_gid: 0,
+        st_mtim_sec: 0,
+        xattrs: RefCell::new(BTreeMap::new()),
+    }
+}
+
 fn debug_fs(fs: FileSystem<impl FsVerityHashValue>) -> String {
     let image = mkfs_erofs(&fs);
     let mut output = vec![];
@@ -30,7 +40,7 @@ fn empty(_fs: &mut FileSystem<impl FsVerityHashValue>) {}
 
 #[test]
 fn test_empty() {
-    let mut fs = FileSystem::<Sha256HashValue>::default();
+    let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
     empty(&mut fs);
     insta::assert_snapshot!(debug_fs(fs));
 }
@@ -83,14 +93,14 @@ fn simple(fs: &mut FileSystem<Sha256HashValue>) {
 
 #[test]
 fn test_simple() {
-    let mut fs = FileSystem::<Sha256HashValue>::default();
+    let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
     simple(&mut fs);
     insta::assert_snapshot!(debug_fs(fs));
 }
 
 fn foreach_case(f: fn(&FileSystem<Sha256HashValue>)) {
     for case in [empty, simple] {
-        let mut fs = FileSystem::default();
+        let mut fs = FileSystem::new(default_stat());
         case(&mut fs);
         f(&fs);
     }

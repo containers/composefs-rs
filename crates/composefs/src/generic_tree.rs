@@ -26,6 +26,26 @@ pub struct Stat {
     pub xattrs: RefCell<BTreeMap<Box<OsStr>, Box<[u8]>>>,
 }
 
+impl Stat {
+    /// Creates a placeholder stat for uninitialized root directories.
+    ///
+    /// This stat has obviously invalid metadata (mode 0) that must be overwritten
+    /// before computing digests. It is intended for use when building a filesystem
+    /// incrementally (e.g., from OCI layers) where the final root metadata will be
+    /// set via `copy_root_metadata_from_usr()`.
+    ///
+    /// NOTE: If changing this, also update `doc/oci.md`.
+    pub fn uninitialized() -> Self {
+        Self {
+            st_mode: 0,
+            st_uid: 0,
+            st_gid: 0,
+            st_mtim_sec: 0,
+            xattrs: RefCell::new(BTreeMap::new()),
+        }
+    }
+}
+
 /// Content types for leaf nodes (non-directory files).
 #[derive(Debug)]
 pub enum LeafContent<T> {
@@ -100,27 +120,6 @@ impl<T> Inode<T> {
     }
 }
 
-// For some reason #[derive(Default)] doesn't work, so let's DIY
-impl<T> Default for Directory<T> {
-    fn default() -> Self {
-        Self {
-            // Default root metadata matches what Podman's containers/storage uses
-            // when extracting OCI layer tars: root:root, mode 0555, epoch mtime.
-            // This is a fallback; callers should use copy_root_metadata_from_usr()
-            // or set_root_stat() to set proper metadata before computing digests.
-            // NOTE: If changing this, also update doc/oci.md.
-            stat: Stat {
-                st_uid: 0,
-                st_gid: 0,
-                st_mode: 0o555,
-                st_mtim_sec: 0,
-                xattrs: Default::default(),
-            },
-            entries: BTreeMap::default(),
-        }
-    }
-}
-
 impl<T> Directory<T> {
     /// Creates a new directory with the given metadata.
     pub fn new(stat: Stat) -> Self {
@@ -142,8 +141,8 @@ impl<T> Directory<T> {
     /// point.
     ///
     /// ```
-    /// use composefs::{tree::FileSystem, fsverity::Sha256HashValue};
-    /// let fs = FileSystem::<Sha256HashValue>::default();
+    /// use composefs::{tree::{FileSystem, Stat}, fsverity::Sha256HashValue};
+    /// let fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
     ///
     /// // populate the fs...
     ///
@@ -456,15 +455,14 @@ pub struct FileSystem<T> {
     pub root: Directory<T>,
 }
 
-impl<T> Default for FileSystem<T> {
-    fn default() -> Self {
+impl<T> FileSystem<T> {
+    /// Creates a new filesystem with a root directory having the given metadata.
+    pub fn new(root_stat: Stat) -> Self {
         Self {
-            root: Directory::default(),
+            root: Directory::new(root_stat),
         }
     }
-}
 
-impl<T> FileSystem<T> {
     /// Sets the metadata for the root directory.
     pub fn set_root_stat(&mut self, stat: Stat) {
         self.root.stat = stat;
@@ -548,6 +546,17 @@ mod tests {
     #[derive(Debug, Default)]
     struct FileContents {}
 
+    // Helper to create a default stat for tests
+    fn default_stat() -> Stat {
+        Stat {
+            st_mode: 0o755,
+            st_uid: 0,
+            st_gid: 0,
+            st_mtim_sec: 0,
+            xattrs: RefCell::new(BTreeMap::new()),
+        }
+    }
+
     // Helper to create a Stat with a specific mtime
     fn stat_with_mtime(mtime: i64) -> Stat {
         Stat {
@@ -592,17 +601,6 @@ mod tests {
     }
 
     #[test]
-    fn test_directory_default() {
-        let dir = Directory::<()>::default();
-        assert_eq!(dir.stat.st_uid, 0);
-        assert_eq!(dir.stat.st_gid, 0);
-        assert_eq!(dir.stat.st_mode, 0o555);
-        assert_eq!(dir.stat.st_mtim_sec, 0);
-        assert!(dir.stat.xattrs.borrow().is_empty());
-        assert!(dir.entries.is_empty());
-    }
-
-    #[test]
     fn test_directory_new() {
         let stat = stat_with_mtime(123);
         let dir = Directory::<()>::new(stat);
@@ -612,7 +610,7 @@ mod tests {
 
     #[test]
     fn test_insert_and_get_leaf() {
-        let mut dir = Directory::<FileContents>::default();
+        let mut dir = Directory::<FileContents>::new(default_stat());
         let leaf = new_leaf_file(10);
         dir.insert(OsStr::new("file.txt"), Inode::Leaf(Rc::clone(&leaf)));
         assert_eq!(dir.entries.len(), 1);
@@ -626,7 +624,7 @@ mod tests {
 
     #[test]
     fn test_insert_and_get_directory() {
-        let mut dir = Directory::<()>::default();
+        let mut dir = Directory::<()>::new(default_stat());
         let sub_dir_inode = new_dir_inode(20);
         dir.insert(OsStr::new("subdir"), sub_dir_inode);
         assert_eq!(dir.entries.len(), 1);
@@ -643,7 +641,7 @@ mod tests {
 
     #[test]
     fn test_get_directory_errors() {
-        let mut root = Directory::default();
+        let mut root = Directory::new(default_stat());
         root.insert(OsStr::new("dir1"), new_dir_inode(10));
         root.insert(OsStr::new("file1"), Inode::Leaf(new_leaf_file(30)));
 
@@ -664,7 +662,7 @@ mod tests {
 
     #[test]
     fn test_get_file_errors() {
-        let mut dir = Directory::default();
+        let mut dir = Directory::new(default_stat());
         dir.insert(OsStr::new("subdir"), new_dir_inode(10));
         dir.insert(
             OsStr::new("link.txt"),
@@ -694,7 +692,7 @@ mod tests {
 
     #[test]
     fn test_remove() {
-        let mut dir = Directory::default();
+        let mut dir = Directory::new(default_stat());
         dir.insert(OsStr::new("file1.txt"), Inode::Leaf(new_leaf_file(10)));
         dir.insert(OsStr::new("subdir"), new_dir_inode(20));
         assert_eq!(dir.entries.len(), 2);
@@ -709,7 +707,7 @@ mod tests {
 
     #[test]
     fn test_merge() {
-        let mut dir = Directory::default();
+        let mut dir = Directory::new(default_stat());
 
         // Merge Leaf onto empty
         dir.merge(OsStr::new("item"), Inode::Leaf(new_leaf_file(10)));
@@ -759,7 +757,7 @@ mod tests {
 
     #[test]
     fn test_clear() {
-        let mut dir = Directory::default();
+        let mut dir = Directory::new(default_stat());
         dir.insert(OsStr::new("file1"), Inode::Leaf(new_leaf_file(10)));
         dir.stat.st_mtim_sec = 100;
 
@@ -793,7 +791,7 @@ mod tests {
 
     #[test]
     fn test_iteration_entries_sorted_inodes() {
-        let mut dir = Directory::default();
+        let mut dir = Directory::new(default_stat());
         dir.insert(OsStr::new("b_file"), Inode::Leaf(new_leaf_file(10)));
         dir.insert(OsStr::new("a_dir"), new_dir_inode(20));
         dir.insert(
@@ -831,7 +829,7 @@ mod tests {
 
     #[test]
     fn test_copy_root_metadata_from_usr() {
-        let mut fs = FileSystem::<FileContents>::default();
+        let mut fs = FileSystem::<FileContents>::new(default_stat());
 
         // Create /usr with specific metadata
         let usr_stat = Stat {
@@ -869,7 +867,7 @@ mod tests {
 
     #[test]
     fn test_copy_root_metadata_from_usr_missing() {
-        let mut fs = FileSystem::<FileContents>::default();
+        let mut fs = FileSystem::<FileContents>::new(default_stat());
 
         match fs.copy_root_metadata_from_usr() {
             Err(ImageError::NotFound(name)) => assert_eq!(name.to_str().unwrap(), "usr"),

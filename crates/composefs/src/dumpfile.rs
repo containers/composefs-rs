@@ -17,7 +17,7 @@ use std::{
     rc::Rc,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use rustix::fs::FileType;
 
 use crate::{
@@ -446,13 +446,37 @@ fn entry_to_stat(entry: &Entry<'_>) -> Stat {
 }
 
 /// Parse a dumpfile string and build a complete FileSystem.
+///
+/// The dumpfile must start with a root directory entry (`/`) which provides
+/// the root metadata. Returns an error if no root entry is found.
 pub fn dumpfile_to_filesystem<ObjectID: FsVerityHashValue>(
     dumpfile: &str,
 ) -> Result<FileSystem<ObjectID>> {
-    let mut fs = FileSystem::default();
+    let mut lines = dumpfile.lines().peekable();
     let mut hardlinks = HashMap::new();
 
-    for line in dumpfile.lines() {
+    // Find the first non-empty line which must be the root entry
+    let root_stat = loop {
+        match lines.next() {
+            Some(line) if line.trim().is_empty() => continue,
+            Some(line) => {
+                let entry = Entry::parse(line)
+                    .with_context(|| format!("Failed to parse dumpfile line: {line}"))?;
+                ensure!(
+                    entry.path.as_ref() == Path::new("/"),
+                    "Dumpfile must start with root directory entry, found: {:?}",
+                    entry.path
+                );
+                break entry_to_stat(&entry);
+            }
+            None => anyhow::bail!("Dumpfile is empty, expected root directory entry"),
+        }
+    };
+
+    let mut fs = FileSystem::new(root_stat);
+
+    // Process remaining entries
+    for line in lines {
         if line.trim().is_empty() {
             continue;
         }

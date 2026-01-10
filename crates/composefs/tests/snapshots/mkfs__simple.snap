@@ -1,7 +1,7 @@
 ---
-source: tests/mkfs.rs
+source: crates/composefs/tests/mkfs.rs
+assertion_line: 100
 expression: debug_fs(fs)
-snapshot_kind: text
 ---
 00000000 ComposefsHeader
       +0     magic: U32(3497550490)
@@ -23,7 +23,7 @@ snapshot_kind: text
 # nid #36
 00000480 ExtendedInodeHeader
       +0     format: 5 = Extended | Ok(FlatInline)
-      +4     mode: 0040555 (directory)
+      +4     mode: 0040755 (directory)
       +8     size: U64(170)
      +14     ino: U32(36)
      +2c     nlink: U32(2)
