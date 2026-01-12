@@ -481,6 +481,31 @@ impl<T> FileSystem<T> {
             self.have_root_stat = true;
         }
     }
+
+    /// Applies a function to every [`Stat`] in the filesystem tree.
+    ///
+    /// This visits the root directory and all descendants (directories and leaves),
+    /// calling the provided function with each node's `Stat`.
+    pub fn for_each_stat<F>(&self, f: F)
+    where
+        F: Fn(&Stat),
+    {
+        fn visit_inode<T, F: Fn(&Stat)>(inode: &Inode<T>, f: &F) {
+            match inode {
+                Inode::Directory(ref dir) => visit_dir(dir, f),
+                Inode::Leaf(ref leaf) => f(&leaf.stat),
+            }
+        }
+
+        fn visit_dir<T, F: Fn(&Stat)>(dir: &Directory<T>, f: &F) {
+            f(&dir.stat);
+            for (_name, inode) in dir.entries.iter() {
+                visit_inode(inode, f);
+            }
+        }
+
+        visit_dir(&self.root, &f);
+    }
 }
 
 #[cfg(test)]
