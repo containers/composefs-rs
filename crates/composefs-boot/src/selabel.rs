@@ -23,6 +23,13 @@ use composefs::{
     tree::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
 };
 
+/// The SELinux security context extended attribute name.
+///
+/// This xattr stores the SELinux label for a file (e.g., `system_u:object_r:bin_t:s0`).
+/// When reading from mounted filesystems, this xattr often contains build-host labels
+/// that should be stripped or regenerated based on the target system's policy.
+pub const XATTR_SECURITY_SELINUX: &str = "security.selinux";
+
 /* We build the entire SELinux policy into a single "lazy DFA" such that:
  *
  *  - the input string is the filename plus a single character representing the type of the file,
@@ -201,13 +208,13 @@ impl Policy {
 }
 
 fn relabel(stat: &Stat, path: &Path, ifmt: u8, policy: &mut Policy) {
-    let security_selinux = OsStr::new("security.selinux"); // no literal syntax for this yet
     let mut xattrs = stat.xattrs.borrow_mut();
+    let key = OsStr::new(XATTR_SECURITY_SELINUX);
 
     if let Some(label) = policy.lookup(path.as_os_str(), ifmt) {
-        xattrs.insert(Box::from(security_selinux), Box::from(label.as_bytes()));
+        xattrs.insert(Box::from(key), Box::from(label.as_bytes()));
     } else {
-        xattrs.remove(security_selinux);
+        xattrs.remove(key);
     }
 }
 
@@ -255,10 +262,22 @@ fn parse_config(file: impl Read) -> Result<Option<String>> {
     Ok(None)
 }
 
+fn strip_selinux_labels<H: FsVerityHashValue>(fs: &FileSystem<H>) {
+    fs.for_each_stat(|stat| {
+        stat.xattrs
+            .borrow_mut()
+            .remove(OsStr::new(XATTR_SECURITY_SELINUX));
+    });
+}
+
 /// Applies SELinux security contexts to all files in a filesystem tree.
 ///
 /// Reads the SELinux policy from /etc/selinux/config and corresponding policy files,
 /// then labels all filesystem nodes with appropriate security.selinux extended attributes.
+///
+/// If no SELinux policy is found in the target filesystem, any existing `security.selinux`
+/// xattrs are stripped. This prevents build-time SELinux labels (e.g., `container_t`) from
+/// leaking into the final image when targeting a non-SELinux host.
 ///
 /// # Arguments
 ///
@@ -267,19 +286,23 @@ fn parse_config(file: impl Read) -> Result<Option<String>> {
 ///
 /// # Returns
 ///
-/// Ok(()) if labeling succeeds or if no SELinux policy is found
-pub fn selabel<H: FsVerityHashValue>(fs: &mut FileSystem<H>, repo: &Repository<H>) -> Result<()> {
-    // if /etc/selinux/config doesn't exist then it's not an error
+/// Returns `Ok(true)` if SELinux labeling was performed (policy was found),
+/// or `Ok(false)` if no policy was found and existing labels were stripped.
+pub fn selabel<H: FsVerityHashValue>(fs: &mut FileSystem<H>, repo: &Repository<H>) -> Result<bool> {
+    // if /etc/selinux/config doesn't exist then strip any existing labels
     let Some(etc_selinux) = fs.root.get_directory_opt("etc/selinux".as_ref())? else {
-        return Ok(());
+        strip_selinux_labels(fs);
+        return Ok(false);
     };
 
     let Some(etc_selinux_config) = openat(etc_selinux, "config", repo)? else {
-        return Ok(());
+        strip_selinux_labels(fs);
+        return Ok(false);
     };
 
     let Some(policy) = parse_config(etc_selinux_config)? else {
-        return Ok(());
+        strip_selinux_labels(fs);
+        return Ok(false);
     };
 
     let dir = etc_selinux
@@ -289,5 +312,5 @@ pub fn selabel<H: FsVerityHashValue>(fs: &mut FileSystem<H>, repo: &Repository<H
     let mut policy = Policy::build(dir, repo)?;
     let mut path = PathBuf::from("/");
     relabel_dir(&fs.root, &mut path, &mut policy);
-    Ok(())
+    Ok(true)
 }
