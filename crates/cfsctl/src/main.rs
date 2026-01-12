@@ -70,6 +70,8 @@ enum OciCommand {
     Dump {
         config_name: String,
         config_verity: Option<String>,
+        #[clap(long)]
+        bootable: bool,
     },
     Pull {
         image: String,
@@ -249,10 +251,14 @@ where
             OciCommand::Dump {
                 ref config_name,
                 ref config_verity,
+                bootable,
             } => {
                 let verity = verity_opt(config_verity)?;
-                let fs =
+                let mut fs =
                     composefs_oci::image::create_filesystem(&repo, config_name, verity.as_ref())?;
+                if bootable {
+                    fs.transform_for_boot(&repo)?;
+                }
                 fs.print_dumpfile()?;
             }
             OciCommand::ComputeId {
