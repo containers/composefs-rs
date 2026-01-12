@@ -344,21 +344,82 @@ pub fn read_filesystem<ObjectID: FsVerityHashValue>(
     Ok(FileSystem { root })
 }
 
+/// Load a filesystem tree from the given path, filtering xattrs with a predicate.
+///
+/// This is a wrapper around [`read_filesystem`] that filters extended attributes
+/// using the provided predicate. Only xattrs for which the predicate returns `true`
+/// are retained. This is useful when reading from a mounted filesystem where host
+/// xattrs may leak into the image.
+///
+/// # Example
+///
+/// ```ignore
+/// use composefs::fs::{read_filesystem_filtered, CONTAINER_XATTR_ALLOWLIST};
+///
+/// // Filter to only allow security.capability
+/// let fs = read_filesystem_filtered(dirfd, path, repo, |name| {
+///     name.as_encoded_bytes() == b"security.capability"
+/// })?;
+/// ```
+pub fn read_filesystem_filtered<ObjectID, F>(
+    dirfd: impl AsFd,
+    path: &Path,
+    repo: Option<&Repository<ObjectID>>,
+    xattr_filter: F,
+) -> Result<FileSystem<ObjectID>>
+where
+    ObjectID: FsVerityHashValue,
+    F: Fn(&OsStr) -> bool,
+{
+    let fs = read_filesystem(dirfd, path, repo)?;
+    fs.filter_xattrs(xattr_filter);
+    Ok(fs)
+}
+
+/// Default xattr allowlist for container filesystems.
+///
+/// When reading from a mounted container filesystem, host xattrs can leak into
+/// the image (e.g., SELinux labels like `container_t` from overlayfs). This
+/// allowlist specifies which xattrs are safe to preserve.
+///
+/// Currently only `security.capability` is allowed, as it represents actual
+/// file capabilities that should be preserved. SELinux labels (`security.selinux`)
+/// are excluded because they come from the build host and will be regenerated
+/// by `transform_for_boot()` based on the target system's policy.
+///
+/// See: <https://github.com/containers/storage/pull/1608#issuecomment-1600915185>
+pub const CONTAINER_XATTR_ALLOWLIST: &[&str] = &["security.capability"];
+
+/// Returns true if the given xattr name is in [`CONTAINER_XATTR_ALLOWLIST`].
+pub fn is_allowed_container_xattr(name: &OsStr) -> bool {
+    CONTAINER_XATTR_ALLOWLIST
+        .iter()
+        .any(|allowed| name.as_encoded_bytes() == allowed.as_bytes())
+}
+
 /// Load a container root filesystem from the given path.
 ///
-/// This is a convenience wrapper around [`read_filesystem`] that also copies
-/// metadata from `/usr` to the root directory. This is the recommended way to
-/// read a container filesystem because OCI container runtimes don't preserve
-/// root directory metadata from layer tars, making it non-deterministic.
+/// This is a convenience wrapper around [`read_filesystem_filtered`] that also
+/// copies metadata from `/usr` to the root directory.
 ///
-/// By copying `/usr` metadata to root, we ensure consistent composefs digests
-/// between build-time and install-time.
+/// Equivalent to calling:
+/// ```ignore
+/// let mut fs = read_filesystem_filtered(dirfd, path, repo, is_allowed_container_xattr)?;
+/// fs.copy_root_metadata_from_usr()?;
+/// ```
+///
+/// This is the recommended way to read a container filesystem because:
+/// - OCI container runtimes don't preserve root directory metadata from layer tars
+/// - Host xattrs (especially `security.selinux`) can leak into mounted filesystems
+///
+/// By filtering xattrs and copying `/usr` metadata to root, we ensure consistent
+/// and reproducible composefs digests between build-time and install-time.
 pub fn read_container_root<ObjectID: FsVerityHashValue>(
     dirfd: impl AsFd,
     path: &Path,
     repo: Option<&Repository<ObjectID>>,
 ) -> Result<FileSystem<ObjectID>> {
-    let mut fs = read_filesystem(dirfd, path, repo)?;
+    let mut fs = read_filesystem_filtered(dirfd, path, repo, is_allowed_container_xattr)?;
     fs.copy_root_metadata_from_usr()?;
     Ok(fs)
 }

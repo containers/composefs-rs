@@ -532,6 +532,21 @@ impl<T> FileSystem<T> {
 
         visit_dir(&self.root, &f);
     }
+
+    /// Filters extended attributes across the entire filesystem tree.
+    ///
+    /// Retains only xattrs whose names match the given predicate.
+    /// This is useful for stripping build-time xattrs that shouldn't
+    /// leak into the final image (e.g., `security.selinux` labels from
+    /// the build host).
+    pub fn filter_xattrs<F>(&self, predicate: F)
+    where
+        F: Fn(&OsStr) -> bool,
+    {
+        self.for_each_stat(|stat| {
+            stat.xattrs.borrow_mut().retain(|k, _| predicate(k));
+        });
+    }
 }
 
 #[cfg(test)]
@@ -873,5 +888,37 @@ mod tests {
             Err(ImageError::NotFound(name)) => assert_eq!(name.to_str().unwrap(), "usr"),
             other => panic!("Expected NotFound error, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_filter_xattrs() {
+        let root_stat = Stat {
+            st_mode: 0o755,
+            st_uid: 0,
+            st_gid: 0,
+            st_mtim_sec: 0,
+            xattrs: RefCell::new(BTreeMap::from([
+                (
+                    Box::from(OsStr::new("security.selinux")),
+                    Box::from(b"label".as_slice()),
+                ),
+                (
+                    Box::from(OsStr::new("security.capability")),
+                    Box::from(b"cap".as_slice()),
+                ),
+                (
+                    Box::from(OsStr::new("user.custom")),
+                    Box::from(b"value".as_slice()),
+                ),
+            ])),
+        };
+        let fs = FileSystem::<FileContents>::new(root_stat);
+
+        // Filter to keep only xattrs starting with "user."
+        fs.filter_xattrs(|name| name.as_encoded_bytes().starts_with(b"user."));
+
+        let root_xattrs = fs.root.stat.xattrs.borrow();
+        assert_eq!(root_xattrs.len(), 1);
+        assert!(root_xattrs.contains_key(OsStr::new("user.custom")));
     }
 }

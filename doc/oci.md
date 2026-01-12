@@ -52,3 +52,28 @@ When building a filesystem from OCI layers programmatically, use
 has mode `0` (obviously invalid) to make it clear that the root metadata should
 be set before computing digests - typically by calling
 `copy_root_metadata_from_usr()` after processing all layers.
+
+# Extended attributes (xattrs)
+
+When reading a container filesystem from a mounted root (as opposed to
+processing OCI layer tars directly), host-side xattrs can leak into the
+image.  This is particularly problematic for `security.selinux` labels:
+if SELinux is enabled at build time, files will have labels like
+`container_t` that come from the build host, not from the target system's
+policy.
+
+To ensure reproducibility, `read_container_root()` filters xattrs to only
+include those in an allowlist.  Currently this is just `security.capability`,
+which represents actual file capabilities that should be preserved.
+
+SELinux labels are handled separately by `transform_for_boot()`:
+ - If the target filesystem contains a SELinux policy (in `/etc/selinux`),
+   all files are relabeled according to that policy
+ - If no SELinux policy is found, all `security.selinux` xattrs are stripped
+
+This ensures that:
+ - Build-time SELinux labels don't leak into non-SELinux targets
+ - SELinux-enabled targets get correct labels from their own policy
+ - Other host xattrs (overlayfs internals, etc.) don't pollute the image
+
+See: https://github.com/containers/storage/pull/1608#issuecomment-1600915185
