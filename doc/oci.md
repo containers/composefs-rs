@@ -77,3 +77,51 @@ This ensures that:
  - Other host xattrs (overlayfs internals, etc.) don't pollute the image
 
 See: https://github.com/containers/storage/pull/1608#issuecomment-1600915185
+
+# The /run directory
+
+When processing OCI images via `create_filesystem()`, the `/run` directory
+is emptied if present. This is a tmpfs at runtime and should always be
+empty in images. Its mtime is set to match `/usr` for consistency with
+how root directory metadata is handled.
+
+This makes it possible to work around podman/buildah's `RUN --mount` issue where cache
+mounts can leave incomplete directory entries in OCI tar layers (directories
+without explicit tar entries inherit incorrect mtimes) by pointing all
+such mounts into `/run`, and then redirecting from their final location
+via e.g. symlinks into `/run`.
+
+## Container build cache mounts
+
+A practical implication of emptying `/run` is that container authors can
+use it for cache mounts without worrying about polluting the final image.
+
+Instead of:
+```dockerfile
+RUN --mount=type=cache,target=/var/cache/dnf dnf install -y ...
+```
+
+Consider:
+```dockerfile
+RUN rm -rf /var/cache/dnf && ln -sr /run/dnfcache /var/cache/dnf
+RUN --mount=type=cache,target=/run/dnfcache dnf install -y ...
+```
+
+This avoids potential mtime inconsistencies in `/var/cache` while still
+benefiting from build caching.
+
+See: https://github.com/containers/composefs-rs/issues/132
+
+# Emptied directories for boot
+
+When preparing a filesystem for boot via `transform_for_boot()`, certain
+additional directories are emptied because their contents should not be
+part of the final verified image:
+
+- `/boot`: Contains the UKI which embeds the composefs digest, so including
+  it would create a circular dependency
+- `/sysroot`: Only has content in ostree-container cases, and traversing
+  it for SELinux labeling causes problems
+
+These directories are emptied and their mtime is set to match `/usr` for
+consistency with how the root directory metadata is handled.

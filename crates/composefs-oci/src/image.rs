@@ -128,9 +128,9 @@ pub fn create_filesystem<ObjectID: FsVerityHashValue>(
         }
     }
 
-    // Copy root metadata from /usr to ensure consistent digests across different
-    // container runtimes and tar implementations.
-    filesystem.copy_root_metadata_from_usr()?;
+    // Apply OCI container transformations for consistent digests.
+    // See https://github.com/containers/composefs-rs/issues/132
+    filesystem.transform_for_oci()?;
 
     Ok(filesystem)
 }
