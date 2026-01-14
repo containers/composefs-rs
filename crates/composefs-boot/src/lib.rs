@@ -14,6 +14,8 @@ pub mod selabel;
 pub mod uki;
 pub mod write_boot;
 
+use std::ffi::OsStr;
+
 use anyhow::Result;
 
 use composefs::{fsverity::FsVerityHashValue, repository::Repository, tree::FileSystem};
@@ -67,9 +69,14 @@ impl<ObjectID: FsVerityHashValue> BootOps<ObjectID> for FileSystem<ObjectID> {
         repo: &Repository<ObjectID>,
     ) -> Result<Vec<BootEntry<ObjectID>>> {
         let boot_entries = get_boot_resources(self, repo)?;
+
+        // Get /usr's mtime to use as the canonical mtime for emptied directories.
+        // This matches how we handle the root directory in copy_root_metadata_from_usr().
+        let usr_mtime = self.root.get_directory(OsStr::new("usr"))?.stat.st_mtim_sec;
+
         for d in REQUIRED_TOPLEVEL_TO_EMPTY_DIRS {
             let d = self.root.get_directory_mut(d.as_ref())?;
-            d.stat.st_mtim_sec = 0;
+            d.stat.st_mtim_sec = usr_mtime;
             d.clear();
         }
 

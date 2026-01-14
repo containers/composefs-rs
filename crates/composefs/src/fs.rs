@@ -400,19 +400,21 @@ pub fn is_allowed_container_xattr(name: &OsStr) -> bool {
 /// Load a container root filesystem from the given path.
 ///
 /// This is a convenience wrapper around [`read_filesystem_filtered`] that also
-/// copies metadata from `/usr` to the root directory.
+/// applies OCI container transformations via [`FileSystem::transform_for_oci`].
 ///
 /// Equivalent to calling:
 /// ```ignore
 /// let mut fs = read_filesystem_filtered(dirfd, path, repo, is_allowed_container_xattr)?;
-/// fs.copy_root_metadata_from_usr()?;
+/// fs.transform_for_oci()?;
 /// ```
 ///
 /// This is the recommended way to read a container filesystem because:
 /// - OCI container runtimes don't preserve root directory metadata from layer tars
 /// - Host xattrs (especially `security.selinux`) can leak into mounted filesystems
+/// - `/run` should be empty (it's a tmpfs at runtime)
+/// - Podman/buildah's `RUN --mount` can leave directory stubs
 ///
-/// By filtering xattrs and copying `/usr` metadata to root, we ensure consistent
+/// By filtering xattrs and applying OCI transformations, we ensure consistent
 /// and reproducible composefs digests between build-time and install-time.
 pub fn read_container_root<ObjectID: FsVerityHashValue>(
     dirfd: impl AsFd,
@@ -420,7 +422,7 @@ pub fn read_container_root<ObjectID: FsVerityHashValue>(
     repo: Option<&Repository<ObjectID>>,
 ) -> Result<FileSystem<ObjectID>> {
     let mut fs = read_filesystem_filtered(dirfd, path, repo, is_allowed_container_xattr)?;
-    fs.copy_root_metadata_from_usr()?;
+    fs.transform_for_oci()?;
     Ok(fs)
 }
 

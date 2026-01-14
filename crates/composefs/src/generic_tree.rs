@@ -547,6 +547,52 @@ impl<T> FileSystem<T> {
             stat.xattrs.borrow_mut().retain(|k, _| predicate(k));
         });
     }
+
+    /// Empties the `/run` directory if present, using `/usr`'s mtime.
+    ///
+    /// `/run` is a tmpfs at runtime and should always be empty in container images.
+    /// This also works around podman/buildah's `RUN --mount` behavior where bind
+    /// mount targets leave directory stubs in the filesystem that shouldn't be
+    /// part of the image content.
+    ///
+    /// The mtime is set to match `/usr` for consistency with [`Self::copy_root_metadata_from_usr`].
+    ///
+    /// NOTE: If changing this behavior, also update `doc/oci.md`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `/usr` does not exist (needed to get the mtime).
+    pub fn canonicalize_run(&mut self) -> Result<(), ImageError> {
+        if self.root.get_directory_opt(OsStr::new("run"))?.is_some() {
+            let usr_mtime = self.root.get_directory(OsStr::new("usr"))?.stat.st_mtim_sec;
+            let run_dir = self.root.get_directory_mut(OsStr::new("run"))?;
+            run_dir.stat.st_mtim_sec = usr_mtime;
+            run_dir.clear();
+        }
+        Ok(())
+    }
+
+    /// Transforms the filesystem for OCI container image consistency.
+    ///
+    /// This applies the standard transformations needed to ensure consistent
+    /// composefs digests between build-time (mounted filesystem) and install-time
+    /// (OCI tar layers) views:
+    ///
+    /// 1. [`Self::copy_root_metadata_from_usr`] - copies `/usr` metadata to root directory
+    /// 2. [`Self::canonicalize_run`] - empties `/run` directory
+    ///
+    /// This is the recommended single entry point for OCI container processing.
+    ///
+    /// NOTE: If changing this behavior, also update `doc/oci.md`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `/usr` does not exist.
+    pub fn transform_for_oci(&mut self) -> Result<(), ImageError> {
+        self.copy_root_metadata_from_usr()?;
+        self.canonicalize_run()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -920,5 +966,94 @@ mod tests {
         let root_xattrs = fs.root.stat.xattrs.borrow();
         assert_eq!(root_xattrs.len(), 1);
         assert!(root_xattrs.contains_key(OsStr::new("user.custom")));
+    }
+
+    #[test]
+    fn test_canonicalize_run() {
+        let mut fs = FileSystem::<FileContents>::new(default_stat());
+
+        // Create /usr with specific mtime
+        let usr_dir = Directory::new(stat_with_mtime(12345));
+        fs.root
+            .insert(OsStr::new("usr"), Inode::Directory(Box::new(usr_dir)));
+
+        // Create /run with content and different mtime
+        let mut run_dir = Directory::new(stat_with_mtime(99999));
+        run_dir.insert(OsStr::new("somefile"), Inode::Leaf(new_leaf_file(11111)));
+        let mut subdir = Directory::new(stat_with_mtime(22222));
+        subdir.insert(OsStr::new("nested"), Inode::Leaf(new_leaf_file(33333)));
+        run_dir.insert(OsStr::new("subdir"), Inode::Directory(Box::new(subdir)));
+        fs.root
+            .insert(OsStr::new("run"), Inode::Directory(Box::new(run_dir)));
+
+        // Verify /run has content before
+        assert_eq!(
+            fs.root
+                .get_directory(OsStr::new("run"))
+                .unwrap()
+                .entries
+                .len(),
+            2
+        );
+
+        // Canonicalize
+        fs.canonicalize_run().unwrap();
+
+        // Verify /run is now empty with /usr's mtime
+        let run = fs.root.get_directory(OsStr::new("run")).unwrap();
+        assert!(run.entries.is_empty());
+        assert_eq!(run.stat.st_mtim_sec, 12345);
+    }
+
+    #[test]
+    fn test_canonicalize_run_no_run_dir() {
+        let mut fs = FileSystem::<FileContents>::new(default_stat());
+
+        // Create /usr but no /run
+        let usr_dir = Directory::new(stat_with_mtime(12345));
+        fs.root
+            .insert(OsStr::new("usr"), Inode::Directory(Box::new(usr_dir)));
+
+        // Should succeed without error
+        fs.canonicalize_run().unwrap();
+    }
+
+    #[test]
+    fn test_transform_for_oci() {
+        let mut fs = FileSystem::<FileContents>::new(default_stat());
+
+        // Create /usr with specific metadata
+        let usr_stat = Stat {
+            st_mode: 0o750,
+            st_uid: 100,
+            st_gid: 200,
+            st_mtim_sec: 54321,
+            xattrs: RefCell::new(BTreeMap::from([(
+                Box::from(OsStr::new("user.test")),
+                Box::from(b"val".as_slice()),
+            )])),
+        };
+        fs.root
+            .insert(OsStr::new("usr"), new_dir_inode_with_stat(usr_stat));
+
+        // Create /run with content
+        let mut run_dir = Directory::new(stat_with_mtime(99999));
+        run_dir.insert(OsStr::new("file"), Inode::Leaf(new_leaf_file(11111)));
+        fs.root
+            .insert(OsStr::new("run"), Inode::Directory(Box::new(run_dir)));
+
+        // Transform for OCI
+        fs.transform_for_oci().unwrap();
+
+        // Verify root metadata copied from /usr
+        assert_eq!(fs.root.stat.st_mode, 0o750);
+        assert_eq!(fs.root.stat.st_uid, 100);
+        assert_eq!(fs.root.stat.st_gid, 200);
+        assert_eq!(fs.root.stat.st_mtim_sec, 54321);
+
+        // Verify /run is emptied with /usr's mtime
+        let run = fs.root.get_directory(OsStr::new("run")).unwrap();
+        assert!(run.entries.is_empty());
+        assert_eq!(run.stat.st_mtim_sec, 54321);
     }
 }
