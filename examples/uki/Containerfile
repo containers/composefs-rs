@@ -13,7 +13,7 @@
 #    arg will be set to the fsverity digest of the container image.  This should
 #    be baked into the UKI.
 
-FROM fedora:42 AS base
+FROM fedora:43 AS base
 RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
     set -eux
 
