@@ -1,4 +1,4 @@
-FROM fedora:42
+FROM fedora:43
 RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
     set -eux
 
