@@ -1,0 +1,127 @@
+# Justfile for bootc reverse dependency testing
+# Invoked via: just bootc/<target>
+#
+# This builds and tests bootc against the local composefs-rs checkout
+# using bootc's auto-detection of path dependencies via `cargo xtask local-rust-deps`.
+# --------------------------------------------------------------------
+
+# Configuration variables (override via environment or command line)
+# Example: COMPOSEFS_BOOTC_REF=v1.0.0 just bootc/build
+
+# Path to bootc checkout (will be cloned if it doesn't exist)
+# Note: Use source_directory() not justfile_directory() so paths resolve correctly
+# when invoked as a submodule (just bootc::test) vs directly (cd bootc && just test)
+export COMPOSEFS_BOOTC_PATH := env("COMPOSEFS_BOOTC_PATH", source_directory() + "/../target/bootc")
+# Git ref to checkout for bootc (branch, tag, or PR ref)
+export COMPOSEFS_BOOTC_REF := env("COMPOSEFS_BOOTC_REF", "main")
+# Remote repository for bootc
+export COMPOSEFS_BOOTC_REPO := env("COMPOSEFS_BOOTC_REPO", "https://github.com/bootc-dev/bootc")
+
+# Internal: absolute path to the composefs-rs checkout (parent of this Justfile)
+export _COMPOSEFS_SRC := canonicalize(source_directory() + "/..")
+
+# Clone or update bootc repository
+clone:
+    #!/bin/bash
+    set -euo pipefail
+    if [ -d "$COMPOSEFS_BOOTC_PATH/.git" ]; then
+        echo "bootc already cloned at $COMPOSEFS_BOOTC_PATH"
+        echo "To update: cd $COMPOSEFS_BOOTC_PATH && git fetch && git checkout <ref>"
+    else
+        echo "Cloning bootc from $COMPOSEFS_BOOTC_REPO (ref: $COMPOSEFS_BOOTC_REF) to $COMPOSEFS_BOOTC_PATH"
+        mkdir -p "$(dirname "$COMPOSEFS_BOOTC_PATH")"
+        # Use --no-checkout with --filter for efficient cloning, then fetch the specific ref
+        # This handles PR refs (refs/pull/123/head) correctly
+        git clone "$COMPOSEFS_BOOTC_REPO" "$COMPOSEFS_BOOTC_PATH" --no-checkout --filter=blob:none
+        cd "$COMPOSEFS_BOOTC_PATH"
+        git fetch --depth=1 origin "$COMPOSEFS_BOOTC_REF"
+        git checkout FETCH_HEAD
+    fi
+
+# Patch bootc's Cargo.toml to use the local composefs-rs checkout
+# The path is auto-detected and bind-mounted by bootc's `cargo xtask local-rust-deps`
+patch: clone
+    #!/bin/bash
+    set -euo pipefail
+    cd "$COMPOSEFS_BOOTC_PATH"
+
+    # Check if already patched
+    if grep -q 'Patched by composefs-rs' Cargo.toml 2>/dev/null; then
+        echo "bootc already patched for composefs-rs"
+        exit 0
+    fi
+
+    echo "Patching bootc Cargo.toml to use $_COMPOSEFS_SRC"
+
+    # Add [patch] section with the real local path
+    # bootc's Justfile will auto-detect this via `cargo xtask local-rust-deps`
+    # and bind-mount it into the container build (mapping /home -> /var/home as needed)
+    {
+        echo ''
+        echo '# Patched by composefs-rs CI to test against local composefs-rs'
+        echo '[patch."https://github.com/containers/composefs-rs"]'
+        echo "composefs = { path = \"$_COMPOSEFS_SRC/crates/composefs\" }"
+        echo "composefs-boot = { path = \"$_COMPOSEFS_SRC/crates/composefs-boot\" }"
+        echo "composefs-oci = { path = \"$_COMPOSEFS_SRC/crates/composefs-oci\" }"
+    } >> Cargo.toml
+
+    # Patch the workspace lints to allow missing_docs for composefs-rs crates
+    # bootc has workspace.lints.rust.missing_docs = "deny" but composefs-rs has undocumented items
+    sed -i 's/missing_docs = "deny"/missing_docs = "allow"/' Cargo.toml
+
+    # Update Cargo.lock so the patch is recognized by cargo xtask local-rust-deps
+    cargo update composefs composefs-boot composefs-oci
+
+    echo "bootc patched successfully"
+
+# Build sealed bootc image using local composefs-rs
+# The path dependency is auto-detected and bind-mounted by bootc's Justfile
+build: patch
+    #!/bin/bash
+    set -euo pipefail
+    cd "$COMPOSEFS_BOOTC_PATH"
+    echo "Building sealed bootc image with local composefs-rs from $_COMPOSEFS_SRC"
+    just build-sealed
+
+# Run bootc composefs tests using local composefs-rs
+# Since the patch uses real local paths, no symlinks or special env vars needed
+test: build
+    #!/bin/bash
+    set -euo pipefail
+    cd "$COMPOSEFS_BOOTC_PATH"
+    echo "Running bootc composefs tests..."
+    just test-composefs
+
+# Clean the bootc checkout and any patches
+clean:
+    #!/bin/bash
+    set -euo pipefail
+    if [ -d "$COMPOSEFS_BOOTC_PATH" ]; then
+        echo "Removing bootc checkout at $COMPOSEFS_BOOTC_PATH"
+        rm -rf "$COMPOSEFS_BOOTC_PATH"
+    else
+        echo "No bootc checkout found at $COMPOSEFS_BOOTC_PATH"
+    fi
+
+# Show current bootc integration configuration
+config:
+    #!/bin/bash
+    cat <<EOF
+    Bootc Integration Configuration
+    ================================
+    path:  $COMPOSEFS_BOOTC_PATH
+    ref:   $COMPOSEFS_BOOTC_REF
+    repo:  $COMPOSEFS_BOOTC_REPO
+
+    composefs-rs source: $_COMPOSEFS_SRC
+
+    Environment Variables:
+      COMPOSEFS_BOOTC_PATH - Override bootc checkout path
+      COMPOSEFS_BOOTC_REF  - Override bootc git ref (branch/tag/PR)
+      COMPOSEFS_BOOTC_REPO - Override bootc git repository
+
+    Example Usage:
+      just bootc/build                                      # Clone main, patch, and build
+      COMPOSEFS_BOOTC_REF=v1.2.0 just bootc/build           # Use specific tag
+      COMPOSEFS_BOOTC_REF=refs/pull/1791/head just bootc/build  # Use PR
+    EOF

@@ -1,9 +1,8 @@
 # Justfile for composefs-rs
 # Run `just --list` to see available targets.
-#
-# Submodules:
-#   bootc/ - bootc reverse dependency testing (just bootc/build, etc.)
 # --------------------------------------------------------------------
+
+mod bootc
 
 # Build all crates
 build:
