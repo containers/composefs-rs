@@ -392,6 +392,13 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// For performance reasons, this function does *not* call fsync() or similar.  After you're
     /// done with everything, call `Repository::sync()`.
     pub fn ensure_object(&self, data: &[u8]) -> Result<ObjectID> {
+        const MAX_OBJECT_SIZE: usize = 4 * 1024; // 4KB
+        ensure!(
+            data.len() <= MAX_OBJECT_SIZE,
+            "Object exceeds maximum size of 4KB: {} bytes",
+            data.len()
+        );
+
         let id: ObjectID = compute_verity(data);
         self.store_object_with_id(data, &id)?;
         Ok(id)
