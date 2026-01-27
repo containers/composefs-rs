@@ -1,16 +1,15 @@
 # composefs repository design
 
-This is an experimental layout for how a composefs repository might end up
-looking on disk.  This attempts to document the status-quo of the code in this
-repo.  This is extremely likely to change substantially or end up in the trash
-for favour of something else.
+This document describes the current on-disk layout of a composefs repository.
+
+At this time, the composefs-rs repository format is not declared stable.
 
 ## Location
 
-A composefs repository is a directory located anywhere.  The location is chosen
+A composefs repository is a directory located anywhere. The location is chosen
 for the `cfsctl` command as follows:
 
- - `--path` can specify an arbitrary directory
+ - `--repo` can specify an arbitrary directory
 
  - if `--user` is specified (default if the current uid is not 0), then the
    repository defaults to `~/.var/lib/composefs`.
@@ -134,16 +133,15 @@ stream in one of two ways:
  - via the user-chosen name such as `refs/1000/flatpak/some_id`
  - via the fs-verity digest stored in the toplevel dir
 
-ie: the name must either start with the string `refs/`, or must be a 64bit
-character hexidecimal string.
+ie: the name must either start with the string `refs/`, or must be a
+hexadecimal string (64 characters for sha256, 128 for sha512).
 
 In both cases, the name is a path relative to the `images/` or `streams/`
 directory and this path contains a symlink (either direct or indirect) to the
 underlying file in `objects/`.
 
-In case the object is specified via its fs-verity digest (64 character hex
-string) then the fs-verity digest is verified before performing the given
-operation.
+When specified via fs-verity digest, the digest is verified before performing
+the operation.
 
 For example:
 
