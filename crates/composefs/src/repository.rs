@@ -3,6 +3,79 @@
 //! This module provides a repository abstraction for storing and retrieving
 //! content-addressed objects, splitstreams, and images with fs-verity
 //! verification and garbage collection support.
+//!
+//! # Repository Layout
+//!
+//! A composefs repository is a directory with the following structure:
+//!
+//! ```text
+//! repository/
+//! ├── objects/                  # Content-addressed object storage
+//! │   ├── 4e/                   # First byte of fs-verity hash (hex)
+//! │   │   └── 67eaccd9fd...     # Remaining bytes of hash
+//! │   └── ...
+//! ├── images/                   # Composefs (erofs) image tracking
+//! │   ├── 4e67eaccd9fd... → ../objects/4e/67eaccd9fd...
+//! │   └── refs/
+//! │       └── myimage → ../4e67eaccd9fd...
+//! └── streams/                  # Splitstream storage
+//!     ├── oci-config-sha256:... → ../objects/XX/YYY...
+//!     ├── oci-layer-sha256:... → ../objects/XX/YYY...
+//!     └── refs/                 # Named references (GC roots)
+//!         └── mytarball → ../oci-layer-sha256:...
+//! ```
+//!
+//! # Object Storage
+//!
+//! All content is stored in `objects/` using fs-verity hashes as filenames,
+//! split into 256 subdirectories (`00`-`ff`) by the first byte for filesystem
+//! efficiency. Objects are immutable and deduplicated by content. Every file
+//! must have fs-verity enabled (except in "insecure" mode).
+//!
+//! # Images vs Streams
+//!
+//! The repository distinguishes between two types of derived content:
+//!
+//! - **Images** (`images/`): Composefs/erofs filesystem images that can be mounted.
+//!   These are tracked separately for security: only images produced by the repository
+//!   (via mkcomposefs) should be mounted, to avoid exposing the kernel's filesystem
+//!   code to untrusted data.
+//!
+//! - **Streams** (`streams/`): Splitstreams storing arbitrary data (e.g., OCI
+//!   image layers and configs). Symlinks map content identifiers to objects.
+//!
+//! # References (GC Roots)
+//!
+//! Both `images/refs/` and `streams/refs/` contain named symlinks that serve as
+//! garbage collection roots. Any object reachable from a ref is protected from GC.
+//! Refs can be organized hierarchically (e.g., `refs/myapp/layer1`).
+//!
+//! See [`Repository::name_stream`] for creating stream refs.
+//!
+//! # Garbage Collection
+//!
+//! The repository supports garbage collection via [`Repository::gc()`]. Objects
+//! not reachable from any reference are deleted. The GC algorithm:
+//!
+//! 1. Walks all references in `images/refs/` and `streams/refs/` to find roots
+//! 2. Transitively follows stream references to find all reachable objects
+//! 3. Deletes unreferenced objects, images, and streams
+//!
+//! # fs-verity Integration
+//!
+//! When running on a filesystem that supports fs-verity (ext4, btrfs, etc.), objects
+//! are stored with fs-verity enabled, providing kernel-level integrity verification.
+//! In "insecure" mode, fs-verity is not required, allowing operation on filesystems
+//! like tmpfs or overlayfs.
+//!
+//! # Concurrency
+//!
+//! The repository uses advisory file locking (flock) to coordinate concurrent access.
+//! Opening a repository acquires a shared lock, while garbage collection requires
+//! an exclusive lock. This ensures GC cannot run while other processes have the
+//! repository open.
+//!
+//! For more details, see the [repository design documentation](../../../doc/repository.md).
 
 use std::{
     collections::{HashMap, HashSet},
@@ -584,8 +657,17 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             .unwrap_or(false))
     }
 
-    /// Assign the given name to a stream.  The stream must already exist.  After this operation it
-    /// will be possible to refer to the stream by its new name 'refs/{name}'.
+    /// Assign a named reference to a stream, making it a GC root.
+    ///
+    /// Creates a symlink at `streams/refs/{name}` pointing to the stream identified
+    /// by `content_identifier`. The stream must already exist in the repository.
+    ///
+    /// Named references serve two purposes:
+    /// 1. They provide human-readable names for streams
+    /// 2. They act as GC roots - streams reachable from refs are not garbage collected
+    ///
+    /// The `name` can include path separators to organize refs hierarchically
+    /// (e.g., `myapp/layer1`), and intermediate directories are created automatically.
     pub fn name_stream(&self, content_identifier: &str, name: &str) -> Result<()> {
         let stream_path = Self::format_stream_path(content_identifier);
         let reference_path = format!("streams/refs/{name}");
