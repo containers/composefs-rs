@@ -18,7 +18,7 @@ use std::{
     thread::available_parallelism,
 };
 
-use log::{debug, info, trace};
+use log::{debug, trace};
 use tokio::sync::Semaphore;
 
 use anyhow::{bail, ensure, Context, Result};
@@ -97,10 +97,25 @@ impl<ObjectID: FsVerityHashValue> Drop for Repository<ObjectID> {
     }
 }
 
-// For Repository::gc_category
+/// For Repository::gc_category
 enum GCCategoryWalkMode {
     RefsOnly,
     AllEntries,
+}
+
+/// Statistics from a garbage collection operation.
+///
+/// Returned by [`Repository::gc`] to report what was (or would be) removed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GcResult {
+    /// Number of unreferenced objects removed (or that would be removed)
+    pub objects_removed: u64,
+    /// Total bytes of object data removed (or that would be removed)
+    pub objects_bytes: u64,
+    /// Number of broken symlinks removed in images/
+    pub images_pruned: u64,
+    /// Number of broken symlinks removed in streams/
+    pub streams_pruned: u64,
 }
 
 impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
@@ -912,7 +927,10 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     }
 
     // Remove all broken links from a directory, may operate recursively
-    fn cleanup_broken_links(fd: &OwnedFd, recursive: bool) -> Result<()> {
+    /// Remove broken symlinks from a directory.
+    /// If `dry_run` is true, counts but does not remove. Returns the count.
+    fn cleanup_broken_links(fd: &OwnedFd, recursive: bool, dry_run: bool) -> Result<u64> {
+        let mut count = 0;
         for item in Dir::read_from(fd)? {
             let entry = item?;
             match entry.file_type() {
@@ -928,7 +946,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                             OFlags::RDONLY | OFlags::CLOEXEC,
                             Mode::empty(),
                         )?;
-                        Self::cleanup_broken_links(&dirfd, recursive)?;
+                        count += Self::cleanup_broken_links(&dirfd, recursive, dry_run)?;
                     }
                 }
 
@@ -938,8 +956,11 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                         .filter_errno(Errno::NOENT)
                         .context("Testing for broken links")?;
                     if result.is_none() {
-                        unlinkat(fd, filename, AtFlags::empty())
-                            .context("Unlinking broken links")?;
+                        count += 1;
+                        if !dry_run {
+                            unlinkat(fd, filename, AtFlags::empty())
+                                .context("Unlinking broken links")?;
+                        }
                     }
                 }
 
@@ -948,20 +969,20 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                 }
             }
         }
-        Ok(())
+        Ok(count)
     }
 
-    // Clean up broken links in a gc category
-    fn cleanup_gc_category(&self, category: &'static str) -> Result<()> {
+    /// Clean up broken links in a gc category. Returns count of links removed.
+    fn cleanup_gc_category(&self, category: &'static str, dry_run: bool) -> Result<u64> {
         let Some(category_fd) = self
             .openat(category, OFlags::RDONLY | OFlags::DIRECTORY)
             .filter_errno(Errno::NOENT)
             .context(format!("Opening {category} dir in repository"))?
         else {
-            return Ok(());
+            return Ok(0);
         };
         // Always cleanup first-level first, then the refs
-        Self::cleanup_broken_links(&category_fd, false)
+        let mut count = Self::cleanup_broken_links(&category_fd, false, dry_run)
             .context(format!("Cleaning up broken links in {category}/"))?;
         let ref_fd = openat(
             &category_fd,
@@ -972,11 +993,11 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         .filter_errno(Errno::NOENT)
         .context(format!("Opening {category}/refs to clean up broken links"))?;
         if let Some(ref dirfd) = ref_fd {
-            Self::cleanup_broken_links(dirfd, true).context(format!(
+            count += Self::cleanup_broken_links(dirfd, true, dry_run).context(format!(
                 "Cleaning up broken links recursively in {category}/refs"
             ))?;
         }
-        Ok(())
+        Ok(count)
     }
 
     // Traverse split streams to resolve all linked objects
@@ -1049,81 +1070,90 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         tokio::task::spawn_blocking(move || self_.sync()).await?
     }
 
-    /// Perform a garbage collection operation.
+    /// Perform garbage collection, removing unreferenced objects.
+    ///
+    /// Objects reachable from `images/refs/` or `streams/refs/` are preserved,
+    /// plus any `additional_roots` (looked up in both images and streams).
+    /// Returns statistics about what was removed.
     ///
     /// # Locking
     ///
     /// An exclusive lock is held for the duration of this operation.
-    ///
-    /// # Dry run mode
-    ///
-    /// When `dry_run` is true, no files are deleted; instead the operation logs
-    /// what would be removed. Use this to preview GC effects before committing.
-    pub fn gc<S: AsRef<str>>(
-        &self,
-        root_image_names: &[S],
-        root_stream_names: &[S],
-        dry_run: bool,
-    ) -> Result<()> {
+    pub fn gc(&self, additional_roots: &[&str]) -> Result<GcResult> {
         flock(&self.repository, FlockOperation::LockExclusive)?;
+        self.gc_impl(additional_roots, false)
+    }
 
-        let mut objects = HashSet::new();
+    /// Preview what garbage collection would remove, without deleting.
+    ///
+    /// Returns the same statistics that [`gc`](Self::gc) would return,
+    /// but no files are actually deleted.
+    ///
+    /// # Locking
+    ///
+    /// A shared lock is held for the duration of this operation (readers
+    /// are not blocked).
+    pub fn gc_dry_run(&self, additional_roots: &[&str]) -> Result<GcResult> {
+        // Shared lock is sufficient since we don't modify anything
+        flock(&self.repository, FlockOperation::LockShared)?;
+        self.gc_impl(additional_roots, true)
+    }
 
-        // All GC root image names, as specified by user
-        let root_image_name_set: HashSet<_> = root_image_names
-            .iter()
-            .map(|s| s.as_ref().to_string())
-            .collect();
-        // All images stored in repo
+    /// Internal GC implementation (lock must already be held).
+    fn gc_impl(&self, additional_roots: &[&str], dry_run: bool) -> Result<GcResult> {
+        let mut result = GcResult::default();
+        let mut live_objects = HashSet::new();
+
+        // Build set of additional roots (checked in both images and streams)
+        let extra_roots: HashSet<_> = additional_roots.iter().map(|s| s.to_string()).collect();
+
+        // Collect images: those in images/refs plus caller-specified roots
         let all_images = self.gc_category("images", GCCategoryWalkMode::AllEntries)?;
-        // All GC root images, including those referenced in images/refs
-        let root_images: Vec<_> = all_images
+        let root_images: Vec<_> = self
+            .gc_category("images", GCCategoryWalkMode::RefsOnly)?
             .into_iter()
-            // filter only keeps user specified images
-            .filter(|(_id, name)| root_image_name_set.contains(name))
-            // then add images referenced in images/refs
-            .chain(self.gc_category("images", GCCategoryWalkMode::RefsOnly)?)
+            .chain(
+                all_images
+                    .into_iter()
+                    .filter(|(_, name)| extra_roots.contains(name)),
+            )
             .collect();
 
         for ref image in root_images {
             debug!("{image:?} lives as an image");
-            objects.insert(image.0.clone());
+            live_objects.insert(image.0.clone());
             self.objects_for_image(&image.1)?.iter().for_each(|id| {
                 debug!("   with {id:?}");
-                objects.insert(id.clone());
+                live_objects.insert(id.clone());
             });
         }
 
-        // All GC root stream names, as specified by user
-        let root_stream_name_set: HashSet<_> = root_stream_names
-            .iter()
-            .map(|s| s.as_ref().to_string())
-            .collect();
-        // All streams stored in repo
+        // Collect all streams for the name map, then filter to roots
         let all_streams = self.gc_category("streams", GCCategoryWalkMode::AllEntries)?;
-        // Reverse map of stream object IDs to their names, used for resolving stream names in repo
-        let stream_name_map: HashMap<_, _> = all_streams.clone().into_iter().collect();
-        // All GC root streams, including those referenced in streams/refs
-        let root_streams: Vec<_> = all_streams
+        let stream_name_map: HashMap<_, _> = all_streams.iter().cloned().collect();
+        let root_streams: Vec<_> = self
+            .gc_category("streams", GCCategoryWalkMode::RefsOnly)?
             .into_iter()
-            // filter only keeps user specified streams
-            .filter(|(_id, name)| root_stream_name_set.contains(name))
-            // then add streams referenced in streams/refs
-            .chain(self.gc_category("streams", GCCategoryWalkMode::RefsOnly)?)
+            .chain(
+                all_streams
+                    .into_iter()
+                    .filter(|(_, name)| extra_roots.contains(name)),
+            )
             .collect();
 
         let mut walked_streams = HashSet::new();
         for stream in root_streams {
             debug!("{stream:?} lives as a stream");
-            objects.insert(stream.0.clone());
+            live_objects.insert(stream.0.clone());
             self.walk_streams(
                 &stream_name_map,
                 &stream.1,
                 &mut walked_streams,
-                &mut objects,
+                &mut live_objects,
             )?;
         }
 
+        // Walk all objects and remove unreferenced ones
         for first_byte in 0x0..=0xff {
             let dirfd = match self.openat(
                 &format!("objects/{first_byte:02x}"),
@@ -1139,29 +1169,33 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                 if filename != c"." && filename != c".." {
                     let id =
                         ObjectID::from_object_dir_and_basename(first_byte, filename.to_bytes())?;
-                    if !objects.contains(&id) {
-                        if dry_run {
-                            info!("would remove: objects/{first_byte:02x}/{filename:?}");
-                        } else {
-                            info!("rm objects/{first_byte:02x}/{filename:?}");
+                    if !live_objects.contains(&id) {
+                        // Get file size before removing
+                        if let Ok(stat) = statat(&dirfd, filename, AtFlags::empty()) {
+                            result.objects_bytes += stat.st_size as u64;
+                        }
+                        result.objects_removed += 1;
+
+                        if !dry_run {
+                            debug!("removing: objects/{first_byte:02x}/{filename:?}");
                             unlinkat(&dirfd, filename, AtFlags::empty())?;
                         }
                     } else {
-                        debug!("objects/{first_byte:02x}/{filename:?} lives");
+                        trace!("objects/{first_byte:02x}/{filename:?} lives");
                     }
                 }
             }
         }
-        // Clean up all broken links
-        if dry_run {
-            info!("Dry run complete; no files were deleted");
-        } else {
-            info!("Cleaning up broken links");
-            self.cleanup_gc_category("images")?;
-            self.cleanup_gc_category("streams")?
-        }
 
-        Ok(flock(&self.repository, FlockOperation::LockShared)?) // XXX: finally { } ?
+        // Clean up broken symlinks
+        result.images_pruned = self.cleanup_gc_category("images", dry_run)?;
+        result.streams_pruned = self.cleanup_gc_category("streams", dry_run)?;
+
+        // Downgrade to shared lock if we had exclusive (for actual GC)
+        if !dry_run {
+            flock(&self.repository, FlockOperation::LockShared)?;
+        }
+        Ok(result)
     }
 
     // fn fsck(&self) -> Result<()> {
@@ -1252,12 +1286,18 @@ mod tests {
             PathBuf::from("streams").join(&link_target)
         )?);
 
-        // Now perform gc
-        repo.gc::<&str>(&vec![], &vec![], false)?;
+        // Now perform gc - should remove 2 objects (obj1 + obj2) and 1 stream symlink
+        let result = repo.gc(&[])?;
 
         assert!(!test_object_exists(&tmp, &obj1_id)?);
         assert!(!test_object_exists(&tmp, &obj2_id)?);
         assert!(!test_path_exists_in_repo(&tmp, "streams/test-stream")?);
+
+        // Verify GcResult: 3 objects removed (obj1, obj2, splitstream), stream symlink pruned
+        assert_eq!(result.objects_removed, 3);
+        assert!(result.objects_bytes > 0);
+        assert_eq!(result.streams_pruned, 1);
+        assert_eq!(result.images_pruned, 0);
         Ok(())
     }
 
@@ -1288,8 +1328,8 @@ mod tests {
             PathBuf::from("streams").join(&link_target)
         )?);
 
-        // Now perform gc
-        repo.gc(&vec![], &vec!["test-stream"], false)?;
+        // Now perform gc - should remove only obj1, keep obj2 and stream
+        let result = repo.gc(&["test-stream"])?;
 
         assert!(!test_object_exists(&tmp, &obj1_id)?);
         assert!(test_object_exists(&tmp, &obj2_id)?);
@@ -1300,6 +1340,12 @@ mod tests {
             &tmp,
             PathBuf::from("streams").join(&link_target)
         )?);
+
+        // Verify GcResult: only 1 object removed, no symlinks pruned
+        assert_eq!(result.objects_removed, 1);
+        assert!(result.objects_bytes > 0);
+        assert_eq!(result.streams_pruned, 0);
+        assert_eq!(result.images_pruned, 0);
         Ok(())
     }
 
@@ -1330,8 +1376,8 @@ mod tests {
             PathBuf::from("streams").join(&link_target)
         )?);
 
-        // Now perform gc
-        repo.gc::<&str>(&vec![], &vec![], false)?;
+        // Now perform gc - stream is kept via ref, only obj1 removed
+        let result = repo.gc(&[])?;
 
         assert!(!test_object_exists(&tmp, &obj1_id)?);
         assert!(test_object_exists(&tmp, &obj2_id)?);
@@ -1342,6 +1388,12 @@ mod tests {
             &tmp,
             PathBuf::from("streams").join(&link_target)
         )?);
+
+        // Verify GcResult: 1 object removed, no symlinks pruned (stream has ref)
+        assert_eq!(result.objects_removed, 1);
+        assert!(result.objects_bytes > 0);
+        assert_eq!(result.streams_pruned, 0);
+        assert_eq!(result.images_pruned, 0);
         Ok(())
     }
 
@@ -1391,8 +1443,8 @@ mod tests {
             PathBuf::from("streams").join(&link_target)
         )?);
 
-        // Now perform gc
-        repo.gc(&vec![], &vec!["test-stream1"], false)?;
+        // Now perform gc - keep stream1, remove obj1, obj4, and stream2
+        let result = repo.gc(&["test-stream1"])?;
 
         assert!(!test_object_exists(&tmp, &obj1_id)?);
         assert!(test_object_exists(&tmp, &obj2_id)?);
@@ -1406,6 +1458,12 @@ mod tests {
             PathBuf::from("streams").join(&link_target)
         )?);
         assert!(!test_path_exists_in_repo(&tmp, "streams/test-stream2")?);
+
+        // Verify GcResult: 3 objects removed (obj1, obj4, stream2's splitstream), 1 stream pruned
+        assert_eq!(result.objects_removed, 3);
+        assert!(result.objects_bytes > 0);
+        assert_eq!(result.streams_pruned, 1);
+        assert_eq!(result.images_pruned, 0);
         Ok(())
     }
 
@@ -1447,8 +1505,8 @@ mod tests {
             PathBuf::from("streams").join(&link_target)
         )?);
 
-        // Now perform gc
-        repo.gc(&vec![], &vec!["test-stream2"], false)?;
+        // Now perform gc - stream2 refs stream1, both kept, only obj1 removed
+        let result = repo.gc(&["test-stream2"])?;
 
         assert!(!test_object_exists(&tmp, &obj1_id)?);
         assert!(test_object_exists(&tmp, &obj2_id)?);
@@ -1466,6 +1524,12 @@ mod tests {
             &tmp,
             PathBuf::from("streams").join(&link_target)
         )?);
+
+        // Verify GcResult: 1 object removed, no symlinks pruned
+        assert_eq!(result.objects_removed, 1);
+        assert!(result.objects_bytes > 0);
+        assert_eq!(result.streams_pruned, 0);
+        assert_eq!(result.images_pruned, 0);
         Ok(())
     }
 
@@ -1507,8 +1571,8 @@ mod tests {
             PathBuf::from("streams").join(&link_target)
         )?);
 
-        // Now perform gc
-        repo.gc(&vec![], &vec!["test-stream2"], false)?;
+        // Now perform gc - different table name, but same object ID links them
+        let result = repo.gc(&["test-stream2"])?;
 
         assert!(!test_object_exists(&tmp, &obj1_id)?);
         assert!(test_object_exists(&tmp, &obj2_id)?);
@@ -1526,6 +1590,12 @@ mod tests {
             &tmp,
             PathBuf::from("streams").join(&link_target)
         )?);
+
+        // Verify GcResult: 1 object removed, no symlinks pruned
+        assert_eq!(result.objects_removed, 1);
+        assert!(result.objects_bytes > 0);
+        assert_eq!(result.streams_pruned, 0);
+        assert_eq!(result.images_pruned, 0);
         Ok(())
     }
 
@@ -1608,8 +1678,8 @@ mod tests {
             PathBuf::from("streams").join(&link_target)
         )?);
 
-        // Now perform gc
-        repo.gc(&vec![], &vec!["ref-stream1".to_string()], false)?;
+        // Now perform gc - ref-stream1 refs stream1+stream2, so keep those and their objects
+        let result = repo.gc(&["ref-stream1"])?;
 
         assert!(!test_object_exists(&tmp, &obj1_id)?);
         assert!(test_object_exists(&tmp, &obj2_id)?);
@@ -1638,6 +1708,12 @@ mod tests {
             PathBuf::from("streams").join(&link_target)
         )?);
         assert!(!test_path_exists_in_repo(&tmp, "streams/ref-stream2")?);
+
+        // Verify GcResult: objects removed include obj1, obj4, plus splitstreams for stream3 and ref-stream2
+        assert_eq!(result.objects_removed, 4);
+        assert!(result.objects_bytes > 0);
+        assert_eq!(result.streams_pruned, 2);
+        assert_eq!(result.images_pruned, 0);
 
         Ok(())
     }
@@ -1700,12 +1776,18 @@ mod tests {
             PathBuf::from("images").join(&link_target)
         )?);
 
-        // Now perform gc
-        repo.gc::<&str>(&vec![], &vec![], false)?;
+        // Now perform gc - no refs, so image and both objects removed
+        let result = repo.gc(&[])?;
 
         assert!(!test_object_exists(&tmp, &obj1_id)?);
         assert!(!test_object_exists(&tmp, &obj2_id)?);
         assert!(!test_path_exists_in_repo(&tmp, &image1_path)?);
+
+        // Verify GcResult: 3 objects removed (obj1, obj2, image erofs), 1 image pruned
+        assert_eq!(result.objects_removed, 3);
+        assert!(result.objects_bytes > 0);
+        assert_eq!(result.images_pruned, 1);
+        assert_eq!(result.streams_pruned, 0);
         Ok(())
     }
 
@@ -1737,8 +1819,9 @@ mod tests {
             PathBuf::from("images").join(&link_target)
         )?);
 
-        // Now perform gc
-        repo.gc(&vec![image1.to_hex()], &vec![], false)?;
+        // Now perform gc - keep image via additional_roots
+        let image1_hex = image1.to_hex();
+        let result = repo.gc(&[image1_hex.as_str()])?;
 
         assert!(!test_object_exists(&tmp, &obj1_id)?);
         assert!(test_object_exists(&tmp, &obj2_id)?);
@@ -1748,6 +1831,12 @@ mod tests {
             &tmp,
             PathBuf::from("images").join(&link_target)
         )?);
+
+        // Verify GcResult: 1 object removed (obj1), no symlinks pruned
+        assert_eq!(result.objects_removed, 1);
+        assert!(result.objects_bytes > 0);
+        assert_eq!(result.images_pruned, 0);
+        assert_eq!(result.streams_pruned, 0);
         Ok(())
     }
 
@@ -1779,8 +1868,8 @@ mod tests {
             PathBuf::from("images").join(&link_target)
         )?);
 
-        // Now perform gc
-        repo.gc::<&str>(&vec![], &vec![], false)?;
+        // Now perform gc - image kept via ref, only obj1 removed
+        let result = repo.gc(&[])?;
 
         assert!(!test_object_exists(&tmp, &obj1_id)?);
         assert!(test_object_exists(&tmp, &obj2_id)?);
@@ -1790,6 +1879,12 @@ mod tests {
             &tmp,
             PathBuf::from("images").join(&link_target)
         )?);
+
+        // Verify GcResult: 1 object removed, no symlinks pruned (image has ref)
+        assert_eq!(result.objects_removed, 1);
+        assert!(result.objects_bytes > 0);
+        assert_eq!(result.images_pruned, 0);
+        assert_eq!(result.streams_pruned, 0);
         Ok(())
     }
 
@@ -1860,8 +1955,9 @@ mod tests {
             PathBuf::from("images").join(&link_target)
         )?);
 
-        // Now perform gc
-        repo.gc(&vec![image1.to_hex()], &vec![], false)?;
+        // Now perform gc - keep image1, remove image2 and its unique objects
+        let image1_hex = image1.to_hex();
+        let result = repo.gc(&[image1_hex.as_str()])?;
 
         assert!(!test_object_exists(&tmp, &obj1_id)?);
         assert!(test_object_exists(&tmp, &obj2_id)?);
@@ -1874,6 +1970,12 @@ mod tests {
             PathBuf::from("images").join(&link_target)
         )?);
         assert!(!test_path_exists_in_repo(&tmp, &image2_path)?);
+
+        // Verify GcResult: 3 objects removed (obj1, obj4, image2 erofs), 1 image pruned
+        assert_eq!(result.objects_removed, 3);
+        assert!(result.objects_bytes > 0);
+        assert_eq!(result.images_pruned, 1);
+        assert_eq!(result.streams_pruned, 0);
         Ok(())
     }
 }

@@ -136,12 +136,9 @@ enum Command {
     },
     /// Perform garbage collection
     GC {
-        // digest of root images for gc operations
-        #[clap(long, short = 'i')]
-        root_images: Vec<String>,
-        // digest of root streams for gc operations
-        #[clap(long, short = 's')]
-        root_streams: Vec<String>,
+        /// Additional roots to keep (image or stream names)
+        #[clap(long, short = 'r')]
+        root: Vec<String>,
         /// Preview what would be deleted without actually deleting
         #[clap(long, short = 'n')]
         dry_run: bool,
@@ -412,12 +409,26 @@ where
                 println!("{}", object.to_id());
             }
         }
-        Command::GC {
-            root_images,
-            root_streams,
-            dry_run,
-        } => {
-            repo.gc(&root_images, &root_streams, dry_run)?;
+        Command::GC { root, dry_run } => {
+            let roots: Vec<&str> = root.iter().map(|s| s.as_str()).collect();
+            let result = if dry_run {
+                repo.gc_dry_run(&roots)?
+            } else {
+                repo.gc(&roots)?
+            };
+            if dry_run {
+                println!("Dry run (no files deleted):");
+            }
+            println!(
+                "Objects: {} removed ({} bytes)",
+                result.objects_removed, result.objects_bytes
+            );
+            if result.images_pruned > 0 || result.streams_pruned > 0 {
+                println!(
+                    "Pruned symlinks: {} images, {} streams",
+                    result.images_pruned, result.streams_pruned
+                );
+            }
         }
         #[cfg(feature = "http")]
         Command::Fetch { url, name } => {
