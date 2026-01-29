@@ -9,7 +9,10 @@
 //! - Converting OCI image layers from tar format to composefs split streams
 //! - Creating mountable filesystems from OCI image configurations
 //! - Sealing containers with fs-verity hashes for integrity verification
+//! - Importing from containers-storage with zero-copy reflinks (optional feature)
 
+#[cfg(feature = "containers-storage")]
+pub mod cstor;
 pub mod image;
 pub mod skopeo;
 pub mod tar;
@@ -26,13 +29,14 @@ use composefs::{fsverity::FsVerityHashValue, repository::Repository};
 use crate::skopeo::{OCI_CONFIG_CONTENT_TYPE, TAR_LAYER_CONTENT_TYPE};
 use crate::tar::get_entry;
 
-type ContentAndVerity<ObjectID> = (String, ObjectID);
+/// A tuple of (content digest, fs-verity ObjectID).
+pub type ContentAndVerity<ObjectID> = (String, ObjectID);
 
-fn layer_identifier(diff_id: &str) -> String {
+pub(crate) fn layer_identifier(diff_id: &str) -> String {
     format!("oci-layer-{diff_id}")
 }
 
-fn config_identifier(config: &str) -> String {
+pub(crate) fn config_identifier(config: &str) -> String {
     format!("oci-config-{config}")
 }
 
