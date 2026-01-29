@@ -46,10 +46,19 @@ pub struct Image {
 impl Image {
     /// Open an image by ID using fd-relative operations.
     ///
+    /// The ID can be provided with or without a `sha256:` prefix - the prefix
+    /// will be stripped if present, since containers-storage directories use
+    /// just the hex digest.
+    ///
     /// # Errors
     ///
     /// Returns an error if the image directory doesn't exist or cannot be opened.
     pub fn open(storage: &Storage, id: &str) -> Result<Self> {
+        // Strip the sha256: prefix if present - containers-storage directories
+        // use just the hex digest, but image IDs from podman (e.g. via --iidfile)
+        // include the prefix. See https://github.com/containers/skopeo/issues/2750
+        let id = id.strip_prefix("sha256:").unwrap_or(id);
+
         // Open overlay-images directory from storage root
         let images_dir = storage.root_dir().open_dir("overlay-images")?;
 
