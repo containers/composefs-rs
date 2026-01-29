@@ -39,6 +39,10 @@ test-all:
 build-cstorage:
     cargo build --workspace --features containers-storage
 
+# Run integration tests (requires podman and skopeo)
+integration-test: build-release
+    cargo run --release -p integration-tests --bin integration-tests
+
 # Clean build artifacts
 clean:
     cargo clean

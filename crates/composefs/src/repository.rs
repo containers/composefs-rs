@@ -1406,8 +1406,6 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
 #[cfg(test)]
 mod tests {
-    use std::vec;
-
     use super::*;
     use crate::fsverity::Sha512HashValue;
     use crate::test::tempdir;
