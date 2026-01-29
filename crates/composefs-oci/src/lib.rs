@@ -11,6 +11,7 @@
 //! - Sealing containers with fs-verity hashes for integrity verification
 
 pub mod image;
+pub mod oci_image;
 pub mod skopeo;
 pub mod tar;
 
@@ -25,6 +26,13 @@ use composefs::{fsverity::FsVerityHashValue, repository::Repository};
 
 use crate::skopeo::{OCI_CONFIG_CONTENT_TYPE, TAR_LAYER_CONTENT_TYPE};
 use crate::tar::get_entry;
+
+// Re-export key types for convenience
+pub use oci_image::{
+    list_images, list_refs, resolve_ref, tag_image, untag_image, ImageInfo, OciImage,
+    OCI_REF_PREFIX,
+};
+pub use skopeo::{pull_image, PullResult};
 
 type ContentAndVerity<ObjectID> = (String, ObjectID);
 
@@ -123,7 +131,11 @@ pub fn open_config<ObjectID: FsVerityHashValue>(
         // No verity means we need to verify the content hash
         let mut data = vec![];
         stream.read_to_end(&mut data)?;
-        ensure!(config_digest == hash(&data), "Data integrity issue");
+        let computed = hash(&data);
+        ensure!(
+            config_digest == computed,
+            "Config integrity check failed: expected {config_digest}, got {computed}"
+        );
         ImageConfiguration::from_reader(&data[..])?
     } else {
         ImageConfiguration::from_reader(&mut stream)?
@@ -251,5 +263,82 @@ mod test {
 /file4096 4096 100700 1 0 0 0 0.0 ba/bc284ee4ffe7f449377fbf6692715b43aec7bc39c094a95878904d34bac97e - babc284ee4ffe7f449377fbf6692715b43aec7bc39c094a95878904d34bac97e
 /file4097 4097 100700 1 0 0 0 0.0 09/3756e4ea9683329106d4a16982682ed182c14bf076463a9e7f97305cbac743 - 093756e4ea9683329106d4a16982682ed182c14bf076463a9e7f97305cbac743
 ");
+    }
+
+    #[test]
+    fn test_write_and_open_config() {
+        use oci_spec::image::{ImageConfigurationBuilder, RootFsBuilder};
+
+        let repo_dir = tempdir();
+        let repo = Arc::new(Repository::<Sha256HashValue>::open_path(CWD, &repo_dir).unwrap());
+
+        // Create a minimal config
+        let rootfs = RootFsBuilder::default()
+            .typ("layers")
+            .diff_ids(vec!["sha256:abc123def456".to_string()])
+            .build()
+            .unwrap();
+
+        let config = ImageConfigurationBuilder::default()
+            .architecture("amd64")
+            .os("linux")
+            .rootfs(rootfs)
+            .build()
+            .unwrap();
+
+        // Create layer refs (simulating what happens during pull)
+        let mut refs = HashMap::new();
+        refs.insert("sha256:abc123def456".into(), Sha256HashValue::EMPTY);
+
+        // Write the config
+        let (config_digest, config_verity) = write_config(&repo, &config, refs.clone()).unwrap();
+
+        // Verify the digest format
+        assert!(config_digest.starts_with("sha256:"));
+
+        // Open the config with verity (fast path)
+        let (opened_config, opened_refs) =
+            open_config(&repo, &config_digest, Some(&config_verity)).unwrap();
+        assert_eq!(opened_config.architecture().to_string(), "amd64");
+        assert_eq!(opened_config.os().to_string(), "linux");
+        assert_eq!(opened_refs.len(), 1);
+        assert!(opened_refs.contains_key("sha256:abc123def456"));
+
+        // Open the config without verity (verifies content hash)
+        let (opened_config2, _) = open_config(&repo, &config_digest, None).unwrap();
+        assert_eq!(opened_config2.architecture().to_string(), "amd64");
+    }
+
+    #[test]
+    fn test_open_config_bad_hash() {
+        use oci_spec::image::{ImageConfigurationBuilder, RootFsBuilder};
+
+        let repo_dir = tempdir();
+        let repo = Arc::new(Repository::<Sha256HashValue>::open_path(CWD, &repo_dir).unwrap());
+
+        // Create and write a config
+        let rootfs = RootFsBuilder::default()
+            .typ("layers")
+            .diff_ids(vec![])
+            .build()
+            .unwrap();
+
+        let config = ImageConfigurationBuilder::default()
+            .architecture("amd64")
+            .os("linux")
+            .rootfs(rootfs)
+            .build()
+            .unwrap();
+
+        let (config_digest, _config_verity) = write_config(&repo, &config, HashMap::new()).unwrap();
+
+        // Try to open with a wrong digest (should fail)
+        let bad_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let result = open_config::<Sha256HashValue>(&repo, bad_digest, None);
+        assert!(result.is_err());
+
+        // Opening with correct digest should work
+        let result = open_config::<Sha256HashValue>(&repo, &config_digest, None);
+        assert!(result.is_ok());
     }
 }
