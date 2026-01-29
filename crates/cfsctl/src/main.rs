@@ -298,8 +298,25 @@ where
                 println!("{}", image_id.to_id());
             }
             OciCommand::Pull { ref image, name } => {
-                let (digest, verity) =
-                    composefs_oci::pull(&Arc::new(repo), image, name.as_deref(), None).await?;
+                let repo = Arc::new(repo);
+                let (digest, verity) = {
+                    #[cfg(feature = "containers-storage")]
+                    if let Some(image_id) =
+                        composefs_oci::cstor::parse_containers_storage_ref(image)
+                    {
+                        composefs_oci::cstor::import_from_containers_storage(
+                            &repo,
+                            image_id,
+                            name.as_deref(),
+                        )
+                        .await?
+                    } else {
+                        composefs_oci::pull(&repo, image, name.as_deref(), None).await?
+                    }
+
+                    #[cfg(not(feature = "containers-storage"))]
+                    composefs_oci::pull(&repo, image, name.as_deref(), None).await?
+                };
 
                 println!("config {digest}");
                 println!("verity {}", verity.to_hex());
