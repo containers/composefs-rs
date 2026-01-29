@@ -115,6 +115,21 @@ use crate::{
     util::{proc_self_fd, replace_symlinkat, ErrnoFilter},
 };
 
+/// How an object was stored in the repository.
+///
+/// Returned by [`Repository::ensure_object_from_file_with_stats`] to indicate
+/// whether the operation used zero-copy reflinks, a regular copy, or found
+/// an existing object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectStoreMethod {
+    /// Object was stored via reflink (zero-copy, FICLONE ioctl).
+    Reflinked,
+    /// Object was stored via regular file copy (reflink not supported).
+    Copied,
+    /// Object already existed in the repository (deduplicated).
+    AlreadyPresent,
+}
+
 /// Call openat() on the named subdirectory of "dirfd", possibly creating it first.
 ///
 /// We assume that the directory will probably exist (ie: we try the open first), and on ENOENT, we
@@ -314,6 +329,28 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// # Returns
     /// The fs-verity ObjectID of the stored object.
     pub fn ensure_object_from_file(&self, src: &std::fs::File, size: u64) -> Result<ObjectID> {
+        let (object_id, _) = self.ensure_object_from_file_with_stats(src, size)?;
+        Ok(object_id)
+    }
+
+    /// Ensure an object exists by reflinking from a source file, with statistics.
+    ///
+    /// Like [`ensure_object_from_file`], but also returns how the object was stored:
+    /// - `ObjectStoreMethod::Reflinked` - Zero-copy via FICLONE
+    /// - `ObjectStoreMethod::Copied` - Regular file copy (reflink not supported)
+    /// - `ObjectStoreMethod::AlreadyPresent` - Object already existed (deduplicated)
+    ///
+    /// # Arguments
+    /// * `src` - An open file descriptor to read from
+    /// * `size` - The size of the source file in bytes
+    ///
+    /// # Returns
+    /// A tuple of (ObjectID, ObjectStoreMethod).
+    pub fn ensure_object_from_file_with_stats(
+        &self,
+        src: &std::fs::File,
+        size: u64,
+    ) -> Result<(ObjectID, ObjectStoreMethod)> {
         use rustix::fs::{fstat, ioctl_ficlone};
 
         // Create tmpfile in objects directory
@@ -327,7 +364,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
         // Try reflink first
         let mut tmpfile = File::from(tmpfile_fd);
-        match ioctl_ficlone(&tmpfile, src) {
+        let used_reflink = match ioctl_ficlone(&tmpfile, src) {
             Ok(()) => {
                 // Reflink succeeded - verify size matches
                 let stat = fstat(&tmpfile)?;
@@ -337,6 +374,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                     size,
                     stat.st_size
                 );
+                true
             }
             Err(Errno::OPNOTSUPP | Errno::XDEV) => {
                 // Reflink not supported or cross-device, fall back to copy
@@ -344,15 +382,26 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                 let mut src_clone = src.try_clone()?;
                 src_clone.seek(SeekFrom::Start(0))?;
                 std::io::copy(&mut src_clone, &mut tmpfile)?;
+                false
             }
             Err(e) => {
                 // Other errors (EACCES, ENOSPC, etc.) should be propagated
                 return Err(e).context("Reflinking source file to objects directory")?;
             }
-        }
+        };
 
         // Finalize the tmpfile (enable verity, link into objects/)
-        self.finalize_object_tmpfile(tmpfile, size)
+        let (object_id, was_new) = self.finalize_object_tmpfile_with_stats(tmpfile, size)?;
+
+        let method = if !was_new {
+            ObjectStoreMethod::AlreadyPresent
+        } else if used_reflink {
+            ObjectStoreMethod::Reflinked
+        } else {
+            ObjectStoreMethod::Copied
+        };
+
+        Ok((object_id, method))
     }
 
     /// Finalize a tmpfile as an object.
@@ -370,6 +419,19 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// By letting the kernel compute the digest during verity enable, we avoid
     /// reading the file an extra time in userspace.
     pub fn finalize_object_tmpfile(&self, file: File, size: u64) -> Result<ObjectID> {
+        let (id, _was_new) = self.finalize_object_tmpfile_with_stats(file, size)?;
+        Ok(id)
+    }
+
+    /// Finalize a tmpfile as an object, returning whether it was newly created.
+    ///
+    /// Like [`finalize_object_tmpfile`], but also returns a boolean indicating
+    /// whether the object was newly stored (`true`) or already existed (`false`).
+    pub fn finalize_object_tmpfile_with_stats(
+        &self,
+        file: File,
+        size: u64,
+    ) -> Result<(ObjectID, bool)> {
         // Re-open as read-only via /proc/self/fd (required for verity enable)
         let fd_path = proc_self_fd(&file);
         let ro_fd = open(&*fd_path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())?;
@@ -407,7 +469,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         match statat(objects_dir, &path, AtFlags::empty()) {
             Ok(stat) if stat.st_size as u64 == size => {
                 // Object already exists with correct size, skip storage
-                return Ok(id);
+                return Ok((id, false));
             }
             _ => {}
         }
@@ -424,8 +486,8 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             &path,
             AtFlags::SYMLINK_FOLLOW,
         ) {
-            Ok(()) => Ok(id),
-            Err(Errno::EXIST) => Ok(id), // Race: another task created it
+            Ok(()) => Ok((id, true)),
+            Err(Errno::EXIST) => Ok((id, false)), // Race: another task created it
             Err(e) => Err(e).context("Linking tmpfile into objects directory")?,
         }
     }

@@ -299,27 +299,38 @@ where
             }
             OciCommand::Pull { ref image, name } => {
                 let repo = Arc::new(repo);
-                let (digest, verity) = {
-                    #[cfg(feature = "containers-storage")]
-                    if let Some(image_id) =
-                        composefs_oci::cstor::parse_containers_storage_ref(image)
-                    {
-                        composefs_oci::cstor::import_from_containers_storage(
-                            &repo,
-                            image_id,
-                            name.as_deref(),
-                        )
-                        .await?
-                    } else {
-                        composefs_oci::pull(&repo, image, name.as_deref(), None).await?
+                let result = composefs_oci::pull(&repo, image, name.as_deref(), None).await?;
+
+                println!("config {}", result.config_digest);
+                println!("verity {}", result.config_verity.to_hex());
+
+                // Print import statistics if available (containers-storage imports)
+                #[cfg(feature = "containers-storage")]
+                if let Some(stats) = result.stats {
+                    println!();
+                    println!("Import statistics:");
+                    println!(
+                        "  layers: {} ({} already present)",
+                        stats.layers, stats.layers_already_present
+                    );
+                    println!(
+                        "  objects: {} total ({} reflinked, {} copied, {} already present)",
+                        stats.total_objects(),
+                        stats.objects_reflinked,
+                        stats.objects_copied,
+                        stats.objects_already_present
+                    );
+                    if stats.used_reflinks() {
+                        println!(
+                            "  reflinked: {} (zero-copy)",
+                            indicatif::HumanBytes(stats.bytes_reflinked)
+                        );
                     }
-
-                    #[cfg(not(feature = "containers-storage"))]
-                    composefs_oci::pull(&repo, image, name.as_deref(), None).await?
-                };
-
-                println!("config {digest}");
-                println!("verity {}", verity.to_hex());
+                    if stats.bytes_copied > 0 {
+                        println!("  copied: {}", indicatif::HumanBytes(stats.bytes_copied));
+                    }
+                    println!("  inlined: {}", indicatif::HumanBytes(stats.bytes_inlined));
+                }
             }
             OciCommand::Seal {
                 ref config_name,
