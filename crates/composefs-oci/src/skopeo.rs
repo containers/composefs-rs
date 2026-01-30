@@ -247,9 +247,18 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
 
             let mut splitstream = self.repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
 
-            // Collect the results.
+            // Collect the results and build a map of diff_id -> verity
+            let mut layer_verities = std::collections::HashMap::new();
             for (diff_id, future) in entries {
-                splitstream.add_named_stream_ref(diff_id, &future.await??);
+                layer_verities.insert(diff_id.clone(), future.await??);
+            }
+
+            // Add layer references in the original diff_id order (not download order)
+            for diff_id in config.rootfs().diff_ids() {
+                let verity = layer_verities
+                    .get(diff_id)
+                    .ok_or_else(|| anyhow::anyhow!("Missing verity for layer {diff_id}"))?;
+                splitstream.add_named_stream_ref(diff_id, verity);
             }
 
             // NB: We trust that skopeo has verified that raw_config has the correct digest
