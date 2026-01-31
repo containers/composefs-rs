@@ -9,7 +9,10 @@
 //! - Converting OCI image layers from tar format to composefs split streams
 //! - Creating mountable filesystems from OCI image configurations
 //! - Sealing containers with fs-verity hashes for integrity verification
+//! - Importing from containers-storage with zero-copy reflinks (optional feature)
 
+#[cfg(feature = "containers-storage")]
+pub mod cstor;
 pub mod image;
 pub mod skopeo;
 pub mod tar;
@@ -26,13 +29,14 @@ use composefs::{fsverity::FsVerityHashValue, repository::Repository};
 use crate::skopeo::{OCI_CONFIG_CONTENT_TYPE, TAR_LAYER_CONTENT_TYPE};
 use crate::tar::get_entry;
 
-type ContentAndVerity<ObjectID> = (String, ObjectID);
+/// A tuple of (content digest, fs-verity ObjectID).
+pub type ContentAndVerity<ObjectID> = (String, ObjectID);
 
-fn layer_identifier(diff_id: &str) -> String {
+pub(crate) fn layer_identifier(diff_id: &str) -> String {
     format!("oci-layer-{diff_id}")
 }
 
-fn config_identifier(config: &str) -> String {
+pub(crate) fn config_identifier(config: &str) -> String {
     format!("oci-config-{config}")
 }
 
@@ -77,15 +81,50 @@ pub fn ls_layer<ObjectID: FsVerityHashValue>(
     Ok(())
 }
 
+/// Result of a pull operation.
+#[derive(Debug)]
+pub struct PullResult<ObjectID> {
+    /// The config digest (sha256:...).
+    pub config_digest: String,
+    /// The fs-verity hash of the config splitstream.
+    pub config_verity: ObjectID,
+    /// Import statistics (only present for containers-storage imports).
+    #[cfg(feature = "containers-storage")]
+    pub stats: Option<cstor::ImportStats>,
+}
+
 /// Pull the target image, and add the provided tag. If this is a mountable
 /// image (i.e. not an artifact), it is *not* unpacked by default.
+///
+/// When the `containers-storage` feature is enabled and the image reference
+/// starts with `containers-storage:`, this uses the native cstor import path
+/// which supports zero-copy reflinks. Otherwise, it uses skopeo.
 pub async fn pull<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     imgref: &str,
     reference: Option<&str>,
     img_proxy_config: Option<ImageProxyConfig>,
-) -> Result<(String, ObjectID)> {
-    skopeo::pull(repo, imgref, reference, img_proxy_config).await
+) -> Result<PullResult<ObjectID>> {
+    #[cfg(feature = "containers-storage")]
+    if let Some(image_id) = cstor::parse_containers_storage_ref(imgref) {
+        let ((config_digest, config_verity), stats) =
+            cstor::import_from_containers_storage(repo, image_id, reference).await?;
+        return Ok(PullResult {
+            config_digest,
+            config_verity,
+            stats: Some(stats),
+        });
+    }
+
+    let (config_digest, config_verity) =
+        skopeo::pull(repo, imgref, reference, img_proxy_config).await?;
+
+    Ok(PullResult {
+        config_digest,
+        config_verity,
+        #[cfg(feature = "containers-storage")]
+        stats: None,
+    })
 }
 
 fn hash(bytes: &[u8]) -> String {

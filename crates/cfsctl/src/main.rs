@@ -211,8 +211,20 @@ where
     Ok(repo)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // If we were spawned as a userns helper process, handle that and exit.
+    // This MUST be called before the tokio runtime is created.
+    #[cfg(feature = "containers-storage")]
+    cstorage::init_if_helper();
+
+    // Now we can create the tokio runtime for the main application
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     env_logger::init();
 
     let args = App::parse();
@@ -298,11 +310,39 @@ where
                 println!("{}", image_id.to_id());
             }
             OciCommand::Pull { ref image, name } => {
-                let (digest, verity) =
-                    composefs_oci::pull(&Arc::new(repo), image, name.as_deref(), None).await?;
+                let repo = Arc::new(repo);
+                let result = composefs_oci::pull(&repo, image, name.as_deref(), None).await?;
 
-                println!("config {digest}");
-                println!("verity {}", verity.to_hex());
+                println!("config {}", result.config_digest);
+                println!("verity {}", result.config_verity.to_hex());
+
+                // Print import statistics if available (containers-storage imports)
+                #[cfg(feature = "containers-storage")]
+                if let Some(stats) = result.stats {
+                    println!();
+                    println!("Import statistics:");
+                    println!(
+                        "  layers: {} ({} already present)",
+                        stats.layers, stats.layers_already_present
+                    );
+                    println!(
+                        "  objects: {} total ({} reflinked, {} copied, {} already present)",
+                        stats.total_objects(),
+                        stats.objects_reflinked,
+                        stats.objects_copied,
+                        stats.objects_already_present
+                    );
+                    if stats.used_reflinks() {
+                        println!(
+                            "  reflinked: {} (zero-copy)",
+                            indicatif::HumanBytes(stats.bytes_reflinked)
+                        );
+                    }
+                    if stats.bytes_copied > 0 {
+                        println!("  copied: {}", indicatif::HumanBytes(stats.bytes_copied));
+                    }
+                    println!("  inlined: {}", indicatif::HumanBytes(stats.bytes_inlined));
+                }
             }
             OciCommand::Seal {
                 ref config_name,

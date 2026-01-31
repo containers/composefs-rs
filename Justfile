@@ -31,6 +31,18 @@ fmt:
 # Run all checks (clippy + fmt + test)
 check: clippy fmt-check test
 
+# Run all tests with all features enabled
+test-all:
+    cargo test --workspace --all-features
+
+# Build with containers-storage feature
+build-cstorage:
+    cargo build --workspace --features containers-storage
+
+# Run integration tests (requires podman and skopeo)
+integration-test: build-release
+    cargo run --release -p integration-tests --bin integration-tests
+
 # Clean build artifacts
 clean:
     cargo clean
