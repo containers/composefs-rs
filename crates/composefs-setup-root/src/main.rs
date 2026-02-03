@@ -179,9 +179,19 @@ fn open_root_fs(path: &Path) -> Result<OwnedFd> {
 }
 
 fn mount_composefs_image(sysroot: &OwnedFd, name: &str, insecure: bool) -> Result<OwnedFd> {
-    let mut repo = Repository::<Sha256HashValue>::open_path(sysroot, "composefs")?;
-    repo.set_insecure(insecure);
-    repo.mount(name).context("Failed to mount composefs image")
+    match name.len() {
+        128 => {
+            let mut repo = Repository::<Sha512HashValue>::open_path(sysroot, "composefs")?;
+            repo.set_insecure(insecure);
+            repo.mount(name).context("Failed to mount composefs image")
+        }
+        64 => {
+            let mut repo = Repository::<Sha256HashValue>::open_path(sysroot, "composefs")?;
+            repo.set_insecure(insecure);
+            repo.mount(name).context("Failed to mount composefs image")
+        }
+        _ => anyhow::bail!("Invalid composefs digest length: {}", name.len()),
+    }
 }
 
 fn mount_subdir(
