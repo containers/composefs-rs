@@ -354,6 +354,11 @@ impl<ObjectID: FsVerityHashValue> std::fmt::Debug for SplitStreamWriter<ObjectID
 }
 
 impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
+    /// Get a reference to the repository.
+    pub fn repo(&self) -> &Repository<ObjectID> {
+        &self.repo
+    }
+
     /// Create a new split stream writer.
     pub fn new(repo: &Arc<Repository<ObjectID>>, content_type: u64) -> Self {
         // SAFETY: we surely can't get an error writing the header to a Vec<u8>

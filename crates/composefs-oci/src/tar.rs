@@ -65,6 +65,8 @@ pub fn split(
     tar_stream: &mut impl Read,
     writer: &mut SplitStreamWriter<impl FsVerityHashValue>,
 ) -> Result<()> {
+    let mut buffer = vec![0u8; 1024 * 1024];
+
     while let Some(header) = read_header(tar_stream)? {
         // the header always gets stored as inline data
         writer.write_inline(header.as_bytes());
@@ -76,16 +78,39 @@ pub fn split(
         // read the corresponding data, if there is any
         let actual_size = header.entry_size()? as usize;
         let storage_size = actual_size.next_multiple_of(512);
-        let mut buffer = vec![0u8; storage_size];
-        tar_stream.read_exact(&mut buffer)?;
 
         if header.entry_type() == EntryType::Regular && actual_size > INLINE_CONTENT_MAX {
-            // non-empty regular file: store the data external and the trailing padding inline
-            writer.write_external(&buffer[..actual_size])?;
-            writer.write_inline(&buffer[actual_size..]);
+            use std::io::Write;
+
+            let mut limited_stream = tar_stream.take(actual_size as u64);
+            let tmpfile_fd = writer.repo().create_object_tmpfile()?;
+            let mut tmpfile = std::io::BufWriter::new(File::from(tmpfile_fd));
+
+            loop {
+                let bytes_read = limited_stream.read(&mut buffer)?;
+                if bytes_read == 0 {
+                    break;
+                }
+                tmpfile.write_all(&buffer[..bytes_read])?;
+            }
+
+            let tmpfile = tmpfile.into_inner()?;
+            let object_id = writer
+                .repo()
+                .finalize_object_tmpfile(tmpfile, actual_size as u64)?;
+            writer.add_external_size(actual_size as u64);
+            writer.write_reference(object_id)?;
+
+            let padding_size = storage_size.checked_sub(actual_size).unwrap();
+            if padding_size > 0 {
+                tar_stream.read_exact(&mut buffer[..padding_size])?;
+                writer.write_inline(&buffer[..padding_size]);
+            }
         } else {
-            // else: store the data inline in the split stream
-            writer.write_inline(&buffer);
+            tar_stream
+                .take(storage_size as u64)
+                .read_exact(&mut buffer[..storage_size])?;
+            writer.write_inline(&buffer[..storage_size]);
         }
     }
     Ok(())
