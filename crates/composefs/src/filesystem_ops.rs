@@ -5,6 +5,7 @@
 //! repositories, and generating dumpfiles.
 
 use anyhow::Result;
+use fn_error_context::context;
 
 use crate::{
     dumpfile::write_dumpfile,
@@ -22,6 +23,7 @@ impl<ObjectID: FsVerityHashValue> FileSystem<ObjectID> {
     ///
     /// Note: Callers should ensure root metadata is set before calling this,
     /// typically via `copy_root_metadata_from_usr()` or `set_root_stat()`.
+    #[context("Committing filesystem as EROFS image")]
     pub fn commit_image(
         &self,
         repository: &Repository<ObjectID>,
@@ -48,6 +50,7 @@ impl<ObjectID: FsVerityHashValue> FileSystem<ObjectID> {
     ///
     /// Note: Callers should ensure root metadata is set before calling this,
     /// typically via `copy_root_metadata_from_usr()` or `set_root_stat()`.
+    #[context("Printing filesystem as dumpfile")]
     pub fn print_dumpfile(&self) -> Result<()> {
         write_dumpfile(&mut std::io::stdout(), self)
     }

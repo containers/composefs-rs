@@ -18,6 +18,7 @@ use std::{
 };
 
 use anyhow::{ensure, Context, Result};
+use fn_error_context::context;
 use rustix::fs::FileType;
 
 use crate::{
@@ -231,6 +232,7 @@ struct DumpfileWriter<'a, W: Write, ObjectID: FsVerityHashValue> {
     writer: &'a mut W,
 }
 
+#[context("Writing formatted line to dumpfile")]
 fn writeln_fmt(writer: &mut impl Write, f: impl Fn(&mut String) -> fmt::Result) -> Result<()> {
     let mut tmp = String::with_capacity(256);
     f(&mut tmp)?;
@@ -245,6 +247,7 @@ impl<'a, W: Write, ObjectID: FsVerityHashValue> DumpfileWriter<'a, W, ObjectID> 
         }
     }
 
+    #[context("Writing directory to dumpfile: {}", path.display())]
     fn write_dir(&mut self, path: &mut PathBuf, dir: &Directory<ObjectID>) -> Result<()> {
         // nlink is 2 + number of subdirectories
         // this is also true for the root dir since '..' is another self-ref
@@ -278,6 +281,7 @@ impl<'a, W: Write, ObjectID: FsVerityHashValue> DumpfileWriter<'a, W, ObjectID> 
         Ok(())
     }
 
+    #[context("Writing leaf to dumpfile: {}", path.display())]
     fn write_leaf(&mut self, path: &Path, leaf: &Rc<Leaf<ObjectID>>) -> Result<()> {
         let nlink = Rc::strong_count(leaf);
 

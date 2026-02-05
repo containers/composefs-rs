@@ -11,6 +11,7 @@
 use std::{ffi::OsStr, os::unix::ffi::OsStrExt, rc::Rc};
 
 use anyhow::{ensure, Context, Result};
+use fn_error_context::context;
 use sha2::{Digest, Sha256};
 
 use composefs::{
@@ -29,6 +30,7 @@ use crate::tar::{TarEntry, TarItem};
 /// delete the corresponding file, and `.wh..wh.opq` marks a directory as opaque (clearing all contents).
 ///
 /// Returns an error if the entry cannot be processed or added to the filesystem.
+#[context("Processing tar entry")]
 pub fn process_entry<ObjectID: FsVerityHashValue>(
     filesystem: &mut FileSystem<ObjectID>,
     entry: TarEntry<ObjectID>,
