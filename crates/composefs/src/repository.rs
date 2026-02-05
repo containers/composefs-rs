@@ -95,6 +95,7 @@ use log::{debug, trace};
 use tokio::sync::Semaphore;
 
 use anyhow::{bail, ensure, Context, Result};
+use fn_error_context::context;
 use once_cell::sync::OnceCell;
 use rustix::{
     fs::{
@@ -213,6 +214,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     }
 
     /// Open a repository at the target directory and path.
+    #[context("Opening repository at {}", path.as_ref().display())]
     pub fn open_path(dirfd: impl AsFd, path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
 
@@ -233,6 +235,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     }
 
     /// Open the default user-owned composefs repository.
+    #[context("Opening user repository")]
     pub fn open_user() -> Result<Self> {
         let home = std::env::var("HOME").with_context(|| "$HOME must be set when in user mode")?;
 
@@ -240,6 +243,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     }
 
     /// Open the default system-global composefs repository.
+    #[context("Opening system repository")]
     pub fn open_system() -> Result<Self> {
         Self::open_path(CWD, PathBuf::from("/sysroot/composefs".to_string()))
     }
@@ -258,6 +262,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     ///
     /// For performance reasons, this function does *not* call fsync() or similar.  After you're
     /// done with everything, call `Repository::sync_async()`.
+    #[context("Ensuring object asynchronously")]
     pub async fn ensure_object_async(self: &Arc<Self>, data: Vec<u8>) -> Result<ObjectID> {
         let self_ = Arc::clone(self);
         tokio::task::spawn_blocking(move || self_.ensure_object(&data)).await?
@@ -268,14 +273,18 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// Returns the file descriptor for writing. The caller should write data to this fd,
     /// then call `spawn_finalize_object_tmpfile()` to compute the verity digest,
     /// enable fs-verity, and link the file into the objects directory.
+    #[context("Creating object tmpfile")]
     pub fn create_object_tmpfile(&self) -> Result<OwnedFd> {
-        let objects_dir = self.objects_dir()?;
+        let objects_dir = self
+            .objects_dir()
+            .context("Getting objects directory for tmpfile creation")?;
         let fd = openat(
             objects_dir,
             ".",
             OFlags::RDWR | OFlags::TMPFILE | OFlags::CLOEXEC,
             Mode::from_raw_mode(0o644),
-        )?;
+        )
+        .context("Opening temp file in objects directory")?;
         Ok(fd)
     }
 
@@ -312,16 +321,20 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     ///
     /// By letting the kernel compute the digest during verity enable, we avoid
     /// reading the file an extra time in userspace.
+    #[context("Finalizing object tempfile")]
     pub fn finalize_object_tmpfile(&self, file: File, size: u64) -> Result<ObjectID> {
         // Re-open as read-only via /proc/self/fd (required for verity enable)
         let fd_path = proc_self_fd(&file);
-        let ro_fd = open(&*fd_path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())?;
+        let ro_fd = open(&*fd_path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+            .context("Re-opening tmpfile as read-only for verity")?;
 
         // Must close writable fd before enabling verity
         drop(file);
 
         // Get objects_dir early since we may need it for verity copy
-        let objects_dir = self.objects_dir()?;
+        let objects_dir = self
+            .objects_dir()
+            .context("Getting objects directory for finalization")?;
 
         // Enable verity - the kernel reads the file and computes the digest.
         // Use enable_verity_maybe_copy to handle the case where forked processes
@@ -340,8 +353,13 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             measure_verity(&ro_fd).context("Measuring verity digest")?
         } else {
             // Insecure mode: compute digest in userspace from ro_fd
-            let mut reader = std::io::BufReader::new(File::from(ro_fd.try_clone()?));
-            Self::compute_verity_digest(&mut reader)?
+            let mut reader = std::io::BufReader::new(File::from(
+                ro_fd
+                    .try_clone()
+                    .context("Cloning fd for digest computation")?,
+            ));
+            Self::compute_verity_digest(&mut reader)
+                .context("Computing verity digest in insecure mode")?
         };
 
         // Check if object already exists
@@ -375,11 +393,14 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
     /// Compute fs-verity digest in userspace by reading from a buffered source.
     /// Used as fallback when kernel verity is not available (insecure mode).
+    #[context("Computing verity digest in userspace")]
     fn compute_verity_digest(reader: &mut impl std::io::BufRead) -> Result<ObjectID> {
         let mut hasher = FsVerityHasher::<ObjectID>::new();
 
         loop {
-            let buf = reader.fill_buf()?;
+            let buf = reader
+                .fill_buf()
+                .context("Reading buffer for verity computation")?;
             if buf.is_empty() {
                 break;
             }
@@ -396,8 +417,11 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     ///
     /// This is an internal helper that stores data assuming the caller has already
     /// computed the correct fs-verity digest. The digest is verified after storage.
+    #[context("Storing object with ID {id:?}")]
     fn store_object_with_id(&self, data: &[u8], id: &ObjectID) -> Result<()> {
-        let dirfd = self.objects_dir()?;
+        let dirfd = self
+            .objects_dir()
+            .context("Getting objects directory for storage")?;
         let path = id.to_object_pathname();
 
         // the usual case is that the file will already exist
@@ -416,15 +440,19 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                         if self.insecure =>
                     {
                         match enable_verity_maybe_copy::<ObjectID>(dirfd, fd.as_fd()) {
-                            Ok(Some(fd)) => ensure_verity_equal(&fd, id)?,
-                            Ok(None) => ensure_verity_equal(&fd, id)?,
-                            Err(other) => Err(other)?,
+                            Ok(Some(fd)) => ensure_verity_equal(&fd, id)
+                                .context("Verifying verity after enabling (copied)")?,
+                            Ok(None) => ensure_verity_equal(&fd, id)
+                                .context("Verifying verity after enabling (original)")?,
+                            Err(other) => {
+                                Err(other).context("Enabling verity on existing object")?
+                            }
                         }
                     }
                     Err(CompareVerityError::Measure(
                         MeasureVerityError::FilesystemNotSupported,
                     )) if self.insecure => {}
-                    Err(other) => Err(other)?,
+                    Err(other) => Err(other).context("Verifying existing object integrity")?,
                 }
                 return Ok(());
             }
@@ -436,15 +464,17 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             }
         }
 
-        let fd = ensure_dir_and_openat(dirfd, &id.to_object_dir(), OFlags::RDWR | OFlags::TMPFILE)?;
+        let fd = ensure_dir_and_openat(dirfd, &id.to_object_dir(), OFlags::RDWR | OFlags::TMPFILE)
+            .with_context(|| "Creating tempfile in object subdirectory")?;
         let mut file = File::from(fd);
-        file.write_all(data)?;
+        file.write_all(data).context("Writing data to tmpfile")?;
         // We can't enable verity with an open writable fd, so re-open and close the old one.
         let ro_fd = open(
             proc_self_fd(&file),
             OFlags::RDONLY | OFlags::CLOEXEC,
             Mode::empty(),
-        )?;
+        )
+        .context("Re-opening file as read-only for verity")?;
         // NB: We should do fdatasync() or fsync() here, but doing this for each file forces the
         // creation of a massive number of journal commits and is a performance disaster.  We need
         // to coordinate this at a higher level.  See .write_stream().
@@ -489,20 +519,24 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     ///
     /// For performance reasons, this function does *not* call fsync() or similar.  After you're
     /// done with everything, call `Repository::sync()`.
+    #[context("Ensuring object exists in repository")]
     pub fn ensure_object(&self, data: &[u8]) -> Result<ObjectID> {
         let id: ObjectID = compute_verity(data);
         self.store_object_with_id(data, &id)?;
         Ok(id)
     }
 
+    #[context("Opening file '{filename}' with verity verification")]
     fn open_with_verity(&self, filename: &str, expected_verity: &ObjectID) -> Result<OwnedFd> {
-        let fd = self.openat(filename, OFlags::RDONLY)?;
+        let fd = self
+            .openat(filename, OFlags::RDONLY)
+            .with_context(|| format!("Opening file '{filename}' in repository"))?;
         match ensure_verity_equal(&fd, expected_verity) {
             Ok(()) => {}
             Err(CompareVerityError::Measure(
                 MeasureVerityError::VerityMissing | MeasureVerityError::FilesystemNotSupported,
             )) if self.insecure => {}
-            Err(other) => Err(other)?,
+            Err(other) => Err(other).context("Verifying file verity digest")?,
         }
         Ok(fd)
     }
@@ -533,6 +567,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
     /// Check if the provided splitstream is present in the repository;
     /// if so, return its fsverity digest.
+    #[context("Checking if stream '{content_identifier}' exists")]
     pub fn has_stream(&self, content_identifier: &str) -> Result<Option<ObjectID>> {
         let stream_path = Self::format_stream_path(content_identifier);
 
@@ -543,10 +578,13 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                     bytes.starts_with(b"../"),
                     "stream symlink has incorrect prefix"
                 );
-                Ok(Some(ObjectID::from_object_pathname(bytes)?))
+                Ok(Some(
+                    ObjectID::from_object_pathname(bytes)
+                        .context("Parsing object ID from stream symlink target")?,
+                ))
             }
             Err(Errno::NOENT) => Ok(None),
-            Err(err) => Err(err)?,
+            Err(err) => Err(err).context("Reading stream symlink")?,
         }
     }
 
@@ -559,13 +597,14 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     ///
     /// In other words: it will not be possible to boot a system which contained a stream named
     /// `content_identifier` but is missing linked streams or objects from that stream.
+    #[context("Writing stream '{content_identifier}' to repository")]
     pub fn write_stream(
         &self,
         writer: SplitStreamWriter<ObjectID>,
         content_identifier: &str,
         reference: Option<&str>,
     ) -> Result<ObjectID> {
-        let object_id = writer.done()?;
+        let object_id = writer.done().context("Finalizing split stream writer")?;
 
         // Right now we have:
         //   - all of the linked external objects and streams; and
@@ -599,6 +638,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     ///
     /// This method ensures atomicity: the stream symlink is only created after
     /// all objects have been synced to disk.
+    #[context("Registering stream '{content_identifier}' with object ID {object_id:?}")]
     pub async fn register_stream(
         self: &Arc<Self>,
         object_id: &ObjectID,
@@ -624,13 +664,17 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// This method awaits any pending parallel object storage tasks before
     /// finalizing the stream. Use this when you've called `write_external_parallel()`
     /// on the writer.
+    #[context("Writing stream '{content_identifier}' to repository (async)")]
     pub async fn write_stream_async(
         self: &Arc<Self>,
         writer: SplitStreamWriter<ObjectID>,
         content_identifier: &str,
         reference: Option<&str>,
     ) -> Result<ObjectID> {
-        let object_id = writer.done_async().await?;
+        let object_id = writer
+            .done_async()
+            .await
+            .context("Finalizing split stream writer (async)")?;
 
         self.sync_async().await?;
 
@@ -647,12 +691,13 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     }
 
     /// Check if a splitstream with a given name exists in the "refs" in the repository.
+    #[context("Checking if named stream '{name}' exists")]
     pub fn has_named_stream(&self, name: &str) -> Result<bool> {
         let stream_path = format!("streams/refs/{name}");
 
         Ok(statat(&self.repository, &stream_path, AtFlags::empty())
             .filter_errno(Errno::NOENT)
-            .context("Looking for stream {name} in repository")?
+            .with_context(|| format!("Looking for stream '{name}' in repository"))?
             .map(|s| FileType::from_raw_mode(s.st_mode).is_symlink())
             .unwrap_or(false))
     }
@@ -668,6 +713,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     ///
     /// The `name` can include path separators to organize refs hierarchically
     /// (e.g., `myapp/layer1`), and intermediate directories are created automatically.
+    #[context("Naming stream '{content_identifier}' as '{name}'")]
     pub fn name_stream(&self, content_identifier: &str, name: &str) -> Result<()> {
         let stream_path = Self::format_stream_path(content_identifier);
         let reference_path = format!("streams/refs/{name}");
@@ -689,6 +735,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     ///
     /// On success, the object ID of the new object is returned.  It is expected that this object
     /// ID will be used when referring to the stream from other linked streams.
+    #[context("Ensuring stream '{content_identifier}' exists")]
     pub fn ensure_stream(
         self: &Arc<Self>,
         content_identifier: &str,
@@ -702,7 +749,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             Some(id) => id,
             None => {
                 let mut writer = self.create_stream(content_type);
-                callback(&mut writer)?;
+                callback(&mut writer).context("Writing stream content via callback")?;
                 self.write_stream(writer, content_identifier, reference)?
             }
         };
@@ -716,6 +763,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     }
 
     /// Open a splitstream with the given name.
+    #[context("Opening stream '{content_identifier}'")]
     pub fn open_stream(
         &self,
         content_identifier: &str,
@@ -736,14 +784,18 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
     /// Given an object identifier (a digest), return a read-only file descriptor
     /// for its contents. The fsverity digest is verified (if the repository is not in `insecure` mode).
+    #[context("Opening object {id:?}")]
     pub fn open_object(&self, id: &ObjectID) -> Result<OwnedFd> {
         self.open_with_verity(&Self::format_object_path(id), id)
     }
 
     /// Read the contents of an object into a Vec
+    #[context("Reading object {id:?} into memory")]
     pub fn read_object(&self, id: &ObjectID) -> Result<Vec<u8>> {
         let mut data = vec![];
-        File::from(self.open_object(id)?).read_to_end(&mut data)?;
+        File::from(self.open_object(id)?)
+            .read_to_end(&mut data)
+            .context("Reading object data")?;
         Ok(data)
     }
 
@@ -752,6 +804,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// Opens the named splitstream, resolves all object references, and writes
     /// the complete merged content to the provided writer. Optionally verifies
     /// the splitstream's fsverity digest matches the expected value.
+    #[context("Merging splitstream '{content_identifier}'")]
     pub fn merge_splitstream(
         &self,
         content_identifier: &str,
@@ -771,6 +824,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// # Integrity
     ///
     /// This function is not safe for untrusted users.
+    #[context("Writing image to repository")]
     pub fn write_image(&self, name: Option<&str>, data: &[u8]) -> Result<ObjectID> {
         let object_id = self.ensure_object(data)?;
 
@@ -794,14 +848,18 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// # Integrity
     ///
     /// This function is not safe for untrusted users.
+    #[context("Importing image '{name}' from reader")]
     pub fn import_image<R: Read>(&self, name: &str, image: &mut R) -> Result<ObjectID> {
         let mut data = vec![];
-        image.read_to_end(&mut data)?;
+        image
+            .read_to_end(&mut data)
+            .context("Reading image data from input")?;
         self.write_image(Some(name), &data)
     }
 
     /// Returns the fd of the image and whether or not verity should be
     /// enabled when mounting it.
+    #[context("Opening image '{name}'")]
     fn open_image(&self, name: &str) -> Result<(OwnedFd, bool)> {
         let image = self
             .openat(&format!("images/{name}"), OFlags::RDONLY)
@@ -813,36 +871,48 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
         // A name with no slashes in it is taken to be a sha256 fs-verity digest
         match measure_verity::<ObjectID>(&image) {
-            Ok(found) if found == FsVerityHashValue::from_hex(name)? => Ok((image, true)),
+            Ok(found)
+                if found
+                    == FsVerityHashValue::from_hex(name)
+                        .context("Parsing expected verity hash from image name")? =>
+            {
+                Ok((image, true))
+            }
             Ok(_) => bail!("fs-verity content mismatch"),
             Err(MeasureVerityError::VerityMissing | MeasureVerityError::FilesystemNotSupported)
                 if self.insecure =>
             {
                 Ok((image, false))
             }
-            Err(other) => Err(other)?,
+            Err(other) => Err(other).context("Measuring image verity digest")?,
         }
     }
 
     /// Create a detached mount of an image. This file descriptor can then
     /// be attached via e.g. `move_mount`.
+    #[context("Mounting image '{name}'")]
     pub fn mount(&self, name: &str) -> Result<OwnedFd> {
         let (image, enable_verity) = self.open_image(name)?;
-        Ok(composefs_fsmount(
+
+        composefs_fsmount(
             image,
             name,
-            self.objects_dir()?,
+            self.objects_dir()
+                .context("Getting objects directory for mount")?,
             enable_verity,
-        )?)
+        )
+        .context("Creating filesystem mount")
     }
 
     /// Mount the image with the provided digest at the target path.
+    #[context("Mounting image '{name}' at path")]
     pub fn mount_at(&self, name: &str, mountpoint: impl AsRef<Path>) -> Result<()> {
-        Ok(mount_at(
+        mount_at(
             self.mount(name)?,
             CWD,
-            &canonicalize(mountpoint)?,
-        )?)
+            &canonicalize(mountpoint).context("Canonicalizing mountpoint path")?,
+        )
+        .context("Attaching mount at target path")
     }
 
     /// Creates a relative symlink within the repository.
@@ -850,7 +920,12 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// Computes the correct relative path from the symlink location to the target,
     /// creating any necessary intermediate directories. Atomically replaces any
     /// existing symlink at the specified name.
-    pub fn symlink(&self, name: impl AsRef<Path>, target: impl AsRef<Path>) -> ErrnoResult<()> {
+    #[context("Creating symlink from {name:?} to {target:?}")]
+    pub fn symlink(
+        &self,
+        name: impl AsRef<Path> + std::fmt::Debug,
+        target: impl AsRef<Path> + std::fmt::Debug,
+    ) -> anyhow::Result<()> {
         let name = name.as_ref();
 
         let mut symlink_components = name.parent().unwrap().components().peekable();
@@ -879,17 +954,20 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         }
 
         // Atomically replace existing symlink
-        replace_symlinkat(&relative, &self.repository, name)
+        Ok(replace_symlinkat(&relative, &self.repository, name)?)
     }
 
+    #[context("Reading symlink hash value from {name:?}")]
     fn read_symlink_hashvalue(dirfd: &OwnedFd, name: &CStr) -> Result<ObjectID> {
-        let link_content = readlinkat(dirfd, name, [])?;
-        Ok(ObjectID::from_object_pathname(link_content.to_bytes())?)
+        let link_content = readlinkat(dirfd, name, []).context("Reading symlink target")?;
+        ObjectID::from_object_pathname(link_content.to_bytes())
+            .context("Parsing object ID from symlink target")
     }
 
+    #[context("Walking symlink directory")]
     fn walk_symlinkdir(fd: OwnedFd, entry_digests: &mut HashSet<OsString>) -> Result<()> {
-        for item in Dir::read_from(&fd)? {
-            let entry = item?;
+        for item in Dir::read_from(&fd).context("Reading directory entries")? {
+            let entry = item.context("Reading directory entry")?;
             // NB: the underlying filesystem must support returning filetype via direntry
             // that's a reasonable assumption, since it must also support fsverity...
             match entry.file_type() {
@@ -901,12 +979,14 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                             filename,
                             OFlags::RDONLY | OFlags::CLOEXEC,
                             Mode::empty(),
-                        )?;
+                        )
+                        .context("Opening subdirectory for walking")?;
                         Self::walk_symlinkdir(dirfd, entry_digests)?;
                     }
                 }
                 FileType::Symlink => {
-                    let link_content = readlinkat(&fd, entry.file_name(), [])?;
+                    let link_content = readlinkat(&fd, entry.file_name(), [])
+                        .context("Reading symlink content")?;
                     let linked_path = Path::new(OsStr::from_bytes(link_content.as_bytes()));
                     if let Some(entry_name) = linked_path.file_name() {
                         entry_digests.insert(entry_name.to_os_string());
@@ -944,6 +1024,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     // Note that this function assumes all`*/refs/` links link to 1st level entries
     // and all 1st level entries link to object store
     // TODO: fsck the above noted assumption
+    #[context("Walking GC category '{category}'")]
     fn gc_category(
         &self,
         category: &str,
@@ -969,13 +1050,14 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                 .filter_errno(Errno::NOENT)
                 .context(format!("Opening {category}/refs dir in repository"))?
                 {
-                    Self::walk_symlinkdir(refs, &mut entry_digests)?;
+                    Self::walk_symlinkdir(refs, &mut entry_digests)
+                        .context("Walking refs symlink directory")?;
                 }
             }
             GCCategoryWalkMode::AllEntries => {
                 // All first-level link entries should be directly object references
-                for item in Dir::read_from(&category_fd)? {
-                    let entry = item?;
+                for item in Dir::read_from(&category_fd).context("Reading category directory")? {
+                    let entry = item.context("Reading category directory entry")?;
                     let filename = entry.file_name();
                     if filename != c"refs" && filename != c"." && filename != c".." {
                         if entry.file_type() != FileType::Symlink {
@@ -995,8 +1077,11 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                 Ok((
                     Self::read_symlink_hashvalue(
                         &category_fd,
-                        CString::new(entry_fn.as_bytes())?.as_c_str(),
-                    )?,
+                        CString::new(entry_fn.as_bytes())
+                            .context("Creating CString from filename")?
+                            .as_c_str(),
+                    )
+                    .context("Reading symlink hash value")?,
                     entry_fn
                         .to_str()
                         .context("str conversion fails")?
@@ -1011,10 +1096,11 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     // Remove all broken links from a directory, may operate recursively
     /// Remove broken symlinks from a directory.
     /// If `dry_run` is true, counts but does not remove. Returns the count.
+    #[context("Cleaning up broken links")]
     fn cleanup_broken_links(fd: &OwnedFd, recursive: bool, dry_run: bool) -> Result<u64> {
         let mut count = 0;
-        for item in Dir::read_from(fd)? {
-            let entry = item?;
+        for item in Dir::read_from(fd).context("Reading directory for broken links cleanup")? {
+            let entry = item.context("Reading directory entry for broken links cleanup")?;
             match entry.file_type() {
                 FileType::Directory => {
                     if !recursive {
@@ -1027,8 +1113,10 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                             filename,
                             OFlags::RDONLY | OFlags::CLOEXEC,
                             Mode::empty(),
-                        )?;
-                        count += Self::cleanup_broken_links(&dirfd, recursive, dry_run)?;
+                        )
+                        .context("Opening subdirectory for recursive broken link cleanup")?;
+                        count += Self::cleanup_broken_links(&dirfd, recursive, dry_run)
+                            .context("Cleaning up broken links in subdirectory")?;
                     }
                 }
 
@@ -1041,7 +1129,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                         count += 1;
                         if !dry_run {
                             unlinkat(fd, filename, AtFlags::empty())
-                                .context("Unlinking broken links")?;
+                                .context("Unlinking broken symlink")?;
                         }
                     }
                 }
@@ -1055,6 +1143,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     }
 
     /// Clean up broken links in a gc category. Returns count of links removed.
+    #[context("Cleaning up broken links in {category} category")]
     fn cleanup_gc_category(&self, category: &'static str, dry_run: bool) -> Result<u64> {
         let Some(category_fd) = self
             .openat(category, OFlags::RDONLY | OFlags::DIRECTORY)
@@ -1065,7 +1154,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         };
         // Always cleanup first-level first, then the refs
         let mut count = Self::cleanup_broken_links(&category_fd, false, dry_run)
-            .context(format!("Cleaning up broken links in {category}/"))?;
+            .with_context(|| format!("Cleaning up broken links in {category}/"))?;
         let ref_fd = openat(
             &category_fd,
             "refs",
@@ -1075,14 +1164,15 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         .filter_errno(Errno::NOENT)
         .context(format!("Opening {category}/refs to clean up broken links"))?;
         if let Some(ref dirfd) = ref_fd {
-            count += Self::cleanup_broken_links(dirfd, true, dry_run).context(format!(
-                "Cleaning up broken links recursively in {category}/refs"
-            ))?;
+            count += Self::cleanup_broken_links(dirfd, true, dry_run).with_context(|| {
+                format!("Cleaning up broken links recursively in {category}/refs")
+            })?;
         }
         Ok(count)
     }
 
     // Traverse split streams to resolve all linked objects
+    #[context("Walking streams starting from '{stream_name}'")]
     fn walk_streams(
         &self,
         stream_name_map: &HashMap<ObjectID, String>,
@@ -1095,12 +1185,16 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         }
         walked_streams.insert(stream_name.to_owned());
 
-        let mut split_stream = self.open_stream(stream_name, None, None)?;
+        let mut split_stream = self
+            .open_stream(stream_name, None, None)
+            .context("Opening stream for walking")?;
         // Plain object references, add to live objects set
-        split_stream.get_object_refs(|id| {
-            debug!("   with {id:?}");
-            objects.insert(id.clone());
-        })?;
+        split_stream
+            .get_object_refs(|id| {
+                debug!("   with {id:?}");
+                objects.insert(id.clone());
+            })
+            .context("Getting object references from stream")?;
         // Collect all stream names from named references table to be walked next
         let streams_to_walk: Vec<_> = split_stream.iter_named_refs().collect();
         // Note that stream name from the named references table is not stream name in repository
@@ -1117,29 +1211,37 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                     stream_name_in_repo,
                     walked_streams,
                     objects,
-                )?;
+                )
+                .context("Walking referenced stream")?;
             } else {
                 // stream is in table but not in repo, the repo is potentially broken, issue a warning
-                trace!("broken repo: named reference stream {stream_name_in_table} not found as stream in repo");
+                trace!(
+                    "broken repo: named reference stream {stream_name_in_table} not found as stream in repo"
+                );
             }
         }
         Ok(())
     }
 
     /// Given an image, return the set of all objects referenced by it.
+    #[context("Collecting objects for image '{name}'")]
     pub fn objects_for_image(&self, name: &str) -> Result<HashSet<ObjectID>> {
         let (image, _) = self.open_image(name)?;
         let mut data = vec![];
-        std::fs::File::from(image).read_to_end(&mut data)?;
-        Ok(crate::erofs::reader::collect_objects(&data)?)
+        std::fs::File::from(image)
+            .read_to_end(&mut data)
+            .context("Reading image data")?;
+        crate::erofs::reader::collect_objects(&data)
+            .context("Collecting objects from erofs image data")
     }
 
     /// Makes sure all content is written to the repository.
     ///
     /// This is currently just syncfs() on the repository's root directory because we don't have
     /// any better options at present.  This blocks until the data is written out.
+    #[context("Syncing repository to disk")]
     pub fn sync(&self) -> Result<()> {
-        syncfs(&self.repository)?;
+        syncfs(&self.repository).context("Syncing filesystem")?;
         Ok(())
     }
 
@@ -1147,9 +1249,12 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     ///
     /// This is currently just syncfs() on the repository's root directory because we don't have
     /// any better options at present.  This won't return until the data is written out.
+    #[context("Syncing repository to disk (async)")]
     pub async fn sync_async(self: &Arc<Self>) -> Result<()> {
         let self_ = Arc::clone(self);
-        tokio::task::spawn_blocking(move || self_.sync()).await?
+        tokio::task::spawn_blocking(move || self_.sync())
+            .await
+            .context("Spawning blocking sync task")?
     }
 
     /// Perform garbage collection, removing unreferenced objects.
@@ -1161,8 +1266,10 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// # Locking
     ///
     /// An exclusive lock is held for the duration of this operation.
+    #[context("Running garbage collection")]
     pub fn gc(&self, additional_roots: &[&str]) -> Result<GcResult> {
-        flock(&self.repository, FlockOperation::LockExclusive)?;
+        flock(&self.repository, FlockOperation::LockExclusive)
+            .context("Acquiring exclusive lock for GC")?;
         self.gc_impl(additional_roots, false)
     }
 
@@ -1175,13 +1282,16 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     ///
     /// A shared lock is held for the duration of this operation (readers
     /// are not blocked).
+    #[context("Running garbage collection dry run")]
     pub fn gc_dry_run(&self, additional_roots: &[&str]) -> Result<GcResult> {
         // Shared lock is sufficient since we don't modify anything
-        flock(&self.repository, FlockOperation::LockShared)?;
+        flock(&self.repository, FlockOperation::LockShared)
+            .context("Acquiring shared lock for GC dry run")?;
         self.gc_impl(additional_roots, true)
     }
 
     /// Internal GC implementation (lock must already be held).
+    #[context("GC implementation (dry_run: {dry_run})")]
     fn gc_impl(&self, additional_roots: &[&str], dry_run: bool) -> Result<GcResult> {
         let mut result = GcResult::default();
         let mut live_objects = HashSet::new();
@@ -1190,9 +1300,12 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         let extra_roots: HashSet<_> = additional_roots.iter().map(|s| s.to_string()).collect();
 
         // Collect images: those in images/refs plus caller-specified roots
-        let all_images = self.gc_category("images", GCCategoryWalkMode::AllEntries)?;
+        let all_images = self
+            .gc_category("images", GCCategoryWalkMode::AllEntries)
+            .context("Collecting all images")?;
         let root_images: Vec<_> = self
-            .gc_category("images", GCCategoryWalkMode::RefsOnly)?
+            .gc_category("images", GCCategoryWalkMode::RefsOnly)
+            .context("Collecting image refs")?
             .into_iter()
             .chain(
                 all_images
@@ -1204,17 +1317,23 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         for ref image in root_images {
             debug!("{image:?} lives as an image");
             live_objects.insert(image.0.clone());
-            self.objects_for_image(&image.1)?.iter().for_each(|id| {
-                debug!("   with {id:?}");
-                live_objects.insert(id.clone());
-            });
+            self.objects_for_image(&image.1)
+                .with_context(|| format!("Collecting objects for image {}", image.1))?
+                .iter()
+                .for_each(|id| {
+                    debug!("   with {id:?}");
+                    live_objects.insert(id.clone());
+                });
         }
 
         // Collect all streams for the name map, then filter to roots
-        let all_streams = self.gc_category("streams", GCCategoryWalkMode::AllEntries)?;
+        let all_streams = self
+            .gc_category("streams", GCCategoryWalkMode::AllEntries)
+            .context("Collecting all streams")?;
         let stream_name_map: HashMap<_, _> = all_streams.iter().cloned().collect();
         let root_streams: Vec<_> = self
-            .gc_category("streams", GCCategoryWalkMode::RefsOnly)?
+            .gc_category("streams", GCCategoryWalkMode::RefsOnly)
+            .context("Collecting stream refs")?
             .into_iter()
             .chain(
                 all_streams
@@ -1232,7 +1351,8 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                 &stream.1,
                 &mut walked_streams,
                 &mut live_objects,
-            )?;
+            )
+            .with_context(|| format!("Walking stream {}", stream.1))?;
         }
 
         // Walk all objects and remove unreferenced ones
@@ -1245,12 +1365,15 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                 Err(Errno::NOENT) => continue,
                 Err(e) => Err(e)?,
             };
-            for item in Dir::read_from(&dirfd)? {
-                let entry = item?;
+            for item in Dir::read_from(&dirfd)
+                .with_context(|| format!("Reading objects/{first_byte:02x} directory"))?
+            {
+                let entry = item.context("Reading object directory entry")?;
                 let filename = entry.file_name();
                 if filename != c"." && filename != c".." {
                     let id =
-                        ObjectID::from_object_dir_and_basename(first_byte, filename.to_bytes())?;
+                        ObjectID::from_object_dir_and_basename(first_byte, filename.to_bytes())
+                            .context("Parsing object ID from directory entry")?;
                     if !live_objects.contains(&id) {
                         // Get file size before removing
                         if let Ok(stat) = statat(&dirfd, filename, AtFlags::empty()) {
@@ -1260,7 +1383,9 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
                         if !dry_run {
                             debug!("removing: objects/{first_byte:02x}/{filename:?}");
-                            unlinkat(&dirfd, filename, AtFlags::empty())?;
+                            unlinkat(&dirfd, filename, AtFlags::empty()).with_context(|| {
+                                format!("Unlinking object {first_byte:02x}/{filename:?}")
+                            })?;
                         }
                     } else {
                         trace!("objects/{first_byte:02x}/{filename:?} lives");
@@ -1270,12 +1395,17 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         }
 
         // Clean up broken symlinks
-        result.images_pruned = self.cleanup_gc_category("images", dry_run)?;
-        result.streams_pruned = self.cleanup_gc_category("streams", dry_run)?;
+        result.images_pruned = self
+            .cleanup_gc_category("images", dry_run)
+            .context("Cleaning up broken image symlinks")?;
+        result.streams_pruned = self
+            .cleanup_gc_category("streams", dry_run)
+            .context("Cleaning up broken stream symlinks")?;
 
         // Downgrade to shared lock if we had exclusive (for actual GC)
         if !dry_run {
-            flock(&self.repository, FlockOperation::LockShared)?;
+            flock(&self.repository, FlockOperation::LockShared)
+                .context("Downgrading to shared lock after GC")?;
         }
         Ok(result)
     }
@@ -1287,8 +1417,6 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
 #[cfg(test)]
 mod tests {
-    use std::vec;
-
     use super::*;
     use crate::fsverity::Sha512HashValue;
     use crate::test::tempdir;

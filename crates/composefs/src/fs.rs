@@ -17,6 +17,7 @@ use std::{
 };
 
 use anyhow::{ensure, Context as _, Result};
+use fn_error_context::context;
 use rustix::{
     buffer::spare_capacity,
     fd::{AsFd, OwnedFd},
@@ -38,6 +39,7 @@ use crate::{
 
 /// Attempt to use O_TMPFILE + rename to atomically set file contents.
 /// Will fall back to a non-atomic write if the target doesn't support O_TMPFILE.
+#[context("Setting file contents for {}", name.to_string_lossy())]
 fn set_file_contents(dirfd: &OwnedFd, name: &OsStr, stat: &Stat, data: &[u8]) -> Result<()> {
     match openat(
         dirfd,
@@ -47,15 +49,17 @@ fn set_file_contents(dirfd: &OwnedFd, name: &OsStr, stat: &Stat, data: &[u8]) ->
     ) {
         Ok(tmp) => {
             let mut tmp = File::from(tmp);
-            tmp.write_all(data)?;
-            tmp.sync_data()?;
+            tmp.write_all(data)
+                .context("Failed to write data to tmpfile")?;
+            tmp.sync_data().context("Failed to sync tmpfile data")?;
             linkat(
                 CWD,
                 proc_self_fd(&tmp),
                 dirfd,
                 name,
                 AtFlags::SYMLINK_FOLLOW,
-            )?;
+            )
+            .with_context(|| format!("Failed to link tmpfile to {}", name.to_string_lossy()))?;
         }
         Err(Errno::OPNOTSUPP) => {
             // vfat? yolo...
@@ -64,16 +68,18 @@ fn set_file_contents(dirfd: &OwnedFd, name: &OsStr, stat: &Stat, data: &[u8]) ->
                 name,
                 OFlags::CREATE | OFlags::WRONLY | OFlags::CLOEXEC,
                 stat.st_mode.into(),
-            )?;
+            )
+            .with_context(|| format!("Failed to create file {}", name.to_string_lossy()))?;
             let mut f = File::from(fd);
-            f.write_all(data)?;
-            f.sync_data()?;
+            f.write_all(data).context("Failed to write file data")?;
+            f.sync_data().context("Failed to sync file data")?;
         }
         Err(e) => Err(e)?,
     }
     Ok(())
 }
 
+#[context("Writing directory {}", name.to_string_lossy())]
 fn write_directory<ObjectID: FsVerityHashValue>(
     dir: &Directory<ObjectID>,
     dirfd: &OwnedFd,
@@ -89,6 +95,7 @@ fn write_directory<ObjectID: FsVerityHashValue>(
     write_directory_contents(dir, &fd, repo)
 }
 
+#[context("Writing leaf {}", name.to_string_lossy())]
 fn write_leaf<ObjectID: FsVerityHashValue>(
     leaf: &Leaf<ObjectID>,
     dirfd: &OwnedFd,
@@ -122,6 +129,7 @@ fn write_leaf<ObjectID: FsVerityHashValue>(
     Ok(())
 }
 
+#[context("Writing directory contents")]
 fn write_directory_contents<ObjectID: FsVerityHashValue>(
     dir: &Directory<ObjectID>,
     fd: &OwnedFd,
@@ -142,6 +150,7 @@ fn write_directory_contents<ObjectID: FsVerityHashValue>(
 /// Reconstructs the filesystem structure at the specified output directory,
 /// creating directories, files, symlinks, and device nodes as needed. External
 /// file content is read from the repository. Note that hardlinks are not supported.
+#[context("Writing to path {}", output_dir.display())]
 pub fn write_to_path<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     dir: &Directory<ObjectID>,
@@ -162,6 +171,7 @@ pub struct FilesystemReader<'repo, ObjectID: FsVerityHashValue> {
 }
 
 impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
+    #[context("Reading extended attributes")]
     fn read_xattrs(fd: &OwnedFd) -> Result<BTreeMap<Box<OsStr>, Box<[u8]>>> {
         // flistxattr() and fgetxattr() don't work with with O_PATH fds, so go via /proc/self/fd.
         // Note: we want the symlink-following version of this call, which produces the correct
@@ -186,6 +196,7 @@ impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
         Ok(xattrs)
     }
 
+    #[context("Getting file stats")]
     fn stat(fd: &OwnedFd, ifmt: FileType) -> Result<(rustix::fs::Stat, Stat)> {
         let buf = fstat(fd)?;
 
@@ -207,6 +218,7 @@ impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
         ))
     }
 
+    #[context("Reading leaf content")]
     fn read_leaf_content(
         &mut self,
         fd: OwnedFd,
@@ -245,6 +257,7 @@ impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
         Ok(content)
     }
 
+    #[context("Reading leaf {}", name.to_string_lossy())]
     fn read_leaf(
         &mut self,
         dirfd: &OwnedFd,
@@ -284,6 +297,7 @@ impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
     /// Recursively reads directory contents, tracking hardlinks and optionally
     /// reading the directory's own metadata. Large files are stored in the repository
     /// if one was provided.
+    #[context("Reading directory {}", name.to_string_lossy())]
     fn read_directory(&mut self, dirfd: impl AsFd, name: &OsStr) -> Result<Directory<ObjectID>> {
         let fd = openat(
             dirfd,
@@ -310,6 +324,7 @@ impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
         Ok(directory)
     }
 
+    #[context("Reading inode {}", name.to_string_lossy())]
     fn read_inode(
         &mut self,
         dirfd: &OwnedFd,
@@ -329,6 +344,7 @@ impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
 /// Load a filesystem tree from the given path. A repository may
 /// be provided; if it is, then all files found in the filesystem
 /// are copied in.
+#[context("Reading filesystem from {}", path.display())]
 pub fn read_filesystem<ObjectID: FsVerityHashValue>(
     dirfd: impl AsFd,
     path: &Path,
@@ -361,6 +377,7 @@ pub fn read_filesystem<ObjectID: FsVerityHashValue>(
 ///     name.as_encoded_bytes() == b"security.capability"
 /// })?;
 /// ```
+#[context("Reading filtered filesystem from {}", path.display())]
 pub fn read_filesystem_filtered<ObjectID, F>(
     dirfd: impl AsFd,
     path: &Path,

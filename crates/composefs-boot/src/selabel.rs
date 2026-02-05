@@ -15,6 +15,7 @@ use std::{
 };
 
 use anyhow::{bail, ensure, Context, Result};
+use fn_error_context::context;
 use regex_automata::{hybrid::dfa, util::syntax, Anchored, Input};
 
 use composefs::{
@@ -49,6 +50,7 @@ pub const XATTR_SECURITY_SELINUX: &str = "security.selinux";
  * could write a policy that we can't properly handle...
  */
 
+#[context("Processing SELinux substitutions file")]
 fn process_subs_file(file: impl Read, aliases: &mut HashMap<OsString, OsString>) -> Result<()> {
     // r"\s*([^\s]+)\s+([^\s]+)\s*";
     for (line_nr, item) in BufReader::new(file).lines().enumerate() {
@@ -136,6 +138,7 @@ pub fn openat<'a, H: FsVerityHashValue>(
 }
 
 impl Policy {
+    #[context("Building SELinux policy")]
     pub fn build<H: FsVerityHashValue>(dir: &Directory<H>, repo: &Repository<H>) -> Result<Self> {
         let mut aliases = HashMap::new();
         let mut regexps = vec![];
@@ -288,6 +291,7 @@ fn strip_selinux_labels<H: FsVerityHashValue>(fs: &FileSystem<H>) {
 ///
 /// Returns `Ok(true)` if SELinux labeling was performed (policy was found),
 /// or `Ok(false)` if no policy was found and existing labels were stripped.
+#[context("Applying SELinux labels to filesystem")]
 pub fn selabel<H: FsVerityHashValue>(fs: &mut FileSystem<H>, repo: &Repository<H>) -> Result<bool> {
     // if /etc/selinux/config doesn't exist then strip any existing labels
     let Some(etc_selinux) = fs.root.get_directory_opt("etc/selinux".as_ref())? else {

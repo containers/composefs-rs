@@ -21,6 +21,7 @@ use std::{
 };
 
 use anyhow::{bail, ensure, Context, Error, Result};
+use fn_error_context::context;
 use rustix::{
     buffer::spare_capacity,
     io::{pread, read},
@@ -84,6 +85,7 @@ impl From<Range<u64>> for FileRange {
     }
 }
 
+#[context("Reading range from splitstream file")]
 fn read_range(file: &mut File, range: FileRange) -> Result<Vec<u8>> {
     let size: usize = (range.len()?.try_into())
         .context("Unable to allocate buffer for implausibly large splitstream section")?;
@@ -629,6 +631,7 @@ impl<ObjectID: FsVerityHashValue> SplitStreamReader<ObjectID> {
     /// Creates a new split stream reader from the provided reader.
     ///
     /// Reads the digest map header from the stream during initialization.
+    #[context("Creating new splitstream reader")]
     pub fn new(mut file: File, expected_content_type: Option<u64>) -> Result<Self> {
         let header = SplitstreamHeader::read_from_io(&mut file)
             .map_err(|e| Error::msg(format!("Error reading splitstream header: {e:?}")))?;
@@ -832,6 +835,7 @@ impl<ObjectID: FsVerityHashValue> SplitStreamReader<ObjectID> {
     ///
     /// Inline content is written directly, while external references are resolved
     /// using the provided load_data callback function.
+    #[context("Concatenating splitstream to output")]
     pub fn cat(&mut self, repo: &Repository<ObjectID>, output: &mut impl Write) -> Result<()> {
         let mut buffer = vec![];
 
@@ -862,6 +866,7 @@ impl<ObjectID: FsVerityHashValue> SplitStreamReader<ObjectID> {
     /// Traverses the split stream and calls the callback for each object reference.
     ///
     /// This includes both references from the digest map and external references in the stream.
+    #[context("Getting object references from splitstream")]
     pub fn get_object_refs(&mut self, mut callback: impl FnMut(&ObjectID)) -> Result<()> {
         for entry in &self.object_refs {
             callback(entry);

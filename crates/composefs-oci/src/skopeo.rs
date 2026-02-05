@@ -17,6 +17,7 @@ use async_compression::tokio::bufread::{GzipDecoder, ZstdDecoder};
 use containers_image_proxy::{
     ConvertedLayerInfo, ImageProxy, ImageProxyConfig, OpenedImage, Transport,
 };
+use fn_error_context::context;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use oci_spec::image::{Descriptor, ImageConfiguration, ImageManifest, MediaType};
 use rustix::process::geteuid;
@@ -85,7 +86,9 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             }
         };
 
-        let proxy = containers_image_proxy::ImageProxy::new_with_config(config).await?;
+        let proxy = containers_image_proxy::ImageProxy::new_with_config(config)
+            .await
+            .context("Creating ImageProxy")?;
         let img = proxy.open_image(imgref).await.context("Opening image")?;
         let progress = MultiProgress::new();
         Ok(ImageOp {
@@ -287,6 +290,7 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
 
 /// Pull the target image, and add the provided tag. If this is a mountable
 /// image (i.e. not an artifact), it is *not* unpacked by default.
+#[context("Pulling image {imgref}")]
 pub async fn pull<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     imgref: &str,
