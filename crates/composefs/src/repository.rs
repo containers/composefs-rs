@@ -1131,7 +1131,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         let (image, _) = self.open_image(name)?;
         let mut data = vec![];
         std::fs::File::from(image).read_to_end(&mut data)?;
-        Ok(crate::erofs::reader::collect_objects(&data)?)
+        Ok(crate::erofs::reader::collect_objects(&data, &[])?)
     }
 
     /// Makes sure all content is written to the repository.
@@ -1287,8 +1287,6 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
 #[cfg(test)]
 mod tests {
-    use std::vec;
-
     use super::*;
     use crate::fsverity::Sha512HashValue;
     use crate::test::tempdir;
