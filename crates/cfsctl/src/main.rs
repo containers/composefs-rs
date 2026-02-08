@@ -101,6 +101,27 @@ enum OciCommand {
         /// optional reference name for the manifest, use as 'ref/<name>' elsewhere
         name: Option<String>,
     },
+    /// List all tagged OCI images in the repository
+    #[clap(name = "images")]
+    ListImages,
+    /// Show information about an OCI image
+    #[clap(name = "inspect")]
+    Inspect {
+        /// Image reference (tag name or manifest digest)
+        image: String,
+    },
+    /// Tag an image with a new name
+    Tag {
+        /// Manifest digest (sha256:...)
+        manifest_digest: String,
+        /// Tag name to assign
+        name: String,
+    },
+    /// Remove a tag from an image
+    Untag {
+        /// Tag name to remove
+        name: String,
+    },
     /// Compute the composefs image object id of the rootfs of a stored OCI image
     ComputeId {
         #[clap(flatten)]
@@ -359,11 +380,110 @@ where
                 println!("{}", image_id.to_id());
             }
             OciCommand::Pull { ref image, name } => {
-                let (digest, verity) =
-                    composefs_oci::pull(&Arc::new(repo), image, name.as_deref(), None).await?;
+                // If no explicit name provided, use the image reference as the tag
+                let tag_name = name.as_deref().unwrap_or(image);
+                let result =
+                    composefs_oci::pull_image(&Arc::new(repo), image, Some(tag_name), None).await?;
 
-                println!("config {digest}");
-                println!("verity {}", verity.to_hex());
+                println!("manifest {}", result.manifest_digest);
+                println!("config   {}", result.config_digest);
+                println!("verity   {}", result.manifest_verity.to_hex());
+                println!("tagged   {tag_name}");
+            }
+            OciCommand::ListImages => {
+                let images = composefs_oci::oci_image::list_images(&repo)?;
+
+                if images.is_empty() {
+                    println!("No images found");
+                } else {
+                    println!(
+                        "{:<30} {:<12} {:<10} {:<8} {:<6}",
+                        "NAME", "DIGEST", "ARCH", "SEALED", "LAYERS"
+                    );
+                    for img in images {
+                        let digest_short = img
+                            .manifest_digest
+                            .strip_prefix("sha256:")
+                            .unwrap_or(&img.manifest_digest);
+                        let digest_display = if digest_short.len() > 12 {
+                            &digest_short[..12]
+                        } else {
+                            digest_short
+                        };
+                        println!(
+                            "{:<30} {:<12} {:<10} {:<8} {:<6}",
+                            img.name,
+                            digest_display,
+                            if img.architecture.is_empty() {
+                                "artifact"
+                            } else {
+                                &img.architecture
+                            },
+                            if img.sealed { "yes" } else { "no" },
+                            img.layer_count
+                        );
+                    }
+                }
+            }
+            OciCommand::Inspect { ref image } => {
+                let img = if image.starts_with("sha256:") {
+                    composefs_oci::oci_image::OciImage::open(&repo, image, None)?
+                } else {
+                    composefs_oci::oci_image::OciImage::open_ref(&repo, image)?
+                };
+
+                println!("Manifest:     {}", img.manifest_digest());
+                println!("Config:       {}", img.config_digest());
+                println!(
+                    "Type:         {}",
+                    if img.is_container_image() {
+                        "container"
+                    } else {
+                        "artifact"
+                    }
+                );
+
+                if img.is_container_image() {
+                    println!("Architecture: {}", img.architecture());
+                    println!("OS:           {}", img.os());
+                }
+
+                if let Some(created) = img.created() {
+                    println!("Created:      {created}");
+                }
+
+                println!(
+                    "Sealed:       {}",
+                    if img.is_sealed() { "yes" } else { "no" }
+                );
+                if let Some(seal) = img.seal_digest() {
+                    println!("Seal digest:  {seal}");
+                }
+
+                println!("Layers:       {}", img.layer_descriptors().len());
+                for (i, layer) in img.layer_descriptors().iter().enumerate() {
+                    println!("  [{i}] {} ({} bytes)", layer.digest(), layer.size());
+                }
+
+                if let Some(labels) = img.labels() {
+                    if !labels.is_empty() {
+                        println!("Labels:");
+                        for (k, v) in labels {
+                            println!("  {k}: {v}");
+                        }
+                    }
+                }
+            }
+            OciCommand::Tag {
+                ref manifest_digest,
+                ref name,
+            } => {
+                composefs_oci::oci_image::tag_image(&repo, manifest_digest, name)?;
+                println!("Tagged {manifest_digest} as {name}");
+            }
+            OciCommand::Untag { ref name } => {
+                composefs_oci::oci_image::untag_image(&repo, name)?;
+                println!("Removed tag {name}");
             }
             OciCommand::Seal {
                 config_opts:

@@ -30,6 +30,7 @@ tokio-util = { version = "0.7", default-features = false, features = ["io"] }
 similar-asserts = "1.7.0"
 composefs = { workspace = true, features = ["test"] }
 once_cell = "1.21.3"
+proptest = "1"
 tempfile = "3.8.0"
 
 [lints]
