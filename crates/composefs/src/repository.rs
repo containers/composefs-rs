@@ -17,12 +17,12 @@
 //! ├── images/                   # Composefs (erofs) image tracking
 //! │   ├── 4e67eaccd9fd... → ../objects/4e/67eaccd9fd...
 //! │   └── refs/
-//! │       └── myimage → ../4e67eaccd9fd...
+//! │       └── myimage → ../../4e67eaccd9fd...
 //! └── streams/                  # Splitstream storage
 //!     ├── oci-config-sha256:... → ../objects/XX/YYY...
 //!     ├── oci-layer-sha256:... → ../objects/XX/YYY...
 //!     └── refs/                 # Named references (GC roots)
-//!         └── mytarball → ../oci-layer-sha256:...
+//!         └── mytarball → ../../oci-layer-sha256:...
 //! ```
 //!
 //! # Object Storage
@@ -83,7 +83,7 @@ use std::{
     fs::{canonicalize, File},
     io::{Read, Write},
     os::{
-        fd::{AsFd, OwnedFd},
+        fd::{AsFd, BorrowedFd, OwnedFd},
         unix::ffi::OsStrExt,
     },
     path::{Path, PathBuf},
@@ -1413,6 +1413,49 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     // fn fsck(&self) -> Result<()> {
     //     unimplemented!()
     // }
+
+    /// Returns a borrowed file descriptor for the repository root.
+    ///
+    /// This allows low-level operations on the repository directory.
+    pub fn repo_fd(&self) -> BorrowedFd<'_> {
+        self.repository.as_fd()
+    }
+
+    /// Lists all named stream references under a given prefix.
+    ///
+    /// Returns (name, target) pairs where name is relative to the prefix.
+    pub fn list_stream_refs(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+        let ref_path = format!("streams/refs/{prefix}");
+
+        let dir_fd = match self.openat(&ref_path, OFlags::RDONLY | OFlags::DIRECTORY) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+
+        let mut refs = Vec::new();
+        for item in Dir::read_from(&dir_fd)? {
+            let entry = item?;
+            let name_bytes = entry.file_name().to_bytes();
+
+            if name_bytes == b"." || name_bytes == b".." {
+                continue;
+            }
+
+            let name = match std::str::from_utf8(name_bytes) {
+                Ok(s) => s.to_string(),
+                Err(_) => continue,
+            };
+
+            if let Ok(target) = readlinkat(&dir_fd, name_bytes, vec![]) {
+                if let Ok(target_str) = target.into_string() {
+                    refs.push((name, target_str));
+                }
+            }
+        }
+
+        Ok(refs)
+    }
 }
 
 #[cfg(test)]

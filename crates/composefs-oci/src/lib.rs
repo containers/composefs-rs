@@ -11,6 +11,7 @@
 //! - Sealing containers with fs-verity hashes for integrity verification
 
 pub mod image;
+pub mod oci_image;
 pub mod skopeo;
 pub mod tar;
 
@@ -25,6 +26,14 @@ use composefs::{fsverity::FsVerityHashValue, repository::Repository};
 
 use crate::skopeo::{OCI_CONFIG_CONTENT_TYPE, TAR_LAYER_CONTENT_TYPE};
 use crate::tar::get_entry;
+
+// Re-export key types for convenience
+pub use oci_image::{
+    add_referrer, list_images, list_referrers, list_refs, remove_referrer,
+    remove_referrers_for_subject, resolve_ref, tag_image, untag_image, ImageInfo, OciImage,
+    OCI_REF_PREFIX,
+};
+pub use skopeo::{pull_image, PullResult};
 
 type ContentAndVerity<ObjectID> = (String, ObjectID);
 
@@ -113,29 +122,30 @@ pub fn open_config<ObjectID: FsVerityHashValue>(
     config_digest: &str,
     verity: Option<&ObjectID>,
 ) -> Result<(ImageConfiguration, HashMap<Box<str>, ObjectID>)> {
-    let mut stream = repo.open_stream(
+    let (data, named_refs) = oci_image::read_external_splitstream(
+        repo,
         &config_identifier(config_digest),
         verity,
         Some(OCI_CONFIG_CONTENT_TYPE),
     )?;
 
-    let config = if verity.is_none() {
-        // No verity means we need to verify the content hash
-        let mut data = vec![];
-        stream.read_to_end(&mut data)?;
-        ensure!(config_digest == hash(&data), "Data integrity issue");
-        ImageConfiguration::from_reader(&data[..])?
-    } else {
-        ImageConfiguration::from_reader(&mut stream)?
-    };
+    if verity.is_none() {
+        let computed = hash(&data);
+        ensure!(
+            config_digest == computed,
+            "Config integrity check failed: expected {config_digest}, got {computed}"
+        );
+    }
 
-    Ok((config, stream.into_named_refs()))
+    let config = ImageConfiguration::from_reader(&data[..])?;
+    Ok((config, named_refs))
 }
 
 /// Writes a container configuration to the repository.
 ///
 /// Serializes the image configuration to JSON and stores it as a split stream with the
-/// provided layer reference map. The configuration is stored inline since it's typically small.
+/// provided layer reference map. The configuration is stored as an external object so
+/// fsverity can be independently enabled on it.
 ///
 /// Returns a tuple of (sha256 content hash, fs-verity hash value).
 pub fn write_config<ObjectID: FsVerityHashValue>(
@@ -150,7 +160,7 @@ pub fn write_config<ObjectID: FsVerityHashValue>(
     for (name, value) in &refs {
         stream.add_named_stream_ref(name, value)
     }
-    stream.write_inline(json_bytes);
+    stream.write_external(json_bytes)?;
     let id = repo.write_stream(stream, &config_identifier(&config_digest), None)?;
     Ok((config_digest, id))
 }
@@ -251,5 +261,132 @@ mod test {
 /file4096 4096 100700 1 0 0 0 0.0 ba/bc284ee4ffe7f449377fbf6692715b43aec7bc39c094a95878904d34bac97e - babc284ee4ffe7f449377fbf6692715b43aec7bc39c094a95878904d34bac97e
 /file4097 4097 100700 1 0 0 0 0.0 09/3756e4ea9683329106d4a16982682ed182c14bf076463a9e7f97305cbac743 - 093756e4ea9683329106d4a16982682ed182c14bf076463a9e7f97305cbac743
 ");
+    }
+
+    #[test]
+    fn test_write_and_open_config() {
+        use oci_spec::image::{ImageConfigurationBuilder, RootFsBuilder};
+
+        let repo_dir = tempdir();
+        let repo = Arc::new(Repository::<Sha256HashValue>::open_path(CWD, &repo_dir).unwrap());
+
+        let rootfs = RootFsBuilder::default()
+            .typ("layers")
+            .diff_ids(vec!["sha256:abc123def456".to_string()])
+            .build()
+            .unwrap();
+
+        let config = ImageConfigurationBuilder::default()
+            .architecture("amd64")
+            .os("linux")
+            .rootfs(rootfs)
+            .build()
+            .unwrap();
+
+        let mut refs = HashMap::new();
+        refs.insert("sha256:abc123def456".into(), Sha256HashValue::EMPTY);
+
+        let (config_digest, config_verity) = write_config(&repo, &config, refs.clone()).unwrap();
+
+        assert!(config_digest.starts_with("sha256:"));
+
+        let (opened_config, opened_refs) =
+            open_config(&repo, &config_digest, Some(&config_verity)).unwrap();
+        assert_eq!(opened_config.architecture().to_string(), "amd64");
+        assert_eq!(opened_config.os().to_string(), "linux");
+        assert_eq!(opened_refs.len(), 1);
+        assert!(opened_refs.contains_key("sha256:abc123def456"));
+
+        let (opened_config2, _) = open_config(&repo, &config_digest, None).unwrap();
+        assert_eq!(opened_config2.architecture().to_string(), "amd64");
+    }
+
+    #[test]
+    fn test_config_stored_as_external_object() {
+        use oci_spec::image::{ImageConfigurationBuilder, RootFsBuilder};
+
+        let repo_dir = tempdir();
+        let repo = Arc::new(Repository::<Sha256HashValue>::open_path(CWD, &repo_dir).unwrap());
+
+        let rootfs = RootFsBuilder::default()
+            .typ("layers")
+            .diff_ids(vec![])
+            .build()
+            .unwrap();
+
+        let config = ImageConfigurationBuilder::default()
+            .architecture("amd64")
+            .os("linux")
+            .rootfs(rootfs)
+            .build()
+            .unwrap();
+
+        let (config_digest, config_verity) = write_config(&repo, &config, HashMap::new()).unwrap();
+
+        // Re-open the splitstream and check that the config JSON is stored
+        // as an external object reference (not inline). This is important
+        // because external objects get their own file in objects/, which
+        // allows fsverity to be independently enabled on the raw content —
+        // a prerequisite for signing the config by its fsverity digest.
+        let mut stream = repo
+            .open_stream(
+                &config_identifier(&config_digest),
+                Some(&config_verity),
+                Some(crate::skopeo::OCI_CONFIG_CONTENT_TYPE),
+            )
+            .unwrap();
+
+        let mut object_refs = Vec::new();
+        stream
+            .get_object_refs(|id| object_refs.push(id.clone()))
+            .unwrap();
+
+        // The config JSON should appear as exactly one external object
+        assert_eq!(
+            object_refs.len(),
+            1,
+            "Config should be stored as one external object, got {} refs",
+            object_refs.len()
+        );
+
+        // The external object's fsverity digest should match what we'd
+        // compute independently from the raw JSON bytes
+        let json_bytes = config.to_string().unwrap();
+        let expected_verity: Sha256HashValue =
+            composefs::fsverity::compute_verity(json_bytes.as_bytes());
+        assert_eq!(
+            object_refs[0], expected_verity,
+            "External object verity should match independently computed verity of config JSON"
+        );
+    }
+
+    #[test]
+    fn test_open_config_bad_hash() {
+        use oci_spec::image::{ImageConfigurationBuilder, RootFsBuilder};
+
+        let repo_dir = tempdir();
+        let repo = Arc::new(Repository::<Sha256HashValue>::open_path(CWD, &repo_dir).unwrap());
+
+        let rootfs = RootFsBuilder::default()
+            .typ("layers")
+            .diff_ids(vec![])
+            .build()
+            .unwrap();
+
+        let config = ImageConfigurationBuilder::default()
+            .architecture("amd64")
+            .os("linux")
+            .rootfs(rootfs)
+            .build()
+            .unwrap();
+
+        let (config_digest, _config_verity) = write_config(&repo, &config, HashMap::new()).unwrap();
+
+        let bad_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let result = open_config::<Sha256HashValue>(&repo, bad_digest, None);
+        assert!(result.is_err());
+
+        let result = open_config::<Sha256HashValue>(&repo, &config_digest, None);
+        assert!(result.is_ok());
     }
 }

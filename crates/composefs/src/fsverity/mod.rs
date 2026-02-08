@@ -4,6 +4,7 @@
 //! digest computation, kernel ioctl interfaces for enabling and measuring
 //! verity, and hash value types for SHA-256 and SHA-512.
 
+pub mod algorithm;
 mod digest;
 mod hashvalue;
 mod ioctl;
