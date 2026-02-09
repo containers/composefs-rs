@@ -1,0 +1,5 @@
+# Keep the build context small: exclude everything, then allowlist sources.
+*
+!Cargo.toml
+!Cargo.lock
+!crates/

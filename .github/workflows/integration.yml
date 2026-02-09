@@ -1,0 +1,42 @@
+name: Integration Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  COMPOSEFS_TEST_IMAGE: localhost/composefs-rs-test:latest
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup
+        uses: bootc-dev/actions/bootc-ubuntu-setup@main
+        with:
+          libvirt: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run unprivileged integration tests
+        run: just integration-unprivileged
+
+      - name: Run privileged integration tests (via bcvk VM)
+        run: just integration-container
