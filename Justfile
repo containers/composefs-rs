@@ -12,9 +12,9 @@ build:
 build-release:
     cargo build --workspace --release
 
-# Run all tests
+# Run unit tests (excludes integration-tests crate)
 test:
-    cargo test --workspace
+    cargo test --workspace --exclude integration-tests
 
 # Run clippy lints
 clippy:
@@ -30,6 +30,26 @@ fmt:
 
 # Run all checks (clippy + fmt + test)
 check: clippy fmt-check test
+
+COMPOSEFS_TEST_IMAGE := "localhost/composefs-rs-test:latest"
+
+# Run integration tests (builds cfsctl first); pass extra args to the harness
+test-integration *ARGS: build
+    CFSCTL_PATH=$(pwd)/target/debug/cfsctl cargo run -p integration-tests -- {{ ARGS }}
+
+# Run only the fast unprivileged integration tests (no root, no VM)
+integration-unprivileged: build
+    CFSCTL_PATH=$(pwd)/target/debug/cfsctl cargo run -p integration-tests -- --skip privileged_
+
+# Build the test container image for VM-based integration tests
+integration-container-build:
+    podman build -t {{COMPOSEFS_TEST_IMAGE}} -f Containerfile .
+
+# Run all integration tests; privileged tests dispatch to a bcvk VM
+integration-container: build integration-container-build
+    COMPOSEFS_TEST_IMAGE={{COMPOSEFS_TEST_IMAGE}} \
+        CFSCTL_PATH=$(pwd)/target/debug/cfsctl \
+        cargo run -p integration-tests
 
 # Clean build artifacts
 clean:

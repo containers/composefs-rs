@@ -1,0 +1,36 @@
+# cargo-nextest configuration for composefs-rs
+# https://nexte.st/book/configuration
+#
+# Integration tests use libtest-mimic which is fully compatible with nextest
+
+[store]
+dir = "target/nextest"
+
+[profile.default]
+test-threads = "num-cpus"
+slow-timeout = { period = "30s", terminate-after = 2 }
+fail-fast = false
+failure-output = "immediate"
+success-output = "never"
+status-level = "pass"
+
+# Profile for integration tests — run with limited parallelism due to QEMU/KVM resources
+[profile.integration]
+test-threads = 2
+# 20 minutes for VM tests on slow CI runners
+slow-timeout = { period = "1200s", terminate-after = 60 }
+fail-fast = false
+failure-output = "immediate"
+success-output = "never"
+status-level = "pass"
+default-filter = "package(integration-tests)"
+
+[profile.integration.junit]
+path = "junit.xml"
+store-success-output = true
+store-failure-output = true
+
+# VM tests boot an ephemeral QEMU instance per test, limit parallelism
+[[profile.integration.overrides]]
+filter = 'test(~^vm_)'
+threads-required = 4
