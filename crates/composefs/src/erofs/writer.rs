@@ -497,32 +497,54 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
         entries.insert(point, entry);
     }
 
-    fn collect_dir(&mut self, dir: &'a tree::Directory<ObjectID>, parent: usize) -> usize {
-        // The root inode number needs to fit in a u16.  That more or less compels us to write the
-        // directory inode before the inode of the children of the directory.  Reserve a slot.
-        let me = self.push_inode(&dir.stat, InodeContent::Directory(Directory::default()));
+    /// Collect all inodes using queue-based breadth-first traversal.
+    /// This matches the C mkcomposefs behavior where all nodes at depth N
+    /// are processed before any nodes at depth N+1.
+    fn collect_tree(&mut self, root: &'a tree::Directory<ObjectID>) {
+        use std::collections::VecDeque;
 
-        let mut entries = vec![];
+        // Queue entries: (directory, parent_inode, my_inode)
+        // For root, parent is self (inode 0)
+        let root_inode = self.push_inode(&root.stat, InodeContent::Directory(Directory::default()));
+        let mut queue: VecDeque<(&'a tree::Directory<ObjectID>, usize, usize)> = VecDeque::new();
+        queue.push_back((root, root_inode, root_inode));
 
-        for (name, inode) in dir.sorted_entries() {
-            let child = match inode {
-                tree::Inode::Directory(dir) => self.collect_dir(dir, me),
-                tree::Inode::Leaf(leaf) => self.collect_leaf(leaf),
-            };
-            entries.push(DirEnt {
-                name: name.as_bytes(),
-                inode: child,
-                file_type: self.inodes[child].file_type(),
-            });
+        while let Some((dir, parent, me)) = queue.pop_front() {
+            let mut entries = vec![];
+
+            for (name, inode) in dir.sorted_entries() {
+                match inode {
+                    tree::Inode::Directory(subdir) => {
+                        // Reserve a slot for the subdirectory and add to queue for later
+                        let child = self.push_inode(
+                            &subdir.stat,
+                            InodeContent::Directory(Directory::default()),
+                        );
+                        queue.push_back((subdir, me, child));
+                        entries.push(DirEnt {
+                            name: name.as_bytes(),
+                            inode: child,
+                            file_type: format::FileType::Directory,
+                        });
+                    }
+                    tree::Inode::Leaf(leaf) => {
+                        let child = self.collect_leaf(leaf);
+                        entries.push(DirEnt {
+                            name: name.as_bytes(),
+                            inode: child,
+                            file_type: self.inodes[child].file_type(),
+                        });
+                    }
+                }
+            }
+
+            // Add . and .. entries
+            Self::insert_sorted(&mut entries, b".", me, format::FileType::Directory);
+            Self::insert_sorted(&mut entries, b"..", parent, format::FileType::Directory);
+
+            // Update the reserved slot with actual content
+            self.inodes[me].content = InodeContent::Directory(Directory::from_entries(entries));
         }
-
-        // We're expected to add those, too
-        Self::insert_sorted(&mut entries, b".", me, format::FileType::Directory);
-        Self::insert_sorted(&mut entries, b"..", parent, format::FileType::Directory);
-
-        // Now that we know the actual content, we can write it to our reserved slot
-        self.inodes[me].content = InodeContent::Directory(Directory::from_entries(entries));
-        me
     }
 
     pub fn collect(fs: &'a tree::FileSystem<ObjectID>) -> Vec<Inode<'a, ObjectID>> {
@@ -531,9 +553,8 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
             hardlinks: HashMap::new(),
         };
 
-        // '..' of the root directory is the root directory again
-        let root_inode = this.collect_dir(&fs.root, 0);
-        assert_eq!(root_inode, 0);
+        // Use queue-based breadth-first traversal to match C mkcomposefs inode ordering
+        this.collect_tree(&fs.root);
 
         this.inodes
     }
