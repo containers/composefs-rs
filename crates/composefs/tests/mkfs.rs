@@ -98,8 +98,81 @@ fn test_simple() {
     insta::assert_snapshot!(debug_fs(fs));
 }
 
+/// Test nested directory structure to establish baseline for V1_1 format.
+///
+/// This test creates a multi-level directory structure with files at various depths
+/// to verify the BFS inode ordering is correctly captured in snapshots. The ordering
+/// matches C mkcomposefs for bit-for-bit compatibility in V1_0 format, and this
+/// same ordering is used for V1_1 format for consistency.
+fn nested(fs: &mut FileSystem<Sha256HashValue>) {
+    let ext_id = Sha256HashValue::from_hex(
+        "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+    )
+    .unwrap();
+
+    // Create /a/b/c/deep-file
+    let mut dir_c = Directory::new(default_stat());
+    add_leaf(
+        &mut dir_c,
+        "deep-file",
+        LeafContent::Regular(RegularFile::Inline((*b"deep content").into())),
+    );
+
+    let mut dir_b = Directory::new(default_stat());
+    dir_b.insert(OsStr::new("c"), Inode::Directory(Box::new(dir_c)));
+    add_leaf(
+        &mut dir_b,
+        "mid-file",
+        LeafContent::Regular(RegularFile::Inline((*b"mid content").into())),
+    );
+
+    let mut dir_a = Directory::new(default_stat());
+    dir_a.insert(OsStr::new("b"), Inode::Directory(Box::new(dir_b)));
+    add_leaf(
+        &mut dir_a,
+        "shallow-file",
+        LeafContent::Regular(RegularFile::External(ext_id.clone(), 4096)),
+    );
+
+    fs.root
+        .insert(OsStr::new("a"), Inode::Directory(Box::new(dir_a)));
+
+    // Create /x/y/z-file to test BFS ordering across sibling directories
+    let mut dir_y = Directory::new(default_stat());
+    add_leaf(
+        &mut dir_y,
+        "z-file",
+        LeafContent::Regular(RegularFile::Inline((*b"xyz").into())),
+    );
+
+    let mut dir_x = Directory::new(default_stat());
+    dir_x.insert(OsStr::new("y"), Inode::Directory(Box::new(dir_y)));
+
+    fs.root
+        .insert(OsStr::new("x"), Inode::Directory(Box::new(dir_x)));
+
+    // Add a file at root level too
+    add_leaf(
+        &mut fs.root,
+        "root-file",
+        LeafContent::Regular(RegularFile::Inline((*b"root").into())),
+    );
+}
+
+/// Snapshot test for nested directory structure.
+///
+/// This establishes the baseline for V1_1 format with subdirectories.
+/// The inode ordering follows BFS (breadth-first search) to match C mkcomposefs,
+/// which processes all nodes at depth N before any nodes at depth N+1.
+#[test]
+fn test_nested() {
+    let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
+    nested(&mut fs);
+    insta::assert_snapshot!(debug_fs(fs));
+}
+
 fn foreach_case(f: fn(&FileSystem<Sha256HashValue>)) {
-    for case in [empty, simple] {
+    for case in [empty, simple, nested] {
         let mut fs = FileSystem::new(default_stat());
         case(&mut fs);
         f(&fs);

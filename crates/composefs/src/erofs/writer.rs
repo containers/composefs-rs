@@ -541,8 +541,31 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
     }
 
     /// Collect all inodes using queue-based breadth-first traversal.
-    /// This matches the C mkcomposefs behavior where all nodes at depth N
-    /// are processed before any nodes at depth N+1.
+    ///
+    /// This algorithm matches the C mkcomposefs `lcfs_compute_tree()` function which uses
+    /// a linked-list queue to process directories. All nodes at depth N are assigned inode
+    /// numbers before any nodes at depth N+1, producing a specific ordering:
+    ///
+    /// For a tree like:
+    /// ```text
+    /// /
+    /// ├── a/
+    /// │   ├── b/
+    /// │   │   └── file1
+    /// │   └── file2
+    /// └── x/
+    ///     └── y/
+    ///         └── file3
+    /// ```
+    ///
+    /// BFS ordering: /, a, x, a/b, a/file2, x/y, a/b/file1, x/y/file3
+    /// (DFS would be: /, a, a/b, a/b/file1, a/file2, x, x/y, x/y/file3)
+    ///
+    /// This ordering is used for both V1_0 (C-compatible) and V1_1 (Rust-native) formats
+    /// to maintain consistency and enable bit-for-bit compatibility with C mkcomposefs
+    /// when using V1_0 format. While V1_1 could technically use a different ordering,
+    /// using the same BFS approach simplifies the implementation and ensures predictable
+    /// behavior across format versions.
     fn collect_tree(&mut self, root: &'a tree::Directory<ObjectID>) {
         use std::collections::VecDeque;
 
