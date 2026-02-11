@@ -58,11 +58,53 @@ trait Output {
     }
 }
 
-#[derive(PartialOrd, PartialEq, Eq, Ord, Clone)]
+/// Extended attribute stored in EROFS format.
+///
+/// Note: Ord is implemented to match C mkcomposefs behavior - xattrs are sorted
+/// in ascending alphabetical order by full key name (prefix + suffix), then by
+/// value. This ensures bit-for-bit compatibility with the C implementation.
+/// See `cmp_xattr` in lcfs-writer.c which uses `strcmp(na->key, nb->key)`.
+#[derive(Clone)]
 struct XAttr {
     prefix: u8,
     suffix: Box<[u8]>,
     value: Box<[u8]>,
+}
+
+impl XAttr {
+    /// Returns the full key name (prefix + suffix) for comparison purposes.
+    fn full_key(&self) -> Vec<u8> {
+        let prefix_str = format::XATTR_PREFIXES[self.prefix as usize];
+        let mut key = Vec::with_capacity(prefix_str.len() + self.suffix.len());
+        key.extend_from_slice(prefix_str);
+        key.extend_from_slice(&self.suffix);
+        key
+    }
+}
+
+impl PartialEq for XAttr {
+    fn eq(&self, other: &Self) -> bool {
+        self.full_key() == other.full_key() && self.value == other.value
+    }
+}
+
+impl Eq for XAttr {}
+
+impl PartialOrd for XAttr {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for XAttr {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Match C mkcomposefs: sort in ascending order by key, then by value
+        // C code in cmp_xattr: strcmp(na->key, nb->key) = ascending order
+        match self.full_key().cmp(&other.full_key()) {
+            std::cmp::Ordering::Equal => self.value.cmp(&other.value),
+            ord => ord,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -146,6 +188,7 @@ impl InodeXAttrs {
                 trace!("    shared {} @{}", idx, output.len());
                 output.write(&output.get_xattr(*idx).to_le_bytes());
             }
+            // Local xattrs are already sorted in ascending order by share_xattrs()
             for attr in &self.local {
                 trace!("    local @{}", output.len());
                 attr.write(output);
@@ -562,8 +605,20 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
 
 /// Takes a list of inodes where each inode contains only local xattr values, determines which
 /// xattrs (key, value) pairs appear more than once, and shares them.
+///
+/// The shared xattr table is returned in descending alphabetical order to match C mkcomposefs,
+/// which uses `xattrs_ht_sort` with `strcmp(v2->key, v1->key)` (reverse alphabetical).
+///
+/// The per-inode shared xattr indices are added in ascending alphabetical order (sorted by xattr
+/// key), matching C mkcomposefs which iterates through `node->xattrs` in sorted order.
 fn share_xattrs(inodes: &mut [Inode<impl FsVerityHashValue>]) -> Vec<XAttr> {
     let mut xattrs: BTreeMap<XAttr, usize> = BTreeMap::new();
+
+    // First, sort all local xattrs in each inode to match C behavior.
+    // C mkcomposefs sorts xattrs in ascending order via cmp_xattr before processing.
+    for inode in inodes.iter_mut() {
+        inode.xattrs.local.sort();
+    }
 
     // Collect all xattrs from the inodes
     for inode in inodes.iter() {
@@ -579,12 +634,16 @@ fn share_xattrs(inodes: &mut [Inode<impl FsVerityHashValue>]) -> Vec<XAttr> {
     // Share only xattrs with more than one user
     xattrs.retain(|_k, v| *v > 1);
 
-    // Repurpose the refcount field as an index lookup
+    // C mkcomposefs writes shared xattrs in descending order (reverse alphabetical).
+    // We need to assign indices based on this reversed order.
+    let n_shared = xattrs.len();
     for (idx, value) in xattrs.values_mut().enumerate() {
-        *value = idx;
+        // Assign indices in reverse order: last item gets index 0, first gets n-1
+        *value = n_shared - 1 - idx;
     }
 
-    // Visit each inode and change local xattrs into shared xattrs
+    // Visit each inode and change local xattrs into shared xattrs.
+    // Since local xattrs are now sorted, shared indices will be added in ascending order.
     for inode in inodes.iter_mut() {
         inode.xattrs.local.retain(|attr| {
             if let Some(idx) = xattrs.get(attr) {
@@ -596,8 +655,10 @@ fn share_xattrs(inodes: &mut [Inode<impl FsVerityHashValue>]) -> Vec<XAttr> {
         });
     }
 
-    // Return the shared xattrs as a vec
-    xattrs.into_keys().collect()
+    // Return shared xattrs in descending order (reverse of BTreeMap's ascending order)
+    let mut result: Vec<_> = xattrs.into_keys().collect();
+    result.reverse();
+    result
 }
 
 fn write_erofs(
