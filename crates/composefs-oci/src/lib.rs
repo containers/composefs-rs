@@ -8,16 +8,18 @@
 //! - Pulling container images from registries using skopeo
 //! - Converting OCI image layers from tar format to composefs split streams
 //! - Creating mountable filesystems from OCI image configurations
-//! - Sealing containers with fs-verity hashes for integrity verification
+//! - Signing and verifying images using fs-verity PKCS#7 signatures
 
 pub mod image;
 pub mod oci_image;
+pub mod signature;
+pub mod signing;
 pub mod skopeo;
 pub mod tar;
 
 use std::{collections::HashMap, io::Read, sync::Arc};
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Result};
 use containers_image_proxy::ImageProxyConfig;
 use oci_spec::image::ImageConfiguration;
 use sha2::{Digest, Sha256};
@@ -29,10 +31,11 @@ use crate::tar::get_entry;
 
 // Re-export key types for convenience
 pub use oci_image::{
-    add_referrer, list_images, list_referrers, list_refs, remove_referrer,
-    remove_referrers_for_subject, resolve_ref, tag_image, untag_image, ImageInfo, OciImage,
-    OCI_REF_PREFIX,
+    add_referrer, export_referrers_to_oci_layout, list_images, list_referrers, list_refs,
+    remove_referrer, remove_referrers_for_subject, resolve_ref, tag_image, untag_image, ImageInfo,
+    OciImage, OCI_REF_PREFIX,
 };
+pub use image::{compute_merged_digest, compute_per_layer_digests};
 pub use skopeo::{pull_image, PullResult};
 
 type ContentAndVerity<ObjectID> = (String, ObjectID);
@@ -165,46 +168,23 @@ pub fn write_config<ObjectID: FsVerityHashValue>(
     Ok((config_digest, id))
 }
 
-/// Seals a container by computing its filesystem fs-verity hash and adding it to the config.
-///
-/// Creates the complete filesystem from all layers, computes its fs-verity hash, and stores
-/// this hash in the container config labels under "containers.composefs.fsverity". This allows
-/// the container to be mounted with integrity protection.
-///
-/// Returns a tuple of (sha256 content hash, fs-verity hash value) for the updated configuration.
-pub fn seal<ObjectID: FsVerityHashValue>(
-    repo: &Arc<Repository<ObjectID>>,
-    config_name: &str,
-    config_verity: Option<&ObjectID>,
-) -> Result<ContentAndVerity<ObjectID>> {
-    let (mut config, refs) = open_config(repo, config_name, config_verity)?;
-    let mut myconfig = config.config().clone().context("no config!")?;
-    let labels = myconfig.labels_mut().get_or_insert_with(HashMap::new);
-    let fs = crate::image::create_filesystem(repo, config_name, config_verity)?;
-    let id = fs.compute_image_id();
-    labels.insert("containers.composefs.fsverity".to_string(), id.to_hex());
-    config.set_config(Some(myconfig));
-    write_config(repo, &config, refs)
-}
 
-/// Mounts a sealed container filesystem at the specified mountpoint.
+
+/// Mounts a container filesystem at the specified mountpoint.
 ///
-/// Reads the container configuration to extract the fs-verity hash from the
-/// "containers.composefs.fsverity" label, then mounts the corresponding filesystem.
-/// The container must have been previously sealed using `seal()`.
+/// Computes the merged composefs filesystem from all layers and mounts it.
+/// The composefs image must have been previously committed to the repository
+/// (e.g., via `cfsctl oci create-image`).
 ///
-/// Returns an error if the container is not sealed or if mounting fails.
+/// Returns an error if the image is not found or if mounting fails.
 pub fn mount<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     name: &str,
     mountpoint: &str,
     verity: Option<&ObjectID>,
 ) -> Result<()> {
-    let (config, _map) = open_config(repo, name, verity)?;
-    let Some(id) = config.get_config_annotation("containers.composefs.fsverity") else {
-        bail!("Can only mount sealed containers");
-    };
-    repo.mount_at(id, mountpoint)
+    let id = image::compute_merged_digest(repo, name, verity)?;
+    repo.mount_at(&id.to_hex(), mountpoint)
 }
 
 #[cfg(test)]
