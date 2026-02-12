@@ -41,6 +41,26 @@ const FS_IOC_ENABLE_VERITY: Opcode = opcode::write::<FsVerityEnableArg>(b'f', 13
 pub(super) fn fs_ioc_enable_verity<H: FsVerityHashValue>(
     fd: impl AsFd,
 ) -> Result<(), EnableVerityError> {
+    fs_ioc_enable_verity_with_sig::<H>(fd, None)
+}
+
+/// Enable fsverity on the target file, optionally with a PKCS#7 signature.
+///
+/// If `signature` is provided, the kernel will verify it against the `.fs-verity`
+/// keyring before enabling verity. The signature must be a DER-encoded PKCS#7
+/// detached signature over the `fsverity_formatted_digest` of this file.
+///
+/// All constraints of `fs_ioc_enable_verity` apply: the file descriptor must be
+/// `O_RDONLY` with no outstanding writable file descriptors or mappings.
+pub(super) fn fs_ioc_enable_verity_with_sig<H: FsVerityHashValue>(
+    fd: impl AsFd,
+    signature: Option<&[u8]>,
+) -> Result<(), EnableVerityError> {
+    let (sig_size, sig_ptr) = match signature {
+        Some(sig) => (sig.len() as u32, sig.as_ptr() as u64),
+        None => (0, 0),
+    };
+
     unsafe {
         match ioctl(
             fd,
@@ -50,9 +70,9 @@ pub(super) fn fs_ioc_enable_verity<H: FsVerityHashValue>(
                 block_size: 4096,
                 salt_size: 0,
                 salt_ptr: 0,
-                sig_size: 0,
+                sig_size,
                 __reserved1: 0,
-                sig_ptr: 0,
+                sig_ptr,
                 __reserved2: [0; 11],
             }),
         ) {
@@ -166,6 +186,25 @@ mod tests {
     fn test_fs_ioc_enable_verity_bad_fd() {
         let fd = ManuallyDrop::new(unsafe { OwnedFd::from_raw_fd(123456) });
         let res = fs_ioc_enable_verity::<Sha256HashValue>(fd.as_fd());
+        let err = res.err().unwrap();
+        assert!(matches!(err, EnableVerityError::Io(..)));
+        assert_eq!(err.to_string(), "Bad file descriptor (os error 9)",);
+    }
+
+    #[test]
+    fn test_fs_ioc_enable_verity_with_sig_bad_fd() {
+        let fd = ManuallyDrop::new(unsafe { OwnedFd::from_raw_fd(123456) });
+        let fake_sig = b"not a real pkcs7 signature";
+        let res = fs_ioc_enable_verity_with_sig::<Sha256HashValue>(fd.as_fd(), Some(fake_sig));
+        let err = res.err().unwrap();
+        assert!(matches!(err, EnableVerityError::Io(..)));
+        assert_eq!(err.to_string(), "Bad file descriptor (os error 9)",);
+    }
+
+    #[test]
+    fn test_fs_ioc_enable_verity_with_sig_none_bad_fd() {
+        let fd = ManuallyDrop::new(unsafe { OwnedFd::from_raw_fd(123456) });
+        let res = fs_ioc_enable_verity_with_sig::<Sha256HashValue>(fd.as_fd(), None);
         let err = res.err().unwrap();
         assert!(matches!(err, EnableVerityError::Io(..)));
         assert_eq!(err.to_string(), "Bad file descriptor (os error 9)",);

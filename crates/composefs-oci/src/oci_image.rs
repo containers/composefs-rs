@@ -38,6 +38,7 @@
 //! This module handles both transparently. Use `is_container_image()` to check.
 
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{ensure, Context, Result};
@@ -244,16 +245,9 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
         self.config.as_ref().and_then(|c| c.created().as_deref())
     }
 
-    /// Returns the composefs seal digest, if sealed.
-    pub fn seal_digest(&self) -> Option<&str> {
-        self.config
-            .as_ref()
-            .and_then(|c| c.get_config_annotation("containers.composefs.fsverity"))
-    }
-
-    /// Returns whether this image has been sealed.
-    pub fn is_sealed(&self) -> bool {
-        self.seal_digest().is_some()
+    /// Returns the layer refs map (diff_id -> fs-verity object ID).
+    pub fn layer_refs(&self) -> &HashMap<Box<str>, ObjectID> {
+        &self.layer_refs
     }
 
     /// Opens an artifact layer's backing object by index, returning a
@@ -439,8 +433,6 @@ pub struct ImageInfo {
     pub os: String,
     /// Creation timestamp
     pub created: Option<String>,
-    /// Whether sealed with composefs
-    pub sealed: bool,
     /// Number of layers/blobs
     pub layer_count: usize,
 }
@@ -461,7 +453,6 @@ pub fn list_images<ObjectID: FsVerityHashValue>(
                     architecture: img.architecture(),
                     os: img.os(),
                     created: img.created().map(String::from),
-                    sealed: img.is_sealed(),
                     layer_count: img.layer_descriptors().len(),
                 });
             }
@@ -857,6 +848,331 @@ pub fn cleanup_dangling_referrers<ObjectID: FsVerityHashValue>(
     Ok(removed)
 }
 
+// =============================================================================
+// OCI Layout Export
+// =============================================================================
+
+/// Exports referrer artifacts (e.g., signature artifacts) for a subject image
+/// to an OCI layout directory.
+///
+/// This function:
+/// 1. Lists all referrers for the given subject manifest digest
+/// 2. For each referrer artifact:
+///    - Reads the artifact manifest from the repo
+///    - Writes the manifest to `blobs/sha256/<hash>` in the OCI layout
+///    - Reads each blob/layer from the repo and writes to `blobs/sha256/<hash>`
+///    - Reads the config blob and writes to `blobs/sha256/<hash>`
+/// 3. Updates the index.json to include the artifact manifests
+///
+/// The OCI layout directory must already exist (e.g., from `skopeo copy`).
+/// This enables tools like skopeo to see signature artifacts when pulling.
+///
+/// # Arguments
+///
+/// * `repo` - The composefs repository
+/// * `subject_digest` - The manifest digest of the subject image (sha256:...)
+/// * `oci_layout_path` - Path to the OCI layout directory
+///
+/// # Returns
+///
+/// The number of referrer artifacts exported.
+pub fn export_referrers_to_oci_layout<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    subject_digest: &str,
+    oci_layout_path: &std::path::Path,
+) -> Result<usize> {
+    use oci_spec::image::{ImageIndex, ImageIndexBuilder};
+    use std::fs;
+    use std::io::Write;
+
+    let blobs_dir = oci_layout_path.join("blobs").join("sha256");
+    fs::create_dir_all(&blobs_dir).context("creating blobs/sha256 directory")?;
+
+    // Read existing index.json
+    let index_path = oci_layout_path.join("index.json");
+    let mut index: ImageIndex = if index_path.exists() {
+        ImageIndex::from_file(&index_path)
+            .map_err(|e| anyhow::anyhow!("parsing index.json: {e}"))?
+    } else {
+        // Create a minimal index if it doesn't exist
+        ImageIndexBuilder::default()
+            .schema_version(2u32)
+            .manifests(Vec::new())
+            .build()
+            .context("creating default index")?
+    };
+
+    let referrers = list_referrers(repo, subject_digest)?;
+    let mut exported_count = 0;
+
+    for (artifact_digest, artifact_verity) in &referrers {
+        // Open the artifact as an OciImage to get manifest and layer info
+        let artifact = OciImage::open(repo, artifact_digest, Some(artifact_verity))
+            .with_context(|| format!("opening referrer artifact {artifact_digest}"))?;
+
+        let manifest = artifact.manifest();
+
+        // Write the manifest blob
+        let manifest_json = manifest.to_string()?;
+        let manifest_hash = artifact_digest
+            .strip_prefix("sha256:")
+            .context("artifact digest must be sha256")?;
+        let manifest_blob_path = blobs_dir.join(manifest_hash);
+        if !manifest_blob_path.exists() {
+            let mut f =
+                fs::File::create(&manifest_blob_path).context("creating manifest blob file")?;
+            f.write_all(manifest_json.as_bytes())
+                .context("writing manifest blob")?;
+        }
+
+        // Write the config blob (for artifacts this is usually empty/minimal)
+        let config_digest = manifest.config().digest().to_string();
+        let config_hash = config_digest
+            .strip_prefix("sha256:")
+            .context("config digest must be sha256")?;
+        let config_blob_path = blobs_dir.join(config_hash);
+        if !config_blob_path.exists() {
+            // For artifacts, config might be empty. Try to read from repo or use empty.
+            let config_data = match read_config_blob(repo, &config_digest) {
+                Ok(data) => data,
+                Err(_) => b"{}".to_vec(), // Empty config for artifacts
+            };
+            let mut f =
+                fs::File::create(&config_blob_path).context("creating config blob file")?;
+            f.write_all(&config_data).context("writing config blob")?;
+        }
+
+        // Write each layer blob
+        for layer_desc in manifest.layers() {
+            let layer_digest = layer_desc.digest().to_string();
+            let layer_hash = layer_digest
+                .strip_prefix("sha256:")
+                .context("layer digest must be sha256")?;
+            let layer_blob_path = blobs_dir.join(layer_hash);
+            if !layer_blob_path.exists() {
+                // Read the layer blob from the repo
+                let layer_data = open_blob(repo, &layer_digest, None)
+                    .with_context(|| format!("reading layer blob {layer_digest}"))?;
+                let mut f =
+                    fs::File::create(&layer_blob_path).context("creating layer blob file")?;
+                f.write_all(&layer_data).context("writing layer blob")?;
+            }
+        }
+
+        // Add the artifact manifest to the index if not already present
+        // Per OCI Distribution Spec, artifact descriptors should include artifactType
+        // to enable discovery via the Referrers API.
+        let mut desc_builder = oci_spec::image::DescriptorBuilder::default()
+            .media_type(oci_spec::image::MediaType::ImageManifest)
+            .digest(
+                oci_spec::image::Digest::from_str(artifact_digest)
+                    .context("parsing artifact digest")?,
+            )
+            .size(manifest_json.len() as u64);
+
+        // Copy artifact_type from manifest if present
+        if let Some(artifact_type) = manifest.artifact_type() {
+            desc_builder = desc_builder.artifact_type(artifact_type.clone());
+        }
+
+        // Copy annotations from manifest if present (required for Referrers API)
+        if let Some(annotations) = manifest.annotations() {
+            desc_builder = desc_builder.annotations(annotations.clone());
+        }
+
+        let manifest_desc = desc_builder.build().context("building manifest descriptor")?;
+
+        // Check if already in index
+        let already_in_index = index
+            .manifests()
+            .iter()
+            .any(|d: &Descriptor| d.digest().to_string() == *artifact_digest);
+
+        if !already_in_index {
+            let mut manifests = index.manifests().clone();
+            manifests.push(manifest_desc);
+            // Rebuild index with new manifests list
+            // Note: ImageIndexBuilder consumes self on each call, so we chain
+            index = ImageIndexBuilder::default()
+                .schema_version(index.schema_version())
+                .manifests(manifests)
+                .build()
+                .context("rebuilding index")?;
+        }
+
+        exported_count += 1;
+    }
+
+    // Write updated index.json
+    index
+        .to_file_pretty(&index_path)
+        .map_err(|e| anyhow::anyhow!("writing index.json: {e}"))?;
+
+    Ok(exported_count)
+}
+
+/// Helper to read a config blob from the repo.
+fn read_config_blob<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    config_digest: &str,
+) -> Result<Vec<u8>> {
+    let config_id = crate::config_identifier(config_digest);
+    let (data, _named_refs) = read_external_splitstream(
+        repo,
+        &config_id,
+        None,
+        Some(crate::skopeo::OCI_CONFIG_CONTENT_TYPE),
+    )?;
+    Ok(data)
+}
+
+/// Imports referrer artifacts (e.g., signature artifacts) from an OCI layout directory
+/// for a given subject manifest digest.
+///
+/// This function:
+/// 1. Reads the index.json from the OCI layout
+/// 2. Finds entries with the specified artifactType
+/// 3. For each matching artifact, imports it as an OCI image to the repository
+///
+/// This is the inverse of `export_referrers_to_oci_layout`.
+///
+/// # Arguments
+///
+/// * `repo` - The composefs repository to import into
+/// * `oci_layout_path` - Path to the OCI layout directory
+/// * `subject_digest` - The manifest digest of the subject image (sha256:...)
+/// * `artifact_type` - The artifactType to filter on (e.g., "application/vnd.composefs.signature.v1")
+///
+/// # Returns
+///
+/// The number of referrer artifacts imported.
+pub fn import_referrers_from_oci_layout<ObjectID: FsVerityHashValue>(
+    repo: &Arc<Repository<ObjectID>>,
+    oci_layout_path: &std::path::Path,
+    subject_digest: &str,
+    artifact_type: &str,
+) -> Result<usize> {
+    use oci_spec::image::{ImageIndex, ImageManifest};
+    use std::fs;
+
+    let blobs_dir = oci_layout_path.join("blobs").join("sha256");
+    let index_path = oci_layout_path.join("index.json");
+
+    if !index_path.exists() {
+        anyhow::bail!("OCI layout missing index.json: {}", oci_layout_path.display());
+    }
+
+    let index: ImageIndex = ImageIndex::from_file(&index_path)
+        .map_err(|e| anyhow::anyhow!("parsing index.json: {e}"))?;
+
+    let mut imported_count = 0;
+
+    for manifest_desc in index.manifests() {
+        // Check if this entry has the right artifactType
+        let is_matching_artifact = matches!(
+            manifest_desc.artifact_type(),
+            Some(oci_spec::image::MediaType::Other(t)) if t == artifact_type
+        );
+
+        if !is_matching_artifact {
+            continue;
+        }
+
+        let artifact_digest = manifest_desc.digest().to_string();
+        let artifact_hash = artifact_digest
+            .strip_prefix("sha256:")
+            .context("artifact digest must be sha256")?;
+
+        // Read the artifact manifest
+        let manifest_blob_path = blobs_dir.join(artifact_hash);
+        let manifest_json = fs::read_to_string(&manifest_blob_path)
+            .with_context(|| format!("reading artifact manifest {artifact_digest}"))?;
+
+        let manifest: ImageManifest = ImageManifest::from_reader(manifest_json.as_bytes())
+            .map_err(|e| anyhow::anyhow!("parsing artifact manifest: {e}"))?;
+
+        // Check if this artifact's subject matches our target
+        let matches_subject = match manifest.subject() {
+            Some(subject) => subject.digest().to_string() == subject_digest,
+            None => false,
+        };
+
+        if !matches_subject {
+            continue;
+        }
+
+        // Import the artifact manifest to repo
+        let manifest_content_id = manifest_identifier(&artifact_digest);
+        if repo.has_stream(&manifest_content_id)?.is_some() {
+            // Already have this artifact
+            imported_count += 1;
+            continue;
+        }
+
+        // Read config blob
+        let config_digest = manifest.config().digest().to_string();
+        let config_hash = config_digest
+            .strip_prefix("sha256:")
+            .context("config digest must be sha256")?;
+        let config_blob_path = blobs_dir.join(config_hash);
+        let config_data = fs::read(&config_blob_path).unwrap_or_else(|_| b"{}".to_vec());
+
+        // Store config
+        let config_content_id = crate::config_identifier(&config_digest);
+        let config_verity = if let Some(v) = repo.has_stream(&config_content_id)? {
+            v
+        } else {
+            let mut config_stream = repo.create_stream(crate::skopeo::OCI_CONFIG_CONTENT_TYPE);
+            config_stream.write_external(&config_data)?;
+            repo.write_stream(config_stream, &config_content_id, None)?
+        };
+
+        // Read and store each layer blob
+        let mut layer_verities = Vec::new();
+        for layer_desc in manifest.layers() {
+            let layer_digest = layer_desc.digest().to_string();
+            let layer_hash = layer_digest
+                .strip_prefix("sha256:")
+                .context("layer digest must be sha256")?;
+            let layer_blob_path = blobs_dir.join(layer_hash);
+
+            let layer_content_id = blob_identifier(&layer_digest);
+            let layer_verity = if let Some(v) = repo.has_stream(&layer_content_id)? {
+                v
+            } else {
+                let layer_data = fs::read(&layer_blob_path)
+                    .with_context(|| format!("reading layer blob {layer_digest}"))?;
+                // Use OCI_BLOB_CONTENT_TYPE for signature artifact layers
+                let mut layer_stream = repo.create_stream(crate::skopeo::OCI_BLOB_CONTENT_TYPE);
+                layer_stream.write_external(&layer_data)?;
+                repo.write_stream(layer_stream, &layer_content_id, None)?
+            };
+            layer_verities.push((layer_digest, layer_verity));
+        }
+
+        // Store the manifest
+        let mut manifest_stream = repo.create_stream(crate::skopeo::OCI_MANIFEST_CONTENT_TYPE);
+
+        // Add named refs for config and layers
+        let config_key = format!("config:{config_digest}");
+        manifest_stream.add_named_stream_ref(&config_key, &config_verity);
+
+        for (layer_digest, layer_verity) in &layer_verities {
+            manifest_stream.add_named_stream_ref(layer_digest, layer_verity);
+        }
+
+        manifest_stream.write_external(manifest_json.as_bytes())?;
+        repo.write_stream(manifest_stream, &manifest_content_id, None)?;
+
+        // Add to referrer index
+        add_referrer(repo, subject_digest, &artifact_digest)?;
+
+        imported_count += 1;
+    }
+
+    Ok(imported_count)
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -1050,11 +1366,11 @@ mod test {
         assert!(digest.starts_with("sha256:"));
 
         // Read back with verity (fast path)
-        let read_data = open_blob(&repo, &digest, Some(&verity)).unwrap();
+        let read_data = open_blob(repo, &digest, Some(&verity)).unwrap();
         assert_eq!(read_data, data);
 
         // Read back without verity (verifies content hash)
-        let read_data2 = open_blob(&repo, &digest, None).unwrap();
+        let read_data2 = open_blob(repo, &digest, None).unwrap();
         assert_eq!(read_data2, data);
     }
 
@@ -1081,7 +1397,7 @@ mod test {
         let (_digest, _verity) = write_blob(repo, data).unwrap();
 
         let bad_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
-        let result = open_blob::<Sha256HashValue>(&repo, bad_digest, None);
+        let result = open_blob::<Sha256HashValue>(repo, bad_digest, None);
         assert!(result.is_err());
     }
 
@@ -1115,7 +1431,7 @@ mod test {
             "Manifest splitstream should contain external object references"
         );
 
-        let img = OciImage::open(&repo, &manifest_digest, Some(&manifest_verity)).unwrap();
+        let img = OciImage::open(repo, &manifest_digest, Some(&manifest_verity)).unwrap();
         let manifest_json = img.manifest().to_string().unwrap();
         let expected_verity: Sha256HashValue =
             composefs::fsverity::compute_verity(manifest_json.as_bytes());
@@ -1220,7 +1536,7 @@ mod test {
         let manifest_digest = hash(manifest_json.as_bytes());
 
         let (stored_digest, manifest_verity) = write_manifest(
-            &repo,
+            repo,
             &manifest,
             &manifest_digest,
             &config_verity,
@@ -1231,7 +1547,7 @@ mod test {
 
         assert_eq!(stored_digest, manifest_digest);
 
-        let opened = OciImage::open(&repo, &manifest_digest, Some(&manifest_verity)).unwrap();
+        let opened = OciImage::open(repo, &manifest_digest, Some(&manifest_verity)).unwrap();
 
         assert!(!opened.is_container_image()); // Not a container image
         assert_eq!(opened.manifest_digest(), manifest_digest);
@@ -1242,15 +1558,15 @@ mod test {
             &MediaType::Other("application/wasm".to_string())
         );
 
-        let by_tag = OciImage::open_ref(&repo, "my-wasm-artifact:v1").unwrap();
+        let by_tag = OciImage::open_ref(repo, "my-wasm-artifact:v1").unwrap();
         assert_eq!(by_tag.manifest_digest(), manifest_digest);
 
-        let images = list_images(&repo).unwrap();
+        let images = list_images(repo).unwrap();
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].name, "my-wasm-artifact:v1");
         assert!(!images[0].is_container);
 
-        let read_wasm = open_blob(&repo, &blob_digest, Some(&blob_verity)).unwrap();
+        let read_wasm = open_blob(repo, &blob_digest, Some(&blob_verity)).unwrap();
         assert_eq!(read_wasm, wasm_bytes);
     }
 
@@ -1332,7 +1648,7 @@ mod test {
         let manifest_digest = hash(manifest_json.as_bytes());
 
         let (_stored_digest, manifest_verity) = write_manifest(
-            &repo,
+            repo,
             &manifest,
             &manifest_digest,
             &config_verity,
@@ -1341,7 +1657,7 @@ mod test {
         )
         .unwrap();
 
-        let opened = OciImage::open(&repo, &manifest_digest, Some(&manifest_verity)).unwrap();
+        let opened = OciImage::open(repo, &manifest_digest, Some(&manifest_verity)).unwrap();
         assert!(!opened.is_container_image());
         assert_eq!(opened.layer_descriptors().len(), 1);
         assert_eq!(
@@ -1349,17 +1665,17 @@ mod test {
             &MediaType::Other("text/spdx+json".to_string())
         );
 
-        let fd = opened.open_layer_fd(&repo, 0).unwrap();
+        let fd = opened.open_layer_fd(repo, 0).unwrap();
         let mut recovered = vec![];
         File::from(fd).read_to_end(&mut recovered).unwrap();
         assert_eq!(recovered, sbom_data);
 
-        assert!(opened.open_layer_fd(&repo, 1).is_err());
+        assert!(opened.open_layer_fd(repo, 1).is_err());
 
         let gc = repo.gc(&[]).unwrap();
         assert_eq!(gc.objects_removed, 0);
 
-        untag_image(&repo, "my-sbom:v1").unwrap();
+        untag_image(repo, "my-sbom:v1").unwrap();
         let gc = repo.gc(&[]).unwrap();
         assert!(gc.objects_removed > 0);
     }
@@ -1371,11 +1687,11 @@ mod test {
         let repo = &test_repo.repo;
 
         let (digest, verity, _) = create_test_image(repo, Some("myimage:v1"), "amd64");
-        let img = OciImage::open(&repo, &digest, Some(&verity)).unwrap();
+        let img = OciImage::open(repo, &digest, Some(&verity)).unwrap();
         assert!(img.is_container_image());
 
         // Tar layer should be rejected
-        let err = img.open_layer_fd(&repo, 0).unwrap_err();
+        let err = img.open_layer_fd(repo, 0).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("does not support tar layers"), "got: {msg}");
     }
@@ -1488,7 +1804,7 @@ mod test {
         let manifest_digest = hash(manifest_json.as_bytes());
 
         let (_stored_digest, _manifest_verity) = write_manifest(
-            &repo,
+            repo,
             &manifest,
             &manifest_digest,
             &config_verity,
