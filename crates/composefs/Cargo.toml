@@ -11,12 +11,13 @@ rust-version.workspace = true
 version.workspace = true
 
 [features]
-'pre-6.15' = ['tempfile']
+'pre-6.15' = ['tempfile', 'composefs-ioctls/loop-device']
 rhel9 = ['pre-6.15']
 test = ["tempfile"]
 
 [dependencies]
 anyhow = { version = "1.0.87", default-features = false }
+composefs-ioctls = { workspace = true }
 fn-error-context = "0.2"
 hex = { version = "0.4.0", default-features = false, features = ["std"] }
 log = { version = "0.4.8", default-features = false }

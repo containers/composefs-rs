@@ -12,7 +12,7 @@ pub use digest::FsVerityHasher;
 
 use std::{
     fs::File,
-    io::{Error, Seek},
+    io::Seek,
     os::{
         fd::{AsFd, BorrowedFd, OwnedFd},
         unix::fs::PermissionsExt,
@@ -24,52 +24,10 @@ use thiserror::Error;
 
 pub use hashvalue::{FsVerityHashValue, Sha256HashValue, Sha512HashValue};
 
+// Re-export error types from composefs-ioctls
+pub use ioctl::{EnableVerityError, MeasureVerityError};
+
 use crate::util::proc_self_fd;
-
-/// Measuring fsverity failed.
-#[derive(Error, Debug)] // can't derive PartialEq because of std::io::Error
-pub enum MeasureVerityError {
-    /// I/O operation failed.
-    #[error("{0}")]
-    Io(#[from] Error),
-    /// fs-verity is not enabled on the file.
-    #[error("fs-verity is not enabled on file")]
-    VerityMissing,
-    /// The filesystem does not support fs-verity.
-    #[error("fs-verity is not supported by filesystem")]
-    FilesystemNotSupported,
-    /// The hash algorithm does not match the expected algorithm.
-    #[error("Expected algorithm {expected}, found {found}")]
-    InvalidDigestAlgorithm {
-        /// The expected algorithm identifier.
-        expected: u16,
-        /// The actual algorithm identifier found.
-        found: u16,
-    },
-    /// The digest size does not match the expected size.
-    #[error("Expected digest size {expected}")]
-    InvalidDigestSize {
-        /// The expected digest size in bytes.
-        expected: u16,
-    },
-}
-
-/// Enabling fsverity failed.
-#[derive(Error, Debug)]
-pub enum EnableVerityError {
-    /// I/O operation failed.
-    #[error("{0}")]
-    Io(#[from] Error),
-    /// The filesystem does not support fs-verity.
-    #[error("Filesystem does not support fs-verity")]
-    FilesystemNotSupported,
-    /// fs-verity is already enabled on the file.
-    #[error("fs-verity is already enabled on file")]
-    AlreadyEnabled,
-    /// The file has an open writable file descriptor.
-    #[error("File is opened for writing")]
-    FileOpenedForWrite,
-}
 
 /// A verity comparison failed.
 #[derive(Error, Debug)]
@@ -298,7 +256,9 @@ pub fn ensure_verity_equal(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, io::Write, os::unix::process::CommandExt, time::Duration};
+    use std::{collections::BTreeSet, io::Write, time::Duration};
+
+    use composefs_ioctls::test_utils_pub::CommandExt;
 
     use once_cell::sync::Lazy;
     use rand::Rng;
@@ -416,7 +376,6 @@ mod tests {
         );
     }
 
-    #[allow(unsafe_code)]
     #[tokio::test]
     async fn test_verity_forking() {
         const DELAY_MIN: u64 = 0;
@@ -447,15 +406,12 @@ mod tests {
 
                     let delay = rng.random_range(DELAY_MIN..=DELAY_MAX);
                     let delay = Duration::from_millis(delay);
-                    unsafe {
-                        std::process::Command::new("true")
-                            .pre_exec(move || {
-                                std::thread::sleep(delay);
-                                Ok(())
-                            })
-                            .status()
-                            .unwrap();
-                    }
+                    // Use the test helper from composefs-ioctls which wraps the
+                    // unsafe pre_exec call
+                    std::process::Command::new("true")
+                        .pre_exec_sleep(delay)
+                        .status()
+                        .unwrap();
                 }
             });
 

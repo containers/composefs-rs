@@ -10,6 +10,8 @@
 //! - Creating mountable filesystems from OCI image configurations
 //! - Sealing containers with fs-verity hashes for integrity verification
 
+#![forbid(unsafe_code)]
+
 pub mod image;
 pub mod oci_image;
 pub mod skopeo;
