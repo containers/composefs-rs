@@ -8,12 +8,14 @@
 //! - Pulling container images from registries using skopeo
 //! - Converting OCI image layers from tar format to composefs split streams
 //! - Creating mountable filesystems from OCI image configurations
-//! - Sealing containers with fs-verity hashes for integrity verification
+//! - Signing and verifying images using fs-verity PKCS#7 signatures
 
 #![forbid(unsafe_code)]
 
 pub mod image;
 pub mod oci_image;
+pub mod signature;
+pub mod signing;
 pub mod skopeo;
 pub mod tar;
 
@@ -34,10 +36,12 @@ use crate::skopeo::{OCI_CONFIG_CONTENT_TYPE, TAR_LAYER_CONTENT_TYPE};
 use crate::tar::get_entry;
 
 // Re-export key types for convenience
+pub use image::{compute_merged_digest, compute_per_layer_digests};
 pub use oci_image::{
-    add_referrer, layer_dumpfile, layer_info, layer_tar, list_images, list_referrers, list_refs,
-    remove_referrer, remove_referrers_for_subject, resolve_ref, tag_image, untag_image, ImageInfo,
-    LayerInfo, OciImage, SplitstreamInfo, OCI_REF_PREFIX,
+    add_referrer, export_referrers_to_oci_layout, layer_dumpfile, layer_info, layer_tar,
+    list_images, list_referrers, list_refs, remove_referrer, remove_referrers_for_subject,
+    resolve_ref, tag_image, untag_image, ImageInfo, LayerInfo, OciImage, SplitstreamInfo,
+    OCI_REF_PREFIX,
 };
 pub use skopeo::pull_image;
 
