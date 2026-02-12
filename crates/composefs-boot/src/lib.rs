@@ -5,6 +5,7 @@
 //! bootloader entries. It supports both Boot Loader Specification (Type 1) entries
 //! and Unified Kernel Images (Type 2) for UEFI boot.
 
+#![forbid(unsafe_code)]
 #![deny(missing_debug_implementations)]
 
 pub mod bootloader;

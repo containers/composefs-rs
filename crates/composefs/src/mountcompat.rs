@@ -134,7 +134,7 @@ pub fn prepare_mount(mnt_fd: OwnedFd) -> Result<impl AsFd> {
 /// cannot directly mount files on these older kernels.
 #[cfg(feature = "rhel9")]
 pub fn make_erofs_mountable(image: OwnedFd) -> Result<OwnedFd> {
-    loopback::loopify(image)
+    loopify(image)
 }
 
 // Finally, we have two submodules which do the heavy lifting for loopback devices and temporary
@@ -191,105 +191,8 @@ mod tmpmount {
 }
 
 /// Required before 6.12: erofs can't directly mount files.
+/// Uses the composefs-ioctls crate for the loop device ioctl.
 #[cfg(feature = "rhel9")]
-mod loopback {
-    #![allow(unsafe_code)]
-    use std::{
-        io::Result,
-        os::fd::{AsFd, AsRawFd, OwnedFd},
-    };
-
-    use rustix::fs::{open, Mode, OFlags};
-
-    struct LoopCtlGetFree;
-
-    // Rustix seems to lack a built-in pattern for an ioctl that returns data by the syscall return
-    // value instead of the usual return-by-reference on the args parameter.  Bake our own.
-    unsafe impl rustix::ioctl::Ioctl for LoopCtlGetFree {
-        type Output = std::ffi::c_int;
-
-        const IS_MUTATING: bool = false;
-
-        fn opcode(&self) -> rustix::ioctl::Opcode {
-            LOOP_CTL_GET_FREE
-        }
-
-        fn as_ptr(&mut self) -> *mut std::ffi::c_void {
-            std::ptr::null_mut()
-        }
-
-        unsafe fn output_from_ptr(
-            out: rustix::ioctl::IoctlOutput,
-            _ptr: *mut std::ffi::c_void,
-        ) -> rustix::io::Result<std::ffi::c_int> {
-            Ok(out)
-        }
-    }
-
-    const LO_NAME_SIZE: usize = 64;
-    const LO_KEY_SIZE: usize = 32;
-
-    #[derive(Default)]
-    #[repr(C)]
-    struct LoopInfo {
-        lo_device: u64,
-        lo_inode: u64,
-        lo_rdevice: u64,
-        lo_offset: u64,
-        lo_sizelimit: u64,
-        lo_number: u32,
-        lo_encrypt_type: u32,
-        lo_encrypt_key_size: u32,
-        lo_flags: u32,
-        // HACK: default trait is only implemented up to [u8; 32]
-        lo_file_name: ([u8; LO_NAME_SIZE / 2], [u8; LO_NAME_SIZE / 2]),
-        lo_crypt_name: ([u8; LO_NAME_SIZE / 2], [u8; LO_NAME_SIZE / 2]),
-        lo_encrypt_key: [u8; LO_KEY_SIZE],
-        lo_init: [u64; 2],
-    }
-
-    #[derive(Default)]
-    #[repr(C)]
-    struct LoopConfig {
-        fd: u32,
-        block_size: u32,
-        info: LoopInfo,
-        reserved: [u64; 8],
-    }
-
-    const LOOP_CTL_GET_FREE: rustix::ioctl::Opcode = 0x4C82;
-    const LOOP_CONFIGURE: rustix::ioctl::Opcode = 0x4C0A;
-    const LO_FLAGS_READ_ONLY: u32 = 1;
-    const LO_FLAGS_AUTOCLEAR: u32 = 4;
-    const LO_FLAGS_DIRECT_IO: u32 = 16;
-
-    pub fn loopify(image: OwnedFd) -> Result<OwnedFd> {
-        let control = open(
-            "/dev/loop-control",
-            OFlags::RDWR | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?;
-        let index = unsafe { rustix::ioctl::ioctl(&control, LoopCtlGetFree {})? };
-        let fd = open(
-            format!("/dev/loop{index}"),
-            OFlags::RDWR | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?;
-        let config = LoopConfig {
-            fd: image.as_fd().as_raw_fd() as u32,
-            block_size: 4096,
-            info: LoopInfo {
-                lo_flags: LO_FLAGS_READ_ONLY | LO_FLAGS_AUTOCLEAR | LO_FLAGS_DIRECT_IO,
-                ..LoopInfo::default()
-            },
-            ..LoopConfig::default()
-        };
-        unsafe {
-            rustix::ioctl::ioctl(
-                &fd,
-                rustix::ioctl::Setter::<{ LOOP_CONFIGURE }, LoopConfig>::new(config),
-            )?;
-        };
-        Ok(fd)
-    }
+fn loopify(image: OwnedFd) -> Result<OwnedFd> {
+    composefs_ioctls::loop_device::loopify(image)
 }

@@ -4,6 +4,8 @@
 //! of container filesystem layers by using content-addressable storage
 //! and fs-verity for integrity verification.
 
+#![forbid(unsafe_code)]
+
 pub mod dumpfile;
 pub mod dumpfile_parse;
 pub mod erofs;

@@ -4,6 +4,8 @@
 //! referenced objects from HTTP servers. It handles recursive fetching of nested splitstream
 //! references and verifies content integrity using fsverity checksums.
 
+#![forbid(unsafe_code)]
+
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
