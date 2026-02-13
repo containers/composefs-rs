@@ -13,7 +13,9 @@
 #![forbid(unsafe_code)]
 
 pub mod image;
+pub mod layer;
 pub mod oci_image;
+pub mod oci_layout;
 pub mod skopeo;
 pub mod tar;
 
@@ -31,9 +33,9 @@ use crate::tar::get_entry;
 
 // Re-export key types for convenience
 pub use oci_image::{
-    add_referrer, list_images, list_referrers, list_refs, remove_referrer,
-    remove_referrers_for_subject, resolve_ref, tag_image, untag_image, ImageInfo, OciImage,
-    OCI_REF_PREFIX,
+    add_referrer, layer_dumpfile, layer_info, layer_tar, list_images, list_referrers, list_refs,
+    remove_referrer, remove_referrers_for_subject, resolve_ref, tag_image, untag_image, ImageInfo,
+    LayerInfo, OciImage, SplitstreamInfo, OCI_REF_PREFIX,
 };
 pub use skopeo::{pull_image, PullResult};
 
