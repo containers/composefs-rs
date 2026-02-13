@@ -84,6 +84,21 @@ enum OciCommand {
         digest: String,
         name: Option<String>,
     },
+    /// Imports a layer from a splitfdstream server into the repository.
+    ImportLayerSplitfdstream {
+        /// Path to the splitfdstream server socket
+        socket: PathBuf,
+        /// The layer digest (e.g., sha256:abc123...)
+        digest: String,
+        /// Optional reference name for the layer
+        name: Option<String>,
+        /// Layer ID to request from splitfdstream server (defaults to digest)
+        #[clap(long)]
+        layer_id: Option<String>,
+        /// Parent layer ID for delta computation
+        #[clap(long)]
+        parent_id: Option<String>,
+    },
     /// Lists the contents of a tar stream
     LsLayer {
         /// the name of the stream to list, either a stream ID in format oci-config-<hash_type>:<hash_digest> or a reference in 'ref/'
@@ -313,6 +328,23 @@ where
                     &digest,
                     name.as_deref(),
                     &mut std::io::stdin(),
+                )?;
+                println!("{}", object_id.to_id());
+            }
+            OciCommand::ImportLayerSplitfdstream {
+                socket,
+                digest,
+                name,
+                layer_id,
+                parent_id,
+            } => {
+                let object_id = composefs_oci::import_from_splitfdstream(
+                    &Arc::new(repo),
+                    &socket,
+                    &digest,
+                    layer_id.as_deref(),
+                    parent_id.as_deref(),
+                    name.as_deref(),
                 )?;
                 println!("{}", object_id.to_id());
             }
