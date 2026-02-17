@@ -530,6 +530,53 @@ pub fn write_manifest<ObjectID: FsVerityHashValue>(
     Ok((manifest_digest.to_string(), id))
 }
 
+/// Writes a manifest to the repository from raw JSON bytes.
+///
+/// Unlike [`write_manifest`], this preserves the exact JSON bytes from the
+/// original source, avoiding digest mismatches from re-serialization.
+pub fn write_manifest_raw<ObjectID: FsVerityHashValue>(
+    repo: &Arc<Repository<ObjectID>>,
+    manifest_json: &[u8],
+    manifest_digest: &str,
+    config_verity: &ObjectID,
+    layer_verities: &HashMap<Box<str>, ObjectID>,
+    reference: Option<&str>,
+) -> Result<(String, ObjectID)> {
+    let content_id = manifest_identifier(manifest_digest);
+
+    if let Some(verity) = repo.has_stream(&content_id)? {
+        if let Some(name) = reference {
+            tag_image(repo, manifest_digest, name)?;
+        }
+        return Ok((manifest_digest.to_string(), verity));
+    }
+
+    let computed = hash(manifest_json);
+    ensure!(
+        manifest_digest == computed,
+        "Manifest digest mismatch: expected {manifest_digest}, got {computed}"
+    );
+
+    let manifest: ImageManifest =
+        serde_json::from_slice(manifest_json).context("parsing manifest JSON")?;
+
+    let mut stream = repo.create_stream(OCI_MANIFEST_CONTENT_TYPE);
+
+    let config_key = format!("config:{}", manifest.config().digest());
+    stream.add_named_stream_ref(&config_key, config_verity);
+
+    for (diff_id, verity) in layer_verities {
+        stream.add_named_stream_ref(diff_id, verity);
+    }
+
+    stream.write_external(manifest_json)?;
+
+    let oci_ref = reference.map(oci_ref_path);
+    let id = repo.write_stream(stream, &content_id, oci_ref.as_deref())?;
+
+    Ok((manifest_digest.to_string(), id))
+}
+
 /// Checks if a manifest exists.
 pub fn has_manifest<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,

@@ -15,7 +15,12 @@
 pub mod image;
 pub mod oci_image;
 pub mod skopeo;
+pub mod splitfdstream;
 pub mod tar;
+
+pub use splitfdstream::{
+    import_complete_image_from_splitfdstream, import_from_splitfdstream, CompleteImageImportResult,
+};
 
 use std::{collections::HashMap, io::Read, sync::Arc};
 
@@ -39,7 +44,7 @@ pub use skopeo::{pull_image, PullResult};
 
 type ContentAndVerity<ObjectID> = (String, ObjectID);
 
-fn layer_identifier(diff_id: &str) -> String {
+pub(crate) fn layer_identifier(diff_id: &str) -> String {
     format!("oci-layer-{diff_id}")
 }
 
