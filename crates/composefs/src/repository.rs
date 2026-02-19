@@ -1191,7 +1191,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         // Plain object references, add to live objects set
         split_stream
             .get_object_refs(|id| {
-                debug!("   with {id:?}");
+                trace!("   with {id:?}");
                 objects.insert(id.clone());
             })
             .context("Getting object references from stream")?;
@@ -1201,7 +1201,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         // In practice repository name is often table name prefixed with stream types (e.g. oci-config-<table name>)
         // Here we always match objectID to be absolutely sure
         for (stream_name_in_table, stream_object_id) in streams_to_walk {
-            debug!(
+            trace!(
                 "   named reference stream {stream_name_in_table} lives, with {stream_object_id:?}"
             );
             objects.insert(stream_object_id.clone());
@@ -1315,13 +1315,13 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             .collect();
 
         for ref image in root_images {
-            debug!("{image:?} lives as an image");
+            trace!("{image:?} lives as an image");
             live_objects.insert(image.0.clone());
             self.objects_for_image(&image.1)
                 .with_context(|| format!("Collecting objects for image {}", image.1))?
                 .iter()
                 .for_each(|id| {
-                    debug!("   with {id:?}");
+                    trace!("   with {id:?}");
                     live_objects.insert(id.clone());
                 });
         }
@@ -1344,7 +1344,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
         let mut walked_streams = HashSet::new();
         for stream in root_streams {
-            debug!("{stream:?} lives as a stream");
+            trace!("{stream:?} lives as a stream");
             live_objects.insert(stream.0.clone());
             self.walk_streams(
                 &stream_name_map,
@@ -1381,8 +1381,12 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                         }
                         result.objects_removed += 1;
 
+                        debug!(
+                            "removing ({}): objects/{first_byte:02x}/{filename:?}",
+                            !dry_run,
+                        );
+
                         if !dry_run {
-                            debug!("removing: objects/{first_byte:02x}/{filename:?}");
                             unlinkat(&dirfd, filename, AtFlags::empty()).with_context(|| {
                                 format!("Unlinking object {first_byte:02x}/{filename:?}")
                             })?;
