@@ -9,9 +9,12 @@
 //! - Converting OCI image layers from tar format to composefs split streams
 //! - Creating mountable filesystems from OCI image configurations
 //! - Sealing containers with fs-verity hashes for integrity verification
+//! - Importing from containers-storage with zero-copy reflinks (optional feature)
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "containers-storage")]
+pub mod cstor;
 pub mod image;
 pub mod oci_image;
 pub mod skopeo;
@@ -71,7 +74,7 @@ impl ImportStats {
         };
         for &(size, method) in &ss.external_objects {
             match method {
-                ObjectStoreMethod::Copied => {
+                ObjectStoreMethod::Copied | ObjectStoreMethod::Reflinked => {
                     stats.objects_copied += 1;
                     stats.bytes_copied += size;
                 }
@@ -84,24 +87,17 @@ impl ImportStats {
     }
 }
 
-/// Result of a pull operation.
-#[derive(Debug)]
-pub struct PullResult<ObjectID> {
-    /// The config digest (sha256:...).
-    pub config_digest: String,
-    /// The fs-verity hash of the config splitstream.
-    pub config_verity: ObjectID,
-    /// Import statistics.
-    pub stats: ImportStats,
-}
+// Re-export the composefs crate for consumers who only need composefs-oci
+pub use composefs;
 
-type ContentAndVerity<ObjectID> = (String, ObjectID);
+/// A tuple of (content digest, fs-verity ObjectID).
+pub type ContentAndVerity<ObjectID> = (String, ObjectID);
 
-fn layer_identifier(diff_id: &str) -> String {
+pub(crate) fn layer_identifier(diff_id: &str) -> String {
     format!("oci-layer-{diff_id}")
 }
 
-fn config_identifier(config: &str) -> String {
+pub(crate) fn config_identifier(config: &str) -> String {
     format!("oci-config-{config}")
 }
 
@@ -146,14 +142,47 @@ pub fn ls_layer<ObjectID: FsVerityHashValue>(
     Ok(())
 }
 
+/// Result of a pull operation.
+#[derive(Debug)]
+pub struct PullResult<ObjectID> {
+    /// The config digest (sha256:...).
+    pub config_digest: String,
+    /// The fs-verity hash of the config splitstream.
+    pub config_verity: ObjectID,
+    /// Import statistics.
+    pub stats: ImportStats,
+}
+
 /// Pull the target image, and add the provided tag. If this is a mountable
 /// image (i.e. not an artifact), it is *not* unpacked by default.
+///
+/// When the `containers-storage` feature is enabled and the image reference
+/// starts with `containers-storage:`, this uses the native cstor import path
+/// which supports zero-copy reflinks. Otherwise, it uses skopeo.
 pub async fn pull<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     imgref: &str,
     reference: Option<&str>,
     img_proxy_config: Option<ImageProxyConfig>,
 ) -> Result<PullResult<ObjectID>> {
+    #[cfg(feature = "containers-storage")]
+    if let Some(image_id) = cstor::parse_containers_storage_ref(imgref) {
+        let ((config_digest, config_verity), cstor_stats) =
+            cstor::import_from_containers_storage(repo, image_id, reference).await?;
+        // Convert cstor::ImportStats to our ImportStats
+        let stats = ImportStats {
+            objects_copied: cstor_stats.objects_reflinked + cstor_stats.objects_copied,
+            objects_already_present: cstor_stats.objects_already_present,
+            bytes_copied: cstor_stats.bytes_reflinked + cstor_stats.bytes_copied,
+            bytes_inlined: cstor_stats.bytes_inlined,
+        };
+        return Ok(PullResult {
+            config_digest,
+            config_verity,
+            stats,
+        });
+    }
+
     let (config_digest, config_verity, stats) =
         skopeo::pull(repo, imgref, reference, img_proxy_config).await?;
     Ok(PullResult {
