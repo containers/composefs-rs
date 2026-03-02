@@ -1,4 +1,26 @@
 //! Library for `cfsctl` command line utility
+//!
+//! This crate also re-exports all composefs-rs library crates, so downstream
+//! consumers can take a single dependency on `cfsctl` instead of listing each
+//! crate individually.
+//!
+//! ```
+//! use cfsctl::composefs::repository::Repository;
+//! use cfsctl::composefs::fsverity::Sha256HashValue;
+//!
+//! let repo = Repository::<Sha256HashValue>::open_path(
+//!     rustix::fs::CWD,
+//!     "/nonexistent",
+//! );
+//! assert!(repo.is_err());
+//! ```
+
+pub use composefs;
+pub use composefs_boot;
+#[cfg(feature = "http")]
+pub use composefs_http;
+#[cfg(feature = "oci")]
+pub use composefs_oci;
 
 use std::{
     ffi::OsString,
