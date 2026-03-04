@@ -58,6 +58,11 @@ pub struct ImportStats {
 }
 
 impl ImportStats {
+    /// Total number of objects processed (new + already present).
+    pub fn total_objects(&self) -> u64 {
+        self.objects_copied + self.objects_already_present
+    }
+
     /// Merge another `ImportStats` into this one.
     pub fn merge(&mut self, other: &ImportStats) {
         self.objects_copied += other.objects_copied;
@@ -84,6 +89,31 @@ impl ImportStats {
             }
         }
         stats
+    }
+}
+
+impl std::fmt::Display for ImportStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn human_bytes(b: u64) -> String {
+            if b >= 1_000_000_000 {
+                format!("{:.1} GB", b as f64 / 1_000_000_000.0)
+            } else if b >= 1_000_000 {
+                format!("{:.1} MB", b as f64 / 1_000_000.0)
+            } else if b >= 1_000 {
+                format!("{:.1} kB", b as f64 / 1_000.0)
+            } else {
+                format!("{b} B")
+            }
+        }
+
+        write!(
+            f,
+            "{} new + {} already present objects; {} stored, {} inlined",
+            self.objects_copied,
+            self.objects_already_present,
+            human_bytes(self.bytes_copied),
+            human_bytes(self.bytes_inlined),
+        )
     }
 }
 
@@ -484,5 +514,27 @@ mod test {
 
         let result = open_config::<Sha256HashValue>(&repo, &config_digest, None);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_import_stats_display() {
+        let stats = ImportStats {
+            objects_copied: 42,
+            objects_already_present: 100,
+            bytes_copied: 1_500_000,
+            bytes_inlined: 800,
+        };
+        assert_eq!(
+            stats.to_string(),
+            "42 new + 100 already present objects; 1.5 MB stored, 800 B inlined"
+        );
+
+        let empty = ImportStats::default();
+        assert_eq!(
+            empty.to_string(),
+            "0 new + 0 already present objects; 0 B stored, 0 B inlined"
+        );
+        assert_eq!(empty.total_objects(), 0);
+        assert_eq!(stats.total_objects(), 142);
     }
 }
