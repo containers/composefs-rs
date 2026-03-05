@@ -21,7 +21,7 @@ pub mod tar;
 
 use std::{collections::HashMap, io::Read, sync::Arc};
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{bail, ensure, Result};
 use containers_image_proxy::ImageProxyConfig;
 use oci_spec::image::ImageConfiguration;
 use sha2::{Digest, Sha256};
@@ -248,7 +248,7 @@ pub fn seal<ObjectID: FsVerityHashValue>(
     config_verity: Option<&ObjectID>,
 ) -> Result<ContentAndVerity<ObjectID>> {
     let (mut config, refs) = open_config(repo, config_name, config_verity)?;
-    let mut myconfig = config.config().clone().context("no config!")?;
+    let mut myconfig = config.config().clone().unwrap_or_default();
     let labels = myconfig.labels_mut().get_or_insert_with(HashMap::new);
     let fs = crate::image::create_filesystem(repo, config_name, config_verity)?;
     let id = fs.compute_image_id();

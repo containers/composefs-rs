@@ -355,6 +355,11 @@ fn run_keyring_cmd(cmd: &KeyringCommand) -> Result<()> {
     Ok(())
 }
 
+/// Run the CLI using `std::env::args()`, as if invoked from the command line.
+pub async fn run_from_args() -> Result<()> {
+    run_app(App::parse()).await
+}
+
 /// Acts as a proxy for the `cfsctl` CLI by executing the CLI logic programmatically
 ///
 /// This function behaves the same as invoking the `cfsctl` binary from the
@@ -368,7 +373,10 @@ where
     let args = App::parse_from(
         std::iter::once(OsString::from("cfsctl")).chain(args.into_iter().map(Into::into)),
     );
+    run_app(args).await
+}
 
+async fn run_app(args: App) -> Result<()> {
     // Handle commands that don't need a repository first
     if let Command::Keyring { ref cmd } = args.cmd {
         return run_keyring_cmd(cmd);
@@ -1125,8 +1133,8 @@ where
                 );
             }
         }
-        Command::Keyring { ref cmd } => {
-            run_keyring_cmd(cmd)?;
+        Command::Keyring { .. } => {
+            unreachable!("keyring commands are handled before opening a repository")
         }
         #[cfg(feature = "http")]
         Command::Fetch { url, name } => {
