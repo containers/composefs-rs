@@ -303,9 +303,14 @@ integration_test!(privileged_seal_then_sign);
 /// Inject a test certificate into the kernel's `.fs-verity` keyring.
 ///
 /// This modifies kernel state and must run in an ephemeral VM to avoid
-/// polluting the host keyring.
+/// polluting the host keyring. Requires `CONFIG_FS_VERITY_BUILTIN_SIGNATURES=y`.
 fn privileged_keyring_add_cert() -> Result<()> {
     if require_privileged("privileged_keyring_add_cert")?.is_some() {
+        return Ok(());
+    }
+
+    if !crate::has_fsverity_builtin_signatures() {
+        eprintln!("SKIP: kernel does not have CONFIG_FS_VERITY_BUILTIN_SIGNATURES=y");
         return Ok(());
     }
 
@@ -324,3 +329,63 @@ fn privileged_keyring_add_cert() -> Result<()> {
     Ok(())
 }
 integration_test!(privileged_keyring_add_cert);
+
+/// Inject a cert into the kernel keyring, then sign and verify an OCI image
+/// on a verity-enabled filesystem.
+///
+/// This exercises the full kernel-level signature enforcement pipeline:
+/// cert injection into `.fs-verity` keyring, pull with real verity, sign,
+/// and verify. Requires `CONFIG_FS_VERITY_BUILTIN_SIGNATURES=y`.
+fn privileged_keyring_and_verify_with_verity() -> Result<()> {
+    if require_privileged("privileged_keyring_and_verify_with_verity")?.is_some() {
+        return Ok(());
+    }
+
+    if !crate::has_fsverity_builtin_signatures() {
+        eprintln!("SKIP: kernel does not have CONFIG_FS_VERITY_BUILTIN_SIGNATURES=y");
+        return Ok(());
+    }
+
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let verity_dir = VerityTempDir::new()?;
+    let repo = verity_dir.path().join("repo");
+    let fixture_dir = tempfile::tempdir()?;
+    let (cert, key) = generate_test_cert(fixture_dir.path())?;
+
+    // Inject cert into kernel's .fs-verity keyring
+    let add_output = cmd!(sh, "{cfsctl} keyring add-cert {cert}").read()?;
+    ensure!(
+        add_output.contains("Certificate added"),
+        "keyring add-cert failed: {add_output}"
+    );
+
+    // Pull an image with real verity (no --insecure)
+    let oci_layout = create_oci_layout(fixture_dir.path())?;
+    pull_oci_image_verity(&sh, &cfsctl, &repo, &oci_layout, "test-image")?;
+
+    // Sign the image
+    let sign_output = cmd!(
+        sh,
+        "{cfsctl} --repo {repo} oci sign test-image --cert {cert} --key {key}"
+    )
+    .read()?;
+    ensure!(
+        sign_output.contains("sha256:"),
+        "expected artifact digest in sign output, got: {sign_output}"
+    );
+
+    // Verify the image with the cert
+    let verify_output = cmd!(
+        sh,
+        "{cfsctl} --repo {repo} oci verify test-image --cert {cert}"
+    )
+    .read()?;
+    ensure!(
+        verify_output.contains("verified"),
+        "expected verification success, got: {verify_output}"
+    );
+
+    Ok(())
+}
+integration_test!(privileged_keyring_and_verify_with_verity);
