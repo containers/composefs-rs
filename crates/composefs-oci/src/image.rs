@@ -145,6 +145,56 @@ pub fn compute_merged_digest<ObjectID: FsVerityHashValue>(
     Ok(fs.compute_image_id())
 }
 
+/// Compute per-layer EROFS images and their fs-verity digests.
+///
+/// Returns one `(erofs_bytes, digest)` pair per OCI layer, in manifest order.
+/// This is the same as `compute_per_layer_digests` but preserves the raw EROFS
+/// bytes for inclusion in composefs artifacts.
+///
+/// **Security note**: When `config_verity` is `None`, layer content is not verified against
+/// the config's diff_ids. Callers MUST provide a trusted `config_verity` when generating
+/// images that will be used in signature artifacts.
+#[context("Generating per-layer EROFS images")]
+pub fn generate_per_layer_images<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    config_name: &str,
+    config_verity: Option<&ObjectID>,
+) -> Result<Vec<(Box<[u8]>, ObjectID)>> {
+    let (config, map) = crate::open_config(repo, config_name, config_verity)?;
+
+    let mut results = Vec::with_capacity(config.rootfs().diff_ids().len());
+
+    for diff_id in config.rootfs().diff_ids() {
+        let layer_verity = map
+            .get(diff_id.as_str())
+            .context("OCI config splitstream missing named ref to layer")?;
+
+        let mut single_fs = FileSystem::new(Stat::uninitialized());
+        let mut layer_stream =
+            repo.open_stream("", Some(layer_verity), Some(TAR_LAYER_CONTENT_TYPE))?;
+        while let Some(entry) = crate::tar::get_entry(&mut layer_stream)? {
+            process_entry(&mut single_fs, entry)?;
+        }
+        results.push(single_fs.generate_erofs_image());
+    }
+
+    Ok(results)
+}
+
+/// Generate the merged EROFS image and its fs-verity digest.
+///
+/// This is the same as `compute_merged_digest` but preserves the raw EROFS
+/// bytes for inclusion in composefs artifacts.
+#[context("Generating merged EROFS image")]
+pub fn generate_merged_image<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    config_name: &str,
+    config_verity: Option<&ObjectID>,
+) -> Result<(Box<[u8]>, ObjectID)> {
+    let fs = create_filesystem(repo, config_name, config_verity)?;
+    Ok(fs.generate_erofs_image())
+}
+
 /// Creates a filesystem from the given OCI container.  No special transformations are performed to
 /// make the filesystem bootable.
 ///

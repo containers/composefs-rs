@@ -840,17 +840,17 @@ where
 
                 let config_digest = img.config_digest().to_string();
 
-                let merged_digest: ObjectID =
-                    composefs_oci::compute_merged_digest(&repo, &config_digest, None)?;
-
                 let algorithm = match ObjectID::ALGORITHM {
                     1 => composefs::fsverity::algorithm::SHA256_12,
                     2 => composefs::fsverity::algorithm::SHA512_12,
                     _ => anyhow::bail!("unsupported hash algorithm {}", ObjectID::ALGORITHM),
                 };
 
-                let per_layer_digests =
-                    composefs_oci::compute_per_layer_digests(&repo, &config_digest, None)?;
+                let per_layer_images =
+                    composefs_oci::generate_per_layer_images(&repo, &config_digest, None)?;
+
+                let (merged_erofs, merged_digest) =
+                    composefs_oci::generate_merged_image(&repo, &config_digest, None)?;
 
                 let cert_pem = std::fs::read(cert).context("failed to read certificate file")?;
                 let key_pem = std::fs::read(key).context("failed to read private key file")?;
@@ -870,7 +870,21 @@ where
                 let mut builder =
                     composefs_oci::signature::SignatureArtifactBuilder::new(algorithm, subject);
 
-                for digest in &per_layer_digests {
+                // Add EROFS layers first (per erofs-alongside spec)
+                let erofs_data_and_digests: Vec<(Vec<u8>, String)> = per_layer_images
+                    .iter()
+                    .map(|(data, digest)| (data.to_vec(), digest.to_hex()))
+                    .collect();
+                builder.add_erofs_layers(&erofs_data_and_digests)?;
+
+                builder.add_erofs_entry(composefs_oci::signature::ErofsEntry {
+                    erofs_type: composefs_oci::signature::ErofsEntryType::Merged,
+                    digest: merged_digest.to_hex(),
+                    data: Some(merged_erofs.to_vec()),
+                })?;
+
+                // Then add signature entries
+                for (_, digest) in &per_layer_images {
                     let sig = signing_key.sign(digest)?;
                     builder.add_entry(composefs_oci::signature::SignatureEntry {
                         sig_type: composefs_oci::signature::SignatureType::Layer,

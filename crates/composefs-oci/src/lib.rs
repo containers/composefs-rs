@@ -36,7 +36,10 @@ use crate::skopeo::{OCI_CONFIG_CONTENT_TYPE, TAR_LAYER_CONTENT_TYPE};
 use crate::tar::get_entry;
 
 // Re-export key types for convenience
-pub use image::{compute_merged_digest, compute_per_layer_digests};
+pub use image::{
+    compute_merged_digest, compute_per_layer_digests, generate_merged_image,
+    generate_per_layer_images,
+};
 pub use oci_image::{
     add_referrer, export_referrers_to_oci_layout, layer_dumpfile, layer_info, layer_tar,
     list_images, list_referrers, list_refs, remove_referrer, remove_referrers_for_subject,
