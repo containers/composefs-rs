@@ -595,7 +595,10 @@ where
                         let layer_descriptors = artifact_image.layer_descriptors();
                         let mut layer_idx = 0usize;
 
-                        for (entry_idx, entry) in parsed.entries.iter().enumerate() {
+                        // Signature entries start after EROFS entries in the layer list
+                        let sig_layer_offset = parsed.erofs_entries.len();
+
+                        for (entry_idx, entry) in parsed.signature_entries.iter().enumerate() {
                             let expected_hex = match entry.sig_type {
                                 composefs_oci::signature::SignatureType::Layer => {
                                     let expected =
@@ -623,7 +626,7 @@ where
                             }
 
                             let layer_desc = layer_descriptors
-                                .get(entry_idx)
+                                .get(sig_layer_offset + entry_idx)
                                 .context("layer descriptor out of bounds")?;
                             let blob_digest = layer_desc.digest().to_string();
 
@@ -955,8 +958,9 @@ where
 
                     let layer_descriptors = artifact_image.layer_descriptors();
                     let mut layer_idx = 0usize;
+                    let sig_layer_offset = parsed.erofs_entries.len();
 
-                    for (entry_idx, entry) in parsed.entries.iter().enumerate() {
+                    for (entry_idx, entry) in parsed.signature_entries.iter().enumerate() {
                         let (label, expected_hex) = match entry.sig_type {
                             composefs_oci::signature::SignatureType::Layer => {
                                 let lbl = format!("  layer[{layer_idx}]:");
@@ -990,7 +994,7 @@ where
 
                         if let Some(ref verifier) = verifier {
                             let layer_desc = layer_descriptors
-                                .get(entry_idx)
+                                .get(sig_layer_offset + entry_idx)
                                 .context("layer descriptor out of bounds")?;
                             let blob_digest = layer_desc.digest().to_string();
 

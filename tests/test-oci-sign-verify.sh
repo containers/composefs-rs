@@ -319,8 +319,8 @@ test_start "Artifact has correct artifactType"
 ARTIFACT_HASH=$(cat "$TMPDIR/busybox-oci/index.json" 2>/dev/null | grep -o '"sha256:[a-f0-9]*"' | tail -1 | tr -d '"' | sed 's/sha256://' || true)
 if [ -n "$ARTIFACT_HASH" ] && [ -f "$TMPDIR/busybox-oci/blobs/sha256/$ARTIFACT_HASH" ]; then
     ARTIFACT_MANIFEST=$(cat "$TMPDIR/busybox-oci/blobs/sha256/$ARTIFACT_HASH")
-    if echo "$ARTIFACT_MANIFEST" | grep -q '"application/vnd.composefs.signature.v1"'; then
-        pass "artifactType is application/vnd.composefs.signature.v1"
+    if echo "$ARTIFACT_MANIFEST" | grep -q '"application/vnd.composefs.erofs-alongside.v1"'; then
+        pass "artifactType is application/vnd.composefs.erofs-alongside.v1"
     else
         fail "Incorrect artifactType"
         echo "  Manifest: $ARTIFACT_MANIFEST"

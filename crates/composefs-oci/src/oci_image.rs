@@ -1257,7 +1257,7 @@ fn read_config_blob<ObjectID: FsVerityHashValue>(
 /// * `repo` - The composefs repository to import into
 /// * `oci_layout_path` - Path to the OCI layout directory
 /// * `subject_digest` - The manifest digest of the subject image (sha256:...)
-/// * `artifact_type` - The artifactType to filter on (e.g., "application/vnd.composefs.signature.v1")
+/// * `artifact_type` - The artifactType to filter on (e.g., "application/vnd.composefs.erofs-alongside.v1")
 ///
 /// # Returns
 ///
