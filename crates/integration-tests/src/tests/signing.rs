@@ -364,3 +364,363 @@ fn test_pull_require_signature_with_sig() -> Result<()> {
     Ok(())
 }
 integration_test!(test_pull_require_signature_with_sig);
+
+// ---------------------------------------------------------------------------
+// Artifact structure & pipeline tests
+// ---------------------------------------------------------------------------
+
+/// Helper: sign an image and export the artifact to an OCI layout, returning
+/// the parsed artifact manifest and the export directory path.
+fn sign_and_export() -> Result<(serde_json::Value, tempfile::TempDir, tempfile::TempDir)> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let oci_layout = create_oci_layout(fixture_dir.path())?;
+    let cert_dir = tempfile::tempdir()?;
+    let (cert, key) = generate_test_cert(cert_dir.path())?;
+
+    pull_oci_image(&sh, &cfsctl, repo, &oci_layout, "test-image")?;
+
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci sign test-image --cert {cert} --key {key}"
+    )
+    .read()?;
+
+    let export_dir = tempfile::tempdir()?;
+    let export = export_dir.path();
+
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci export-signatures test-image {export}"
+    )
+    .read()?;
+
+    // Parse the OCI index to find the artifact manifest
+    let index: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(export.join("index.json"))?)?;
+    let manifest_desc = &index["manifests"]
+        .as_array()
+        .expect("expected manifests array")[0];
+    let manifest_digest = manifest_desc["digest"]
+        .as_str()
+        .expect("expected digest string");
+    let hash = manifest_digest
+        .strip_prefix("sha256:")
+        .expect("expected sha256: prefix");
+    let manifest_path = export.join("blobs").join("sha256").join(hash);
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(manifest_path)?)?;
+
+    Ok((manifest, export_dir, repo_dir))
+}
+
+fn test_sign_artifact_contains_erofs_layers() -> Result<()> {
+    let (manifest, _export_dir, _repo_dir) = sign_and_export()?;
+
+    // Check artifactType
+    let artifact_type = manifest["artifactType"]
+        .as_str()
+        .expect("expected artifactType");
+    assert_eq!(
+        artifact_type, "application/vnd.composefs.erofs-alongside.v1",
+        "unexpected artifactType"
+    );
+
+    let layers = manifest["layers"]
+        .as_array()
+        .expect("expected layers array");
+    assert!(!layers.is_empty(), "expected non-empty layers");
+
+    let erofs_layers: Vec<&serde_json::Value> = layers
+        .iter()
+        .filter(|l| l["mediaType"].as_str() == Some("application/vnd.composefs.v1.erofs"))
+        .collect();
+    let sig_layers: Vec<&serde_json::Value> = layers
+        .iter()
+        .filter(|l| l["mediaType"].as_str() == Some("application/vnd.composefs.signature.v1+pkcs7"))
+        .collect();
+
+    assert!(
+        !erofs_layers.is_empty(),
+        "expected at least one EROFS layer"
+    );
+    assert!(
+        !sig_layers.is_empty(),
+        "expected at least one signature layer"
+    );
+
+    // EROFS layers must come before signature layers in the manifest
+    let last_erofs_idx = layers
+        .iter()
+        .rposition(|l| l["mediaType"].as_str() == Some("application/vnd.composefs.v1.erofs"))
+        .unwrap();
+    let first_sig_idx = layers
+        .iter()
+        .position(|l| {
+            l["mediaType"].as_str() == Some("application/vnd.composefs.signature.v1+pkcs7")
+        })
+        .unwrap();
+    assert!(
+        last_erofs_idx < first_sig_idx,
+        "EROFS layers (last at {last_erofs_idx}) must precede signature layers (first at {first_sig_idx})"
+    );
+
+    // Each EROFS layer has composefs.erofs.type annotation ("layer" or "merged")
+    for layer in &erofs_layers {
+        let annotations = layer["annotations"]
+            .as_object()
+            .expect("expected annotations");
+        let erofs_type = annotations
+            .get("composefs.erofs.type")
+            .and_then(|v| v.as_str())
+            .expect("expected composefs.erofs.type annotation");
+        assert!(
+            erofs_type == "layer" || erofs_type == "merged",
+            "unexpected composefs.erofs.type value: {erofs_type}"
+        );
+    }
+
+    // Each signature layer has composefs.signature.type annotation
+    for layer in &sig_layers {
+        let annotations = layer["annotations"]
+            .as_object()
+            .expect("expected annotations");
+        assert!(
+            annotations.contains_key("composefs.signature.type"),
+            "signature layer missing composefs.signature.type annotation"
+        );
+    }
+
+    // Each layer has a valid hex composefs.digest annotation
+    for layer in layers {
+        let annotations = layer["annotations"]
+            .as_object()
+            .expect("expected annotations");
+        let digest = annotations
+            .get("composefs.digest")
+            .and_then(|v| v.as_str())
+            .expect("expected composefs.digest annotation");
+        assert!(
+            !digest.is_empty() && digest.chars().all(|c| c.is_ascii_hexdigit()),
+            "composefs.digest is not valid hex: {digest}"
+        );
+    }
+
+    // The OCI layout creates 1 layer, so we expect:
+    //   - 2 EROFS layers (1 per OCI layer + 1 merged)
+    //   - 2 signature layers (1 per OCI layer + 1 merged)
+    assert_eq!(
+        erofs_layers.len(),
+        2,
+        "expected 2 EROFS layers (1 layer + 1 merged), got {}",
+        erofs_layers.len()
+    );
+    assert_eq!(
+        sig_layers.len(),
+        2,
+        "expected 2 signature layers (1 layer + 1 merged), got {}",
+        sig_layers.len()
+    );
+
+    // Manifest must have composefs.algorithm annotation
+    let manifest_annotations = manifest["annotations"]
+        .as_object()
+        .expect("expected manifest-level annotations");
+    assert!(
+        manifest_annotations.contains_key("composefs.algorithm"),
+        "manifest missing composefs.algorithm annotation"
+    );
+
+    Ok(())
+}
+integration_test!(test_sign_artifact_contains_erofs_layers);
+
+fn test_sign_erofs_blobs_nonempty() -> Result<()> {
+    let (manifest, export_dir, _repo_dir) = sign_and_export()?;
+    let export = export_dir.path();
+
+    let layers = manifest["layers"]
+        .as_array()
+        .expect("expected layers array");
+
+    let erofs_layers: Vec<&serde_json::Value> = layers
+        .iter()
+        .filter(|l| l["mediaType"].as_str() == Some("application/vnd.composefs.v1.erofs"))
+        .collect();
+
+    assert!(!erofs_layers.is_empty(), "no EROFS layers found");
+
+    for layer in &erofs_layers {
+        let digest = layer["digest"]
+            .as_str()
+            .expect("expected digest on EROFS layer");
+        let hash = digest
+            .strip_prefix("sha256:")
+            .expect("expected sha256: prefix on layer digest");
+        let blob_path = export.join("blobs").join("sha256").join(hash);
+        let metadata = std::fs::metadata(&blob_path)
+            .unwrap_or_else(|_| panic!("EROFS blob not found at {}", blob_path.display()));
+        assert!(
+            metadata.len() > 0,
+            "EROFS blob {} is empty (0 bytes)",
+            blob_path.display()
+        );
+    }
+
+    Ok(())
+}
+integration_test!(test_sign_erofs_blobs_nonempty);
+
+fn test_seal_and_sign_roundtrip() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let oci_layout = create_oci_layout(fixture_dir.path())?;
+    let cert_dir = tempfile::tempdir()?;
+    let (cert, key) = generate_test_cert(cert_dir.path())?;
+
+    // 1. Pull
+    pull_oci_image(&sh, &cfsctl, repo, &oci_layout, "test-image")?;
+
+    // 2. Sign
+    let sign_output = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci sign test-image --cert {cert} --key {key}"
+    )
+    .read()?;
+    assert!(
+        sign_output.contains("sha256:"),
+        "sign should produce artifact digest, got: {sign_output}"
+    );
+
+    // 3. Verify
+    let verify_output = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci verify test-image --cert {cert}"
+    )
+    .read()?;
+    assert!(
+        verify_output.contains("verified"),
+        "verify should succeed, got: {verify_output}"
+    );
+
+    // 4. Export
+    let export_dir = tempfile::tempdir()?;
+    let export = export_dir.path();
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci export-signatures test-image {export}"
+    )
+    .read()?;
+
+    // 5. Parse and validate the exported artifact manifest
+    let index: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(export.join("index.json"))?)?;
+    let manifests = index["manifests"]
+        .as_array()
+        .expect("expected manifests array");
+    assert!(
+        !manifests.is_empty(),
+        "expected at least one manifest in exported OCI layout"
+    );
+
+    let manifest_desc = &manifests[0];
+    let hash = manifest_desc["digest"]
+        .as_str()
+        .expect("expected digest")
+        .strip_prefix("sha256:")
+        .expect("expected sha256: prefix");
+    let artifact_manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+        export.join("blobs").join("sha256").join(hash),
+    )?)?;
+
+    // Validate artifact structure
+    assert_eq!(
+        artifact_manifest["artifactType"].as_str(),
+        Some("application/vnd.composefs.erofs-alongside.v1"),
+    );
+    let layers = artifact_manifest["layers"]
+        .as_array()
+        .expect("expected layers");
+    let has_erofs = layers
+        .iter()
+        .any(|l| l["mediaType"].as_str() == Some("application/vnd.composefs.v1.erofs"));
+    let has_sigs = layers
+        .iter()
+        .any(|l| l["mediaType"].as_str() == Some("application/vnd.composefs.signature.v1+pkcs7"));
+    assert!(has_erofs, "artifact should contain EROFS layers");
+    assert!(has_sigs, "artifact should contain signature layers");
+
+    // 6. Verify the image has referrers via oci images --json
+    let images_json = cmd!(sh, "{cfsctl} --insecure --repo {repo} oci images --json").read()?;
+    let images: Vec<serde_json::Value> = serde_json::from_str(&images_json)?;
+    let test_image = images
+        .iter()
+        .find(|img| img["name"].as_str() == Some("test-image"))
+        .expect("test-image not found in oci images output");
+    let referrer_count = test_image["referrerCount"]
+        .as_u64()
+        .expect("expected referrerCount");
+    assert!(
+        referrer_count > 0,
+        "expected referrer_count > 0, got {referrer_count}"
+    );
+
+    Ok(())
+}
+integration_test!(test_seal_and_sign_roundtrip);
+
+fn test_inspect_shows_referrer_info() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let oci_layout = create_oci_layout(fixture_dir.path())?;
+    let cert_dir = tempfile::tempdir()?;
+    let (cert, key) = generate_test_cert(cert_dir.path())?;
+
+    pull_oci_image(&sh, &cfsctl, repo, &oci_layout, "test-image")?;
+
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci sign test-image --cert {cert} --key {key}"
+    )
+    .read()?;
+
+    // Inspect the image and parse JSON output
+    let inspect_json = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci inspect test-image"
+    )
+    .read()?;
+    let inspect: serde_json::Value = serde_json::from_str(&inspect_json)?;
+
+    // The "referrers" array should have at least one entry
+    let referrers = inspect["referrers"]
+        .as_array()
+        .expect("expected referrers array in inspect output");
+    assert!(
+        !referrers.is_empty(),
+        "expected at least one referrer after signing"
+    );
+
+    // Each referrer should have a digest field
+    for referrer in referrers {
+        let digest = referrer["digest"]
+            .as_str()
+            .expect("expected digest field in referrer");
+        assert!(
+            digest.starts_with("sha256:"),
+            "referrer digest should start with sha256:, got: {digest}"
+        );
+    }
+
+    Ok(())
+}
+integration_test!(test_inspect_shows_referrer_info);
