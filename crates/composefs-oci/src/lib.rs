@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 pub mod image;
+pub mod layer;
 pub mod oci_image;
 pub mod skopeo;
 pub mod tar;
