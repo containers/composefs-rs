@@ -1,27 +1,29 @@
-# Containerfile for composefs-rs
+# Containerfile for composefs-rs integration testing
 #
 # Builds cfsctl and integration test binaries, then produces a bootable
 # (bootc-compatible) container image suitable for privileged integration
 # testing via `bcvk ephemeral run-ssh`.
 #
 # Build:
-#   podman build --tag composefs-rs-test -f Containerfile .
+#   podman build --tag composefs-rs-test .
+#   podman build --build-arg base_image=ghcr.io/bootcrew/debian-bootc:latest --tag composefs-rs-test-debian .
 #
 # Uses BuildKit-style cache mounts for fast incremental Rust builds.
+# Note: when switching between base images locally, run
+#   podman system prune --volumes
+# to clear stale build caches that may be incompatible across distros.
+
+ARG base_image=quay.io/centos-bootc/centos-bootc:stream10
 
 # -- source snapshot (keeps layer graph clean) --
 FROM scratch AS src
 COPY . /src
 
 # -- build stage --
-FROM quay.io/centos-bootc/centos-bootc:stream10 AS build
+FROM ${base_image} AS build
 
-RUN dnf install -y \
-        rust cargo clippy rustfmt \
-        openssl-devel \
-        gcc \
-        composefs \
-    && dnf clean all
+COPY --from=src /src/contrib /src/contrib
+RUN /src/contrib/packaging/install-build-deps.sh
 
 COPY --from=src /src /src
 WORKDIR /src
@@ -42,9 +44,10 @@ RUN --network=none \
     cp /src/target/release/cfsctl-integration-tests /usr/bin/cfsctl-integration-tests
 
 # -- final bootable image --
-FROM quay.io/centos-bootc/centos-bootc:stream10
+FROM ${base_image}
 
-RUN dnf install -y composefs openssl && dnf clean all
+COPY --from=src /src/contrib /src/contrib
+RUN /src/contrib/packaging/install-test-deps.sh && rm -rf /src
 
 COPY --from=build /usr/bin/cfsctl /usr/bin/cfsctl
 COPY --from=build /usr/bin/cfsctl-integration-tests /usr/bin/cfsctl-integration-tests
