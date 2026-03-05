@@ -31,7 +31,13 @@ fmt:
 # Run all checks (clippy + fmt + test)
 check: clippy fmt-check test
 
-COMPOSEFS_TEST_IMAGE := "localhost/composefs-rs-test:latest"
+# Base image for test container builds.
+# Override to test on different distros:
+#   just base_image=ghcr.io/bootcrew/debian-bootc:latest integration-container
+base_image := env("COMPOSEFS_BASE_IMAGE", "quay.io/centos-bootc/centos-bootc:stream10")
+
+# Derive test image name from base_image
+_test_image := if base_image =~ "debian" { "localhost/composefs-rs-test-debian:latest" } else { "localhost/composefs-rs-test:latest" }
 
 # Run integration tests (builds cfsctl first); pass extra args to the harness
 test-integration *ARGS: build
@@ -43,11 +49,11 @@ integration-unprivileged: build
 
 # Build the test container image for VM-based integration tests
 integration-container-build:
-    podman build -t {{COMPOSEFS_TEST_IMAGE}} -f Containerfile .
+    podman build --build-arg base_image={{base_image}} -t {{_test_image}} .
 
 # Run all integration tests; privileged tests dispatch to a bcvk VM
 integration-container: build integration-container-build
-    COMPOSEFS_TEST_IMAGE={{COMPOSEFS_TEST_IMAGE}} \
+    COMPOSEFS_TEST_IMAGE={{_test_image}} \
         CFSCTL_PATH=$(pwd)/target/debug/cfsctl \
         cargo run -p integration-tests
 
