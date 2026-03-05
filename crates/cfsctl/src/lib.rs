@@ -244,6 +244,16 @@ enum OciCommand {
         #[clap(long)]
         cert: Option<PathBuf>,
     },
+    /// Export an OCI image to an OCI layout directory
+    Push {
+        /// Image reference (tag name)
+        image: String,
+        /// Destination OCI layout path (optionally prefixed with oci:)
+        destination: String,
+        /// Also export signature/composefs artifacts
+        #[clap(long)]
+        signatures: bool,
+    },
     /// Export signature artifacts for an image to an OCI layout directory
     ExportSignatures {
         /// Image reference (tag name)
@@ -1052,6 +1062,55 @@ where
 
                 if verifier.is_some() {
                     println!("\nVerification passed ({verified_count} signatures verified)");
+                }
+            }
+            OciCommand::Push {
+                ref image,
+                ref destination,
+                signatures,
+            } => {
+                // Parse destination: strip "oci:" prefix, handle "oci:/path:tag" syntax
+                let dest = destination.strip_prefix("oci:").unwrap_or(destination);
+
+                // Parse optional tag from path — only split on the last colon if
+                // it isn't part of an absolute path (i.e. not position 0 like "/tmp/foo")
+                let (path_str, dest_tag) = if let Some(colon_pos) = dest.rfind(':') {
+                    // Don't split on the colon right after a drive letter or at position 0
+                    if colon_pos > 0
+                        && !dest[..colon_pos].ends_with('/')
+                        && !dest[colon_pos + 1..].contains('/')
+                    {
+                        (&dest[..colon_pos], Some(&dest[colon_pos + 1..]))
+                    } else {
+                        (dest, None)
+                    }
+                } else {
+                    (dest, None)
+                };
+
+                let oci_layout_path = std::path::Path::new(path_str);
+                std::fs::create_dir_all(oci_layout_path).with_context(|| {
+                    format!(
+                        "creating destination directory: {}",
+                        oci_layout_path.display()
+                    )
+                })?;
+
+                let img = composefs_oci::OciImage::open_ref(&repo, image)?;
+                let tag = dest_tag.or(Some(image));
+
+                composefs_oci::export_image_to_oci_layout(
+                    &repo,
+                    &img,
+                    oci_layout_path,
+                    tag,
+                    signatures,
+                )
+                .context("exporting image to OCI layout")?;
+
+                println!("Exported {} to {}", image, oci_layout_path.display());
+                if let Some(t) = tag {
+                    println!("Tagged as {t}");
                 }
             }
             OciCommand::ExportSignatures {

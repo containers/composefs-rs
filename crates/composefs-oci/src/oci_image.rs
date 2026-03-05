@@ -1067,6 +1067,173 @@ pub fn layer_tar<ObjectID: FsVerityHashValue>(
 // OCI Layout Export
 // =============================================================================
 
+/// Export an OCI image to an OCI layout directory.
+///
+/// Writes the manifest, config, and all layers (as uncompressed tar) to the
+/// OCI layout. Since composefs stores layers as uncompressed splitstreams,
+/// the exported manifest is rewritten with uncompressed layer descriptors.
+///
+/// If `tag` is provided, the manifest is tagged in the index.
+/// If `include_referrers` is true, also exports any referrer artifacts
+/// (composefs signature artifacts).
+pub fn export_image_to_oci_layout<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    image: &OciImage<ObjectID>,
+    oci_layout_path: &std::path::Path,
+    tag: Option<&str>,
+    include_referrers: bool,
+) -> Result<()> {
+    use oci_spec::image::{
+        DescriptorBuilder, Digest as OciDigest, ImageIndex, ImageIndexBuilder, ImageManifest,
+        ImageManifestBuilder,
+    };
+    use std::fs;
+    use std::io::Write;
+    use std::str::FromStr;
+
+    let blobs_dir = oci_layout_path.join("blobs").join("sha256");
+    fs::create_dir_all(&blobs_dir).context("creating blobs/sha256 directory")?;
+
+    // Write the oci-layout marker file
+    let layout_path = oci_layout_path.join("oci-layout");
+    if !layout_path.exists() {
+        fs::write(&layout_path, r#"{"imageLayoutVersion":"1.0.0"}"#)
+            .context("writing oci-layout file")?;
+    }
+
+    // 1. Write the config blob
+    let config_json = image.read_config_json(repo)?;
+    let config_digest = hash(&config_json);
+    let config_hash = config_digest
+        .strip_prefix("sha256:")
+        .context("config digest must be sha256")?;
+    let config_blob_path = blobs_dir.join(config_hash);
+    if !config_blob_path.exists() {
+        fs::write(&config_blob_path, &config_json).context("writing config blob")?;
+    }
+
+    // 2. Write each tar layer and build new descriptors
+    let diff_ids = image.layer_diff_ids();
+    let mut new_layer_descriptors = Vec::with_capacity(diff_ids.len());
+
+    for diff_id in &diff_ids {
+        // Reconstitute the tar stream into a buffer
+        let mut tar_data = Vec::new();
+        layer_tar(repo, diff_id, &mut tar_data)
+            .with_context(|| format!("reconstituting layer tar for {diff_id}"))?;
+
+        let layer_digest = hash(&tar_data);
+        let layer_hash = layer_digest
+            .strip_prefix("sha256:")
+            .context("layer digest must be sha256")?;
+        let layer_blob_path = blobs_dir.join(layer_hash);
+        if !layer_blob_path.exists() {
+            fs::write(&layer_blob_path, &tar_data).context("writing layer blob")?;
+        }
+
+        let descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::ImageLayer)
+            .digest(OciDigest::from_str(&layer_digest).context("parsing layer digest")?)
+            .size(tar_data.len() as u64)
+            .build()
+            .context("building layer descriptor")?;
+        new_layer_descriptors.push(descriptor);
+    }
+
+    // 3. Build a new manifest with the uncompressed layer descriptors
+    let original_manifest = image.manifest();
+    let config_descriptor = DescriptorBuilder::default()
+        .media_type(original_manifest.config().media_type().clone())
+        .digest(OciDigest::from_str(&config_digest).context("parsing config digest")?)
+        .size(config_json.len() as u64)
+        .build()
+        .context("building config descriptor")?;
+
+    let mut manifest_builder = ImageManifestBuilder::default()
+        .schema_version(original_manifest.schema_version())
+        .media_type(MediaType::ImageManifest)
+        .config(config_descriptor)
+        .layers(new_layer_descriptors);
+
+    if let Some(annotations) = original_manifest.annotations() {
+        manifest_builder = manifest_builder.annotations(annotations.clone());
+    }
+
+    let new_manifest: ImageManifest = manifest_builder.build().context("building manifest")?;
+
+    let manifest_json = new_manifest.to_string()?;
+    let manifest_json_bytes = manifest_json.as_bytes();
+    let manifest_digest = hash(manifest_json_bytes);
+    let manifest_hash = manifest_digest
+        .strip_prefix("sha256:")
+        .context("manifest digest must be sha256")?;
+    let manifest_blob_path = blobs_dir.join(manifest_hash);
+    if !manifest_blob_path.exists() {
+        let mut f = fs::File::create(&manifest_blob_path).context("creating manifest blob file")?;
+        f.write_all(manifest_json_bytes)
+            .context("writing manifest blob")?;
+    }
+
+    // 4. Write/update index.json
+    let index_path = oci_layout_path.join("index.json");
+    let mut index: ImageIndex = if index_path.exists() {
+        ImageIndex::from_file(&index_path)
+            .map_err(|e| anyhow::anyhow!("parsing index.json: {e}"))?
+    } else {
+        ImageIndexBuilder::default()
+            .schema_version(2u32)
+            .manifests(Vec::new())
+            .build()
+            .context("creating default index")?
+    };
+
+    // Build the manifest descriptor for the index
+    let mut desc_builder = DescriptorBuilder::default()
+        .media_type(MediaType::ImageManifest)
+        .digest(OciDigest::from_str(&manifest_digest).context("parsing manifest digest")?)
+        .size(manifest_json_bytes.len() as u64);
+
+    if let Some(tag_name) = tag {
+        let mut annotations = HashMap::new();
+        annotations.insert(
+            "org.opencontainers.image.ref.name".to_string(),
+            tag_name.to_string(),
+        );
+        desc_builder = desc_builder.annotations(annotations);
+    }
+
+    let manifest_desc = desc_builder
+        .build()
+        .context("building index manifest descriptor")?;
+
+    // Check if already in index (by digest)
+    let already_in_index = index
+        .manifests()
+        .iter()
+        .any(|d| d.digest().to_string() == manifest_digest);
+
+    if !already_in_index {
+        let mut manifests = index.manifests().clone();
+        manifests.push(manifest_desc);
+        index = ImageIndexBuilder::default()
+            .schema_version(index.schema_version())
+            .manifests(manifests)
+            .build()
+            .context("rebuilding index")?;
+    }
+
+    index
+        .to_file_pretty(&index_path)
+        .map_err(|e| anyhow::anyhow!("writing index.json: {e}"))?;
+
+    // 5. Optionally export referrers
+    if include_referrers {
+        export_referrers_to_oci_layout(repo, image.manifest_digest(), oci_layout_path)?;
+    }
+
+    Ok(())
+}
+
 /// Exports referrer artifacts (e.g., signature artifacts) for a subject image
 /// to an OCI layout directory.
 ///
