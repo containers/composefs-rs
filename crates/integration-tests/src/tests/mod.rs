@@ -2,3 +2,4 @@
 
 pub mod cli;
 pub mod privileged;
+pub mod signing;

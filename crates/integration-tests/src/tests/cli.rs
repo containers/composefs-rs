@@ -8,7 +8,7 @@
 use anyhow::Result;
 use xshell::{cmd, Shell};
 
-use crate::{cfsctl, create_test_rootfs, integration_test};
+use crate::{cfsctl, create_oci_layout, create_test_rootfs, integration_test};
 
 fn test_gc_empty_repo() -> Result<()> {
     let sh = Shell::new()?;
@@ -193,65 +193,6 @@ fn test_oci_images_json_empty_repo() -> Result<()> {
 }
 integration_test!(test_oci_images_json_empty_repo);
 
-/// Creates a minimal OCI image layout directory for testing using the ocidir crate.
-///
-/// Returns the path to the OCI layout directory.
-fn create_oci_layout(parent: &std::path::Path) -> Result<std::path::PathBuf> {
-    use cap_std_ext::cap_std;
-    use ocidir::oci_spec::image::{
-        ImageConfigurationBuilder, Platform, PlatformBuilder, RootFsBuilder,
-    };
-
-    let oci_dir = parent.join("oci-image");
-    std::fs::create_dir_all(&oci_dir)?;
-
-    let dir = cap_std::fs::Dir::open_ambient_dir(&oci_dir, cap_std::ambient_authority())?;
-    let ocidir = ocidir::OciDir::ensure(dir)?;
-
-    // Create a new empty manifest
-    let mut manifest = ocidir.new_empty_manifest()?.build()?;
-
-    // Create config with architecture and OS
-    let rootfs = RootFsBuilder::default()
-        .typ("layers")
-        .diff_ids(Vec::<String>::new())
-        .build()?;
-    let mut config = ImageConfigurationBuilder::default()
-        .architecture("amd64")
-        .os("linux")
-        .rootfs(rootfs)
-        .build()?;
-
-    // Create a simple layer with one file
-    let mut layer_builder = ocidir.create_layer(None)?;
-    {
-        let data = b"hello from test layer\n";
-        let mut header = tar::Header::new_gnu();
-        header.set_size(data.len() as u64);
-        header.set_mode(0o644);
-        header.set_uid(0);
-        header.set_gid(0);
-        header.set_mtime(1234567890);
-        header.set_cksum();
-        layer_builder.append_data(&mut header, "hello.txt", &data[..])?;
-    }
-    let layer = layer_builder.into_inner()?.complete()?;
-
-    // Push the layer to manifest and config
-    ocidir.push_layer(&mut manifest, &mut config, layer, "test layer", None);
-
-    // Create platform for the manifest
-    let platform: Platform = PlatformBuilder::default()
-        .architecture("amd64")
-        .os("linux")
-        .build()?;
-
-    // Insert manifest and config into the OCI directory
-    ocidir.insert_manifest_and_config(manifest, config, None, platform)?;
-
-    Ok(oci_dir)
-}
-
 fn test_oci_pull_and_inspect() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
@@ -377,10 +318,9 @@ fn test_oci_layer_inspect() -> Result<()> {
     assert_eq!(info["diffId"], layer_id);
     assert!(info["verity"].as_str().is_some(), "expected verity hash");
     assert!(info["size"].as_u64().unwrap() > 0, "expected non-zero size");
-    assert_eq!(
-        info["entryCount"].as_u64().unwrap(),
-        1,
-        "expected exactly 1 entry (hello.txt)"
+    assert!(
+        info["entryCount"].as_u64().unwrap() >= 1,
+        "expected at least 1 entry"
     );
     // Check splitstream metadata
     let splitstream = info
@@ -414,7 +354,7 @@ fn test_oci_layer_inspect() -> Result<()> {
         let entry = Entry::parse(line)
             .unwrap_or_else(|e| panic!("failed to parse dumpfile line '{line}': {e}"));
 
-        if entry.path.as_ref() == Path::new("/hello.txt") {
+        if entry.path.as_ref() == Path::new("/usr/bin/hello.txt") {
             found_hello_txt = true;
             // Verify it's a regular file with inline content
             match &entry.item {
@@ -433,7 +373,10 @@ fn test_oci_layer_inspect() -> Result<()> {
             assert_eq!(entry.mode, 0o100644, "expected mode 0o100644");
         }
     }
-    assert!(found_hello_txt, "expected to find /hello.txt in dumpfile");
+    assert!(
+        found_hello_txt,
+        "expected to find /usr/bin/hello.txt in dumpfile"
+    );
 
     // Test raw tar output - parse as actual tar and verify contents
     let tar_output = cmd!(sh, "{cfsctl} --insecure --repo {repo} oci layer {layer_id}").output()?;
@@ -442,14 +385,17 @@ fn test_oci_layer_inspect() -> Result<()> {
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?;
-        if path.as_ref() == Path::new("hello.txt") {
+        if path.as_ref() == Path::new("usr/bin/hello.txt") {
             found_in_tar = true;
             let mut content = String::new();
             entry.read_to_string(&mut content)?;
             assert_eq!(content, "hello from test layer\n", "tar content mismatch");
         }
     }
-    assert!(found_in_tar, "expected to find hello.txt in tar output");
+    assert!(
+        found_in_tar,
+        "expected to find usr/bin/hello.txt in tar output"
+    );
 
     Ok(())
 }
