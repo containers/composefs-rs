@@ -197,8 +197,8 @@ enum OciCommand {
     /// Seal a stored OCI image by creating a cloned manifest with embedded verity digest (a.k.a. composefs image object ID)
     /// in the repo, then prints the stream and verity digest of the new sealed manifest
     Seal {
-        #[clap(flatten)]
-        config_opts: OCIConfigOptions,
+        /// Image reference (tag name or manifest digest)
+        image: String,
     },
     /// Mounts a stored and sealed OCI image by looking up its composefs image. Note that the composefs image must be built
     /// and committed to the repo first
@@ -767,16 +767,11 @@ where
                     composefs_oci::layer_tar(&repo, layer, &mut out)?;
                 }
             }
-            OciCommand::Seal {
-                config_opts:
-                    OCIConfigOptions {
-                        ref config_name,
-                        ref config_verity,
-                    },
-            } => {
-                let verity = verity_opt(config_verity)?;
-                let (digest, verity) =
-                    composefs_oci::seal(&Arc::new(repo), config_name, verity.as_ref())?;
+            OciCommand::Seal { ref image } => {
+                let repo = Arc::new(repo);
+                let img = composefs_oci::OciImage::open_ref(&repo, image)?;
+                let config_digest = img.config_digest().to_string();
+                let (digest, verity) = composefs_oci::seal(&repo, &config_digest, None)?;
                 println!("config {digest}");
                 println!("verity {}", verity.to_id());
             }
