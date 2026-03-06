@@ -132,18 +132,19 @@ pub struct InodeXAttrs {
     pub data: [u8],
 }
 
-impl XAttrHeader {
-    /// Calculates the total size of this xattr including padding
-    pub fn calculate_n_elems(&self) -> usize {
-        round_up(self.name_len as usize + self.value_size.get() as usize, 4)
-    }
+/// Calculates the total number of elements for an xattr entry including padding
+fn xattr_n_elems(header: &XAttrHeader) -> usize {
+    round_up(
+        header.name_len as usize + header.value_size.get() as usize,
+        4,
+    )
 }
 
 impl XAttr {
     /// Parses an xattr from a byte slice, returning the xattr and remaining bytes
     pub fn from_prefix(data: &[u8]) -> (&XAttr, &[u8]) {
         let header = XAttrHeader::ref_from_bytes(&data[..4]).unwrap();
-        Self::ref_from_prefix_with_elems(data, header.calculate_n_elems()).unwrap()
+        Self::ref_from_prefix_with_elems(data, xattr_n_elems(header)).unwrap()
     }
 
     /// Returns the attribute name suffix
@@ -376,7 +377,7 @@ impl<'img> Image<'img> {
     pub fn shared_xattr(&self, id: u32) -> &XAttr {
         let xattr_data = &self.xattrs[id as usize * 4..];
         let header = XAttrHeader::ref_from_bytes(&xattr_data[..4]).unwrap();
-        XAttr::ref_from_prefix_with_elems(xattr_data, header.calculate_n_elems())
+        XAttr::ref_from_prefix_with_elems(xattr_data, xattr_n_elems(header))
             .unwrap()
             .0
     }

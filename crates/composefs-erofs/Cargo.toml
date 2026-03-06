@@ -1,0 +1,17 @@
+[package]
+name = "composefs-erofs"
+description = "EROFS format support for composefs"
+publish = false
+
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+zerocopy = { version = "0.8.0", default-features = false, features = ["derive", "std"] }
+
+[lints]
+workspace = true
