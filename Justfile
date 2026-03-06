@@ -38,30 +38,29 @@ fmt:
 check: clippy check-feature-combos fmt-check test
 
 # Base image for test container builds.
-# Override to test on different distros:
-#   just base_image=ghcr.io/bootcrew/debian-bootc:latest integration-container
-base_image := env("COMPOSEFS_BASE_IMAGE", "quay.io/centos-bootc/centos-bootc:stream10")
+# Override to test on a different distro, e.g.:
+#   just base_image=quay.io/centos-bootc/centos-bootc:stream10 test-integration-vm
+base_image := env("COMPOSEFS_BASE_IMAGE", "ghcr.io/bootcrew/debian-bootc:latest")
 
 # Derive test image name from base_image
 _test_image := if base_image =~ "debian" { "localhost/composefs-rs-test-debian:latest" } else { "localhost/composefs-rs-test:latest" }
 
-# Run integration tests (builds cfsctl first); pass extra args to the harness
-test-integration *ARGS: build
-    CFSCTL_PATH=$(pwd)/target/debug/cfsctl cargo run -p integration-tests -- {{ ARGS }}
-
-# Run only the fast unprivileged integration tests (no root, no VM)
-integration-unprivileged: build
+# Run unprivileged integration tests against the cfsctl binary (no root, no VM)
+test-integration: build
     CFSCTL_PATH=$(pwd)/target/debug/cfsctl cargo run -p integration-tests -- --skip privileged_
 
 # Build the test container image for VM-based integration tests
-integration-container-build:
+_integration-container-build:
     podman build --build-arg base_image={{base_image}} -t {{_test_image}} .
 
-# Run all integration tests; privileged tests dispatch to a bcvk VM
-integration-container: build integration-container-build
+# Run all integration tests including privileged VM tests (requires podman + libvirt)
+test-integration-vm: build _integration-container-build
     COMPOSEFS_TEST_IMAGE={{_test_image}} \
         CFSCTL_PATH=$(pwd)/target/debug/cfsctl \
         cargo run -p integration-tests
+
+# Run everything: checks + full integration tests including VM
+ci: check test-integration-vm
 
 # Clean build artifacts
 clean:
