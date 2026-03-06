@@ -29,7 +29,7 @@ jobs:
       - uses: extractions/setup-just@v2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: just integration-unprivileged
+      - run: just test-integration
 
   # Full integration tests: builds a bootc container image, runs all
   # tests (both unprivileged and privileged).  Privileged tests execute
@@ -64,4 +64,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run integration tests (unprivileged + privileged via VM)
-        run: just integration-container
+        run: just test-integration-vm
