@@ -115,7 +115,7 @@ pub async fn import_layer<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     diff_id: &str,
     name: Option<&str>,
-    tar_stream: impl tokio::io::AsyncBufRead + Unpin,
+    tar_stream: impl tokio::io::AsyncRead + Unpin,
 ) -> Result<(ObjectID, ImportStats)> {
     let content_identifier = layer_identifier(diff_id);
 
