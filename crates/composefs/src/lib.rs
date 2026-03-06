@@ -27,3 +27,16 @@ pub mod test;
 /// in the erofs image (and also in splitstreams).  All files with 65 or more bytes (size > MAX)
 /// should be written to the object storage and referred to from the image (and splitstreams).
 pub const INLINE_CONTENT_MAX: usize = 64;
+
+/// Internal constants shared across workspace crates.
+///
+/// Not part of the public API — may change without notice.
+#[doc(hidden)]
+pub mod shared_internals {
+    /// Default I/O buffer capacity for BufWriter/BufReader in streaming paths.
+    ///
+    /// The stdlib default of 8 KiB is suboptimal for large file I/O.
+    /// 64 KiB provides significantly better throughput.
+    /// See <https://github.com/bootc-dev/ocidir-rs/pull/63>.
+    pub const IO_BUF_CAPACITY: usize = 64 * 1024;
+}
