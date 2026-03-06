@@ -34,6 +34,7 @@ use composefs::{
     dumpfile,
     fsverity::FsVerityHashValue,
     repository::{ObjectStoreMethod, Repository},
+    shared_internals::IO_BUF_CAPACITY,
     splitstream::{SplitStreamBuilder, SplitStreamData, SplitStreamReader, SplitStreamWriter},
     tree::{LeafContent, RegularFile, Stat},
     util::{read_exactish, read_exactish_async},
@@ -143,7 +144,7 @@ fn receive_and_finalize_object<ObjectID: FsVerityHashValue>(
 
     // Create tmpfile in the blocking context
     let tmpfile_fd = repo.create_object_tmpfile()?;
-    let mut tmpfile = std::io::BufWriter::new(File::from(tmpfile_fd));
+    let mut tmpfile = std::io::BufWriter::with_capacity(IO_BUF_CAPACITY, File::from(tmpfile_fd));
 
     // Receive chunks and write to tmpfile
     let mut rx = rx;

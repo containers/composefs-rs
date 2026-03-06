@@ -30,6 +30,7 @@ use tokio::{
 use composefs::{
     fsverity::FsVerityHashValue,
     repository::{ObjectStoreMethod, Repository},
+    shared_internals::IO_BUF_CAPACITY,
 };
 
 use crate::{
@@ -197,13 +198,19 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
                 // Tar layers: decompress and split into a splitstream
                 let reader: Box<dyn tokio::io::AsyncBufRead + Unpin + Send> = match media_type {
                     MediaType::ImageLayer | MediaType::ImageLayerNonDistributable => {
-                        Box::new(BufReader::new(progress))
+                        Box::new(BufReader::with_capacity(IO_BUF_CAPACITY, progress))
                     }
                     MediaType::ImageLayerGzip | MediaType::ImageLayerNonDistributableGzip => {
-                        Box::new(BufReader::new(GzipDecoder::new(BufReader::new(progress))))
+                        Box::new(BufReader::with_capacity(
+                            IO_BUF_CAPACITY,
+                            GzipDecoder::new(BufReader::new(progress)),
+                        ))
                     }
                     MediaType::ImageLayerZstd | MediaType::ImageLayerNonDistributableZstd => {
-                        Box::new(BufReader::new(ZstdDecoder::new(BufReader::new(progress))))
+                        Box::new(BufReader::with_capacity(
+                            IO_BUF_CAPACITY,
+                            ZstdDecoder::new(BufReader::new(progress)),
+                        ))
                     }
                     _ => unreachable!("is_tar_media_type returned true"),
                 };
