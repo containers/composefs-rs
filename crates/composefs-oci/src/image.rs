@@ -316,8 +316,8 @@ mod test {
     /// Comprehensive round-trip test: build a busybox-like tar layer via
     /// `build_baseimage()`, import it with `import_layer()`, read it back
     /// with `get_entry()`, and verify every entry type round-trips correctly.
-    #[test]
-    fn test_build_baseimage_roundtrip() -> Result<()> {
+    #[tokio::test]
+    async fn test_build_baseimage_roundtrip() -> Result<()> {
         use composefs::{repository::Repository, test::tempdir, INLINE_CONTENT_MAX};
         use rustix::fs::CWD;
         use std::ffi::OsStr;
@@ -328,7 +328,7 @@ mod test {
         let repo_dir = tempdir();
         let repo = Arc::new(Repository::<Sha256HashValue>::open_path(CWD, &repo_dir)?);
         let (verity, _stats) =
-            crate::import_layer(&repo, &diff_id, Some("layer"), &mut tar_data.as_slice())?;
+            crate::import_layer(&repo, &diff_id, Some("layer"), &tar_data[..]).await?;
 
         let mut stream = repo.open_stream("refs/layer", Some(&verity), None)?;
         let mut entries = vec![];
