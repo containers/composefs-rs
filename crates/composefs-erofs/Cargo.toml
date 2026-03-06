@@ -11,6 +11,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+composefs-types = { workspace = true }
 zerocopy = { version = "0.8.0", default-features = false, features = ["derive", "std"] }
 
 [lints]
