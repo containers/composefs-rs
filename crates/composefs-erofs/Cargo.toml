@@ -11,6 +11,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+anyhow = { version = "1.0.87", default-features = false }
 composefs-types = { workspace = true }
 hex = { version = "0.4.0", default-features = false, features = ["std"] }
 thiserror = { version = "2.0.0", default-features = false }

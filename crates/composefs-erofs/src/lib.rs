@@ -9,6 +9,6 @@
 #![allow(missing_debug_implementations)]
 
 pub mod composefs;
-mod debug;
+pub mod debug;
 pub mod format;
 pub mod reader;
