@@ -51,6 +51,7 @@ use sha2::{Digest, Sha256};
 
 use composefs::{fsverity::FsVerityHashValue, repository::Repository};
 
+use crate::layer::is_tar_media_type;
 use crate::skopeo::{OCI_BLOB_CONTENT_TYPE, OCI_CONFIG_CONTENT_TYPE, OCI_MANIFEST_CONTENT_TYPE};
 
 /// Data and named refs from a splitstream with external object storage.
@@ -550,12 +551,12 @@ pub fn list_images<ObjectID: FsVerityHashValue>(
 /// a signature can reference the fsverity digest of the manifest content directly.
 ///
 /// The manifest becomes a GC root only if a `reference` name is provided.
-pub fn write_manifest<ObjectID: FsVerityHashValue>(
+pub fn write_manifest<ObjectID: FsVerityHashValue, S: AsRef<str>>(
     repo: &Arc<Repository<ObjectID>>,
     manifest: &ImageManifest,
     manifest_digest: &str,
     config_verity: &ObjectID,
-    layer_verities: &HashMap<Box<str>, ObjectID>,
+    layer_verities: &[(S, ObjectID)],
     reference: Option<&str>,
 ) -> Result<(String, ObjectID)> {
     let content_id = manifest_identifier(manifest_digest);
@@ -583,7 +584,7 @@ pub fn write_manifest<ObjectID: FsVerityHashValue>(
     stream.add_named_stream_ref(&config_key, config_verity);
 
     for (diff_id, verity) in layer_verities {
-        stream.add_named_stream_ref(diff_id, verity);
+        stream.add_named_stream_ref(diff_id.as_ref(), verity);
     }
 
     stream.write_external(json_bytes)?;
@@ -605,19 +606,6 @@ pub fn has_manifest<ObjectID: FsVerityHashValue>(
 /// Returns the content identifier for a manifest.
 pub fn manifest_identifier(digest: &str) -> String {
     format!("oci-manifest-{digest}")
-}
-
-/// Returns true if this is a tar-based layer media type.
-pub(crate) fn is_tar_media_type(media_type: &MediaType) -> bool {
-    matches!(
-        media_type,
-        MediaType::ImageLayer
-            | MediaType::ImageLayerGzip
-            | MediaType::ImageLayerZstd
-            | MediaType::ImageLayerNonDistributable
-            | MediaType::ImageLayerNonDistributableGzip
-            | MediaType::ImageLayerNonDistributableZstd
-    )
 }
 
 /// Returns the reference path for an OCI name.
@@ -1148,8 +1136,7 @@ mod test {
             .build()
             .unwrap();
 
-        let mut layer_verities = HashMap::new();
-        layer_verities.insert(layer_digest.into_boxed_str(), layer_verity);
+        let layer_verities = [(layer_digest, layer_verity)];
 
         let manifest_json = manifest.to_string().unwrap();
         let manifest_digest = hash(manifest_json.as_bytes());
@@ -1412,9 +1399,8 @@ mod test {
             .build()
             .unwrap();
 
-        let mut layer_verities = HashMap::new();
         // For artifacts, we use the blob digest as the "diff_id" equivalent
-        layer_verities.insert(blob_digest.clone().into_boxed_str(), blob_verity.clone());
+        let layer_verities = [(blob_digest.clone(), blob_verity.clone())];
 
         let manifest_json = manifest.to_string().unwrap();
         let manifest_digest = hash(manifest_json.as_bytes());
@@ -1525,8 +1511,7 @@ mod test {
 
         // Store manifest — layer_verities uses the layer digest as key
         // (same logic as ensure_config_with_layers when !is_image_config)
-        let mut layer_verities = HashMap::new();
-        layer_verities.insert(layer_digest.clone().into_boxed_str(), layer_verity.clone());
+        let layer_verities = [(layer_digest.clone(), layer_verity.clone())];
 
         let manifest_json = manifest.to_string().unwrap();
         let manifest_digest = hash(manifest_json.as_bytes());
@@ -1681,8 +1666,7 @@ mod test {
             .build()
             .unwrap();
 
-        let mut layer_verities = HashMap::new();
-        layer_verities.insert(diff_id.clone().into_boxed_str(), layer_verity);
+        let layer_verities = [(diff_id.clone(), layer_verity)];
 
         let manifest_json = manifest.to_string().unwrap();
         let manifest_digest = hash(manifest_json.as_bytes());
@@ -2079,11 +2063,7 @@ mod test {
                 .build()
                 .unwrap();
 
-            let mut layer_verities = HashMap::new();
-            layer_verities.insert(
-                shared_layer_digest.clone().into_boxed_str(),
-                shared_layer_verity.clone(),
-            );
+            let layer_verities = [(shared_layer_digest.clone(), shared_layer_verity.clone())];
 
             let manifest_json = manifest.to_string().unwrap();
             let manifest_digest = hash(manifest_json.as_bytes());
@@ -2243,8 +2223,7 @@ mod test {
                 .build()
                 .unwrap();
 
-            let mut layer_verities = HashMap::new();
-            layer_verities.insert(blob_digest.into_boxed_str(), blob_verity);
+            let layer_verities = [(blob_digest, blob_verity)];
 
             let manifest_json = manifest.to_string().unwrap();
             let manifest_digest = hash(manifest_json.as_bytes());
@@ -2319,8 +2298,7 @@ mod test {
             .build()
             .unwrap();
 
-        let mut layer_verities = HashMap::new();
-        layer_verities.insert(blob_digest.into_boxed_str(), blob_verity);
+        let layer_verities = [(blob_digest, blob_verity)];
 
         let manifest_json = manifest.to_string().unwrap();
         let manifest_digest = hash(manifest_json.as_bytes());
