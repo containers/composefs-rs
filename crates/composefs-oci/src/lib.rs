@@ -9,9 +9,12 @@
 //! - Converting OCI image layers from tar format to composefs split streams
 //! - Creating mountable filesystems from OCI image configurations
 //! - Sealing containers with fs-verity hashes for integrity verification
+//! - Importing from containers-storage with zero-copy reflinks (optional feature)
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "containers-storage")]
+pub mod cstor;
 pub mod image;
 pub mod oci_image;
 pub mod skopeo;
@@ -55,6 +58,11 @@ pub struct ImportStats {
 }
 
 impl ImportStats {
+    /// Total number of objects processed (new + already present).
+    pub fn total_objects(&self) -> u64 {
+        self.objects_copied + self.objects_already_present
+    }
+
     /// Merge another `ImportStats` into this one.
     pub fn merge(&mut self, other: &ImportStats) {
         self.objects_copied += other.objects_copied;
@@ -71,7 +79,7 @@ impl ImportStats {
         };
         for &(size, method) in &ss.external_objects {
             match method {
-                ObjectStoreMethod::Copied => {
+                ObjectStoreMethod::Copied | ObjectStoreMethod::Reflinked => {
                     stats.objects_copied += 1;
                     stats.bytes_copied += size;
                 }
@@ -84,24 +92,42 @@ impl ImportStats {
     }
 }
 
-/// Result of a pull operation.
-#[derive(Debug)]
-pub struct PullResult<ObjectID> {
-    /// The config digest (sha256:...).
-    pub config_digest: String,
-    /// The fs-verity hash of the config splitstream.
-    pub config_verity: ObjectID,
-    /// Import statistics.
-    pub stats: ImportStats,
+impl std::fmt::Display for ImportStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn human_bytes(b: u64) -> String {
+            if b >= 1_000_000_000 {
+                format!("{:.1} GB", b as f64 / 1_000_000_000.0)
+            } else if b >= 1_000_000 {
+                format!("{:.1} MB", b as f64 / 1_000_000.0)
+            } else if b >= 1_000 {
+                format!("{:.1} kB", b as f64 / 1_000.0)
+            } else {
+                format!("{b} B")
+            }
+        }
+
+        write!(
+            f,
+            "{} new + {} already present objects; {} stored, {} inlined",
+            self.objects_copied,
+            self.objects_already_present,
+            human_bytes(self.bytes_copied),
+            human_bytes(self.bytes_inlined),
+        )
+    }
 }
 
-type ContentAndVerity<ObjectID> = (String, ObjectID);
+// Re-export the composefs crate for consumers who only need composefs-oci
+pub use composefs;
 
-fn layer_identifier(diff_id: &str) -> String {
+/// A tuple of (content digest, fs-verity ObjectID).
+pub type ContentAndVerity<ObjectID> = (String, ObjectID);
+
+pub(crate) fn layer_identifier(diff_id: &str) -> String {
     format!("oci-layer-{diff_id}")
 }
 
-fn config_identifier(config: &str) -> String {
+pub(crate) fn config_identifier(config: &str) -> String {
     format!("oci-config-{config}")
 }
 
@@ -146,14 +172,47 @@ pub fn ls_layer<ObjectID: FsVerityHashValue>(
     Ok(())
 }
 
+/// Result of a pull operation.
+#[derive(Debug)]
+pub struct PullResult<ObjectID> {
+    /// The config digest (sha256:...).
+    pub config_digest: String,
+    /// The fs-verity hash of the config splitstream.
+    pub config_verity: ObjectID,
+    /// Import statistics.
+    pub stats: ImportStats,
+}
+
 /// Pull the target image, and add the provided tag. If this is a mountable
 /// image (i.e. not an artifact), it is *not* unpacked by default.
+///
+/// When the `containers-storage` feature is enabled and the image reference
+/// starts with `containers-storage:`, this uses the native cstor import path
+/// which supports zero-copy reflinks. Otherwise, it uses skopeo.
 pub async fn pull<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     imgref: &str,
     reference: Option<&str>,
     img_proxy_config: Option<ImageProxyConfig>,
 ) -> Result<PullResult<ObjectID>> {
+    #[cfg(feature = "containers-storage")]
+    if let Some(image_id) = cstor::parse_containers_storage_ref(imgref) {
+        let ((config_digest, config_verity), cstor_stats) =
+            cstor::import_from_containers_storage(repo, image_id, reference).await?;
+        // Convert cstor::ImportStats to our ImportStats
+        let stats = ImportStats {
+            objects_copied: cstor_stats.objects_reflinked + cstor_stats.objects_copied,
+            objects_already_present: cstor_stats.objects_already_present,
+            bytes_copied: cstor_stats.bytes_reflinked + cstor_stats.bytes_copied,
+            bytes_inlined: cstor_stats.bytes_inlined,
+        };
+        return Ok(PullResult {
+            config_digest,
+            config_verity,
+            stats,
+        });
+    }
+
     let (config_digest, config_verity, stats) =
         skopeo::pull(repo, imgref, reference, img_proxy_config).await?;
     Ok(PullResult {
@@ -455,5 +514,27 @@ mod test {
 
         let result = open_config::<Sha256HashValue>(&repo, &config_digest, None);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_import_stats_display() {
+        let stats = ImportStats {
+            objects_copied: 42,
+            objects_already_present: 100,
+            bytes_copied: 1_500_000,
+            bytes_inlined: 800,
+        };
+        assert_eq!(
+            stats.to_string(),
+            "42 new + 100 already present objects; 1.5 MB stored, 800 B inlined"
+        );
+
+        let empty = ImportStats::default();
+        assert_eq!(
+            empty.to_string(),
+            "0 new + 0 already present objects; 0 B stored, 0 B inlined"
+        );
+        assert_eq!(empty.total_objects(), 0);
+        assert_eq!(stats.total_objects(), 142);
     }
 }
