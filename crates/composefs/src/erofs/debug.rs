@@ -226,27 +226,6 @@ impl fmt::Debug for XAttr {
     }
 }
 
-impl fmt::Debug for CompactInodeHeader {
-    // Injective (ie: accounts for every byte in the input)
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "CompactInodeHeader")?;
-        write_fields!(f, self, self,
-            format; xattr_icount; mode; reserved; size; u; ino; uid; gid; nlink; reserved2);
-        Ok(())
-    }
-}
-
-impl fmt::Debug for ExtendedInodeHeader {
-    // Injective (ie: accounts for every byte in the input)
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "ExtendedInodeHeader")?;
-        write_fields!(f, self, self,
-            format; xattr_icount; mode; reserved; size; u; ino; uid;
-            gid; mtime; mtime_nsec; nlink; reserved2);
-        Ok(())
-    }
-}
-
 fn hexdump(f: &mut impl fmt::Write, data: &[u8], rel: usize) -> fmt::Result {
     let start = match rel {
         0 => 0,
@@ -361,29 +340,6 @@ impl fmt::Debug for DirectoryBlock {
 impl fmt::Debug for DataBlock {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         hexdump(f, &self.0, 0)
-    }
-}
-
-impl fmt::Debug for ComposefsHeader {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "ComposefsHeader")?;
-        write_fields!(f, self, self,
-            magic; flags; version; composefs_version; unused
-        );
-        Ok(())
-    }
-}
-
-impl fmt::Debug for Superblock {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "Superblock")?;
-        write_fields!(f, self, self,
-            magic; checksum; feature_compat; blkszbits; extslots; root_nid; inos; build_time;
-            build_time_nsec; blocks; meta_blkaddr; xattr_blkaddr; uuid; volume_name;
-            feature_incompat; available_compr_algs; extra_devices; devt_slotoff; dirblkbits;
-            xattr_prefix_count; xattr_prefix_start; packed_nid; xattr_filter_reserved; reserved2
-        );
-        Ok(())
     }
 }
 
