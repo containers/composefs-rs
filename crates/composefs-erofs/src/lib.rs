@@ -8,5 +8,6 @@
 // definition; their Debug impls live in the debug module instead.
 #![allow(missing_debug_implementations)]
 
+pub mod composefs;
 mod debug;
 pub mod format;
