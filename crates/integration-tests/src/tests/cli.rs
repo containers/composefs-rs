@@ -8,7 +8,7 @@
 use anyhow::Result;
 use xshell::{cmd, Shell};
 
-use crate::{cfsctl, create_test_rootfs, integration_test};
+use crate::{cfsctl, create_oci_layout, create_test_rootfs, integration_test};
 
 fn test_gc_empty_repo() -> Result<()> {
     let sh = Shell::new()?;
@@ -193,65 +193,6 @@ fn test_oci_images_json_empty_repo() -> Result<()> {
 }
 integration_test!(test_oci_images_json_empty_repo);
 
-/// Creates a minimal OCI image layout directory for testing using the ocidir crate.
-///
-/// Returns the path to the OCI layout directory.
-fn create_oci_layout(parent: &std::path::Path) -> Result<std::path::PathBuf> {
-    use cap_std_ext::cap_std;
-    use ocidir::oci_spec::image::{
-        ImageConfigurationBuilder, Platform, PlatformBuilder, RootFsBuilder,
-    };
-
-    let oci_dir = parent.join("oci-image");
-    std::fs::create_dir_all(&oci_dir)?;
-
-    let dir = cap_std::fs::Dir::open_ambient_dir(&oci_dir, cap_std::ambient_authority())?;
-    let ocidir = ocidir::OciDir::ensure(dir)?;
-
-    // Create a new empty manifest
-    let mut manifest = ocidir.new_empty_manifest()?.build()?;
-
-    // Create config with architecture and OS
-    let rootfs = RootFsBuilder::default()
-        .typ("layers")
-        .diff_ids(Vec::<String>::new())
-        .build()?;
-    let mut config = ImageConfigurationBuilder::default()
-        .architecture("amd64")
-        .os("linux")
-        .rootfs(rootfs)
-        .build()?;
-
-    // Create a simple layer with one file
-    let mut layer_builder = ocidir.create_layer(None)?;
-    {
-        let data = b"hello from test layer\n";
-        let mut header = tar::Header::new_gnu();
-        header.set_size(data.len() as u64);
-        header.set_mode(0o644);
-        header.set_uid(0);
-        header.set_gid(0);
-        header.set_mtime(1234567890);
-        header.set_cksum();
-        layer_builder.append_data(&mut header, "hello.txt", &data[..])?;
-    }
-    let layer = layer_builder.into_inner()?.complete()?;
-
-    // Push the layer to manifest and config
-    ocidir.push_layer(&mut manifest, &mut config, layer, "test layer", None);
-
-    // Create platform for the manifest
-    let platform: Platform = PlatformBuilder::default()
-        .architecture("amd64")
-        .os("linux")
-        .build()?;
-
-    // Insert manifest and config into the OCI directory
-    ocidir.insert_manifest_and_config(manifest, config, None, platform)?;
-
-    Ok(oci_dir)
-}
-
 fn test_oci_pull_and_inspect() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
@@ -377,10 +318,9 @@ fn test_oci_layer_inspect() -> Result<()> {
     assert_eq!(info["diffId"], layer_id);
     assert!(info["verity"].as_str().is_some(), "expected verity hash");
     assert!(info["size"].as_u64().unwrap() > 0, "expected non-zero size");
-    assert_eq!(
-        info["entryCount"].as_u64().unwrap(),
-        1,
-        "expected exactly 1 entry (hello.txt)"
+    assert!(
+        info["entryCount"].as_u64().unwrap() >= 1,
+        "expected at least 1 entry"
     );
     // Check splitstream metadata
     let splitstream = info
@@ -414,7 +354,7 @@ fn test_oci_layer_inspect() -> Result<()> {
         let entry = Entry::parse(line)
             .unwrap_or_else(|e| panic!("failed to parse dumpfile line '{line}': {e}"));
 
-        if entry.path.as_ref() == Path::new("/hello.txt") {
+        if entry.path.as_ref() == Path::new("/usr/bin/hello.txt") {
             found_hello_txt = true;
             // Verify it's a regular file with inline content
             match &entry.item {
@@ -433,7 +373,10 @@ fn test_oci_layer_inspect() -> Result<()> {
             assert_eq!(entry.mode, 0o100644, "expected mode 0o100644");
         }
     }
-    assert!(found_hello_txt, "expected to find /hello.txt in dumpfile");
+    assert!(
+        found_hello_txt,
+        "expected to find /usr/bin/hello.txt in dumpfile"
+    );
 
     // Test raw tar output - parse as actual tar and verify contents
     let tar_output = cmd!(sh, "{cfsctl} --insecure --repo {repo} oci layer {layer_id}").output()?;
@@ -442,15 +385,191 @@ fn test_oci_layer_inspect() -> Result<()> {
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?;
-        if path.as_ref() == Path::new("hello.txt") {
+        if path.as_ref() == Path::new("usr/bin/hello.txt") {
             found_in_tar = true;
             let mut content = String::new();
             entry.read_to_string(&mut content)?;
             assert_eq!(content, "hello from test layer\n", "tar content mismatch");
         }
     }
-    assert!(found_in_tar, "expected to find hello.txt in tar output");
+    assert!(
+        found_in_tar,
+        "expected to find usr/bin/hello.txt in tar output"
+    );
 
     Ok(())
 }
 integration_test!(test_oci_layer_inspect);
+
+fn test_oci_push_to_layout() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let oci_layout = create_oci_layout(fixture_dir.path())?;
+
+    // Pull from OCI layout into repo
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci pull oci:{oci_layout} test-image"
+    )
+    .read()?;
+
+    // Push to a new OCI layout directory
+    let output_dir = tempfile::tempdir()?;
+    let output_path = output_dir.path().join("exported");
+    let push_output = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci push test-image oci:{output_path}"
+    )
+    .read()?;
+    assert!(
+        push_output.contains("Exported"),
+        "expected export confirmation, got: {push_output}"
+    );
+
+    // Verify the output directory structure
+    assert!(
+        output_path.join("oci-layout").exists(),
+        "expected oci-layout file"
+    );
+    assert!(
+        output_path.join("index.json").exists(),
+        "expected index.json"
+    );
+    assert!(
+        output_path.join("blobs/sha256").exists(),
+        "expected blobs/sha256 directory"
+    );
+
+    // Parse index.json and verify it has a manifest entry
+    let index_json = std::fs::read_to_string(output_path.join("index.json"))?;
+    let index: serde_json::Value = serde_json::from_str(&index_json)?;
+    let manifests = index["manifests"]
+        .as_array()
+        .expect("expected manifests array");
+    assert_eq!(manifests.len(), 1, "expected 1 manifest entry");
+
+    // Verify the manifest has a tag annotation
+    let annotations = manifests[0]["annotations"]
+        .as_object()
+        .expect("expected annotations");
+    assert_eq!(
+        annotations["org.opencontainers.image.ref.name"],
+        "test-image"
+    );
+
+    // Read the manifest blob and verify it has layers
+    let manifest_digest = manifests[0]["digest"]
+        .as_str()
+        .expect("expected digest string");
+    let manifest_hash = manifest_digest
+        .strip_prefix("sha256:")
+        .expect("expected sha256 prefix");
+    let manifest_blob =
+        std::fs::read_to_string(output_path.join("blobs/sha256").join(manifest_hash))?;
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_blob)?;
+    let layers = manifest["layers"]
+        .as_array()
+        .expect("expected layers array");
+    assert!(!layers.is_empty(), "expected at least one layer");
+
+    // Verify layers are uncompressed tar (not gzip/zstd)
+    assert_eq!(
+        layers[0]["mediaType"], "application/vnd.oci.image.layer.v1.tar",
+        "expected uncompressed tar media type"
+    );
+
+    // Verify layer blobs exist and are non-empty
+    for layer in layers {
+        let layer_digest = layer["digest"].as_str().expect("expected layer digest");
+        let layer_hash = layer_digest
+            .strip_prefix("sha256:")
+            .expect("expected sha256 prefix");
+        let layer_blob_path = output_path.join("blobs/sha256").join(layer_hash);
+        assert!(layer_blob_path.exists(), "layer blob should exist");
+        let metadata = std::fs::metadata(&layer_blob_path)?;
+        assert!(metadata.len() > 0, "layer blob should be non-empty");
+    }
+
+    // Verify config blob exists
+    let config_digest = manifest["config"]["digest"]
+        .as_str()
+        .expect("expected config digest");
+    let config_hash = config_digest
+        .strip_prefix("sha256:")
+        .expect("expected sha256 prefix");
+    assert!(
+        output_path.join("blobs/sha256").join(config_hash).exists(),
+        "config blob should exist"
+    );
+
+    Ok(())
+}
+integration_test!(test_oci_push_to_layout);
+
+fn test_oci_push_pull_roundtrip() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let oci_layout = create_oci_layout(fixture_dir.path())?;
+
+    // Pull from OCI layout into repo
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci pull oci:{oci_layout} test-image"
+    )
+    .read()?;
+
+    // Push to a new OCI layout directory
+    let output_dir = tempfile::tempdir()?;
+    let output_path = output_dir.path().join("exported");
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci push test-image oci:{output_path}"
+    )
+    .read()?;
+
+    // Pull from the exported layout into a fresh repo
+    let repo2_dir = tempfile::tempdir()?;
+    let repo2 = repo2_dir.path();
+    let pull_output = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo2} oci pull oci:{output_path} roundtrip-image"
+    )
+    .read()?;
+    assert!(
+        pull_output.contains("manifest sha256:"),
+        "expected manifest digest in roundtrip pull, got: {pull_output}"
+    );
+
+    // Verify the image exists in the new repo
+    let list_output = cmd!(sh, "{cfsctl} --insecure --repo {repo2} oci images --json").read()?;
+    let images: serde_json::Value = serde_json::from_str(&list_output)?;
+    let arr = images.as_array().expect("expected array");
+    assert_eq!(arr.len(), 1, "expected 1 image in new repo");
+    assert_eq!(arr[0]["name"], "roundtrip-image");
+    assert_eq!(arr[0]["architecture"], "amd64");
+
+    // Verify the config is intact
+    let config_output = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo2} oci inspect roundtrip-image --config"
+    )
+    .read()?;
+    let config: serde_json::Value = serde_json::from_str(&config_output)?;
+    assert_eq!(config["architecture"], "amd64");
+    assert_eq!(config["os"], "linux");
+
+    // Verify layers survived the roundtrip
+    let diff_ids = config["rootfs"]["diff_ids"]
+        .as_array()
+        .expect("expected diff_ids");
+    assert_eq!(diff_ids.len(), 1, "expected 1 layer after roundtrip");
+
+    Ok(())
+}
+integration_test!(test_oci_push_pull_roundtrip);

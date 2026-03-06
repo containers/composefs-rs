@@ -8,18 +8,20 @@
 //! - Pulling container images from registries using skopeo
 //! - Converting OCI image layers from tar format to composefs split streams
 //! - Creating mountable filesystems from OCI image configurations
-//! - Sealing containers with fs-verity hashes for integrity verification
+//! - Signing and verifying images using fs-verity PKCS#7 signatures
 
 #![forbid(unsafe_code)]
 
 pub mod image;
 pub mod oci_image;
+pub mod signature;
+pub mod signing;
 pub mod skopeo;
 pub mod tar;
 
 use std::{collections::HashMap, io::Read, sync::Arc};
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{bail, ensure, Result};
 use containers_image_proxy::ImageProxyConfig;
 use oci_spec::image::ImageConfiguration;
 use sha2::{Digest, Sha256};
@@ -34,9 +36,14 @@ use crate::skopeo::{OCI_CONFIG_CONTENT_TYPE, TAR_LAYER_CONTENT_TYPE};
 use crate::tar::get_entry;
 
 // Re-export key types for convenience
+pub use image::{
+    compute_merged_digest, compute_per_layer_digests, generate_merged_image,
+    generate_per_layer_images,
+};
 pub use oci_image::{
-    add_referrer, layer_dumpfile, layer_info, layer_tar, list_images, list_referrers, list_refs,
-    remove_referrer, remove_referrers_for_subject, resolve_ref, tag_image, untag_image, ImageInfo,
+    add_referrer, export_image_to_oci_layout, export_referrers_to_oci_layout, layer_dumpfile,
+    layer_info, layer_tar, list_images, list_referrers, list_refs, remove_referrer,
+    remove_referrers_for_subject, resolve_ref, seal_image, tag_image, untag_image, ImageInfo,
     LayerInfo, OciImage, SplitstreamInfo, OCI_REF_PREFIX,
 };
 pub use skopeo::pull_image;
@@ -244,7 +251,7 @@ pub fn seal<ObjectID: FsVerityHashValue>(
     config_verity: Option<&ObjectID>,
 ) -> Result<ContentAndVerity<ObjectID>> {
     let (mut config, refs) = open_config(repo, config_name, config_verity)?;
-    let mut myconfig = config.config().clone().context("no config!")?;
+    let mut myconfig = config.config().clone().unwrap_or_default();
     let labels = myconfig.labels_mut().get_or_insert_with(HashMap::new);
     let fs = crate::image::create_filesystem(repo, config_name, config_verity)?;
     let id = fs.compute_image_id();
