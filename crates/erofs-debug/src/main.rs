@@ -8,7 +8,7 @@ use std::{fs::File, io::Read, path::PathBuf};
 
 use clap::Parser;
 
-use composefs::erofs::debug::debug_img;
+use composefs_erofs::debug::debug_img;
 
 /// Produce a detailed dump of an entire erofs image
 ///
