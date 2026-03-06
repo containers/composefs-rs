@@ -17,7 +17,7 @@ pub mod oci_image;
 pub mod skopeo;
 pub mod tar;
 
-use std::{collections::HashMap, io::Read, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{bail, ensure, Context, Result};
 use containers_image_proxy::ImageProxyConfig;
@@ -111,18 +111,30 @@ fn config_identifier(config: &str) -> String {
 /// If a name is provided, creates a reference to the imported layer for easier access.
 ///
 /// Returns the fs-verity hash value and import statistics for the stored split stream.
-pub fn import_layer<ObjectID: FsVerityHashValue>(
+pub async fn import_layer<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     diff_id: &str,
     name: Option<&str>,
-    tar_stream: &mut impl Read,
+    tar_stream: impl tokio::io::AsyncBufRead + Unpin,
 ) -> Result<(ObjectID, ImportStats)> {
-    repo.ensure_stream(
-        &layer_identifier(diff_id),
-        TAR_LAYER_CONTENT_TYPE,
-        |writer| tar::split(tar_stream, writer),
-        name,
-    )
+    let content_identifier = layer_identifier(diff_id);
+
+    // Idempotency: if the stream already exists, just ensure the reference symlink
+    if let Some(id) = repo.has_stream(&content_identifier)? {
+        if let Some(name) = name {
+            repo.name_stream(&content_identifier, name)?;
+        }
+        return Ok((id, ImportStats::default()));
+    }
+
+    let (object_id, stats) =
+        tar::split_async(tar_stream, repo.clone(), TAR_LAYER_CONTENT_TYPE).await?;
+
+    // Sync and register the stream with its content identifier
+    repo.register_stream(&object_id, &content_identifier, name)
+        .await?;
+
+    Ok((object_id, stats))
 }
 
 /// Lists the contents of a container layer stored in the repository.
@@ -305,8 +317,8 @@ mod test {
         builder.into_inner().unwrap()
     }
 
-    #[test]
-    fn test_layer() {
+    #[tokio::test]
+    async fn test_layer() {
         let layer = example_layer();
         let mut context = Sha256::new();
         context.update(&layer);
@@ -314,8 +326,9 @@ mod test {
 
         let repo_dir = tempdir();
         let repo = Arc::new(Repository::<Sha256HashValue>::open_path(CWD, &repo_dir).unwrap());
-        let (id, _stats) =
-            import_layer(&repo, &layer_id, Some("name"), &mut layer.as_slice()).unwrap();
+        let (id, _stats) = import_layer(&repo, &layer_id, Some("name"), &layer[..])
+            .await
+            .unwrap();
 
         let mut dump = String::new();
         let mut split_stream = repo.open_stream("refs/name", Some(&id), None).unwrap();

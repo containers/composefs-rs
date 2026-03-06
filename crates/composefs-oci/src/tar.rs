@@ -1,10 +1,10 @@
 //! TAR archive processing and split stream conversion.
 //!
-//! This module handles the conversion of tar archives (container image layers) into composefs split streams.
-//! It provides both synchronous and asynchronous tar processing, intelligently deciding whether to store
-//! file content inline in the split stream or externally in the object store based on file size.
+//! This module handles the conversion of tar archives (container image layers) into composefs split streams,
+//! intelligently deciding whether to store file content inline in the split stream or externally in the
+//! object store based on file size.
 //!
-//! Key components include the `split()` and `split_async()` functions for converting tar streams,
+//! Key components include the `split_async()` function for converting tar streams,
 //! `get_entry()` for reading back tar entries from split streams, and comprehensive support for
 //! tar format features including GNU long names, PAX extensions, and various file types.
 //! The `TarEntry` and `TarItem` types represent processed tar entries in composefs format.
@@ -15,7 +15,6 @@ use std::{
     ffi::{OsStr, OsString},
     fmt,
     fs::File,
-    io::Read,
     os::unix::prelude::{OsStrExt, OsStringExt},
     path::PathBuf,
     sync::Arc,
@@ -35,101 +34,21 @@ use composefs::{
     fsverity::FsVerityHashValue,
     repository::{ObjectStoreMethod, Repository},
     shared_internals::IO_BUF_CAPACITY,
-    splitstream::{SplitStreamBuilder, SplitStreamData, SplitStreamReader, SplitStreamWriter},
+    splitstream::{SplitStreamBuilder, SplitStreamData, SplitStreamReader},
     tree::{LeafContent, RegularFile, Stat},
-    util::{read_exactish, read_exactish_async},
+    util::read_exactish_async,
     INLINE_CONTENT_MAX,
 };
 
 use crate::ImportStats;
 
-fn read_header<R: Read>(reader: &mut R) -> Result<Option<Header>> {
-    let mut header = Header::new_gnu();
-    if read_exactish(reader, header.as_mut_bytes())? {
-        Ok(Some(header))
-    } else {
-        Ok(None)
-    }
-}
-
-async fn read_header_async(reader: &mut (impl AsyncRead + Unpin)) -> Result<Option<Header>> {
+async fn read_header(reader: &mut (impl AsyncRead + Unpin)) -> Result<Option<Header>> {
     let mut header = Header::new_gnu();
     if read_exactish_async(reader, header.as_mut_bytes()).await? {
         Ok(Some(header))
     } else {
         Ok(None)
     }
-}
-
-/// Splits the tar file from tar_stream into a Split Stream.  The store_data function is
-/// responsible for ensuring that "external data" is in the composefs repository and returns the
-/// fsverity hash value of that data.
-pub fn split(
-    tar_stream: &mut impl Read,
-    writer: &mut SplitStreamWriter<impl FsVerityHashValue>,
-) -> Result<ImportStats> {
-    let mut stats = ImportStats::default();
-    let mut buffer = vec![0u8; 1024 * 1024];
-
-    while let Some(header) = read_header(tar_stream)? {
-        // the header always gets stored as inline data
-        writer.write_inline(header.as_bytes());
-        stats.bytes_inlined += header.as_bytes().len() as u64;
-
-        if header.as_bytes() == &[0u8; 512] {
-            continue;
-        }
-
-        // read the corresponding data, if there is any
-        let actual_size = header.entry_size()? as usize;
-        let storage_size = actual_size.next_multiple_of(512);
-
-        if header.entry_type() == EntryType::Regular && actual_size > INLINE_CONTENT_MAX {
-            use std::io::Write;
-
-            let mut limited_stream = tar_stream.take(actual_size as u64);
-            let tmpfile_fd = writer.repo().create_object_tmpfile()?;
-            let mut tmpfile = std::io::BufWriter::new(File::from(tmpfile_fd));
-
-            loop {
-                let bytes_read = limited_stream.read(&mut buffer)?;
-                if bytes_read == 0 {
-                    break;
-                }
-                tmpfile.write_all(&buffer[..bytes_read])?;
-            }
-
-            let tmpfile = tmpfile.into_inner()?;
-            let (object_id, method) = writer
-                .repo()
-                .finalize_object_tmpfile(tmpfile, actual_size as u64)?;
-            match method {
-                ObjectStoreMethod::Copied => {
-                    stats.objects_copied += 1;
-                    stats.bytes_copied += actual_size as u64;
-                }
-                ObjectStoreMethod::AlreadyPresent => {
-                    stats.objects_already_present += 1;
-                }
-            }
-            writer.add_external_size(actual_size as u64);
-            writer.write_reference(object_id)?;
-
-            let padding_size = storage_size.checked_sub(actual_size).unwrap();
-            if padding_size > 0 {
-                tar_stream.read_exact(&mut buffer[..padding_size])?;
-                writer.write_inline(&buffer[..padding_size]);
-                stats.bytes_inlined += padding_size as u64;
-            }
-        } else {
-            tar_stream
-                .take(storage_size as u64)
-                .read_exact(&mut buffer[..storage_size])?;
-            writer.write_inline(&buffer[..storage_size]);
-            stats.bytes_inlined += storage_size as u64;
-        }
-    }
-    Ok(stats)
 }
 
 /// Receive data from channel, write to tmpfile, compute verity, and store object.
@@ -161,10 +80,10 @@ fn receive_and_finalize_object<ObjectID: FsVerityHashValue>(
 
 /// Asynchronously splits a tar archive into a composefs split stream.
 ///
-/// Similar to `split()` but processes the tar stream asynchronously with parallel
-/// object storage. Large files are streamed to O_TMPFILE via a channel, and their
-/// fs-verity digests are computed in background blocking tasks. This avoids blocking
-/// the async runtime while allowing multiple files to be processed concurrently.
+/// Processes the tar stream asynchronously with parallel object storage. Large files are
+/// streamed to O_TMPFILE via a channel, and their fs-verity digests are computed in
+/// background blocking tasks. This avoids blocking the async runtime while allowing
+/// multiple files to be processed concurrently.
 ///
 /// Concurrency is limited to `available_parallelism()` to avoid overwhelming the
 /// system with too many concurrent I/O operations.
@@ -188,7 +107,7 @@ pub async fn split_async<ObjectID: FsVerityHashValue>(
 
     let mut builder = SplitStreamBuilder::new(repo.clone(), content_type);
 
-    while let Some(header) = read_header_async(&mut tar_stream).await? {
+    while let Some(header) = read_header(&mut tar_stream).await? {
         // The header always gets stored as inline data
         builder.push_inline(header.as_bytes());
 
@@ -467,7 +386,7 @@ mod tests {
         fsverity::Sha256HashValue, generic_tree::LeafContent, repository::Repository,
         splitstream::SplitStreamReader,
     };
-    use std::{io::Cursor, path::Path, sync::Arc};
+    use std::{io::Read, path::Path, sync::Arc};
     use tar::Builder;
 
     use once_cell::sync::Lazy;
@@ -514,14 +433,12 @@ mod tests {
         Ok(header)
     }
 
-    /// Helper method to process tar data through split/get_entry pipeline
-    fn read_all_via_splitstream(tar_data: Vec<u8>) -> Result<Vec<TarEntry<Sha256HashValue>>> {
-        let mut tar_cursor = Cursor::new(tar_data);
+    /// Helper method to process tar data through split_async/get_entry pipeline
+    async fn read_all_via_splitstream(tar_data: Vec<u8>) -> Result<Vec<TarEntry<Sha256HashValue>>> {
         let repo = create_test_repository()?;
-        let mut writer = repo.create_stream(TAR_LAYER_CONTENT_TYPE);
 
-        let _stats = split(&mut tar_cursor, &mut writer)?;
-        let object_id = writer.done()?;
+        let (object_id, _stats) =
+            split_async(&tar_data[..], repo.clone(), TAR_LAYER_CONTENT_TYPE).await?;
 
         let mut reader: SplitStreamReader<Sha256HashValue> = SplitStreamReader::new(
             repo.open_object(&object_id)?.into(),
@@ -535,20 +452,23 @@ mod tests {
         Ok(entries)
     }
 
-    #[test]
-    fn test_empty_tar() {
+    #[tokio::test]
+    async fn test_empty_tar() {
         let mut tar_data = Vec::new();
         {
             let mut builder = Builder::new(&mut tar_data);
             builder.finish().unwrap();
         }
 
-        let mut tar_cursor = Cursor::new(tar_data);
         let repo = create_test_repository().unwrap();
-        let mut writer = repo.create_stream(TAR_LAYER_CONTENT_TYPE);
 
-        split(&mut tar_cursor, &mut writer).unwrap();
-        let object_id = writer.done().unwrap();
+        let (object_id, stats) = split_async(&tar_data[..], repo.clone(), TAR_LAYER_CONTENT_TYPE)
+            .await
+            .unwrap();
+        assert_eq!(
+            stats.objects_copied, 0,
+            "empty tar should have no external objects"
+        );
 
         let mut reader: SplitStreamReader<Sha256HashValue> = SplitStreamReader::new(
             repo.open_object(&object_id).unwrap().into(),
@@ -558,8 +478,8 @@ mod tests {
         assert!(get_entry(&mut reader).unwrap().is_none());
     }
 
-    #[test]
-    fn test_single_small_file() {
+    #[tokio::test]
+    async fn test_single_small_file() {
         let mut tar_data = Vec::new();
         let original_header = {
             let mut builder = Builder::new(&mut tar_data);
@@ -572,12 +492,15 @@ mod tests {
             header
         };
 
-        let mut tar_cursor = Cursor::new(tar_data);
         let repo = create_test_repository().unwrap();
-        let mut writer = repo.create_stream(TAR_LAYER_CONTENT_TYPE);
 
-        split(&mut tar_cursor, &mut writer).unwrap();
-        let object_id = writer.done().unwrap();
+        let (object_id, stats) = split_async(&tar_data[..], repo.clone(), TAR_LAYER_CONTENT_TYPE)
+            .await
+            .unwrap();
+        assert_eq!(
+            stats.objects_copied, 0,
+            "small file should be inline, not external"
+        );
 
         let mut reader: SplitStreamReader<Sha256HashValue> = SplitStreamReader::new(
             repo.open_object(&object_id).unwrap().into(),
@@ -606,8 +529,8 @@ mod tests {
         assert!(get_entry(&mut reader).unwrap().is_none());
     }
 
-    #[test]
-    fn test_inline_threshold() {
+    #[tokio::test]
+    async fn test_inline_threshold() {
         let mut tar_data = Vec::new();
         let (threshold_header, over_threshold_header) = {
             let mut builder = Builder::new(&mut tar_data);
@@ -630,12 +553,15 @@ mod tests {
             (header1, header2)
         };
 
-        let mut tar_cursor = Cursor::new(tar_data);
         let repo = create_test_repository().unwrap();
-        let mut writer = repo.create_stream(TAR_LAYER_CONTENT_TYPE);
 
-        split(&mut tar_cursor, &mut writer).unwrap();
-        let object_id = writer.done().unwrap();
+        let (object_id, stats) = split_async(&tar_data[..], repo.clone(), TAR_LAYER_CONTENT_TYPE)
+            .await
+            .unwrap();
+        assert_eq!(
+            stats.objects_copied, 1,
+            "one file over threshold should be external"
+        );
 
         let mut reader: SplitStreamReader<Sha256HashValue> = SplitStreamReader::new(
             repo.open_object(&object_id).unwrap().into(),
@@ -677,8 +603,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_round_trip_simple() {
+    #[tokio::test]
+    async fn test_round_trip_simple() {
         // Create a simple tar with various file types
         let mut original_tar = Vec::new();
         let (small_header, large_header) = {
@@ -696,12 +622,16 @@ mod tests {
             (header1, header2)
         };
 
-        // Split the tar
-        let mut tar_cursor = Cursor::new(original_tar.clone());
         let repo = create_test_repository().unwrap();
-        let mut writer = repo.create_stream(TAR_LAYER_CONTENT_TYPE);
-        split(&mut tar_cursor, &mut writer).unwrap();
-        let object_id = writer.done().unwrap();
+
+        let (object_id, stats) =
+            split_async(&original_tar[..], repo.clone(), TAR_LAYER_CONTENT_TYPE)
+                .await
+                .unwrap();
+        assert_eq!(
+            stats.objects_copied, 1,
+            "only the large file should be external"
+        );
 
         // Read back entries and compare with original headers
         let mut reader: SplitStreamReader<Sha256HashValue> = SplitStreamReader::new(
@@ -753,8 +683,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_special_filename_cases() {
+    #[tokio::test]
+    async fn test_special_filename_cases() {
         let mut tar_data = Vec::new();
         {
             let mut builder = Builder::new(&mut tar_data);
@@ -771,7 +701,7 @@ mod tests {
             builder.finish().unwrap();
         };
 
-        let entries = read_all_via_splitstream(tar_data).unwrap();
+        let entries = read_all_via_splitstream(tar_data).await.unwrap();
         assert_eq!(entries.len(), 2);
 
         // Verify special characters filename
@@ -790,8 +720,8 @@ mod tests {
         assert_eq!(entries[1].path.file_name().unwrap(), &*"a".repeat(100));
     }
 
-    #[test]
-    fn test_gnu_long_filename_reproduction() {
+    #[tokio::test]
+    async fn test_gnu_long_filename_reproduction() {
         // Create a very long path that will definitely trigger GNU long name extensions
         let very_long_path = format!(
             "very/long/path/that/exceeds/the/normal/tar/header/limit/{}",
@@ -807,14 +737,14 @@ mod tests {
             builder.finish().unwrap();
         };
 
-        let entries = read_all_via_splitstream(tar_data).unwrap();
+        let entries = read_all_via_splitstream(tar_data).await.unwrap();
         assert_eq!(entries.len(), 1);
         let abspath = format!("/{very_long_path}");
         assert_eq!(entries[0].path, Path::new(&abspath));
     }
 
-    #[test]
-    fn test_gnu_longlink() {
+    #[tokio::test]
+    async fn test_gnu_longlink() {
         let very_long_path = format!(
             "very/long/path/that/exceeds/the/normal/tar/header/limit/{}",
             "x".repeat(120)
@@ -836,7 +766,7 @@ mod tests {
             builder.finish().unwrap();
         };
 
-        let entries = read_all_via_splitstream(tar_data).unwrap();
+        let entries = read_all_via_splitstream(tar_data).await.unwrap();
         assert_eq!(entries.len(), 1);
         match &entries[0].item {
             TarItem::Leaf(LeafContent::Symlink(ref target)) => {

@@ -41,6 +41,7 @@ use composefs_boot::{write_boot, BootOps};
 use composefs::{
     fsverity::{FsVerityHashValue, Sha256HashValue, Sha512HashValue},
     repository::Repository,
+    shared_internals::IO_BUF_CAPACITY,
 };
 
 /// cfsctl
@@ -370,12 +371,14 @@ where
         #[cfg(feature = "oci")]
         Command::Oci { cmd: oci_cmd } => match oci_cmd {
             OciCommand::ImportLayer { name, digest } => {
+                let repo = Arc::new(repo);
                 let (object_id, _stats) = composefs_oci::import_layer(
-                    &Arc::new(repo),
+                    &repo,
                     &digest,
                     name.as_deref(),
-                    &mut std::io::stdin(),
-                )?;
+                    tokio::io::BufReader::with_capacity(IO_BUF_CAPACITY, tokio::io::stdin()),
+                )
+                .await?;
                 println!("{}", object_id.to_id());
             }
             OciCommand::LsLayer { name } => {
