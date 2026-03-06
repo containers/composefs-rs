@@ -23,9 +23,12 @@ use std::{
 use anyhow::{bail, ensure, Result};
 use bytes::Bytes;
 use rustix::fs::makedev;
-use tar::{EntryType, Header, PaxExtensions};
+use tar_core::{
+    parse::{ParseEvent, Parser},
+    EntryType, HEADER_SIZE,
+};
 use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt},
     sync::mpsc,
 };
 
@@ -36,20 +39,10 @@ use composefs::{
     shared_internals::IO_BUF_CAPACITY,
     splitstream::{SplitStreamBuilder, SplitStreamData, SplitStreamReader},
     tree::{LeafContent, RegularFile, Stat},
-    util::read_exactish_async,
     INLINE_CONTENT_MAX,
 };
 
 use crate::ImportStats;
-
-async fn read_header(reader: &mut (impl AsyncRead + Unpin)) -> Result<Option<Header>> {
-    let mut header = Header::new_gnu();
-    if read_exactish_async(reader, header.as_mut_bytes()).await? {
-        Ok(Some(header))
-    } else {
-        Ok(None)
-    }
-}
 
 /// Receive data from channel, write to tmpfile, compute verity, and store object.
 ///
@@ -102,81 +95,140 @@ pub async fn split_async<ObjectID: FsVerityHashValue>(
     repo: Arc<Repository<ObjectID>>,
     content_type: u64,
 ) -> Result<(ObjectID, ImportStats)> {
-    // Use the repository's shared semaphore to limit concurrent object storage
     let semaphore = repo.write_semaphore();
-
     let mut builder = SplitStreamBuilder::new(repo.clone(), content_type);
+    let mut parser = Parser::with_defaults();
+    let mut buf: Vec<u8> = Vec::with_capacity(IO_BUF_CAPACITY);
+    let mut need = HEADER_SIZE;
 
-    while let Some(header) = read_header(&mut tar_stream).await? {
-        // The header always gets stored as inline data
-        builder.push_inline(header.as_bytes());
-
-        if header.as_bytes() == &[0u8; 512] {
-            continue;
+    loop {
+        // Ensure we have enough data for the parser
+        while buf.len() < need {
+            let chunk = tar_stream.fill_buf().await?;
+            if chunk.is_empty() {
+                if buf.is_empty() {
+                    // Clean EOF at header boundary
+                    let (object_id, ss_stats) = builder.finish().await?;
+                    return Ok((object_id, ImportStats::from_split_stream_stats(&ss_stats)));
+                }
+                bail!("unexpected EOF in tar stream");
+            }
+            let n = chunk.len();
+            buf.extend_from_slice(chunk);
+            tar_stream.consume(n);
         }
 
-        // Read the corresponding data, if there is any
-        let actual_size = header.entry_size()? as usize;
-        let storage_size = actual_size.next_multiple_of(512);
-
-        if header.entry_type() == EntryType::Regular && actual_size > INLINE_CONTENT_MAX {
-            // Large file: stream to O_TMPFILE via channel to avoid blocking async runtime
-
-            // Acquire permit before starting
-            let permit = semaphore.clone().acquire_owned().await?;
-
-            // Create a channel for streaming data to the blocking task.
-            // Buffer a few chunks to allow async/blocking to run concurrently.
-            let (tx, rx) = mpsc::channel::<Bytes>(4);
-
-            // Spawn blocking task that receives data, writes to tmpfile, computes verity
-            let repo_clone = repo.clone();
-            let handle = tokio::task::spawn_blocking(move || {
-                let result = receive_and_finalize_object(rx, actual_size as u64, &repo_clone);
-                drop(permit); // Release permit when done
-                result
-            });
-
-            // Send data chunks to the blocking task using fill_buf to avoid extra copies
-            let mut remaining = actual_size;
-            while remaining > 0 {
-                let chunk = tar_stream.fill_buf().await?;
-                if chunk.is_empty() {
-                    bail!("unexpected EOF reading tar entry");
-                }
-                let chunk_size = std::cmp::min(remaining, chunk.len());
-                // If send fails, the receiver dropped (task panicked/errored)
-                if tx
-                    .send(Bytes::copy_from_slice(&chunk[..chunk_size]))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-                tar_stream.consume(chunk_size);
-                remaining -= chunk_size;
+        match parser.parse(&buf)? {
+            ParseEvent::NeedData { min_bytes } => {
+                need = min_bytes;
+                continue;
             }
-            drop(tx); // Close channel to signal EOF
-
-            // Push external entry to builder (will be resolved at finish())
-            builder.push_external(handle, actual_size as u64);
-
-            // Read and push padding inline (must come after external ref)
-            let padding_size = storage_size - actual_size;
-            if padding_size > 0 {
-                let mut padding = vec![0u8; padding_size];
-                tar_stream.read_exact(&mut padding).await?;
-                builder.push_inline(&padding);
+            ParseEvent::GlobalExtensions { consumed, .. } => {
+                builder.push_inline(&buf[..consumed]);
+                buf.drain(..consumed);
+                need = HEADER_SIZE;
+                continue;
             }
-        } else {
-            // Small file or non-regular entry: buffer and write inline
-            let mut buffer = vec![0u8; storage_size];
-            tar_stream.read_exact(&mut buffer).await?;
-            builder.push_inline(&buffer);
+            ParseEvent::End { consumed } => {
+                builder.push_inline(&buf[..consumed]);
+                break;
+            }
+            ParseEvent::SparseEntry { .. } => {
+                bail!("sparse tar entries are not supported");
+            }
+            ParseEvent::Entry { consumed, entry } => {
+                // Extract what we need before mutating buf
+                let actual_size = entry.size as usize;
+                let is_large_file = entry.entry_type.is_file() && actual_size > INLINE_CONTENT_MAX;
+
+                // Write all header bytes (including extension headers) inline
+                builder.push_inline(&buf[..consumed]);
+                buf.drain(..consumed);
+
+                let storage_size = actual_size.next_multiple_of(512);
+
+                if is_large_file {
+                    // Large file: stream to O_TMPFILE via channel
+                    let permit = semaphore.clone().acquire_owned().await?;
+                    let (tx, rx) = mpsc::channel::<Bytes>(4);
+                    let repo_clone = repo.clone();
+                    let handle = tokio::task::spawn_blocking(move || {
+                        let result =
+                            receive_and_finalize_object(rx, actual_size as u64, &repo_clone);
+                        drop(permit);
+                        result
+                    });
+
+                    // Drain any leftover bytes in our buffer that belong to content
+                    let from_buf = std::cmp::min(buf.len(), actual_size);
+                    if from_buf > 0 {
+                        if tx
+                            .send(Bytes::copy_from_slice(&buf[..from_buf]))
+                            .await
+                            .is_err()
+                        {
+                            bail!("object write task failed");
+                        }
+                        buf.drain(..from_buf);
+                    }
+
+                    let mut remaining = actual_size - from_buf;
+                    while remaining > 0 {
+                        let chunk = tar_stream.fill_buf().await?;
+                        if chunk.is_empty() {
+                            bail!("unexpected EOF reading tar entry");
+                        }
+                        let chunk_size = std::cmp::min(remaining, chunk.len());
+                        if tx
+                            .send(Bytes::copy_from_slice(&chunk[..chunk_size]))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        tar_stream.consume(chunk_size);
+                        remaining -= chunk_size;
+                    }
+                    drop(tx);
+
+                    builder.push_external(handle, actual_size as u64);
+
+                    // Read and push padding (from buf first, then stream)
+                    let padding_size = storage_size - actual_size;
+                    if padding_size > 0 {
+                        let mut padding = vec![0u8; padding_size];
+                        let pad_from_buf = std::cmp::min(buf.len(), padding_size);
+                        if pad_from_buf > 0 {
+                            padding[..pad_from_buf].copy_from_slice(&buf[..pad_from_buf]);
+                            buf.drain(..pad_from_buf);
+                        }
+                        if pad_from_buf < padding_size {
+                            tar_stream.read_exact(&mut padding[pad_from_buf..]).await?;
+                        }
+                        builder.push_inline(&padding);
+                    }
+                } else {
+                    // Small file or non-file entry: read content inline
+                    if storage_size > 0 {
+                        let mut content = vec![0u8; storage_size];
+                        // Drain from our buffer first
+                        let from_buf = std::cmp::min(buf.len(), storage_size);
+                        if from_buf > 0 {
+                            content[..from_buf].copy_from_slice(&buf[..from_buf]);
+                            buf.drain(..from_buf);
+                        }
+                        if from_buf < storage_size {
+                            tar_stream.read_exact(&mut content[from_buf..]).await?;
+                        }
+                        builder.push_inline(&content);
+                    }
+                }
+
+                need = HEADER_SIZE;
+            }
         }
     }
 
-    // Finalize: await all handles, build stream, store it
     let (object_id, ss_stats) = builder.finish().await?;
     Ok((object_id, ImportStats::from_split_stream_stats(&ss_stats)))
 }
@@ -221,159 +273,139 @@ impl<ObjectID: FsVerityHashValue> fmt::Display for TarEntry<ObjectID> {
     }
 }
 
-fn path_from_tar(pax: Option<Box<[u8]>>, gnu: Vec<u8>, short: &[u8]) -> PathBuf {
-    // Prepend leading /
-    let mut path = vec![b'/'];
-    if let Some(name) = pax {
-        path.extend(name);
-    } else if !gnu.is_empty() {
-        path.extend(gnu);
-    } else {
-        path.extend(short);
+/// Prepend '/' to a tar path and strip any trailing slashes.
+fn make_absolute_path(tar_path: &[u8]) -> PathBuf {
+    let tar_path = tar_path.strip_prefix(b"/").unwrap_or(tar_path);
+    let mut path = Vec::with_capacity(1 + tar_path.len());
+    path.push(b'/');
+    path.extend(tar_path);
+    while path.last() == Some(&b'/') && path.len() > 1 {
+        path.pop();
     }
-
-    // Drop trailing '/' characters in case of directories.
-    path.pop_if(|x| x == &b'/');
-
+    // A bare "/" becomes empty to match the convention for root entries
+    if path == b"/" {
+        path.clear();
+    }
     PathBuf::from(OsString::from_vec(path))
-}
-
-fn symlink_target_from_tar(pax: Option<Box<[u8]>>, gnu: Vec<u8>, short: &[u8]) -> Box<OsStr> {
-    if let Some(name) = pax {
-        OsStr::from_bytes(name.as_ref()).into()
-    } else if !gnu.is_empty() {
-        OsStr::from_bytes(&gnu).into()
-    } else {
-        OsStr::from_bytes(short).into()
-    }
 }
 
 /// Reads and parses the next tar entry from a split stream.
 ///
-/// Decodes tar headers and data from a composefs split stream, handling both inline and
-/// external content storage. Supports GNU long name/link extensions, PAX headers, and
-/// extended attributes. Returns `None` when the end of the archive is reached.
+/// Uses `tar_core::parse::Parser` to handle all tar format complexity (GNU long
+/// names/links, PAX extensions, UStar prefix, xattrs) via its sans-IO state machine.
+/// Header bytes are accumulated from the split stream and fed to the parser until
+/// it emits a fully-resolved `ParsedEntry`.
 ///
 /// Returns the parsed tar entry, or `None` if the end of the stream is reached.
 pub fn get_entry<ObjectID: FsVerityHashValue>(
     reader: &mut SplitStreamReader<ObjectID>,
 ) -> Result<Option<TarEntry<ObjectID>>> {
-    // We don't have a way to drive the standard tar crate that lets us feed it random bits of
-    // header data while continuing to handle the external references as references.  That means we
-    // have to do the header interpretation ourselves, including handling of PAX/GNU extensions for
-    // xattrs and long filenames.
-    //
-    // We try to use as much of the tar crate as possible to help us with this.
-    let mut gnu_longlink: Vec<u8> = vec![];
-    let mut gnu_longname: Vec<u8> = vec![];
-    let mut pax_longlink: Option<Box<[u8]>> = None;
-    let mut pax_longname: Option<Box<[u8]>> = None;
-    let mut xattrs = BTreeMap::new();
+    let mut parser = Parser::with_defaults();
+    let mut header_buf: Vec<u8> = Vec::new();
+    let mut block = [0u8; 512];
 
-    let mut buf = [0u8; 512];
+    // Accumulate header bytes (including extension headers and their content)
+    // until the parser emits an Entry or End event.
     loop {
-        if !reader.read_inline_exact(&mut buf)? || buf == [0u8; 512] {
+        if !reader.read_inline_exact(&mut block)? {
             return Ok(None);
         }
+        header_buf.extend_from_slice(&block);
 
-        let header = tar::Header::from_byte_slice(&buf);
-
-        let size = header.entry_size()?;
-        let stored_size = size.next_multiple_of(512);
-
-        let item = match reader.read_exact(size as usize, stored_size as usize)? {
-            SplitStreamData::External(id) => match header.entry_type() {
-                EntryType::Regular | EntryType::Continuous => {
-                    ensure!(
-                        size as usize > INLINE_CONTENT_MAX,
-                        "Splitstream incorrectly stored a small ({size} byte) file external"
-                    );
-                    TarItem::Leaf(LeafContent::Regular(RegularFile::External(id, size)))
+        // Feed accumulated data to parser, handling events.
+        loop {
+            match parser.parse(&header_buf)? {
+                ParseEvent::NeedData { .. } => {
+                    // Parser needs more data — read another block from the splitstream.
+                    break;
                 }
-                _ => bail!("Unsupported external-chunked entry {header:?} {id:?}"),
-            },
-            SplitStreamData::Inline(content) => match header.entry_type() {
-                EntryType::GNULongLink => {
-                    gnu_longlink.extend(content);
-                    gnu_longlink.pop_if(|x| *x == b'\0');
-
+                ParseEvent::GlobalExtensions { consumed, .. } => {
+                    // Skip global PAX headers.
+                    header_buf.drain(..consumed);
                     continue;
                 }
-                EntryType::GNULongName => {
-                    gnu_longname.extend(content);
-                    gnu_longname.pop_if(|x| *x == b'\0');
-                    continue;
+                ParseEvent::End { .. } => {
+                    return Ok(None);
                 }
-                EntryType::XGlobalHeader => {
-                    todo!();
-                }
-                EntryType::XHeader => {
-                    for item in PaxExtensions::new(&content) {
-                        let extension = item?;
-                        let key = extension.key()?;
-                        let value = Box::from(extension.value_bytes());
+                ParseEvent::Entry { entry, .. } => {
+                    let size = entry.size;
+                    let stored_size = size.next_multiple_of(512);
 
-                        if key == "path" {
-                            pax_longname = Some(value);
-                        } else if key == "linkpath" {
-                            pax_longlink = Some(value);
-                        } else if let Some(xattr) = key.strip_prefix("SCHILY.xattr.") {
-                            xattrs.insert(Box::from(OsStr::new(xattr)), value);
-                        }
-                    }
-                    continue;
-                }
-                EntryType::Directory => TarItem::Directory,
-                EntryType::Regular | EntryType::Continuous => {
-                    ensure!(
-                        content.len() <= INLINE_CONTENT_MAX,
-                        "Splitstream incorrectly stored a large ({} byte) file inline",
-                        content.len()
-                    );
-                    TarItem::Leaf(LeafContent::Regular(RegularFile::Inline(content)))
-                }
-                EntryType::Link => TarItem::Hardlink({
-                    let Some(link_name) = header.link_name_bytes() else {
-                        bail!("link without a name?")
+                    let item = match reader.read_exact(size as usize, stored_size as usize)? {
+                        SplitStreamData::External(id) => match entry.entry_type {
+                            EntryType::Regular | EntryType::Continuous => {
+                                ensure!(
+                                    size as usize > INLINE_CONTENT_MAX,
+                                    "Splitstream incorrectly stored a small ({size} byte) file external"
+                                );
+                                TarItem::Leaf(LeafContent::Regular(RegularFile::External(id, size)))
+                            }
+                            _ => bail!(
+                                "Unsupported external-chunked entry {:?} {id:?}",
+                                entry.entry_type
+                            ),
+                        },
+                        SplitStreamData::Inline(content) => match entry.entry_type {
+                            EntryType::Directory => TarItem::Directory,
+                            EntryType::Regular | EntryType::Continuous => {
+                                ensure!(
+                                    content.len() <= INLINE_CONTENT_MAX,
+                                    "Splitstream incorrectly stored a large ({} byte) file inline",
+                                    content.len()
+                                );
+                                TarItem::Leaf(LeafContent::Regular(RegularFile::Inline(content)))
+                            }
+                            EntryType::Link => TarItem::Hardlink({
+                                let link_target = entry.link_target.as_deref().unwrap_or_default();
+                                make_absolute_path(link_target).into_os_string()
+                            }),
+                            EntryType::Symlink => TarItem::Leaf(LeafContent::Symlink({
+                                let link_target = entry.link_target.as_deref().unwrap_or_default();
+                                OsStr::from_bytes(link_target).into()
+                            })),
+                            EntryType::Block => TarItem::Leaf(LeafContent::BlockDevice(
+                                match (entry.dev_major, entry.dev_minor) {
+                                    (Some(major), Some(minor)) => makedev(major, minor),
+                                    _ => bail!("Device entry without device numbers?"),
+                                },
+                            )),
+                            EntryType::Char => TarItem::Leaf(LeafContent::CharacterDevice(match (
+                                entry.dev_major,
+                                entry.dev_minor,
+                            ) {
+                                (Some(major), Some(minor)) => makedev(major, minor),
+                                _ => bail!("Device entry without device numbers?"),
+                            })),
+                            EntryType::Fifo => TarItem::Leaf(LeafContent::Fifo),
+                            _ => {
+                                bail!("Unsupported entry type {:?}", entry.entry_type);
+                            }
+                        },
                     };
-                    OsString::from(path_from_tar(pax_longlink, gnu_longlink, &link_name))
-                }),
-                EntryType::Symlink => TarItem::Leaf(LeafContent::Symlink({
-                    let Some(link_name) = header.link_name_bytes() else {
-                        bail!("symlink without a name?")
-                    };
-                    symlink_target_from_tar(pax_longlink, gnu_longlink, &link_name)
-                })),
-                EntryType::Block => TarItem::Leaf(LeafContent::BlockDevice(
-                    match (header.device_major()?, header.device_minor()?) {
-                        (Some(major), Some(minor)) => makedev(major, minor),
-                        _ => bail!("Device entry without device numbers?"),
-                    },
-                )),
-                EntryType::Char => TarItem::Leaf(LeafContent::CharacterDevice(
-                    match (header.device_major()?, header.device_minor()?) {
-                        (Some(major), Some(minor)) => makedev(major, minor),
-                        _ => bail!("Device entry without device numbers?"),
-                    },
-                )),
-                EntryType::Fifo => TarItem::Leaf(LeafContent::Fifo),
-                _ => {
-                    todo!("Unsupported entry {:?}", header);
-                }
-            },
-        };
 
-        return Ok(Some(TarEntry {
-            path: path_from_tar(pax_longname, gnu_longname, &header.path_bytes()),
-            stat: Stat {
-                st_uid: header.uid()? as u32,
-                st_gid: header.gid()? as u32,
-                st_mode: header.mode()?,
-                st_mtim_sec: header.mtime()? as i64,
-                xattrs: RefCell::new(xattrs),
-            },
-            item,
-        }));
+                    let xattrs: BTreeMap<_, _> = entry
+                        .xattrs
+                        .into_iter()
+                        .map(|(k, v)| (Box::from(OsStr::from_bytes(&k)), Box::from(v.as_ref())))
+                        .collect();
+
+                    return Ok(Some(TarEntry {
+                        path: make_absolute_path(&entry.path),
+                        stat: Stat {
+                            st_uid: entry.uid as u32,
+                            st_gid: entry.gid as u32,
+                            st_mode: entry.mode,
+                            st_mtim_sec: entry.mtime as i64,
+                            xattrs: RefCell::new(xattrs),
+                        },
+                        item,
+                    }));
+                }
+                ParseEvent::SparseEntry { .. } => {
+                    bail!("Sparse tar entries are not supported");
+                }
+            }
+        }
     }
 }
 
@@ -450,6 +482,40 @@ mod tests {
             entries.push(entry);
         }
         Ok(entries)
+    }
+
+    #[test]
+    fn test_make_absolute_path() {
+        let cases: &[(&[u8], &str)] = &[
+            (b"foo/bar", "/foo/bar"),
+            (b"/foo/bar", "/foo/bar"),
+            (b"dir/", "/dir"),
+            (b"/dir/", "/dir"),
+            (b"a", "/a"),
+            (b"/a", "/a"),
+            (
+                b"usr/lib/python3/dist-packages/foo",
+                "/usr/lib/python3/dist-packages/foo",
+            ),
+            // Multiple trailing slashes are all stripped
+            (b"dir//", "/dir"),
+            // Just a filename
+            (b"file.txt", "/file.txt"),
+            // Nested with trailing slash
+            (b"a/b/c/", "/a/b/c"),
+            // Empty (edge case — guarded by parser's EmptyPath rejection)
+            (b"", ""),
+            // Root only
+            (b"/", ""),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                make_absolute_path(input),
+                PathBuf::from(expected),
+                "make_absolute_path({:?})",
+                String::from_utf8_lossy(input),
+            );
+        }
     }
 
     #[tokio::test]
@@ -778,7 +844,7 @@ mod tests {
             let mut builder = Builder::new(&mut tar_data);
             let mut header = tar::Header::new_gnu();
             header.set_mode(0o777);
-            header.set_entry_type(EntryType::Symlink);
+            header.set_entry_type(tar::EntryType::Symlink);
             header.set_size(0);
             header.set_uid(0);
             header.set_gid(0);
@@ -1261,9 +1327,6 @@ mod tests {
             let mut builder = Builder::new(&mut tar_data);
             let mut header = tar::Header::new_ustar();
             header.set_mode(0o644);
-            header.set_uid(1000);
-            header.set_gid(1000);
-            header.set_mtime(1234567890);
             header.set_size(4);
             header.set_entry_type(tar::EntryType::Regular);
             header.set_path(&full_path).unwrap();
