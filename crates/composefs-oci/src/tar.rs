@@ -568,6 +568,17 @@ mod tests {
             Some(TAR_LAYER_CONTENT_TYPE),
         )
         .unwrap();
+
+        let mut object_refs = Vec::new();
+        reader
+            .get_object_refs(|id| object_refs.push(id.clone()))
+            .unwrap();
+        assert_eq!(
+            object_refs.len(),
+            1,
+            "should have exactly 1 external object ref"
+        );
+
         let mut entries = Vec::new();
 
         while let Some(entry) = get_entry(&mut reader).unwrap() {
@@ -639,6 +650,17 @@ mod tests {
             Some(TAR_LAYER_CONTENT_TYPE),
         )
         .unwrap();
+
+        let mut object_refs = Vec::new();
+        reader
+            .get_object_refs(|id| object_refs.push(id.clone()))
+            .unwrap();
+        assert_eq!(
+            object_refs.len(),
+            1,
+            "should have exactly 1 external object ref"
+        );
+
         let mut entries = Vec::new();
 
         while let Some(entry) = get_entry(&mut reader).unwrap() {
@@ -905,9 +927,13 @@ mod tests {
         let repo = create_test_repository().unwrap();
 
         // Use split_async which returns (object_id, stats)
-        let (object_id, _stats) = split_async(&tar_data[..], repo.clone(), TAR_LAYER_CONTENT_TYPE)
+        let (object_id, stats) = split_async(&tar_data[..], repo.clone(), TAR_LAYER_CONTENT_TYPE)
             .await
             .unwrap();
+        assert_eq!(
+            stats.objects_copied, 1,
+            "only the large file should be external"
+        );
 
         // Read back and verify
         let mut reader: SplitStreamReader<Sha256HashValue> = SplitStreamReader::new(
@@ -915,6 +941,16 @@ mod tests {
             Some(TAR_LAYER_CONTENT_TYPE),
         )
         .unwrap();
+
+        let mut object_refs = Vec::new();
+        reader
+            .get_object_refs(|id| object_refs.push(id.clone()))
+            .unwrap();
+        assert_eq!(
+            object_refs.len(),
+            1,
+            "should have exactly 1 external object ref"
+        );
 
         let mut entries = Vec::new();
         while let Some(entry) = get_entry(&mut reader).unwrap() {
@@ -983,9 +1019,13 @@ mod tests {
 
         let repo = create_test_repository().unwrap();
 
-        let (object_id, _stats) = split_async(&tar_data[..], repo.clone(), TAR_LAYER_CONTENT_TYPE)
+        let (object_id, stats) = split_async(&tar_data[..], repo.clone(), TAR_LAYER_CONTENT_TYPE)
             .await
             .unwrap();
+        assert_eq!(
+            stats.objects_copied, 3,
+            "all 3 large files should be external"
+        );
 
         // Read back and verify
         let mut reader: SplitStreamReader<Sha256HashValue> = SplitStreamReader::new(
@@ -993,6 +1033,16 @@ mod tests {
             Some(TAR_LAYER_CONTENT_TYPE),
         )
         .unwrap();
+
+        let mut object_refs = Vec::new();
+        reader
+            .get_object_refs(|id| object_refs.push(id.clone()))
+            .unwrap();
+        assert_eq!(
+            object_refs.len(),
+            3,
+            "should have exactly 3 external object refs"
+        );
 
         let mut entries = Vec::new();
         while let Some(entry) = get_entry(&mut reader).unwrap() {
@@ -1021,6 +1071,340 @@ mod tests {
                 );
             } else {
                 panic!("Expected external regular file for file{}.bin", i);
+            }
+        }
+    }
+
+    // ==========================================================================
+    // Long path format tests using proptest
+    // ==========================================================================
+    //
+    // Tar archives use different mechanisms for paths > 100 characters:
+    // - GNU LongName: type 'L' entry before actual entry (used by tar crate with new_gnu())
+    // - UStar prefix: 155-byte prefix field + 100-byte name field (max ~255 bytes)
+    // - PAX extended: type 'x' entry with key=value pairs (unlimited length)
+
+    /// Table-driven test for specific path length edge cases and format triggers.
+    #[tokio::test]
+    async fn test_longpath_formats() {
+        // (description, path generator, use_gnu_header)
+        // The tar crate auto-selects format based on path length and header type
+        let cases: &[(&str, fn() -> String, bool)] = &[
+            // Basic name field (≤100 chars)
+            ("short path", || "short.txt".to_string(), false),
+            ("exactly 100 chars", || "x".repeat(100), false),
+            // UStar prefix (101-255 chars with /)
+            (
+                "ustar prefix",
+                || format!("{}/{}", "dir".repeat(40), "file.txt"),
+                false,
+            ),
+            (
+                "max ustar (~254 chars)",
+                || format!("{}/{}", "p".repeat(154), "n".repeat(99)),
+                false,
+            ),
+            // GNU LongName (>100 chars with gnu header)
+            (
+                "gnu longname",
+                || format!("{}/{}", "a".repeat(80), "b".repeat(50)),
+                true,
+            ),
+            // PAX (>255 chars, any header)
+            (
+                "pax extended",
+                || format!("{}/{}", "sub/".repeat(60), "file.txt"),
+                false,
+            ),
+        ];
+
+        for (desc, make_path, use_gnu) in cases {
+            let path = make_path();
+            let content = b"test content";
+
+            let mut tar_data = Vec::new();
+            {
+                let mut builder = Builder::new(&mut tar_data);
+                let mut header = if *use_gnu {
+                    tar::Header::new_gnu()
+                } else {
+                    tar::Header::new_ustar()
+                };
+                header.set_mode(0o644);
+                header.set_uid(1000);
+                header.set_gid(1000);
+                header.set_mtime(1234567890);
+                header.set_size(content.len() as u64);
+                header.set_entry_type(tar::EntryType::Regular);
+                builder
+                    .append_data(&mut header, &path, &content[..])
+                    .unwrap();
+                builder.finish().unwrap();
+            }
+
+            let entries = read_all_via_splitstream(tar_data).await.unwrap();
+            assert_eq!(entries.len(), 1, "{desc}: expected 1 entry");
+            assert_eq!(
+                entries[0].path,
+                PathBuf::from(format!("/{}", path)),
+                "{desc}: path mismatch (len={})",
+                path.len()
+            );
+        }
+    }
+
+    /// Table-driven test for hardlinks with long targets.
+    #[tokio::test]
+    async fn test_longpath_hardlinks() {
+        let cases: &[(&str, fn() -> String, bool)] = &[
+            ("short target", || "target.txt".to_string(), true),
+            (
+                "gnu longlink",
+                || format!("{}/{}", "c".repeat(80), "d".repeat(50)),
+                true,
+            ),
+            (
+                "pax linkpath",
+                || format!("{}/{}", "sub/".repeat(60), "target.txt"),
+                false,
+            ),
+        ];
+
+        for (desc, make_target, use_gnu) in cases {
+            let target_path = make_target();
+            let link_name = "hardlink";
+            let content = b"target content";
+
+            let mut tar_data = Vec::new();
+            {
+                let mut builder = Builder::new(&mut tar_data);
+
+                // Create target file
+                let mut header = if *use_gnu {
+                    tar::Header::new_gnu()
+                } else {
+                    tar::Header::new_ustar()
+                };
+                header.set_mode(0o644);
+                header.set_uid(1000);
+                header.set_gid(1000);
+                header.set_mtime(1234567890);
+                header.set_size(content.len() as u64);
+                header.set_entry_type(tar::EntryType::Regular);
+                builder
+                    .append_data(&mut header, &target_path, &content[..])
+                    .unwrap();
+
+                // Create hardlink
+                let mut link_header = if *use_gnu {
+                    tar::Header::new_gnu()
+                } else {
+                    tar::Header::new_ustar()
+                };
+                link_header.set_mode(0o644);
+                link_header.set_uid(1000);
+                link_header.set_gid(1000);
+                link_header.set_mtime(1234567890);
+                link_header.set_size(0);
+                link_header.set_entry_type(tar::EntryType::Link);
+                builder
+                    .append_link(&mut link_header, link_name, &target_path)
+                    .unwrap();
+
+                builder.finish().unwrap();
+            }
+
+            let entries = read_all_via_splitstream(tar_data).await.unwrap();
+            assert_eq!(entries.len(), 2, "{desc}: expected 2 entries");
+            assert_eq!(
+                entries[0].path,
+                PathBuf::from(format!("/{}", target_path)),
+                "{desc}"
+            );
+            assert_eq!(
+                entries[1].path,
+                PathBuf::from(format!("/{}", link_name)),
+                "{desc}"
+            );
+
+            match &entries[1].item {
+                TarItem::Hardlink(target) => {
+                    assert_eq!(
+                        target.to_str().unwrap(),
+                        format!("/{}", target_path),
+                        "{desc}: hardlink target mismatch"
+                    );
+                }
+                _ => panic!("{desc}: expected hardlink entry"),
+            }
+        }
+    }
+
+    /// Verify UStar prefix field is actually used for paths > 100 chars.
+    #[tokio::test]
+    async fn test_ustar_prefix_field_used() {
+        // Path must be > 100 chars to trigger prefix usage, but filename must be <= 100 chars
+        let dir_path =
+            "usr/lib/python3.12/site-packages/some-very-long-package-name-here/__pycache__/subdir";
+        let filename = "module_name_with_extra_stuff.cpython-312.opt-2.pyc";
+        let full_path = format!("{dir_path}/{filename}");
+
+        // Verify our test setup: full path > 100 chars, filename <= 100 chars
+        assert!(
+            full_path.len() > 100,
+            "full path must exceed 100 chars to use prefix"
+        );
+        assert!(filename.len() <= 100, "filename must fit in name field");
+
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = Builder::new(&mut tar_data);
+            let mut header = tar::Header::new_ustar();
+            header.set_mode(0o644);
+            header.set_uid(1000);
+            header.set_gid(1000);
+            header.set_mtime(1234567890);
+            header.set_size(4);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_path(&full_path).unwrap();
+            header.set_cksum();
+            builder.append(&header, b"test".as_slice()).unwrap();
+            builder.finish().unwrap();
+        }
+
+        // Verify prefix field (bytes 345-500) is populated
+        let prefix_field = &tar_data[345..500];
+        let prefix_str = std::str::from_utf8(prefix_field)
+            .unwrap()
+            .trim_end_matches('\0');
+        assert_eq!(
+            prefix_str, dir_path,
+            "UStar prefix field should contain directory"
+        );
+
+        let entries = read_all_via_splitstream(tar_data).await.unwrap();
+        assert_eq!(entries[0].path, PathBuf::from(format!("/{full_path}")));
+    }
+
+    /// Property-based tests for tar path handling.
+    mod proptest_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Strategy for generating valid path components.
+        fn path_component() -> impl Strategy<Value = String> {
+            proptest::string::string_regex("[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,30}")
+                .expect("valid regex")
+                .prop_filter("non-empty", |s| !s.is_empty())
+        }
+
+        /// Strategy for generating paths with a target total length.
+        fn path_with_length(min_len: usize, max_len: usize) -> impl Strategy<Value = String> {
+            prop::collection::vec(path_component(), 1..20)
+                .prop_map(|components| components.join("/"))
+                .prop_filter("length in range", move |p| {
+                    p.len() >= min_len && p.len() <= max_len
+                })
+        }
+
+        /// Create a tar archive with a single file and verify round-trip.
+        fn roundtrip_path(path: &str) {
+            let content = b"proptest content";
+
+            let mut tar_data = Vec::new();
+            {
+                let mut builder = Builder::new(&mut tar_data);
+                let mut header = tar::Header::new_ustar();
+                header.set_mode(0o644);
+                header.set_uid(1000);
+                header.set_gid(1000);
+                header.set_mtime(1234567890);
+                header.set_size(content.len() as u64);
+                header.set_entry_type(tar::EntryType::Regular);
+                builder
+                    .append_data(&mut header, path, &content[..])
+                    .unwrap();
+                builder.finish().unwrap();
+            }
+
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let entries = rt.block_on(read_all_via_splitstream(tar_data)).unwrap();
+            assert_eq!(entries.len(), 1, "expected 1 entry for path: {path}");
+            assert_eq!(
+                entries[0].path,
+                PathBuf::from(format!("/{path}")),
+                "path mismatch"
+            );
+        }
+
+        /// Create a tar archive with a hardlink and verify round-trip.
+        fn roundtrip_hardlink(target_path: &str) {
+            let link_name = "link";
+            let content = b"target content";
+
+            let mut tar_data = Vec::new();
+            {
+                let mut builder = Builder::new(&mut tar_data);
+
+                let mut header = tar::Header::new_ustar();
+                header.set_mode(0o644);
+                header.set_uid(1000);
+                header.set_gid(1000);
+                header.set_mtime(1234567890);
+                header.set_size(content.len() as u64);
+                header.set_entry_type(tar::EntryType::Regular);
+                builder
+                    .append_data(&mut header, target_path, &content[..])
+                    .unwrap();
+
+                let mut link_header = tar::Header::new_ustar();
+                link_header.set_mode(0o644);
+                link_header.set_uid(1000);
+                link_header.set_gid(1000);
+                link_header.set_mtime(1234567890);
+                link_header.set_size(0);
+                link_header.set_entry_type(tar::EntryType::Link);
+                builder
+                    .append_link(&mut link_header, link_name, target_path)
+                    .unwrap();
+
+                builder.finish().unwrap();
+            }
+
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let entries = rt.block_on(read_all_via_splitstream(tar_data)).unwrap();
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].path, PathBuf::from(format!("/{target_path}")));
+
+            match &entries[1].item {
+                TarItem::Hardlink(target) => {
+                    assert_eq!(target.to_str().unwrap(), format!("/{target_path}"));
+                }
+                _ => panic!("expected hardlink"),
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(64))]
+
+            #[test]
+            fn test_short_paths(path in path_with_length(1, 100)) {
+                roundtrip_path(&path);
+            }
+
+            #[test]
+            fn test_medium_paths(path in path_with_length(101, 255)) {
+                roundtrip_path(&path);
+            }
+
+            #[test]
+            fn test_long_paths(path in path_with_length(256, 500)) {
+                roundtrip_path(&path);
+            }
+
+            #[test]
+            fn test_hardlink_targets(target in path_with_length(1, 400)) {
+                roundtrip_hardlink(&target);
             }
         }
     }
