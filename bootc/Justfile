@@ -59,8 +59,9 @@ patch: clone
     {
         echo ''
         echo '# Patched by composefs-rs CI to test against local composefs-rs'
-        echo '[patch."https://github.com/containers/composefs-rs"]'
+        echo '[patch."https://github.com/composefs/composefs-rs"]'
         echo "composefs = { path = \"$_COMPOSEFS_SRC/crates/composefs\" }"
+        echo "cfsctl = { path = \"$_COMPOSEFS_SRC/crates/cfsctl\" }"
         echo "composefs-boot = { path = \"$_COMPOSEFS_SRC/crates/composefs-boot\" }"
         echo "composefs-oci = { path = \"$_COMPOSEFS_SRC/crates/composefs-oci\" }"
     } >> Cargo.toml
@@ -70,7 +71,7 @@ patch: clone
     sed -i 's/missing_docs = "deny"/missing_docs = "allow"/' Cargo.toml
 
     # Update Cargo.lock so the patch is recognized by cargo xtask local-rust-deps
-    cargo update composefs composefs-boot composefs-oci
+    cargo update composefs cfsctl composefs-boot composefs-oci
 
     echo "bootc patched successfully"
 
@@ -85,12 +86,12 @@ build: patch
 
 # Run bootc composefs tests using local composefs-rs
 # Since the patch uses real local paths, no symlinks or special env vars needed
-test: build
+test bootloader="grub" filesystem="ext4": build
     #!/bin/bash
     set -euo pipefail
     cd "$COMPOSEFS_BOOTC_PATH"
-    echo "Running bootc composefs tests..."
-    just test-composefs
+    echo "Running bootc composefs tests (bootloader={{bootloader}}, filesystem={{filesystem}})..."
+    just test-composefs {{bootloader}} {{filesystem}}
 
 # Clean the bootc checkout and any patches
 clean:
@@ -119,6 +120,11 @@ config:
       COMPOSEFS_BOOTC_PATH - Override bootc checkout path
       COMPOSEFS_BOOTC_REF  - Override bootc git ref (branch/tag/PR)
       COMPOSEFS_BOOTC_REPO - Override bootc git repository
+
+    Test Parameters:
+      just bootc/test                            # Default: grub + ext4
+      just bootc/test systemd ext4               # systemd-boot + ext4
+      just bootc/test grub xfs                   # grub + xfs
 
     Example Usage:
       just bootc/build                                      # Clone main, patch, and build
