@@ -25,15 +25,16 @@ wrapper functions needed. Set `COMPOSEFS_TEST_IMAGE` to enable this.
 
 ```sh
 # Fast CLI tests only (no root, no VM)
-just integration-unprivileged
+just test-integration
 
 # Everything, privileged tests auto-dispatch to bcvk VM
-just integration-container
+just test-integration-vm
 ```
 
 The container image is built from the repo's `Containerfile` and
 includes both `cfsctl` and `cfsctl-integration-tests` at `/usr/bin/`.
-It's based on `centos-bootc:stream10` so bcvk can boot it as a VM.
+It's based on `debian-bootc` by default (override with `base_image`)
+so bcvk can boot it as a VM.
 
 ## Running privileged tests without bcvk
 

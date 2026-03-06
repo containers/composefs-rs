@@ -39,7 +39,7 @@ fn require_privileged(test_name: &str) -> Result<Option<()>> {
     let image = std::env::var("COMPOSEFS_TEST_IMAGE").map_err(|_| {
         anyhow::anyhow!(
             "not root and COMPOSEFS_TEST_IMAGE not set; \
-             run `just build-test-image` or use `just test-integration-vm`"
+             run `just test-integration-vm` to build the image and run all tests"
         )
     })?;
 
