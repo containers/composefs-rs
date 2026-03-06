@@ -38,11 +38,13 @@
 //! This module handles both transparently. Use `is_container_image()` to check.
 
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{ensure, Context, Result};
 use containers_image_proxy::oci_spec::image::{
-    Descriptor, ImageConfiguration, ImageManifest, MediaType,
+    Descriptor, DescriptorBuilder, Digest as OciDigest, ImageConfiguration, ImageManifest,
+    ImageManifestBuilder, MediaType,
 };
 use rustix::fs::{openat, readlinkat, unlinkat, AtFlags, Dir, Mode, OFlags};
 use rustix::io::Errno;
@@ -389,7 +391,15 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
 
         let referrers_value: Vec<serde_json::Value> = referrers
             .iter()
-            .map(|(digest, _verity)| serde_json::json!({ "digest": digest }))
+            .map(|(digest, verity)| {
+                let mut entry = serde_json::json!({ "digest": digest });
+                if let Ok(referrer_img) = OciImage::open(repo, digest, Some(verity)) {
+                    if let Some(artifact_type) = referrer_img.manifest().artifact_type() {
+                        entry["artifactType"] = serde_json::json!(artifact_type.to_string());
+                    }
+                }
+                entry
+            })
             .collect();
 
         Ok(serde_json::json!({
@@ -597,6 +607,76 @@ pub fn write_manifest<ObjectID: FsVerityHashValue>(
     let id = repo.write_stream(stream, &content_id, oci_ref.as_deref())?;
 
     Ok((manifest_digest.to_string(), id))
+}
+
+/// Seals an image by tag: creates a sealed config, a new manifest referencing it,
+/// and updates the tag to point to the new manifest.
+///
+/// This is the complete seal workflow. It:
+/// 1. Opens the image by tag to get the original manifest and layer refs
+/// 2. Calls `seal()` to create a config with the fsverity label
+/// 3. Builds a new manifest referencing the sealed config (same layers)
+/// 4. Stores the new manifest and updates the tag
+///
+/// Returns the new manifest digest.
+pub fn seal_image<ObjectID: FsVerityHashValue>(
+    repo: &Arc<Repository<ObjectID>>,
+    name: &str,
+) -> Result<String> {
+    let img = OciImage::open_ref(repo, name)?;
+    ensure!(
+        img.is_container_image(),
+        "Can only seal container images, not artifacts"
+    );
+
+    let config_digest = img.config_digest().to_string();
+    let (sealed_config_digest, sealed_config_verity) =
+        crate::seal(repo, &config_digest, None)?;
+
+    // Build a new config descriptor for the sealed config
+    let sealed_config_json = {
+        let config_id = crate::config_identifier(&sealed_config_digest);
+        let (data, _) = read_external_splitstream(
+            repo,
+            &config_id,
+            Some(&sealed_config_verity),
+            Some(OCI_CONFIG_CONTENT_TYPE),
+        )?;
+        data
+    };
+
+    let new_config_descriptor = DescriptorBuilder::default()
+        .media_type(MediaType::ImageConfig)
+        .digest(
+            OciDigest::from_str(&sealed_config_digest)
+                .context("parsing sealed config digest")?,
+        )
+        .size(sealed_config_json.len() as u64)
+        .build()
+        .context("building config descriptor")?;
+
+    // Build new manifest with same layers but sealed config
+    let new_manifest = ImageManifestBuilder::default()
+        .schema_version(2u32)
+        .media_type(MediaType::ImageManifest)
+        .config(new_config_descriptor)
+        .layers(img.manifest().layers().to_vec())
+        .build()
+        .context("building sealed manifest")?;
+
+    let new_manifest_json = new_manifest.to_string()?;
+    let new_manifest_digest = hash(new_manifest_json.as_bytes());
+
+    write_manifest(
+        repo,
+        &new_manifest,
+        &new_manifest_digest,
+        &sealed_config_verity,
+        img.layer_refs(),
+        Some(name),
+    )?;
+
+    Ok(new_manifest_digest)
 }
 
 /// Checks if a manifest exists.

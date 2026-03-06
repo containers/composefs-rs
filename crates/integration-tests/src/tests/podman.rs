@@ -136,11 +136,11 @@ fn test_podman_build_seal_sign_verify() -> Result<()> {
     )
     .read()?;
 
-    // 3. Seal — produces a new config with fsverity digest baked in
+    // 3. Seal — creates sealed config + new manifest, updates the tag
     let seal_output = cmd!(sh, "{cfsctl} --insecure --repo {repo} oci seal test-podman").read()?;
     assert!(
-        seal_output.contains("config") && seal_output.contains("verity"),
-        "expected config/verity in seal output, got: {seal_output}"
+        seal_output.contains("Sealed") && seal_output.contains("sha256:"),
+        "expected sealed manifest digest in seal output, got: {seal_output}"
     );
 
     // 4. Sign

@@ -195,6 +195,10 @@ fn test_verify_without_cert() -> Result<()> {
         verify_output.contains("digest matches"),
         "expected digest-only verification, got: {verify_output}"
     );
+    assert!(
+        verify_output.contains("no certificate provided"),
+        "expected warning about missing certificate, got: {verify_output}"
+    );
     Ok(())
 }
 integration_test!(test_verify_without_cert);
@@ -710,7 +714,7 @@ fn test_inspect_shows_referrer_info() -> Result<()> {
         "expected at least one referrer after signing"
     );
 
-    // Each referrer should have a digest field
+    // Each referrer should have a digest field and artifactType
     for referrer in referrers {
         let digest = referrer["digest"]
             .as_str()
@@ -718,6 +722,13 @@ fn test_inspect_shows_referrer_info() -> Result<()> {
         assert!(
             digest.starts_with("sha256:"),
             "referrer digest should start with sha256:, got: {digest}"
+        );
+        let artifact_type = referrer["artifactType"]
+            .as_str()
+            .expect("expected artifactType field in referrer");
+        assert!(
+            !artifact_type.is_empty(),
+            "artifactType should not be empty"
         );
     }
 

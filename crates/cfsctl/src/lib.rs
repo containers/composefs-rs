@@ -779,11 +779,8 @@ where
             }
             OciCommand::Seal { ref image } => {
                 let repo = Arc::new(repo);
-                let img = composefs_oci::OciImage::open_ref(&repo, image)?;
-                let config_digest = img.config_digest().to_string();
-                let (digest, verity) = composefs_oci::seal(&repo, &config_digest, None)?;
-                println!("config {digest}");
-                println!("verity {}", verity.to_id());
+                let manifest_digest = composefs_oci::seal_image(&repo, image)?;
+                println!("Sealed {image} -> {manifest_digest}");
             }
             OciCommand::Mount {
                 ref name,
@@ -1062,6 +1059,9 @@ where
 
                 if verifier.is_some() {
                     println!("\nVerification passed ({verified_count} signatures verified)");
+                } else {
+                    println!("\nDigest check passed. NOTE: no certificate provided, signatures were NOT cryptographically verified.");
+                    println!("To verify signatures, use: cfsctl oci verify {image} --cert <certificate.pem>");
                 }
             }
             OciCommand::Push {

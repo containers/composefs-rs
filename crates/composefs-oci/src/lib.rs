@@ -43,8 +43,8 @@ pub use image::{
 pub use oci_image::{
     add_referrer, export_image_to_oci_layout, export_referrers_to_oci_layout, layer_dumpfile,
     layer_info, layer_tar, list_images, list_referrers, list_refs, remove_referrer,
-    remove_referrers_for_subject, resolve_ref, tag_image, untag_image, ImageInfo, LayerInfo,
-    OciImage, SplitstreamInfo, OCI_REF_PREFIX,
+    remove_referrers_for_subject, resolve_ref, seal_image, tag_image, untag_image, ImageInfo,
+    LayerInfo, OciImage, SplitstreamInfo, OCI_REF_PREFIX,
 };
 pub use skopeo::pull_image;
 
