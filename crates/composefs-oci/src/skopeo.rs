@@ -196,7 +196,7 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             let media_type = descriptor.media_type();
             let (object_id, layer_stats) = if is_tar_media_type(media_type) {
                 // Tar layers: decompress and split into a splitstream
-                let reader: Box<dyn tokio::io::AsyncBufRead + Unpin + Send> = match media_type {
+                let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = match media_type {
                     MediaType::ImageLayer | MediaType::ImageLayerNonDistributable => {
                         Box::new(BufReader::with_capacity(IO_BUF_CAPACITY, progress))
                     }
