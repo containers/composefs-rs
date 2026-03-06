@@ -16,11 +16,9 @@ use log::trace;
 use xxhash_rust::xxh32::xxh32;
 use zerocopy::{Immutable, IntoBytes};
 
-use crate::{
-    erofs::{composefs::OverlayMetacopy, format, reader::round_up},
-    fsverity::FsVerityHashValue,
-    tree,
-};
+use composefs_erofs::{composefs::OverlayMetacopy, format, reader::round_up};
+
+use crate::{fsverity::FsVerityHashValue, tree};
 
 #[derive(Clone, Copy, Debug)]
 enum Offset {
