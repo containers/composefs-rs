@@ -23,7 +23,4 @@ pub mod generic_tree;
 #[cfg(any(test, feature = "test"))]
 pub mod test;
 
-/// All files that contain 64 or fewer bytes (size <= INLINE_CONTENT_MAX) should be stored inline
-/// in the erofs image (and also in splitstreams).  All files with 65 or more bytes (size > MAX)
-/// should be written to the object storage and referred to from the image (and splitstreams).
-pub const INLINE_CONTENT_MAX: usize = 64;
+pub use composefs_types::INLINE_CONTENT_MAX;

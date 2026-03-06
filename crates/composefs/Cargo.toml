@@ -17,7 +17,9 @@ test = ["tempfile"]
 
 [dependencies]
 anyhow = { version = "1.0.87", default-features = false }
+composefs-erofs = { workspace = true }
 composefs-ioctls = { workspace = true }
+composefs-types = { workspace = true }
 fn-error-context = "0.2"
 hex = { version = "0.4.0", default-features = false, features = ["std"] }
 log = { version = "0.4.8", default-features = false }
