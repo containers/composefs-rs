@@ -471,12 +471,14 @@ pub fn debug_img(output: &mut impl std::io::Write, data: &[u8]) -> Result<()> {
 
         match offset.cmp(&start) {
             Ordering::Less => {
-                dump_unassigned(output, offset, &data[offset..start])?;
-                addto(
-                    &mut padding_stats,
-                    &(last_segment_type, segment_type),
-                    start - offset,
-                );
+                if let Some(unassigned) = data.get(offset..start) {
+                    dump_unassigned(output, offset, unassigned)?;
+                    addto(
+                        &mut padding_stats,
+                        &(last_segment_type, segment_type),
+                        start - offset,
+                    );
+                }
                 offset = start;
             }
             Ordering::Greater => {
