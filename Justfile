@@ -79,6 +79,10 @@ fuzz-all seconds="120":
         fi
     done
 
+# Generate seed corpus for fuzz targets
+generate-corpus:
+    cargo run --manifest-path crates/composefs-erofs/fuzz/Cargo.toml --bin generate-corpus
+
 # List available fuzz targets
 fuzz-list:
     cd crates/composefs-erofs && cargo +nightly fuzz list

@@ -20,6 +20,10 @@ path = ".."
 [dependencies.composefs-types]
 path = "../../composefs-types"
 
+# composefs is needed by the corpus generator to build valid EROFS images
+[dependencies.composefs]
+path = "../../composefs"
+
 [[bin]]
 name = "read_image"
 path = "fuzz_targets/read_image.rs"
@@ -33,3 +37,7 @@ path = "fuzz_targets/debug_image.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "generate-corpus"
+path = "generate_corpus.rs"
