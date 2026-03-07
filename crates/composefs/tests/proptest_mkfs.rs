@@ -434,7 +434,7 @@ proptest! {
             stat,
         );
 
-        compare_with_c_mkcomposefs(&fs).map_err(|e| TestCaseError::fail(e))?;
+        compare_with_c_mkcomposefs(&fs).map_err(TestCaseError::fail)?;
     }
 
     /// Test various inline file sizes
@@ -445,7 +445,7 @@ proptest! {
         let mut fs = FileSystem::new(default_stat());
         add_leaf(&mut fs.root, OsStr::new("file"), LeafContent::Regular(RegularFile::Inline(content)));
 
-        compare_with_c_mkcomposefs(&fs).map_err(|e| TestCaseError::fail(e))?;
+        compare_with_c_mkcomposefs(&fs).map_err(TestCaseError::fail)?;
     }
 
     /// Test external file sizes at various boundaries
@@ -457,7 +457,7 @@ proptest! {
         let mut fs = FileSystem::new(default_stat());
         add_leaf(&mut fs.root, OsStr::new("external"), LeafContent::Regular(RegularFile::External(hash, size)));
 
-        compare_with_c_mkcomposefs(&fs).map_err(|e| TestCaseError::fail(e))?;
+        compare_with_c_mkcomposefs(&fs).map_err(TestCaseError::fail)?;
     }
 
     /// Test ASCII filenames
@@ -468,7 +468,7 @@ proptest! {
         let mut fs = FileSystem::new(default_stat());
         add_leaf(&mut fs.root, &name, LeafContent::Regular(RegularFile::Inline(b"content".to_vec().into_boxed_slice())));
 
-        compare_with_c_mkcomposefs(&fs).map_err(|e| TestCaseError::fail(e))?;
+        compare_with_c_mkcomposefs(&fs).map_err(TestCaseError::fail)?;
     }
 
     /// Test filenames with special characters
@@ -479,7 +479,7 @@ proptest! {
         let mut fs = FileSystem::new(default_stat());
         add_leaf(&mut fs.root, &name, LeafContent::Regular(RegularFile::Inline(b"content".to_vec().into_boxed_slice())));
 
-        compare_with_c_mkcomposefs(&fs).map_err(|e| TestCaseError::fail(e))?;
+        compare_with_c_mkcomposefs(&fs).map_err(TestCaseError::fail)?;
     }
 
     /// Test long filenames
@@ -490,7 +490,7 @@ proptest! {
         let mut fs = FileSystem::new(default_stat());
         add_leaf(&mut fs.root, &name, LeafContent::Regular(RegularFile::Inline(b"content".to_vec().into_boxed_slice())));
 
-        compare_with_c_mkcomposefs(&fs).map_err(|e| TestCaseError::fail(e))?;
+        compare_with_c_mkcomposefs(&fs).map_err(TestCaseError::fail)?;
     }
 
     /// Test different file types
@@ -501,7 +501,7 @@ proptest! {
         let mut fs = FileSystem::new(default_stat());
         add_leaf(&mut fs.root, OsStr::new("item"), content);
 
-        compare_with_c_mkcomposefs(&fs).map_err(|e| TestCaseError::fail(e))?;
+        compare_with_c_mkcomposefs(&fs).map_err(TestCaseError::fail)?;
     }
 
     /// Test various stat metadata combinations
@@ -517,7 +517,7 @@ proptest! {
             stat,
         );
 
-        compare_with_c_mkcomposefs(&fs).map_err(|e| TestCaseError::fail(e))?;
+        compare_with_c_mkcomposefs(&fs).map_err(TestCaseError::fail)?;
     }
 
     /// Test compact inode conditions (uid/gid fit in u16)
@@ -531,7 +531,7 @@ proptest! {
         let mut fs = FileSystem::new(stat);
         add_leaf(&mut fs.root, OsStr::new("file"), LeafContent::Regular(RegularFile::Inline(b"x".to_vec().into_boxed_slice())));
 
-        compare_with_c_mkcomposefs(&fs).map_err(|e| TestCaseError::fail(e))?;
+        compare_with_c_mkcomposefs(&fs).map_err(TestCaseError::fail)?;
     }
 
     /// Test extended inodes (uid/gid > u16::MAX)
@@ -549,7 +549,7 @@ proptest! {
             stat,
         );
 
-        compare_with_c_mkcomposefs(&fs).map_err(|e| TestCaseError::fail(e))?;
+        compare_with_c_mkcomposefs(&fs).map_err(TestCaseError::fail)?;
     }
 
     /// Test extended inodes with different mtime values
@@ -575,7 +575,7 @@ proptest! {
             stat2,
         );
 
-        compare_with_c_mkcomposefs(&fs).map_err(|e| TestCaseError::fail(e))?;
+        compare_with_c_mkcomposefs(&fs).map_err(TestCaseError::fail)?;
     }
 
     /// Test multiple files with varied content
@@ -596,7 +596,7 @@ proptest! {
             }
         }
 
-        compare_with_c_mkcomposefs(&fs).map_err(|e| TestCaseError::fail(e))?;
+        compare_with_c_mkcomposefs(&fs).map_err(TestCaseError::fail)?;
     }
 
     /// Test symlinks with various targets
@@ -607,7 +607,7 @@ proptest! {
         let mut fs = FileSystem::new(default_stat());
         add_leaf(&mut fs.root, OsStr::new("link"), LeafContent::Symlink(target));
 
-        compare_with_c_mkcomposefs(&fs).map_err(|e| TestCaseError::fail(e))?;
+        compare_with_c_mkcomposefs(&fs).map_err(TestCaseError::fail)?;
     }
 
     /// Test device nodes
@@ -620,7 +620,7 @@ proptest! {
         add_leaf(&mut fs.root, OsStr::new("chrdev"), LeafContent::CharacterDevice(char_rdev));
         add_leaf(&mut fs.root, OsStr::new("blkdev"), LeafContent::BlockDevice(block_rdev));
 
-        compare_with_c_mkcomposefs(&fs).map_err(|e| TestCaseError::fail(e))?;
+        compare_with_c_mkcomposefs(&fs).map_err(TestCaseError::fail)?;
     }
 }
 
@@ -670,7 +670,7 @@ proptest! {
     fn test_directory_shallow(
         fs in flat_filesystem_strategy(10)
     ) {
-        compare_with_c_mkcomposefs(&fs).map_err(|e| TestCaseError::fail(e))?;
+        compare_with_c_mkcomposefs(&fs).map_err(TestCaseError::fail)?;
     }
 
     /// Test directories with many entries
@@ -690,7 +690,7 @@ proptest! {
             }
         }
 
-        compare_with_c_mkcomposefs(&fs).map_err(|e| TestCaseError::fail(e))?;
+        compare_with_c_mkcomposefs(&fs).map_err(TestCaseError::fail)?;
     }
 }
 
@@ -1189,7 +1189,7 @@ proptest! {
             }
         }
 
-        dumpfile_roundtrip_test(&fs).map_err(|e| TestCaseError::fail(e))?;
+        dumpfile_roundtrip_test(&fs).map_err(TestCaseError::fail)?;
     }
 
     /// Test C dumpfile roundtrip with random filesystems
@@ -1209,6 +1209,6 @@ proptest! {
             }
         }
 
-        c_dumpfile_roundtrip_test(&fs).map_err(|e| TestCaseError::fail(e))?;
+        c_dumpfile_roundtrip_test(&fs).map_err(TestCaseError::fail)?;
     }
 }

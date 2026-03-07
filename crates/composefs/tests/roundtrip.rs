@@ -15,14 +15,17 @@ use std::{
 use composefs::{
     dumpfile::dumpfile_to_filesystem,
     erofs::{
+        dump::dump_erofs,
         format::{self, FormatVersion, XATTR_PREFIXES},
-        reader::{DirectoryBlock, Image, InodeHeader, InodeOps},
+        reader::{DirectoryBlock, Image, InodeHeader, InodeOps, InodeType},
         writer::mkfs_erofs,
     },
     fsverity::{FsVerityHashValue, Sha256HashValue},
     tree::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
 };
 use zerocopy::FromBytes;
+
+type SetupFn = fn(&mut FileSystem<Sha256HashValue>);
 
 /// Helper to create a default Stat
 fn default_stat() -> Stat {
@@ -1075,4 +1078,687 @@ fn test_image_metadata() {
     // Verify root inode is a directory
     let root = img.root();
     assert!(root.mode().is_dir());
+}
+
+// ============================================================================
+// Format version roundtrip tests
+// ============================================================================
+
+/// Verify that V1_0 images can be generated, opened, and read without panics.
+///
+/// V1_0 adds overlay whiteout entries to the root directory, so entry counts differ
+/// from V1_1. Instead of reusing the V1_1 verify functions, we just verify the
+/// images are structurally valid and the root is readable.
+#[test]
+fn test_roundtrip_all_cases_v1_0() {
+    let setups: &[(&str, SetupFn)] = &[
+        ("empty", setup_empty),
+        ("simple_inline_file", setup_simple_inline_file),
+        ("multiple_files", setup_multiple_files),
+        ("directory_with_entries", setup_directory_with_entries),
+        ("symlink", setup_symlink),
+        ("fifo", setup_fifo),
+        ("devices", setup_devices),
+        ("external_file", setup_external_file),
+        ("deep_nesting", setup_deep_nesting),
+        ("empty_file", setup_empty_file),
+        ("mixed_content", setup_mixed_content),
+    ];
+
+    for (name, setup) in setups {
+        println!("Running V1_0 test case: {name}");
+        let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
+        setup(&mut fs);
+        fs.add_overlay_whiteouts();
+        let image = mkfs_erofs(&fs, FormatVersion::V1_0);
+        let img = Image::open(&image);
+
+        // Verify basic structure
+        let root = img.root();
+        assert!(root.mode().is_dir(), "V1_0 root should be a directory");
+
+        // Verify root entries can be read
+        let root_nid = img.sb.root_nid.get() as u64;
+        let entries = collect_entries(&img, root_nid);
+        println!("  V1_0 root has {} entries, PASSED: {name}", entries.len());
+    }
+}
+
+/// Verify that V1_0 images use compact inodes where possible.
+#[test]
+fn test_v1_0_uses_compact_root() {
+    let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
+    setup_simple_inline_file(&mut fs);
+    fs.add_overlay_whiteouts();
+
+    let image = mkfs_erofs(&fs, FormatVersion::V1_0);
+    let img = Image::open(&image);
+    let root = img.root();
+
+    // With all mtimes=0, uid/gid=0, the root should be a compact inode in V1_0.
+    assert!(
+        matches!(root, InodeType::Compact(_)),
+        "V1_0 root with mtime=0, uid/gid=0 should use compact inode"
+    );
+}
+
+/// Verify that V1_1 images always use extended inodes.
+#[test]
+fn test_v1_1_uses_extended_root() {
+    let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
+    setup_simple_inline_file(&mut fs);
+
+    let image = mkfs_erofs(&fs, FormatVersion::V1_1);
+    let img = Image::open(&image);
+    let root = img.root();
+
+    assert!(
+        matches!(root, InodeType::Extended(_)),
+        "V1_1 should always use extended inodes"
+    );
+}
+
+// ============================================================================
+// Xattr edge cases
+// ============================================================================
+
+/// Test file with empty xattr value
+fn setup_xattr_empty_value(fs: &mut FileSystem<Sha256HashValue>) {
+    let mut xattrs = BTreeMap::new();
+    xattrs.insert(
+        Box::from(OsStr::new("user.emptyval")),
+        Box::from(b"".as_slice()),
+    );
+    let stat = Stat {
+        st_mode: 0o644,
+        st_uid: 0,
+        st_gid: 0,
+        st_mtim_sec: 0,
+        xattrs: RefCell::new(xattrs),
+    };
+    add_leaf_with_stat(
+        &mut fs.root,
+        OsStr::new("empty_xattr_val"),
+        LeafContent::Regular(RegularFile::Inline(b"data".to_vec().into())),
+        stat,
+    );
+}
+
+fn verify_xattr_empty_value(_img: &Image, entries: &[ReconstructedEntry]) {
+    assert_eq!(entries.len(), 1);
+    let entry = verify_entry_exists(entries, "empty_xattr_val");
+    // Verify the xattr with empty value is present
+    assert!(
+        entry
+            .xattrs
+            .iter()
+            .any(|(k, v)| k == "user.emptyval" && v.is_empty()),
+        "Should have user.emptyval xattr with empty value, got: {:?}",
+        entry.xattrs
+    );
+}
+
+/// Test file with large xattr value (close to the 64KB limit)
+fn setup_xattr_large_value(fs: &mut FileSystem<Sha256HashValue>) {
+    let mut xattrs = BTreeMap::new();
+    // Use a moderately large value (4KB) - not too close to the 64KB limit
+    // to avoid cross-block-boundary complications.
+    let large_value: Vec<u8> = (0..4096).map(|i| (i % 256) as u8).collect();
+    xattrs.insert(
+        Box::from(OsStr::new("user.largeval")),
+        large_value.into_boxed_slice(),
+    );
+    let stat = Stat {
+        st_mode: 0o644,
+        st_uid: 0,
+        st_gid: 0,
+        st_mtim_sec: 0,
+        xattrs: RefCell::new(xattrs),
+    };
+    add_leaf_with_stat(
+        &mut fs.root,
+        OsStr::new("large_xattr"),
+        LeafContent::Regular(RegularFile::Inline(b"x".to_vec().into())),
+        stat,
+    );
+}
+
+fn verify_xattr_large_value(_img: &Image, entries: &[ReconstructedEntry]) {
+    assert_eq!(entries.len(), 1);
+    let entry = verify_entry_exists(entries, "large_xattr");
+    let xattr = entry
+        .xattrs
+        .iter()
+        .find(|(k, _)| k == "user.largeval")
+        .expect("Should have user.largeval xattr");
+    assert_eq!(
+        xattr.1.len(),
+        4096,
+        "Large xattr value should be 4096 bytes"
+    );
+    // Verify the content pattern
+    for (i, byte) in xattr.1.iter().enumerate() {
+        assert_eq!(*byte, (i % 256) as u8, "Byte mismatch at position {i}");
+    }
+}
+
+/// Test file with many xattrs
+fn setup_xattr_many(fs: &mut FileSystem<Sha256HashValue>) {
+    let mut xattrs = BTreeMap::new();
+    for i in 0..20 {
+        let key = format!("user.attr_{i:02}");
+        let val = format!("value_{i:02}");
+        xattrs.insert(
+            Box::from(OsStr::new(&key)),
+            val.into_bytes().into_boxed_slice(),
+        );
+    }
+    let stat = Stat {
+        st_mode: 0o644,
+        st_uid: 0,
+        st_gid: 0,
+        st_mtim_sec: 0,
+        xattrs: RefCell::new(xattrs),
+    };
+    add_leaf_with_stat(
+        &mut fs.root,
+        OsStr::new("many_xattrs"),
+        LeafContent::Regular(RegularFile::Inline(b"data".to_vec().into())),
+        stat,
+    );
+}
+
+fn verify_xattr_many(_img: &Image, entries: &[ReconstructedEntry]) {
+    assert_eq!(entries.len(), 1);
+    let entry = verify_entry_exists(entries, "many_xattrs");
+    // Should have at least 20 xattrs (may also have overlay xattrs)
+    assert!(
+        entry.xattrs.len() >= 20,
+        "Should have at least 20 xattrs, got {}",
+        entry.xattrs.len()
+    );
+    for i in 0..20 {
+        let key = format!("user.attr_{i:02}");
+        let val = format!("value_{i:02}");
+        assert!(
+            entry
+                .xattrs
+                .iter()
+                .any(|(k, v)| k == &key && v == val.as_bytes()),
+            "Missing xattr {key}={val}"
+        );
+    }
+}
+
+#[test]
+fn test_roundtrip_xattr_empty_value() {
+    let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
+    setup_xattr_empty_value(&mut fs);
+    let image = mkfs_erofs_default(&fs);
+    let img = Image::open(&image);
+    let root_nid = img.sb.root_nid.get() as u64;
+    let entries = collect_entries(&img, root_nid);
+    verify_xattr_empty_value(&img, &entries);
+}
+
+#[test]
+fn test_roundtrip_xattr_large_value() {
+    let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
+    setup_xattr_large_value(&mut fs);
+    let image = mkfs_erofs_default(&fs);
+    let img = Image::open(&image);
+    let root_nid = img.sb.root_nid.get() as u64;
+    let entries = collect_entries(&img, root_nid);
+    verify_xattr_large_value(&img, &entries);
+}
+
+#[test]
+fn test_roundtrip_xattr_many() {
+    let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
+    setup_xattr_many(&mut fs);
+    let image = mkfs_erofs_default(&fs);
+    let img = Image::open(&image);
+    let root_nid = img.sb.root_nid.get() as u64;
+    let entries = collect_entries(&img, root_nid);
+    verify_xattr_many(&img, &entries);
+}
+
+// ============================================================================
+// Hardlinks across directories
+// ============================================================================
+
+fn setup_hardlinks_across_dirs(fs: &mut FileSystem<Sha256HashValue>) {
+    let shared_leaf = Rc::new(Leaf {
+        content: LeafContent::Regular(RegularFile::Inline(b"shared across dirs".to_vec().into())),
+        stat: default_stat(),
+    });
+
+    // Put the same leaf in root and in a subdirectory
+    fs.root.insert(
+        OsStr::new("root_link"),
+        Inode::Leaf(Rc::clone(&shared_leaf)),
+    );
+
+    let mut subdir = Directory::new(default_stat());
+    subdir.insert(OsStr::new("sub_link"), Inode::Leaf(Rc::clone(&shared_leaf)));
+    fs.root
+        .insert(OsStr::new("dir"), Inode::Directory(Box::new(subdir)));
+
+    // And in a nested subdirectory
+    let mut subdir2 = Directory::new(default_stat());
+    subdir2.insert(OsStr::new("deep_link"), Inode::Leaf(shared_leaf));
+    let dir2 = fs.root.get_directory_mut(OsStr::new("dir")).unwrap();
+    dir2.insert(OsStr::new("nested"), Inode::Directory(Box::new(subdir2)));
+}
+
+fn verify_hardlinks_across_dirs(img: &Image, entries: &[ReconstructedEntry]) {
+    // Root should have root_link and dir
+    assert_eq!(entries.len(), 2);
+    let root_link = verify_entry_exists(entries, "root_link");
+    assert_eq!(root_link.inline_data, Some(b"shared across dirs".to_vec()));
+    let dir = verify_entry_exists(entries, "dir");
+    assert!(dir.is_dir);
+
+    // Navigate into dir to find sub_link and nested/deep_link
+    let root_nid = img.sb.root_nid.get() as u64;
+    let find_child_nid = |parent_nid: u64, name: &[u8]| -> Option<u64> {
+        let inode = img.inode(parent_nid);
+        if let Some(inline) = inode.inline() {
+            if let Ok(block) = DirectoryBlock::ref_from_bytes(inline) {
+                for entry in block.entries() {
+                    if entry.name == name {
+                        return Some(entry.header.inode_offset.get());
+                    }
+                }
+            }
+        }
+        for blkid in inode.blocks(img.blkszbits) {
+            let block = img.directory_block(blkid);
+            for entry in block.entries() {
+                if entry.name == name {
+                    return Some(entry.header.inode_offset.get());
+                }
+            }
+        }
+        None
+    };
+
+    let dir_nid = find_child_nid(root_nid, b"dir").expect("dir not found");
+    let root_link_nid = find_child_nid(root_nid, b"root_link").expect("root_link not found");
+    let sub_link_nid = find_child_nid(dir_nid, b"sub_link").expect("sub_link not found");
+    let nested_nid = find_child_nid(dir_nid, b"nested").expect("nested not found");
+    let deep_link_nid = find_child_nid(nested_nid, b"deep_link").expect("deep_link not found");
+
+    // All three hardlinks should point to the same inode
+    assert_eq!(
+        root_link_nid, sub_link_nid,
+        "root_link and sub_link should share inode"
+    );
+    assert_eq!(
+        root_link_nid, deep_link_nid,
+        "root_link and deep_link should share inode"
+    );
+}
+
+#[test]
+fn test_roundtrip_hardlinks_across_dirs() {
+    let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
+    setup_hardlinks_across_dirs(&mut fs);
+    let image = mkfs_erofs_default(&fs);
+    let img = Image::open(&image);
+    let root_nid = img.sb.root_nid.get() as u64;
+    let entries = collect_entries(&img, root_nid);
+    verify_hardlinks_across_dirs(&img, &entries);
+}
+
+// ============================================================================
+// Deeply nested paths
+// ============================================================================
+
+fn setup_deeply_nested(fs: &mut FileSystem<Sha256HashValue>) {
+    // Create a 10-level deep path: /d0/d1/d2/.../d9/leaf.txt
+    let mut current = &mut fs.root;
+    for i in 0..10 {
+        let name = format!("d{i}");
+        current.insert(
+            OsStr::new(&name),
+            Inode::Directory(Box::new(Directory::new(default_stat()))),
+        );
+        current = current.get_directory_mut(OsStr::new(&name)).unwrap();
+    }
+    current.insert(
+        OsStr::new("leaf.txt"),
+        Inode::Leaf(Rc::new(Leaf {
+            content: LeafContent::Regular(RegularFile::Inline(b"ten levels deep".to_vec().into())),
+            stat: default_stat(),
+        })),
+    );
+}
+
+fn verify_deeply_nested(img: &Image, entries: &[ReconstructedEntry]) {
+    assert_eq!(entries.len(), 1);
+    let d0 = verify_entry_exists(entries, "d0");
+    assert!(d0.is_dir);
+
+    // Navigate down to the leaf
+    let find_child_nid = |parent_nid: u64, name: &[u8]| -> Option<u64> {
+        let inode = img.inode(parent_nid);
+        if let Some(inline) = inode.inline() {
+            if let Ok(block) = DirectoryBlock::ref_from_bytes(inline) {
+                for entry in block.entries() {
+                    if entry.name == name {
+                        return Some(entry.header.inode_offset.get());
+                    }
+                }
+            }
+        }
+        for blkid in inode.blocks(img.blkszbits) {
+            let block = img.directory_block(blkid);
+            for entry in block.entries() {
+                if entry.name == name {
+                    return Some(entry.header.inode_offset.get());
+                }
+            }
+        }
+        None
+    };
+
+    let root_nid = img.sb.root_nid.get() as u64;
+    let mut nid = root_nid;
+    for i in 0..10 {
+        let name = format!("d{i}");
+        nid = find_child_nid(nid, name.as_bytes())
+            .unwrap_or_else(|| panic!("Directory {name} not found at depth {i}"));
+    }
+    let leaf_nid = find_child_nid(nid, b"leaf.txt").expect("leaf.txt not found at depth 10");
+    let leaf_inode = img.inode(leaf_nid);
+    let inline = leaf_inode.inline().expect("leaf should have inline data");
+    assert_eq!(inline, b"ten levels deep");
+}
+
+#[test]
+fn test_roundtrip_deeply_nested() {
+    let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
+    setup_deeply_nested(&mut fs);
+    let image = mkfs_erofs_default(&fs);
+    let img = Image::open(&image);
+    let root_nid = img.sb.root_nid.get() as u64;
+    let entries = collect_entries(&img, root_nid);
+    verify_deeply_nested(&img, &entries);
+}
+
+// ============================================================================
+// Maximum filename length (255 bytes)
+// ============================================================================
+
+fn setup_max_filename(fs: &mut FileSystem<Sha256HashValue>) {
+    // POSIX maximum filename is 255 bytes
+    let long_name: String = (0..255).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+    add_leaf(
+        &mut fs.root,
+        OsStr::new(&long_name),
+        LeafContent::Regular(RegularFile::Inline(b"long name file".to_vec().into())),
+    );
+}
+
+fn verify_max_filename(_img: &Image, entries: &[ReconstructedEntry]) {
+    assert_eq!(entries.len(), 1);
+    let long_name: String = (0..255).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+    let entry = verify_entry_exists(entries, &long_name);
+    assert_eq!(entry.inline_data, Some(b"long name file".to_vec()));
+    assert_eq!(entry.name.len(), 255);
+}
+
+#[test]
+fn test_roundtrip_max_filename() {
+    let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
+    setup_max_filename(&mut fs);
+    let image = mkfs_erofs_default(&fs);
+    let img = Image::open(&image);
+    let root_nid = img.sb.root_nid.get() as u64;
+    let entries = collect_entries(&img, root_nid);
+    verify_max_filename(&img, &entries);
+}
+
+// ============================================================================
+// All file types in the same directory
+// ============================================================================
+
+fn setup_all_types(fs: &mut FileSystem<Sha256HashValue>) {
+    let ext_hash = Sha256HashValue::from_hex(
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    )
+    .unwrap();
+
+    add_leaf(
+        &mut fs.root,
+        OsStr::new("inline_file"),
+        LeafContent::Regular(RegularFile::Inline(b"inline content".to_vec().into())),
+    );
+    add_leaf(
+        &mut fs.root,
+        OsStr::new("external_file"),
+        LeafContent::Regular(RegularFile::External(ext_hash, 8192)),
+    );
+    add_leaf(
+        &mut fs.root,
+        OsStr::new("symlink"),
+        LeafContent::Symlink(Box::from(OsStr::new("/usr/bin/target"))),
+    );
+    add_leaf(&mut fs.root, OsStr::new("fifo"), LeafContent::Fifo);
+    add_leaf(&mut fs.root, OsStr::new("socket"), LeafContent::Socket);
+    add_leaf(
+        &mut fs.root,
+        OsStr::new("chardev"),
+        LeafContent::CharacterDevice(0x0501),
+    );
+    add_leaf(
+        &mut fs.root,
+        OsStr::new("blockdev"),
+        LeafContent::BlockDevice(0x0801),
+    );
+    add_leaf(
+        &mut fs.root,
+        OsStr::new("empty_file"),
+        LeafContent::Regular(RegularFile::Inline(Box::new([]))),
+    );
+
+    // Also add a subdirectory
+    add_subdir(&mut fs.root, OsStr::new("subdir"));
+}
+
+fn verify_all_types(_img: &Image, entries: &[ReconstructedEntry]) {
+    assert_eq!(entries.len(), 9, "Should have 9 entries (8 files + 1 dir)");
+
+    let inline = verify_entry_exists(entries, "inline_file");
+    assert_eq!(inline.inline_data, Some(b"inline content".to_vec()));
+    assert!(!inline.is_dir);
+
+    let external = verify_entry_exists(entries, "external_file");
+    assert_eq!(external.size, 8192);
+    assert!(!external.is_dir);
+
+    let sym = verify_entry_exists(entries, "symlink");
+    assert_eq!(sym.inline_data, Some(b"/usr/bin/target".to_vec()));
+    assert!(!sym.is_dir);
+
+    let fifo_entry = verify_entry_exists(entries, "fifo");
+    assert!(!fifo_entry.is_dir);
+    assert_eq!(fifo_entry.size, 0);
+
+    let socket_entry = verify_entry_exists(entries, "socket");
+    assert!(!socket_entry.is_dir);
+    assert_eq!(socket_entry.size, 0);
+
+    let _ = verify_entry_exists(entries, "chardev");
+    let _ = verify_entry_exists(entries, "blockdev");
+
+    let empty = verify_entry_exists(entries, "empty_file");
+    assert_eq!(empty.size, 0);
+
+    let subdir = verify_entry_exists(entries, "subdir");
+    assert!(subdir.is_dir);
+}
+
+#[test]
+fn test_roundtrip_all_types() {
+    let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
+    setup_all_types(&mut fs);
+    let image = mkfs_erofs_default(&fs);
+    let img = Image::open(&image);
+    let root_nid = img.sb.root_nid.get() as u64;
+    let entries = collect_entries(&img, root_nid);
+    verify_all_types(&img, &entries);
+}
+
+// ============================================================================
+// Dump→parse→mkfs→dump roundtrip consistency
+// ============================================================================
+
+/// Tests that dump→parse→mkfs→dump produces semantically identical output.
+/// This is a stronger test than binary comparison because it tests the full pipeline.
+#[test]
+fn test_dumpfile_full_roundtrip_consistency() {
+    // Build various filesystems, dump them, parse back, rebuild, dump again, compare.
+    let setups: Vec<(&str, SetupFn)> = vec![
+        ("empty", setup_empty),
+        ("simple_inline_file", setup_simple_inline_file),
+        ("multiple_files", setup_multiple_files),
+        ("symlink", setup_symlink),
+        ("fifo", setup_fifo),
+        ("devices", setup_devices),
+        ("external_file", setup_external_file),
+        ("deep_nesting", setup_deep_nesting),
+        // Note: setup_all_types is excluded because it includes a socket,
+        // which the dumpfile parser doesn't support.
+    ];
+
+    for (name, setup) in setups {
+        println!("Testing dump roundtrip: {name}");
+
+        let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
+        setup(&mut fs);
+
+        // Generate image and dump it
+        let image1 = mkfs_erofs_default(&fs);
+        let mut dump1_buf = Vec::new();
+        dump_erofs(&mut dump1_buf, &image1, &[]).unwrap();
+        let dump1 = String::from_utf8(dump1_buf).unwrap();
+
+        // Parse the dump back and regenerate
+        let fs2 = dumpfile_to_filesystem::<Sha256HashValue>(&dump1).unwrap();
+        let image2 = mkfs_erofs_default(&fs2);
+        let mut dump2_buf = Vec::new();
+        dump_erofs(&mut dump2_buf, &image2, &[]).unwrap();
+        let dump2 = String::from_utf8(dump2_buf).unwrap();
+
+        // The two dumps should be identical
+        similar_asserts::assert_eq!(dump1, dump2, "Dump roundtrip failed for: {name}");
+        println!("  PASSED: {name}");
+    }
+}
+
+// ============================================================================
+// Stat preservation tests
+// ============================================================================
+
+/// Tests that uid/gid/mode/mtime survive the roundtrip
+#[test]
+fn test_roundtrip_preserves_stat_fields() {
+    let stat = Stat {
+        st_mode: 0o4755, // setuid + rwxr-xr-x
+        st_uid: 1000,
+        st_gid: 2000,
+        st_mtim_sec: 1700000000,
+        xattrs: RefCell::new(BTreeMap::new()),
+    };
+    let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
+    add_leaf_with_stat(
+        &mut fs.root,
+        OsStr::new("special_file"),
+        LeafContent::Regular(RegularFile::Inline(b"data".to_vec().into())),
+        stat,
+    );
+
+    let image = mkfs_erofs_default(&fs);
+    let img = Image::open(&image);
+
+    let root_nid = img.sb.root_nid.get() as u64;
+    let entries = collect_entries(&img, root_nid);
+    let entry = verify_entry_exists(&entries, "special_file");
+
+    // mode_permissions includes setuid bit
+    assert_eq!(
+        entry.mode_permissions, 0o4755,
+        "Mode should preserve setuid bit"
+    );
+
+    // Also check uid/gid/mtime by inspecting the raw inode
+    let find_child_nid = |parent_nid: u64, name: &[u8]| -> Option<u64> {
+        let inode = img.inode(parent_nid);
+        if let Some(inline) = inode.inline() {
+            if let Ok(block) = DirectoryBlock::ref_from_bytes(inline) {
+                for entry in block.entries() {
+                    if entry.name == name {
+                        return Some(entry.header.inode_offset.get());
+                    }
+                }
+            }
+        }
+        for blkid in inode.blocks(img.blkszbits) {
+            let block = img.directory_block(blkid);
+            for entry in block.entries() {
+                if entry.name == name {
+                    return Some(entry.header.inode_offset.get());
+                }
+            }
+        }
+        None
+    };
+    let file_nid = find_child_nid(root_nid, b"special_file").unwrap();
+    let file_inode = img.inode(file_nid);
+    assert_eq!(file_inode.uid(), 1000);
+    assert_eq!(file_inode.gid(), 2000);
+    assert_eq!(file_inode.mtime(), 1700000000);
+}
+
+/// Tests that the permissions-only bits (sticky, setgid, setuid) survive roundtrip
+#[test]
+fn test_roundtrip_special_mode_bits() {
+    let test_modes = [
+        (0o1755, "sticky"),
+        (0o2755, "setgid"),
+        (0o4755, "setuid"),
+        (0o7777, "all special bits"),
+        (0o0000, "no permissions"),
+        (0o0644, "regular file perms"),
+    ];
+
+    for (mode, desc) in test_modes {
+        let stat = Stat {
+            st_mode: mode,
+            st_uid: 0,
+            st_gid: 0,
+            st_mtim_sec: 0,
+            xattrs: RefCell::new(BTreeMap::new()),
+        };
+        let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
+        add_leaf_with_stat(
+            &mut fs.root,
+            OsStr::new("file"),
+            LeafContent::Regular(RegularFile::Inline(b"x".to_vec().into())),
+            stat,
+        );
+
+        let image = mkfs_erofs_default(&fs);
+        let img = Image::open(&image);
+        let root_nid = img.sb.root_nid.get() as u64;
+        let entries = collect_entries(&img, root_nid);
+        let entry = verify_entry_exists(&entries, "file");
+
+        assert_eq!(
+            entry.mode_permissions, mode as u16,
+            "Mode bits {desc} (0o{mode:o}) should survive roundtrip"
+        );
+    }
 }
