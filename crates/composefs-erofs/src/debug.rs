@@ -453,8 +453,12 @@ pub fn debug_img(output: &mut impl std::io::Write, data: &[u8]) -> Result<()> {
     let image = Image::open(data)?;
     let visited = ImageVisitor::visit_image(&image)?;
 
-    let inode_start = (image.sb.meta_blkaddr.get() as usize) << image.sb.blkszbits;
-    let xattr_start = (image.sb.xattr_blkaddr.get() as usize) << image.sb.blkszbits;
+    let inode_start = (image.sb.meta_blkaddr.get() as usize)
+        .checked_mul(image.block_size)
+        .ok_or_else(|| anyhow::anyhow!("inode start offset overflow"))?;
+    let xattr_start = (image.sb.xattr_blkaddr.get() as usize)
+        .checked_mul(image.block_size)
+        .ok_or_else(|| anyhow::anyhow!("xattr start offset overflow"))?;
 
     let mut space_stats = BTreeMap::new();
     let mut padding_stats = BTreeMap::new();
@@ -501,15 +505,19 @@ pub fn debug_img(output: &mut impl std::io::Write, data: &[u8]) -> Result<()> {
                 writeln!(output, "{offset:08x} {sb:?}")?;
             }
             SegmentType::CompactInode(inode) => {
-                writeln!(output, "# nid #{}", (offset - inode_start) / 32)?;
+                writeln!(output, "# nid #{}", offset.saturating_sub(inode_start) / 32)?;
                 writeln!(output, "{offset:08x} {inode:#?}")?;
             }
             SegmentType::ExtendedInode(inode) => {
-                writeln!(output, "# nid #{}", (offset - inode_start) / 32)?;
+                writeln!(output, "# nid #{}", offset.saturating_sub(inode_start) / 32)?;
                 writeln!(output, "{offset:08x} {inode:#?}")?;
             }
             SegmentType::XAttr(xattr) => {
-                writeln!(output, "# xattr #{}", (offset - xattr_start) / 4)?;
+                writeln!(
+                    output,
+                    "# xattr #{}",
+                    offset.saturating_sub(xattr_start) / 4
+                )?;
                 writeln!(output, "{offset:08x} {xattr:?}")?;
             }
             SegmentType::DirectoryBlock(block) => {

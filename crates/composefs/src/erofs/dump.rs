@@ -5,7 +5,7 @@
 //! C composefs-info tool.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     ffi::OsStr,
     fmt::{self, Write as FmtWrite},
     io::Write,
@@ -114,11 +114,16 @@ fn xattr_full_name(name_index: u8, suffix: &[u8]) -> Vec<u8> {
     full_name
 }
 
+/// Maximum directory nesting depth to prevent stack overflow from crafted images
+const MAX_DIRECTORY_DEPTH: usize = 512;
+
 /// Context for dump operation, tracking hardlinks
 struct DumpContext<'img> {
     image: &'img Image<'img>,
     /// Maps nid to the first path where it was seen (for hardlink tracking)
     seen_nids: HashMap<u64, PathBuf>,
+    /// Tracks visited directory nids to detect cycles
+    visited_dir_nids: BTreeSet<u64>,
     /// Optional filters for top-level entries
     filters: &'img [String],
 }
@@ -128,6 +133,7 @@ impl<'img> DumpContext<'img> {
         Self {
             image,
             seen_nids: HashMap::new(),
+            visited_dir_nids: BTreeSet::new(),
             filters,
         }
     }
@@ -282,10 +288,13 @@ impl<'img> DumpContext<'img> {
     /// Reads file content from blocks and optional inline tail
     /// This handles FlatPlain (blocks only) and FlatInline (blocks + tail) layouts
     fn read_file_content(&self, inode: &InodeType<'_>) -> Result<Vec<u8>> {
-        let size = inode.size() as usize;
+        let size = usize::try_from(inode.size())
+            .map_err(|_| anyhow::anyhow!("inode size too large for platform"))?;
         if size == 0 {
             return Ok(vec![]);
         }
+        // Cap pre-allocation against actual image size to avoid OOM from crafted images
+        let alloc_size = size.min(self.image.image.len());
 
         let layout = inode.data_layout()?;
         let blocks: Vec<u64> = inode.blocks(self.image.blkszbits)?.collect();
@@ -294,7 +303,7 @@ impl<'img> DumpContext<'img> {
         match layout {
             DataLayout::FlatPlain => {
                 // All data in blocks, no inline tail
-                let mut content = Vec::with_capacity(size);
+                let mut content = Vec::with_capacity(alloc_size);
                 for blkid in blocks {
                     content.extend_from_slice(self.image.block(blkid)?);
                 }
@@ -304,7 +313,7 @@ impl<'img> DumpContext<'img> {
             DataLayout::FlatInline => {
                 // Data in blocks + inline tail
                 let n_blocks = blocks.len();
-                let mut content = Vec::with_capacity(size);
+                let mut content = Vec::with_capacity(alloc_size);
                 for blkid in blocks {
                     content.extend_from_slice(self.image.block(blkid)?);
                 }
@@ -315,7 +324,12 @@ impl<'img> DumpContext<'img> {
                 // Truncate to actual size (inline portion may include padding)
                 let inline_size = size % block_size;
                 if inline_size > 0 {
-                    content.truncate(n_blocks * block_size + inline_size);
+                    if let Some(total) = n_blocks
+                        .checked_mul(block_size)
+                        .and_then(|n| n.checked_add(inline_size))
+                    {
+                        content.truncate(total);
+                    }
                 }
                 Ok(content)
             }
@@ -398,11 +412,13 @@ impl<'img> DumpContext<'img> {
                 }
                 S_IFLNK => {
                     // Symlink - target can be inline (short) or in blocks (long)
-                    let size = inode.size() as usize;
+                    let size = usize::try_from(inode.size())
+                        .map_err(|_| anyhow::anyhow!("symlink size too large for platform"))?;
+                    let alloc_size = size.min(self.image.image.len());
                     let blocks: Vec<u64> = inode.blocks(self.image.blkszbits)?.collect();
                     if !blocks.is_empty() {
                         // Long symlink: data is in blocks
-                        let mut target = Vec::with_capacity(size);
+                        let mut target = Vec::with_capacity(alloc_size);
                         for blkid in blocks {
                             target.extend_from_slice(self.image.block(blkid)?);
                         }
@@ -469,7 +485,8 @@ impl<'img> DumpContext<'img> {
     /// Walks a directory and writes dump entries for all children
     ///
     /// The `depth` parameter is 0 for the root directory's immediate children,
-    /// used for applying filters.
+    /// used for applying filters. Enforces a maximum depth and detects cycles
+    /// to prevent stack overflow from crafted images.
     fn walk_directory(
         &mut self,
         output: &mut impl Write,
@@ -477,6 +494,13 @@ impl<'img> DumpContext<'img> {
         nid: u64,
         depth: usize,
     ) -> Result<()> {
+        if depth > MAX_DIRECTORY_DEPTH {
+            anyhow::bail!("maximum directory depth ({MAX_DIRECTORY_DEPTH}) exceeded");
+        }
+        if !self.visited_dir_nids.insert(nid) {
+            // Already visited this directory nid — cycle detected, skip
+            return Ok(());
+        }
         let inode = self.image.inode(nid)?;
 
         // Write this directory's entry first

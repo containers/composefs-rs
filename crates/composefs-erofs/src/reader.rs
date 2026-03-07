@@ -75,7 +75,12 @@ pub trait InodeHeader {
         Ok(self.xattr_size()
             + match data_layout {
                 DataLayout::FlatPlain => 0,
-                DataLayout::FlatInline => self.size() as usize % block_size,
+                DataLayout::FlatInline => {
+                    let size = usize::try_from(self.size()).map_err(|_| {
+                        ReaderError::InvalidImage("inode size too large for platform".into())
+                    })?;
+                    size % block_size
+                }
                 DataLayout::ChunkBased => 4,
             })
     }
@@ -327,11 +332,15 @@ impl<Header: InodeHeader> InodeOps for &Inode<Header> {
         Ok(match data_layout {
             DataLayout::FlatPlain => Range {
                 start,
-                end: start + size.div_ceil(block_size),
+                end: start
+                    .checked_add(size.div_ceil(block_size))
+                    .ok_or_else(|| ReaderError::InvalidImage("block range overflow".into()))?,
             },
             DataLayout::FlatInline => Range {
                 start,
-                end: start + size / block_size,
+                end: start
+                    .checked_add(size / block_size)
+                    .ok_or_else(|| ReaderError::InvalidImage("block range overflow".into()))?,
             },
             DataLayout::ChunkBased => Range { start, end: start },
         })
@@ -476,9 +485,10 @@ impl<'img> Image<'img> {
             .map_err(|_| ReaderError::InvalidImage("cannot parse superblock".into()))?
             .0;
         let blkszbits = sb.blkszbits;
-        if blkszbits >= 64 {
+        if blkszbits as u32 >= usize::BITS {
             return Err(ReaderError::InvalidImage(format!(
-                "blkszbits {blkszbits} is too large (must be < 64)"
+                "blkszbits {blkszbits} >= platform word size {}",
+                usize::BITS
             )));
         }
         let block_size = 1usize << blkszbits;
@@ -510,8 +520,9 @@ impl<'img> Image<'img> {
 
     /// Returns an inode by its ID
     pub fn inode(&self, id: u64) -> Result<InodeType<'_>, ReaderError> {
-        let offset = (id as usize)
-            .checked_mul(32)
+        let offset = usize::try_from(id)
+            .ok()
+            .and_then(|id| id.checked_mul(32))
             .ok_or(ReaderError::InvalidInode(id))?;
         let inode_data = self
             .inodes
@@ -569,8 +580,9 @@ impl<'img> Image<'img> {
 
     /// Returns a data block by its ID
     pub fn block(&self, id: u64) -> Result<&[u8], ReaderError> {
-        let start = (id as usize)
-            .checked_mul(self.block_size)
+        let start = usize::try_from(id)
+            .ok()
+            .and_then(|id| id.checked_mul(self.block_size))
             .ok_or(ReaderError::OutOfBounds)?;
         let end = start
             .checked_add(self.block_size)
