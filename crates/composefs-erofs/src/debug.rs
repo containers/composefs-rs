@@ -154,6 +154,9 @@ impl fmt::Debug for XAttr {
             .get(self.header.name_index as usize)
             .and_then(|p| std::str::from_utf8(p).ok())
             .unwrap_or("?");
+        let suffix = self.suffix().map_err(|_| fmt::Error)?;
+        let value = self.value().map_err(|_| fmt::Error)?;
+        let padding = self.padding().map_err(|_| fmt::Error)?;
         write!(
             f,
             "({} {} {}) {}{} = {}",
@@ -161,11 +164,11 @@ impl fmt::Debug for XAttr {
             self.header.name_len,
             self.header.value_size,
             prefix,
-            utf8_or_hex(self.suffix()),
-            utf8_or_hex(self.value()),
+            utf8_or_hex(suffix),
+            utf8_or_hex(value),
         )?;
-        if self.padding().iter().any(|c| *c != 0) {
-            write!(f, " {:?}", self.padding())?;
+        if padding.iter().any(|c| *c != 0) {
+            write!(f, " {:?}", padding)?;
         }
         Ok(())
     }

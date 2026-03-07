@@ -208,39 +208,22 @@ fn test_nested_directories() {
     let root_nid = img.sb.root_nid.get() as u64;
     validate_directory_entries(&img, root_nid, &[".", "..", "a"]);
 
-    // Helper to find a directory entry by name
-    let find_entry = |parent_nid: u64, name: &[u8]| -> u64 {
-        let inode = img.inode(parent_nid).unwrap();
-
-        if let Some(inline) = inode.inline() {
-            let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
-            for entry in inline_block.entries() {
-                let entry = entry.unwrap();
-                if entry.name == name {
-                    return entry.nid();
-                }
-            }
-        }
-
-        for blkid in inode.blocks(img.blkszbits).unwrap() {
-            let block = img.directory_block(blkid).unwrap();
-            for entry in block.entries() {
-                let entry = entry.unwrap();
-                if entry.name == name {
-                    return entry.nid();
-                }
-            }
-        }
-        panic!("Entry not found: {:?}", std::str::from_utf8(name));
-    };
-
-    let a_nid = find_entry(root_nid, b"a");
+    let a_nid = img
+        .find_child_nid(root_nid, b"a")
+        .unwrap()
+        .expect("a not found");
     validate_directory_entries(&img, a_nid, &[".", "..", "b"]);
 
-    let b_nid = find_entry(a_nid, b"b");
+    let b_nid = img
+        .find_child_nid(a_nid, b"b")
+        .unwrap()
+        .expect("b not found");
     validate_directory_entries(&img, b_nid, &[".", "..", "c"]);
 
-    let c_nid = find_entry(b_nid, b"c");
+    let c_nid = img
+        .find_child_nid(b_nid, b"c")
+        .unwrap()
+        .expect("c not found");
     validate_directory_entries(&img, c_nid, &[".", "..", "file.txt"]);
 }
 

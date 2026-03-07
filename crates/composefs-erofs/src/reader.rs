@@ -15,7 +15,7 @@ use crate::{
     composefs::OverlayMetacopy,
     format::{
         CompactInodeHeader, ComposefsHeader, DataLayout, DirectoryEntryHeader, ExtendedInodeHeader,
-        InodeXAttrHeader, ModeField, Superblock, XAttrHeader,
+        InodeXAttrHeader, ModeField, Superblock, XAttrHeader, S_IFCHR, S_IFMT,
     },
 };
 use composefs_types::fsverity::FsVerityHashValue;
@@ -64,6 +64,12 @@ pub trait InodeHeader {
     /// Returns the device number (for block/character devices, from the `u` field)
     fn rdev(&self) -> u32 {
         self.u()
+    }
+
+    /// Returns true if this inode is a whiteout entry (character device with rdev == 0).
+    fn is_whiteout(&self) -> bool {
+        let mode = self.mode().0.get();
+        (mode & S_IFMT == S_IFCHR) && (self.rdev() == 0)
     }
 
     /// Calculates the number of additional bytes after the header
@@ -231,25 +237,25 @@ impl XAttr {
     }
 
     /// Returns the attribute name suffix
-    pub fn suffix(&self) -> &[u8] {
+    pub fn suffix(&self) -> Result<&[u8], ReaderError> {
         self.data
             .get(..self.header.name_len as usize)
-            .unwrap_or(&[])
+            .ok_or(ReaderError::OutOfBounds)
     }
 
     /// Returns the attribute value
-    pub fn value(&self) -> &[u8] {
+    pub fn value(&self) -> Result<&[u8], ReaderError> {
         let name_len = self.header.name_len as usize;
         let value_size = self.header.value_size.get() as usize;
         self.data
             .get(name_len..name_len + value_size)
-            .unwrap_or(&[])
+            .ok_or(ReaderError::OutOfBounds)
     }
 
     /// Returns the padding bytes after the value
-    pub fn padding(&self) -> &[u8] {
+    pub fn padding(&self) -> Result<&[u8], ReaderError> {
         let end = self.header.name_len as usize + self.header.value_size.get() as usize;
-        self.data.get(end..).unwrap_or(&[])
+        self.data.get(end..).ok_or(ReaderError::OutOfBounds)
     }
 }
 
@@ -611,6 +617,33 @@ impl<'img> Image<'img> {
     pub fn root(&self) -> Result<InodeType<'_>, ReaderError> {
         self.inode(self.sb.root_nid.get() as u64)
     }
+
+    /// Finds a child directory entry by name within a directory inode.
+    ///
+    /// Returns the nid (inode number) of the child if found.
+    pub fn find_child_nid(&self, parent_nid: u64, name: &[u8]) -> Result<Option<u64>, ReaderError> {
+        let inode = self.inode(parent_nid)?;
+        if let Some(inline) = inode.inline() {
+            if let Ok(block) = DirectoryBlock::ref_from_bytes(inline) {
+                for entry in block.entries() {
+                    let entry = entry?;
+                    if entry.name == name {
+                        return Ok(Some(entry.nid()));
+                    }
+                }
+            }
+        }
+        for blkid in inode.blocks(self.blkszbits)? {
+            let block = self.directory_block(blkid)?;
+            for entry in block.entries() {
+                let entry = entry?;
+                if entry.name == name {
+                    return Ok(Some(entry.nid()));
+                }
+            }
+        }
+        Ok(None)
+    }
 }
 
 // TODO: there must be an easier way...
@@ -857,27 +890,28 @@ impl<ObjectID: FsVerityHashValue> std::fmt::Debug for ObjectCollector<'_, Object
 }
 
 impl<ObjectID: FsVerityHashValue> ObjectCollector<'_, ObjectID> {
-    fn visit_xattr(&mut self, attr: &XAttr) {
+    fn visit_xattr(&mut self, attr: &XAttr) -> Result<(), ReaderError> {
         // This is the index of "trusted".  See XATTR_PREFIXES in format.rs.
         if attr.header.name_index != 4 {
-            return;
+            return Ok(());
         }
-        if attr.suffix() != b"overlay.metacopy" {
-            return;
+        if attr.suffix()? != b"overlay.metacopy" {
+            return Ok(());
         }
-        if let Ok(value) = OverlayMetacopy::read_from_bytes(attr.value()) {
+        if let Ok(value) = OverlayMetacopy::read_from_bytes(attr.value()?) {
             if value.valid() {
                 self.objects.insert(value.digest);
             }
         }
+        Ok(())
     }
 
     fn visit_xattrs(&mut self, img: &Image, xattrs: &InodeXAttrs) -> ReadResult<()> {
         for id in xattrs.shared()? {
-            self.visit_xattr(img.shared_xattr(id.get())?);
+            self.visit_xattr(img.shared_xattr(id.get())?)?;
         }
         for attr in xattrs.local() {
-            self.visit_xattr(attr?);
+            self.visit_xattr(attr?)?;
         }
         Ok(())
     }

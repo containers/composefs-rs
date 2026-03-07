@@ -90,17 +90,6 @@ fn write_escaped_xattr(writer: &mut impl fmt::Write, bytes: &[u8]) -> fmt::Resul
     write_escaped_core(writer, bytes, true, false)
 }
 
-/// Checks if an inode is a whiteout entry (internal to composefs, should not be dumped)
-///
-/// Whiteout entries are character devices with rdev == 0. They are used for
-/// overlayfs whiteout tracking and should be filtered from dump output.
-fn is_whiteout(inode: &InodeType<'_>) -> bool {
-    let mode = inode.mode().0.get();
-    let ifmt = mode & S_IFMT;
-    // Character device with rdev == 0 is a whiteout
-    (ifmt == S_IFCHR) && (inode.rdev() == 0)
-}
-
 /// Reconstructs full xattr name from prefix index and suffix
 fn xattr_full_name(name_index: u8, suffix: &[u8]) -> Vec<u8> {
     let prefix = if (name_index as usize) < format::XATTR_PREFIXES.len() {
@@ -195,8 +184,8 @@ impl<'img> DumpContext<'img> {
             // Local (inline) xattrs first - matches C implementation order
             for xattr in inode_xattrs.local() {
                 let xattr = xattr?;
-                let full_name = xattr_full_name(xattr.header.name_index, xattr.suffix());
-                if let Some(pair) = self.transform_xattr(&full_name, xattr.value()) {
+                let full_name = xattr_full_name(xattr.header.name_index, xattr.suffix()?);
+                if let Some(pair) = self.transform_xattr(&full_name, xattr.value()?) {
                     xattrs.push(pair);
                 }
             }
@@ -204,8 +193,8 @@ impl<'img> DumpContext<'img> {
             // Shared xattrs second
             for id in inode_xattrs.shared()? {
                 let xattr = self.image.shared_xattr(id.get())?;
-                let full_name = xattr_full_name(xattr.header.name_index, xattr.suffix());
-                if let Some(pair) = self.transform_xattr(&full_name, xattr.value()) {
+                let full_name = xattr_full_name(xattr.header.name_index, xattr.suffix()?);
+                if let Some(pair) = self.transform_xattr(&full_name, xattr.value()?) {
                     xattrs.push(pair);
                 }
             }
@@ -225,7 +214,7 @@ impl<'img> DumpContext<'img> {
         // Check shared xattrs
         for id in inode_xattrs.shared()? {
             let xattr = self.image.shared_xattr(id.get())?;
-            if let Some(digest) = self.check_metacopy_xattr(xattr) {
+            if let Some(digest) = self.check_metacopy_xattr(xattr)? {
                 return Ok(Some(digest));
             }
         }
@@ -233,7 +222,7 @@ impl<'img> DumpContext<'img> {
         // Check local xattrs
         for xattr in inode_xattrs.local() {
             let xattr = xattr?;
-            if let Some(digest) = self.check_metacopy_xattr(xattr) {
+            if let Some(digest) = self.check_metacopy_xattr(xattr)? {
                 return Ok(Some(digest));
             }
         }
@@ -241,20 +230,20 @@ impl<'img> DumpContext<'img> {
         Ok(None)
     }
 
-    fn check_metacopy_xattr(&self, xattr: &XAttr) -> Option<Sha256HashValue> {
+    fn check_metacopy_xattr(&self, xattr: &XAttr) -> Result<Option<Sha256HashValue>> {
         // trusted. prefix has index 4
         if xattr.header.name_index != 4 {
-            return None;
+            return Ok(None);
         }
-        if xattr.suffix() != b"overlay.metacopy" {
-            return None;
+        if xattr.suffix()? != b"overlay.metacopy" {
+            return Ok(None);
         }
-        if let Ok(value) = OverlayMetacopy::<Sha256HashValue>::read_from_bytes(xattr.value()) {
+        if let Ok(value) = OverlayMetacopy::<Sha256HashValue>::read_from_bytes(xattr.value()?) {
             if value.valid() {
-                return Some(value.digest.clone());
+                return Ok(Some(value.digest.clone()));
             }
         }
-        None
+        Ok(None)
     }
 
     /// Checks if an inode has the escaped whiteout xattr (trusted.overlay.overlay.whiteout)
@@ -267,7 +256,7 @@ impl<'img> DumpContext<'img> {
         // Check local xattrs
         for xattr in inode_xattrs.local() {
             let xattr = xattr?;
-            let full_name = xattr_full_name(xattr.header.name_index, xattr.suffix());
+            let full_name = xattr_full_name(xattr.header.name_index, xattr.suffix()?);
             if full_name == OVERLAY_XATTR_ESCAPED_WHITEOUT {
                 return Ok(true);
             }
@@ -276,7 +265,7 @@ impl<'img> DumpContext<'img> {
         // Check shared xattrs
         for id in inode_xattrs.shared()? {
             let xattr = self.image.shared_xattr(id.get())?;
-            let full_name = xattr_full_name(xattr.header.name_index, xattr.suffix());
+            let full_name = xattr_full_name(xattr.header.name_index, xattr.suffix()?);
             if full_name == OVERLAY_XATTR_ESCAPED_WHITEOUT {
                 return Ok(true);
             }
@@ -544,7 +533,7 @@ impl<'img> DumpContext<'img> {
             let child_inode = self.image.inode(child_nid)?;
 
             // Skip whiteout entries (internal to composefs)
-            if is_whiteout(&child_inode) {
+            if child_inode.is_whiteout() {
                 continue;
             }
 

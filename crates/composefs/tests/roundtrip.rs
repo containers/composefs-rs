@@ -90,11 +90,6 @@ struct ReconstructedEntry {
     xattrs: Vec<(String, Vec<u8>)>, // (full name, value)
 }
 
-/// Gets the inode number from a directory entry header
-fn entry_nid(entry: &composefs::erofs::reader::DirectoryEntry<'_>) -> u64 {
-    entry.header.inode_offset.get()
-}
-
 /// Collects directory entries from an EROFS image starting at the given inode
 fn collect_entries(img: &Image, nid: u64) -> Vec<ReconstructedEntry> {
     let inode = img.inode(nid).unwrap();
@@ -108,7 +103,7 @@ fn collect_entries(img: &Image, nid: u64) -> Vec<ReconstructedEntry> {
                     let entry = entry.unwrap();
 
                     if entry.name != b"." && entry.name != b".." {
-                        entries.push(reconstruct_entry(img, entry.name, entry_nid(&entry)));
+                        entries.push(reconstruct_entry(img, entry.name, entry.nid()));
                     }
                 }
             }
@@ -122,7 +117,7 @@ fn collect_entries(img: &Image, nid: u64) -> Vec<ReconstructedEntry> {
             let entry = entry.unwrap();
 
             if entry.name != b"." && entry.name != b".." {
-                entries.push(reconstruct_entry(img, entry.name, entry_nid(&entry)));
+                entries.push(reconstruct_entry(img, entry.name, entry.nid()));
             }
         }
     }
@@ -161,9 +156,9 @@ fn reconstruct_entry(img: &Image, name: &[u8], nid: u64) -> ReconstructedEntry {
             let full_name = format!(
                 "{}{}",
                 String::from_utf8_lossy(prefix),
-                String::from_utf8_lossy(xattr.suffix())
+                String::from_utf8_lossy(xattr.suffix().unwrap())
             );
-            xattrs.push((full_name, xattr.value().to_vec()));
+            xattrs.push((full_name, xattr.value().unwrap().to_vec()));
         }
 
         // Local xattrs
@@ -178,9 +173,9 @@ fn reconstruct_entry(img: &Image, name: &[u8], nid: u64) -> ReconstructedEntry {
             let full_name = format!(
                 "{}{}",
                 String::from_utf8_lossy(prefix),
-                String::from_utf8_lossy(xattr.suffix())
+                String::from_utf8_lossy(xattr.suffix().unwrap())
             );
-            xattrs.push((full_name, xattr.value().to_vec()));
+            xattrs.push((full_name, xattr.value().unwrap().to_vec()));
         }
     }
     xattrs.sort_by(|a, b| a.0.cmp(&b.0));
@@ -303,7 +298,7 @@ fn verify_directory_with_entries(img: &Image, entries: &[ReconstructedEntry]) {
             for entry in block.entries() {
                 let entry = entry.unwrap();
                 if entry.name == b"subdir" {
-                    subdir_nid = Some(entry_nid(&entry));
+                    subdir_nid = Some(entry.nid());
                 }
             }
         }
@@ -478,7 +473,7 @@ fn verify_hardlinks(img: &Image, entries: &[ReconstructedEntry]) {
             for entry in block.entries() {
                 let entry = entry.unwrap();
                 if entry.name == b"file1" || entry.name == b"file2" || entry.name == b"file3" {
-                    nids.push(entry_nid(&entry));
+                    nids.push(entry.nid());
                 }
             }
         }
@@ -488,7 +483,7 @@ fn verify_hardlinks(img: &Image, entries: &[ReconstructedEntry]) {
         for entry in block.entries() {
             let entry = entry.unwrap();
             if entry.name == b"file1" || entry.name == b"file2" || entry.name == b"file3" {
-                nids.push(entry_nid(&entry));
+                nids.push(entry.nid());
             }
         }
     }
@@ -532,34 +527,18 @@ fn verify_deep_nesting(img: &Image, entries: &[ReconstructedEntry]) {
     // Navigate through the nested structure
     let root_nid = img.sb.root_nid.get() as u64;
 
-    // Helper to find a directory entry by name
-    let find_entry_nid = |parent_nid: u64, name: &[u8]| -> Option<u64> {
-        let inode = img.inode(parent_nid).unwrap();
-        if let Some(inline) = inode.inline() {
-            if let Ok(block) = DirectoryBlock::ref_from_bytes(inline) {
-                for entry in block.entries() {
-                    let entry = entry.unwrap();
-                    if entry.name == name {
-                        return Some(entry_nid(&entry));
-                    }
-                }
-            }
-        }
-        for blkid in inode.blocks(img.blkszbits).unwrap() {
-            let block = img.directory_block(blkid).unwrap();
-            for entry in block.entries() {
-                let entry = entry.unwrap();
-                if entry.name == name {
-                    return Some(entry_nid(&entry));
-                }
-            }
-        }
-        None
-    };
-
-    let a_nid = find_entry_nid(root_nid, b"a").expect("a not found");
-    let b_nid = find_entry_nid(a_nid, b"b").expect("b not found");
-    let c_nid = find_entry_nid(b_nid, b"c").expect("c not found");
+    let a_nid = img
+        .find_child_nid(root_nid, b"a")
+        .unwrap()
+        .expect("a not found");
+    let b_nid = img
+        .find_child_nid(a_nid, b"b")
+        .unwrap()
+        .expect("b not found");
+    let c_nid = img
+        .find_child_nid(b_nid, b"c")
+        .unwrap()
+        .expect("c not found");
     let c_entries = collect_entries(img, c_nid);
     assert_eq!(c_entries.len(), 1);
     let deepfile = verify_entry_exists(&c_entries, "deepfile.txt");
@@ -1371,35 +1350,27 @@ fn verify_hardlinks_across_dirs(img: &Image, entries: &[ReconstructedEntry]) {
 
     // Navigate into dir to find sub_link and nested/deep_link
     let root_nid = img.sb.root_nid.get() as u64;
-    let find_child_nid = |parent_nid: u64, name: &[u8]| -> Option<u64> {
-        let inode = img.inode(parent_nid).unwrap();
-        if let Some(inline) = inode.inline() {
-            if let Ok(block) = DirectoryBlock::ref_from_bytes(inline) {
-                for entry in block.entries() {
-                    let entry = entry.unwrap();
-                    if entry.name == name {
-                        return Some(entry.header.inode_offset.get());
-                    }
-                }
-            }
-        }
-        for blkid in inode.blocks(img.blkszbits).unwrap() {
-            let block = img.directory_block(blkid).unwrap();
-            for entry in block.entries() {
-                let entry = entry.unwrap();
-                if entry.name == name {
-                    return Some(entry.header.inode_offset.get());
-                }
-            }
-        }
-        None
-    };
 
-    let dir_nid = find_child_nid(root_nid, b"dir").expect("dir not found");
-    let root_link_nid = find_child_nid(root_nid, b"root_link").expect("root_link not found");
-    let sub_link_nid = find_child_nid(dir_nid, b"sub_link").expect("sub_link not found");
-    let nested_nid = find_child_nid(dir_nid, b"nested").expect("nested not found");
-    let deep_link_nid = find_child_nid(nested_nid, b"deep_link").expect("deep_link not found");
+    let dir_nid = img
+        .find_child_nid(root_nid, b"dir")
+        .unwrap()
+        .expect("dir not found");
+    let root_link_nid = img
+        .find_child_nid(root_nid, b"root_link")
+        .unwrap()
+        .expect("root_link not found");
+    let sub_link_nid = img
+        .find_child_nid(dir_nid, b"sub_link")
+        .unwrap()
+        .expect("sub_link not found");
+    let nested_nid = img
+        .find_child_nid(dir_nid, b"nested")
+        .unwrap()
+        .expect("nested not found");
+    let deep_link_nid = img
+        .find_child_nid(nested_nid, b"deep_link")
+        .unwrap()
+        .expect("deep_link not found");
 
     // All three hardlinks should point to the same inode
     assert_eq!(
@@ -1453,38 +1424,19 @@ fn verify_deeply_nested(img: &Image, entries: &[ReconstructedEntry]) {
     assert!(d0.is_dir);
 
     // Navigate down to the leaf
-    let find_child_nid = |parent_nid: u64, name: &[u8]| -> Option<u64> {
-        let inode = img.inode(parent_nid).unwrap();
-        if let Some(inline) = inode.inline() {
-            if let Ok(block) = DirectoryBlock::ref_from_bytes(inline) {
-                for entry in block.entries() {
-                    let entry = entry.unwrap();
-                    if entry.name == name {
-                        return Some(entry.header.inode_offset.get());
-                    }
-                }
-            }
-        }
-        for blkid in inode.blocks(img.blkszbits).unwrap() {
-            let block = img.directory_block(blkid).unwrap();
-            for entry in block.entries() {
-                let entry = entry.unwrap();
-                if entry.name == name {
-                    return Some(entry.header.inode_offset.get());
-                }
-            }
-        }
-        None
-    };
-
     let root_nid = img.sb.root_nid.get() as u64;
     let mut nid = root_nid;
     for i in 0..10 {
         let name = format!("d{i}");
-        nid = find_child_nid(nid, name.as_bytes())
+        nid = img
+            .find_child_nid(nid, name.as_bytes())
+            .unwrap()
             .unwrap_or_else(|| panic!("Directory {name} not found at depth {i}"));
     }
-    let leaf_nid = find_child_nid(nid, b"leaf.txt").expect("leaf.txt not found at depth 10");
+    let leaf_nid = img
+        .find_child_nid(nid, b"leaf.txt")
+        .unwrap()
+        .expect("leaf.txt not found at depth 10");
     let leaf_inode = img.inode(leaf_nid).unwrap();
     let inline = leaf_inode.inline().expect("leaf should have inline data");
     assert_eq!(inline, b"ten levels deep");
@@ -1708,30 +1660,10 @@ fn test_roundtrip_preserves_stat_fields() {
     );
 
     // Also check uid/gid/mtime by inspecting the raw inode
-    let find_child_nid = |parent_nid: u64, name: &[u8]| -> Option<u64> {
-        let inode = img.inode(parent_nid).unwrap();
-        if let Some(inline) = inode.inline() {
-            if let Ok(block) = DirectoryBlock::ref_from_bytes(inline) {
-                for entry in block.entries() {
-                    let entry = entry.unwrap();
-                    if entry.name == name {
-                        return Some(entry.header.inode_offset.get());
-                    }
-                }
-            }
-        }
-        for blkid in inode.blocks(img.blkszbits).unwrap() {
-            let block = img.directory_block(blkid).unwrap();
-            for entry in block.entries() {
-                let entry = entry.unwrap();
-                if entry.name == name {
-                    return Some(entry.header.inode_offset.get());
-                }
-            }
-        }
-        None
-    };
-    let file_nid = find_child_nid(root_nid, b"special_file").unwrap();
+    let file_nid = img
+        .find_child_nid(root_nid, b"special_file")
+        .unwrap()
+        .unwrap();
     let file_inode = img.inode(file_nid).unwrap();
     assert_eq!(file_inode.uid(), 1000);
     assert_eq!(file_inode.gid(), 2000);

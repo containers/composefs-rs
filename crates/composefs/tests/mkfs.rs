@@ -297,8 +297,8 @@ fn collect_inode_xattrs(img: &Image, inode: &InodeType<'_>) -> Vec<(Vec<u8>, Vec
                 b""
             };
             let mut full_name = prefix.to_vec();
-            full_name.extend_from_slice(xattr.suffix());
-            xattrs.push((full_name, xattr.value().to_vec()));
+            full_name.extend_from_slice(xattr.suffix().unwrap());
+            xattrs.push((full_name, xattr.value().unwrap().to_vec()));
         }
         for xattr in inode_xattrs.local() {
             let xattr = xattr.unwrap();
@@ -309,8 +309,8 @@ fn collect_inode_xattrs(img: &Image, inode: &InodeType<'_>) -> Vec<(Vec<u8>, Vec
                 b""
             };
             let mut full_name = prefix.to_vec();
-            full_name.extend_from_slice(xattr.suffix());
-            xattrs.push((full_name, xattr.value().to_vec()));
+            full_name.extend_from_slice(xattr.suffix().unwrap());
+            xattrs.push((full_name, xattr.value().unwrap().to_vec()));
         }
     }
     xattrs

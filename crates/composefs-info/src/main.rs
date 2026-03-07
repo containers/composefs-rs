@@ -14,7 +14,7 @@ use composefs::{
     erofs::{
         composefs::OverlayMetacopy,
         dump::dump_erofs,
-        format::{S_IFCHR, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG},
+        format::{S_IFDIR, S_IFLNK, S_IFMT, S_IFREG},
         reader::{collect_objects, DirectoryBlock, Image, InodeHeader, InodeOps, InodeType},
     },
     fsverity::{FsVerityHashValue, FsVerityHasher, Sha256HashValue},
@@ -84,17 +84,6 @@ fn main() -> Result<()> {
     }
 }
 
-/// Checks if an inode is a whiteout entry (internal to composefs, should not be listed).
-///
-/// Whiteout entries are character devices with rdev == 0. They are used for
-/// overlayfs whiteout tracking and the xattr hash table.
-fn is_whiteout(inode: &InodeType<'_>) -> bool {
-    let mode = inode.mode().0.get();
-    let ifmt = mode & S_IFMT;
-    // Character device with rdev == 0 is a whiteout
-    (ifmt == S_IFCHR) && (inode.rdev() == 0)
-}
-
 /// Print escaped path (matches C implementation behavior).
 fn print_escaped<W: Write>(out: &mut W, s: &[u8]) -> std::io::Result<()> {
     for &c in s {
@@ -121,8 +110,8 @@ fn get_backing_path(img: &Image, inode: &InodeType) -> Result<Option<String>> {
     for id in xattrs.shared()? {
         let attr = img.shared_xattr(id.get())?;
         // trusted. prefix has name_index == 4
-        if attr.header.name_index == 4 && attr.suffix() == b"overlay.metacopy" {
-            if let Ok(metacopy) = OverlayMetacopy::<Sha256HashValue>::read_from_bytes(attr.value())
+        if attr.header.name_index == 4 && attr.suffix()? == b"overlay.metacopy" {
+            if let Ok(metacopy) = OverlayMetacopy::<Sha256HashValue>::read_from_bytes(attr.value()?)
             {
                 if metacopy.valid() {
                     let hex = metacopy.digest.to_hex();
@@ -135,8 +124,8 @@ fn get_backing_path(img: &Image, inode: &InodeType) -> Result<Option<String>> {
     // Check local xattrs
     for attr in xattrs.local() {
         let attr = attr?;
-        if attr.header.name_index == 4 && attr.suffix() == b"overlay.metacopy" {
-            if let Ok(metacopy) = OverlayMetacopy::<Sha256HashValue>::read_from_bytes(attr.value())
+        if attr.header.name_index == 4 && attr.suffix()? == b"overlay.metacopy" {
+            if let Ok(metacopy) = OverlayMetacopy::<Sha256HashValue>::read_from_bytes(attr.value()?)
             {
                 if metacopy.valid() {
                     let hex = metacopy.digest.to_hex();
@@ -226,7 +215,7 @@ impl<'a> CollectContext<'a> {
             let child_inode = self.img.inode(child_nid)?;
 
             // Skip whiteout entries (internal to composefs, e.g., xattr hash table buckets)
-            if is_whiteout(&child_inode) {
+            if child_inode.is_whiteout() {
                 continue;
             }
 
