@@ -287,9 +287,9 @@ fn get_composefs_header(image: &[u8]) -> &ComposefsHeader {
 /// Helper to collect xattr (name, value) pairs from a reader inode.
 fn collect_inode_xattrs(img: &Image, inode: &InodeType<'_>) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut xattrs = Vec::new();
-    if let Some(inode_xattrs) = inode.xattrs() {
-        for id in inode_xattrs.shared() {
-            let xattr = img.shared_xattr(id.get());
+    if let Some(inode_xattrs) = inode.xattrs().unwrap() {
+        for id in inode_xattrs.shared().unwrap() {
+            let xattr = img.shared_xattr(id.get()).unwrap();
             let prefix_idx = xattr.header.name_index as usize;
             let prefix: &[u8] = if prefix_idx < XATTR_PREFIXES.len() {
                 XATTR_PREFIXES[prefix_idx]
@@ -301,6 +301,7 @@ fn collect_inode_xattrs(img: &Image, inode: &InodeType<'_>) -> Vec<(Vec<u8>, Vec
             xattrs.push((full_name, xattr.value().to_vec()));
         }
         for xattr in inode_xattrs.local() {
+            let xattr = xattr.unwrap();
             let prefix_idx = xattr.header.name_index as usize;
             let prefix: &[u8] = if prefix_idx < XATTR_PREFIXES.len() {
                 XATTR_PREFIXES[prefix_idx]
@@ -355,7 +356,7 @@ fn test_format_version_build_time() {
     );
 
     let image_v11 = mkfs_erofs(&fs, FormatVersion::V1_1);
-    let img_v11 = Image::open(&image_v11);
+    let img_v11 = Image::open(&image_v11).unwrap();
     assert_eq!(
         img_v11.sb.build_time.get(),
         0,
@@ -377,7 +378,7 @@ fn test_format_version_build_time() {
     );
     fs2.add_overlay_whiteouts();
     let image_v10 = mkfs_erofs(&fs2, FormatVersion::V1_0);
-    let img_v10 = Image::open(&image_v10);
+    let img_v10 = Image::open(&image_v10).unwrap();
 
     // build_time is the minimum mtime. Root has mtime=100, file has mtime=0.
     // The file's stat has st_mtim_sec=0 (from default_stat in add_leaf),
@@ -415,7 +416,7 @@ fn test_format_version_build_time_nonzero_min() {
     );
     fs.add_overlay_whiteouts();
     let image = mkfs_erofs(&fs, FormatVersion::V1_0);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
     assert_eq!(
         img.sb.build_time.get(),
         500,
@@ -442,9 +443,9 @@ fn test_format_v1_0_compact_inodes() {
     );
     fs.add_overlay_whiteouts();
     let image = mkfs_erofs(&fs, FormatVersion::V1_0);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
 
-    let root = img.root();
+    let root = img.root().unwrap();
     assert!(
         matches!(root, InodeType::Compact(_)),
         "V1_0 root with mtime=0, uid/gid=0 should use compact inode"
@@ -461,9 +462,9 @@ fn test_format_v1_1_always_extended_inodes() {
         LeafContent::Regular(RegularFile::Inline((*b"extended").into())),
     );
     let image = mkfs_erofs(&fs, FormatVersion::V1_1);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
 
-    let root = img.root();
+    let root = img.root().unwrap();
     assert!(
         matches!(root, InodeType::Extended(_)),
         "V1_1 should always use extended inodes"
@@ -481,9 +482,9 @@ fn test_format_v1_0_overlay_opaque_on_root() {
     );
     fs.add_overlay_whiteouts();
     let image = mkfs_erofs(&fs, FormatVersion::V1_0);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
 
-    let root = img.root();
+    let root = img.root().unwrap();
     let xattrs = collect_inode_xattrs(&img, &root);
     let has_opaque = xattrs
         .iter()
@@ -508,9 +509,9 @@ fn test_format_v1_1_no_overlay_opaque_on_root() {
         LeafContent::Regular(RegularFile::Inline((*b"data").into())),
     );
     let image = mkfs_erofs(&fs, FormatVersion::V1_1);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
 
-    let root = img.root();
+    let root = img.root().unwrap();
     let xattrs = collect_inode_xattrs(&img, &root);
     let has_opaque = xattrs.iter().any(|(k, _)| k == b"trusted.overlay.opaque");
     assert!(
@@ -539,15 +540,16 @@ fn test_format_v1_0_extended_when_uid_too_large() {
     );
     fs.add_overlay_whiteouts();
     let image = mkfs_erofs(&fs, FormatVersion::V1_0);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
 
     // Find the file's inode through the root directory
-    let root = img.root();
+    let root = img.root().unwrap();
     if let Some(inline) = root.inline() {
         if let Ok(block) = composefs::erofs::reader::DirectoryBlock::ref_from_bytes(inline) {
             for entry in block.entries() {
+                let entry = entry.unwrap();
                 if entry.name == b"biguid" {
-                    let inode = img.inode(entry.header.inode_offset.get());
+                    let inode = img.inode(entry.header.inode_offset.get()).unwrap();
                     assert!(
                         matches!(inode, InodeType::Extended(_)),
                         "V1_0 inode with uid=70000 should use extended format"

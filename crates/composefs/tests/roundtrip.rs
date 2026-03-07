@@ -97,7 +97,7 @@ fn entry_nid(entry: &composefs::erofs::reader::DirectoryEntry<'_>) -> u64 {
 
 /// Collects directory entries from an EROFS image starting at the given inode
 fn collect_entries(img: &Image, nid: u64) -> Vec<ReconstructedEntry> {
-    let inode = img.inode(nid);
+    let inode = img.inode(nid).unwrap();
     let mut entries = Vec::new();
 
     // Collect from inline directory data
@@ -105,6 +105,8 @@ fn collect_entries(img: &Image, nid: u64) -> Vec<ReconstructedEntry> {
         if inode.mode().is_dir() {
             if let Ok(inline_block) = DirectoryBlock::ref_from_bytes(inline) {
                 for entry in inline_block.entries() {
+                    let entry = entry.unwrap();
+
                     if entry.name != b"." && entry.name != b".." {
                         entries.push(reconstruct_entry(img, entry.name, entry_nid(&entry)));
                     }
@@ -114,9 +116,11 @@ fn collect_entries(img: &Image, nid: u64) -> Vec<ReconstructedEntry> {
     }
 
     // Collect from directory blocks
-    for blkid in inode.blocks(img.blkszbits) {
-        let block = img.directory_block(blkid);
+    for blkid in inode.blocks(img.blkszbits).unwrap() {
+        let block = img.directory_block(blkid).unwrap();
         for entry in block.entries() {
+            let entry = entry.unwrap();
+
             if entry.name != b"." && entry.name != b".." {
                 entries.push(reconstruct_entry(img, entry.name, entry_nid(&entry)));
             }
@@ -130,7 +134,7 @@ fn collect_entries(img: &Image, nid: u64) -> Vec<ReconstructedEntry> {
 
 /// Reconstructs an entry from an inode
 fn reconstruct_entry(img: &Image, name: &[u8], nid: u64) -> ReconstructedEntry {
-    let inode = img.inode(nid);
+    let inode = img.inode(nid).unwrap();
     let mode = inode.mode().0.get();
     let is_dir = inode.mode().is_dir();
     let size = inode.size();
@@ -144,10 +148,10 @@ fn reconstruct_entry(img: &Image, name: &[u8], nid: u64) -> ReconstructedEntry {
 
     // Collect xattrs
     let mut xattrs = Vec::new();
-    if let Some(inode_xattrs) = inode.xattrs() {
+    if let Some(inode_xattrs) = inode.xattrs().unwrap() {
         // Shared xattrs
-        for id in inode_xattrs.shared() {
-            let xattr = img.shared_xattr(id.get());
+        for id in inode_xattrs.shared().unwrap() {
+            let xattr = img.shared_xattr(id.get()).unwrap();
             let prefix_idx = xattr.header.name_index as usize;
             let prefix: &[u8] = if prefix_idx < XATTR_PREFIXES.len() {
                 XATTR_PREFIXES[prefix_idx]
@@ -164,6 +168,7 @@ fn reconstruct_entry(img: &Image, name: &[u8], nid: u64) -> ReconstructedEntry {
 
         // Local xattrs
         for xattr in inode_xattrs.local() {
+            let xattr = xattr.unwrap();
             let prefix_idx = xattr.header.name_index as usize;
             let prefix: &[u8] = if prefix_idx < XATTR_PREFIXES.len() {
                 XATTR_PREFIXES[prefix_idx]
@@ -290,12 +295,13 @@ fn verify_directory_with_entries(img: &Image, entries: &[ReconstructedEntry]) {
 
     // Find the subdir's nid and verify its contents
     let root_nid = img.sb.root_nid.get() as u64;
-    let root_inode = img.inode(root_nid);
+    let root_inode = img.inode(root_nid).unwrap();
 
     let mut subdir_nid = None;
     if let Some(inline) = root_inode.inline() {
         if let Ok(block) = DirectoryBlock::ref_from_bytes(inline) {
             for entry in block.entries() {
+                let entry = entry.unwrap();
                 if entry.name == b"subdir" {
                     subdir_nid = Some(entry_nid(&entry));
                 }
@@ -464,21 +470,23 @@ fn verify_hardlinks(img: &Image, entries: &[ReconstructedEntry]) {
 
     // Verify they point to the same inode in the image
     let root_nid = img.sb.root_nid.get() as u64;
-    let root_inode = img.inode(root_nid);
+    let root_inode = img.inode(root_nid).unwrap();
 
     let mut nids = Vec::new();
     if let Some(inline) = root_inode.inline() {
         if let Ok(block) = DirectoryBlock::ref_from_bytes(inline) {
             for entry in block.entries() {
+                let entry = entry.unwrap();
                 if entry.name == b"file1" || entry.name == b"file2" || entry.name == b"file3" {
                     nids.push(entry_nid(&entry));
                 }
             }
         }
     }
-    for blkid in root_inode.blocks(img.blkszbits) {
-        let block = img.directory_block(blkid);
+    for blkid in root_inode.blocks(img.blkszbits).unwrap() {
+        let block = img.directory_block(blkid).unwrap();
         for entry in block.entries() {
+            let entry = entry.unwrap();
             if entry.name == b"file1" || entry.name == b"file2" || entry.name == b"file3" {
                 nids.push(entry_nid(&entry));
             }
@@ -526,19 +534,21 @@ fn verify_deep_nesting(img: &Image, entries: &[ReconstructedEntry]) {
 
     // Helper to find a directory entry by name
     let find_entry_nid = |parent_nid: u64, name: &[u8]| -> Option<u64> {
-        let inode = img.inode(parent_nid);
+        let inode = img.inode(parent_nid).unwrap();
         if let Some(inline) = inode.inline() {
             if let Ok(block) = DirectoryBlock::ref_from_bytes(inline) {
                 for entry in block.entries() {
+                    let entry = entry.unwrap();
                     if entry.name == name {
                         return Some(entry_nid(&entry));
                     }
                 }
             }
         }
-        for blkid in inode.blocks(img.blkszbits) {
-            let block = img.directory_block(blkid);
+        for blkid in inode.blocks(img.blkszbits).unwrap() {
+            let block = img.directory_block(blkid).unwrap();
             for entry in block.entries() {
+                let entry = entry.unwrap();
                 if entry.name == name {
                     return Some(entry_nid(&entry));
                 }
@@ -732,7 +742,7 @@ fn test_roundtrip_all_cases() {
         let image = mkfs_erofs_default(&fs);
 
         // Open and read the image
-        let img = Image::open(&image);
+        let img = Image::open(&image).unwrap();
 
         // Collect root entries
         let root_nid = img.sb.root_nid.get() as u64;
@@ -754,7 +764,7 @@ fn test_roundtrip_empty() {
     let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
     setup_empty(&mut fs);
     let image = mkfs_erofs_default(&fs);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
     let root_nid = img.sb.root_nid.get() as u64;
     let entries = collect_entries(&img, root_nid);
     verify_empty(&img, &entries);
@@ -765,7 +775,7 @@ fn test_roundtrip_simple_inline_file() {
     let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
     setup_simple_inline_file(&mut fs);
     let image = mkfs_erofs_default(&fs);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
     let root_nid = img.sb.root_nid.get() as u64;
     let entries = collect_entries(&img, root_nid);
     verify_simple_inline_file(&img, &entries);
@@ -776,7 +786,7 @@ fn test_roundtrip_multiple_files() {
     let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
     setup_multiple_files(&mut fs);
     let image = mkfs_erofs_default(&fs);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
     let root_nid = img.sb.root_nid.get() as u64;
     let entries = collect_entries(&img, root_nid);
     verify_multiple_files(&img, &entries);
@@ -787,7 +797,7 @@ fn test_roundtrip_directory_with_entries() {
     let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
     setup_directory_with_entries(&mut fs);
     let image = mkfs_erofs_default(&fs);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
     let root_nid = img.sb.root_nid.get() as u64;
     let entries = collect_entries(&img, root_nid);
     verify_directory_with_entries(&img, &entries);
@@ -798,7 +808,7 @@ fn test_roundtrip_symlink() {
     let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
     setup_symlink(&mut fs);
     let image = mkfs_erofs_default(&fs);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
     let root_nid = img.sb.root_nid.get() as u64;
     let entries = collect_entries(&img, root_nid);
     verify_symlink(&img, &entries);
@@ -809,7 +819,7 @@ fn test_roundtrip_fifo() {
     let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
     setup_fifo(&mut fs);
     let image = mkfs_erofs_default(&fs);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
     let root_nid = img.sb.root_nid.get() as u64;
     let entries = collect_entries(&img, root_nid);
     verify_fifo(&img, &entries);
@@ -820,7 +830,7 @@ fn test_roundtrip_devices() {
     let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
     setup_devices(&mut fs);
     let image = mkfs_erofs_default(&fs);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
     let root_nid = img.sb.root_nid.get() as u64;
     let entries = collect_entries(&img, root_nid);
     verify_devices(&img, &entries);
@@ -831,7 +841,7 @@ fn test_roundtrip_external_file() {
     let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
     setup_external_file(&mut fs);
     let image = mkfs_erofs_default(&fs);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
     let root_nid = img.sb.root_nid.get() as u64;
     let entries = collect_entries(&img, root_nid);
     verify_external_file(&img, &entries);
@@ -842,7 +852,7 @@ fn test_roundtrip_file_with_xattrs() {
     let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
     setup_file_with_xattrs(&mut fs);
     let image = mkfs_erofs_default(&fs);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
     let root_nid = img.sb.root_nid.get() as u64;
     let entries = collect_entries(&img, root_nid);
     verify_file_with_xattrs(&img, &entries);
@@ -853,7 +863,7 @@ fn test_roundtrip_hardlinks() {
     let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
     setup_hardlinks(&mut fs);
     let image = mkfs_erofs_default(&fs);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
     let root_nid = img.sb.root_nid.get() as u64;
     let entries = collect_entries(&img, root_nid);
     verify_hardlinks(&img, &entries);
@@ -864,7 +874,7 @@ fn test_roundtrip_deep_nesting() {
     let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
     setup_deep_nesting(&mut fs);
     let image = mkfs_erofs_default(&fs);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
     let root_nid = img.sb.root_nid.get() as u64;
     let entries = collect_entries(&img, root_nid);
     verify_deep_nesting(&img, &entries);
@@ -875,7 +885,7 @@ fn test_roundtrip_large_directory() {
     let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
     setup_large_directory(&mut fs);
     let image = mkfs_erofs_default(&fs);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
     let root_nid = img.sb.root_nid.get() as u64;
     let entries = collect_entries(&img, root_nid);
     verify_large_directory(&img, &entries);
@@ -886,7 +896,7 @@ fn test_roundtrip_empty_file() {
     let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
     setup_empty_file(&mut fs);
     let image = mkfs_erofs_default(&fs);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
     let root_nid = img.sb.root_nid.get() as u64;
     let entries = collect_entries(&img, root_nid);
     verify_empty_file(&img, &entries);
@@ -897,7 +907,7 @@ fn test_roundtrip_mixed_content() {
     let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
     setup_mixed_content(&mut fs);
     let image = mkfs_erofs_default(&fs);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
     let root_nid = img.sb.root_nid.get() as u64;
     let entries = collect_entries(&img, root_nid);
     verify_mixed_content(&img, &entries);
@@ -918,7 +928,7 @@ fn test_dumpfile_roundtrip_simple() {
 
     let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
     let image = mkfs_erofs_default(&fs);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
 
     let root_nid = img.sb.root_nid.get() as u64;
     let entries = collect_entries(&img, root_nid);
@@ -944,7 +954,7 @@ fn test_dumpfile_roundtrip_file_types() {
 
     let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
     let image = mkfs_erofs_default(&fs);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
 
     let root_nid = img.sb.root_nid.get() as u64;
     let entries = collect_entries(&img, root_nid);
@@ -968,7 +978,7 @@ fn test_dumpfile_roundtrip_hardlinks() {
 
     let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
     let image = mkfs_erofs_default(&fs);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
 
     let root_nid = img.sb.root_nid.get() as u64;
     let entries = collect_entries(&img, root_nid);
@@ -994,7 +1004,7 @@ fn test_dumpfile_roundtrip_xattrs() {
 
     let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
     let image = mkfs_erofs_default(&fs);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
 
     let root_nid = img.sb.root_nid.get() as u64;
     let entries = collect_entries(&img, root_nid);
@@ -1068,7 +1078,7 @@ fn test_image_metadata() {
     );
 
     let image = mkfs_erofs_default(&fs);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
 
     // Verify basic image properties
     assert_eq!(img.sb.magic.get(), format::MAGIC_V1.get());
@@ -1076,7 +1086,7 @@ fn test_image_metadata() {
     assert_eq!(img.block_size, format::BLOCK_SIZE as usize);
 
     // Verify root inode is a directory
-    let root = img.root();
+    let root = img.root().unwrap();
     assert!(root.mode().is_dir());
 }
 
@@ -1111,10 +1121,10 @@ fn test_roundtrip_all_cases_v1_0() {
         setup(&mut fs);
         fs.add_overlay_whiteouts();
         let image = mkfs_erofs(&fs, FormatVersion::V1_0);
-        let img = Image::open(&image);
+        let img = Image::open(&image).unwrap();
 
         // Verify basic structure
-        let root = img.root();
+        let root = img.root().unwrap();
         assert!(root.mode().is_dir(), "V1_0 root should be a directory");
 
         // Verify root entries can be read
@@ -1132,8 +1142,8 @@ fn test_v1_0_uses_compact_root() {
     fs.add_overlay_whiteouts();
 
     let image = mkfs_erofs(&fs, FormatVersion::V1_0);
-    let img = Image::open(&image);
-    let root = img.root();
+    let img = Image::open(&image).unwrap();
+    let root = img.root().unwrap();
 
     // With all mtimes=0, uid/gid=0, the root should be a compact inode in V1_0.
     assert!(
@@ -1149,8 +1159,8 @@ fn test_v1_1_uses_extended_root() {
     setup_simple_inline_file(&mut fs);
 
     let image = mkfs_erofs(&fs, FormatVersion::V1_1);
-    let img = Image::open(&image);
-    let root = img.root();
+    let img = Image::open(&image).unwrap();
+    let root = img.root().unwrap();
 
     assert!(
         matches!(root, InodeType::Extended(_)),
@@ -1295,7 +1305,7 @@ fn test_roundtrip_xattr_empty_value() {
     let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
     setup_xattr_empty_value(&mut fs);
     let image = mkfs_erofs_default(&fs);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
     let root_nid = img.sb.root_nid.get() as u64;
     let entries = collect_entries(&img, root_nid);
     verify_xattr_empty_value(&img, &entries);
@@ -1306,7 +1316,7 @@ fn test_roundtrip_xattr_large_value() {
     let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
     setup_xattr_large_value(&mut fs);
     let image = mkfs_erofs_default(&fs);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
     let root_nid = img.sb.root_nid.get() as u64;
     let entries = collect_entries(&img, root_nid);
     verify_xattr_large_value(&img, &entries);
@@ -1317,7 +1327,7 @@ fn test_roundtrip_xattr_many() {
     let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
     setup_xattr_many(&mut fs);
     let image = mkfs_erofs_default(&fs);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
     let root_nid = img.sb.root_nid.get() as u64;
     let entries = collect_entries(&img, root_nid);
     verify_xattr_many(&img, &entries);
@@ -1362,19 +1372,21 @@ fn verify_hardlinks_across_dirs(img: &Image, entries: &[ReconstructedEntry]) {
     // Navigate into dir to find sub_link and nested/deep_link
     let root_nid = img.sb.root_nid.get() as u64;
     let find_child_nid = |parent_nid: u64, name: &[u8]| -> Option<u64> {
-        let inode = img.inode(parent_nid);
+        let inode = img.inode(parent_nid).unwrap();
         if let Some(inline) = inode.inline() {
             if let Ok(block) = DirectoryBlock::ref_from_bytes(inline) {
                 for entry in block.entries() {
+                    let entry = entry.unwrap();
                     if entry.name == name {
                         return Some(entry.header.inode_offset.get());
                     }
                 }
             }
         }
-        for blkid in inode.blocks(img.blkszbits) {
-            let block = img.directory_block(blkid);
+        for blkid in inode.blocks(img.blkszbits).unwrap() {
+            let block = img.directory_block(blkid).unwrap();
             for entry in block.entries() {
+                let entry = entry.unwrap();
                 if entry.name == name {
                     return Some(entry.header.inode_offset.get());
                 }
@@ -1405,7 +1417,7 @@ fn test_roundtrip_hardlinks_across_dirs() {
     let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
     setup_hardlinks_across_dirs(&mut fs);
     let image = mkfs_erofs_default(&fs);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
     let root_nid = img.sb.root_nid.get() as u64;
     let entries = collect_entries(&img, root_nid);
     verify_hardlinks_across_dirs(&img, &entries);
@@ -1442,19 +1454,21 @@ fn verify_deeply_nested(img: &Image, entries: &[ReconstructedEntry]) {
 
     // Navigate down to the leaf
     let find_child_nid = |parent_nid: u64, name: &[u8]| -> Option<u64> {
-        let inode = img.inode(parent_nid);
+        let inode = img.inode(parent_nid).unwrap();
         if let Some(inline) = inode.inline() {
             if let Ok(block) = DirectoryBlock::ref_from_bytes(inline) {
                 for entry in block.entries() {
+                    let entry = entry.unwrap();
                     if entry.name == name {
                         return Some(entry.header.inode_offset.get());
                     }
                 }
             }
         }
-        for blkid in inode.blocks(img.blkszbits) {
-            let block = img.directory_block(blkid);
+        for blkid in inode.blocks(img.blkszbits).unwrap() {
+            let block = img.directory_block(blkid).unwrap();
             for entry in block.entries() {
+                let entry = entry.unwrap();
                 if entry.name == name {
                     return Some(entry.header.inode_offset.get());
                 }
@@ -1471,7 +1485,7 @@ fn verify_deeply_nested(img: &Image, entries: &[ReconstructedEntry]) {
             .unwrap_or_else(|| panic!("Directory {name} not found at depth {i}"));
     }
     let leaf_nid = find_child_nid(nid, b"leaf.txt").expect("leaf.txt not found at depth 10");
-    let leaf_inode = img.inode(leaf_nid);
+    let leaf_inode = img.inode(leaf_nid).unwrap();
     let inline = leaf_inode.inline().expect("leaf should have inline data");
     assert_eq!(inline, b"ten levels deep");
 }
@@ -1481,7 +1495,7 @@ fn test_roundtrip_deeply_nested() {
     let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
     setup_deeply_nested(&mut fs);
     let image = mkfs_erofs_default(&fs);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
     let root_nid = img.sb.root_nid.get() as u64;
     let entries = collect_entries(&img, root_nid);
     verify_deeply_nested(&img, &entries);
@@ -1514,7 +1528,7 @@ fn test_roundtrip_max_filename() {
     let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
     setup_max_filename(&mut fs);
     let image = mkfs_erofs_default(&fs);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
     let root_nid = img.sb.root_nid.get() as u64;
     let entries = collect_entries(&img, root_nid);
     verify_max_filename(&img, &entries);
@@ -1605,7 +1619,7 @@ fn test_roundtrip_all_types() {
     let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
     setup_all_types(&mut fs);
     let image = mkfs_erofs_default(&fs);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
     let root_nid = img.sb.root_nid.get() as u64;
     let entries = collect_entries(&img, root_nid);
     verify_all_types(&img, &entries);
@@ -1681,7 +1695,7 @@ fn test_roundtrip_preserves_stat_fields() {
     );
 
     let image = mkfs_erofs_default(&fs);
-    let img = Image::open(&image);
+    let img = Image::open(&image).unwrap();
 
     let root_nid = img.sb.root_nid.get() as u64;
     let entries = collect_entries(&img, root_nid);
@@ -1695,19 +1709,21 @@ fn test_roundtrip_preserves_stat_fields() {
 
     // Also check uid/gid/mtime by inspecting the raw inode
     let find_child_nid = |parent_nid: u64, name: &[u8]| -> Option<u64> {
-        let inode = img.inode(parent_nid);
+        let inode = img.inode(parent_nid).unwrap();
         if let Some(inline) = inode.inline() {
             if let Ok(block) = DirectoryBlock::ref_from_bytes(inline) {
                 for entry in block.entries() {
+                    let entry = entry.unwrap();
                     if entry.name == name {
                         return Some(entry.header.inode_offset.get());
                     }
                 }
             }
         }
-        for blkid in inode.blocks(img.blkszbits) {
-            let block = img.directory_block(blkid);
+        for blkid in inode.blocks(img.blkszbits).unwrap() {
+            let block = img.directory_block(blkid).unwrap();
             for entry in block.entries() {
+                let entry = entry.unwrap();
                 if entry.name == name {
                     return Some(entry.header.inode_offset.get());
                 }
@@ -1716,7 +1732,7 @@ fn test_roundtrip_preserves_stat_fields() {
         None
     };
     let file_nid = find_child_nid(root_nid, b"special_file").unwrap();
-    let file_inode = img.inode(file_nid);
+    let file_inode = img.inode(file_nid).unwrap();
     assert_eq!(file_inode.uid(), 1000);
     assert_eq!(file_inode.gid(), 2000);
     assert_eq!(file_inode.mtime(), 1700000000);
@@ -1751,7 +1767,7 @@ fn test_roundtrip_special_mode_bits() {
         );
 
         let image = mkfs_erofs_default(&fs);
-        let img = Image::open(&image);
+        let img = Image::open(&image).unwrap();
         let root_nid = img.sb.root_nid.get() as u64;
         let entries = collect_entries(&img, root_nid);
         let entry = verify_entry_exists(&entries, "file");

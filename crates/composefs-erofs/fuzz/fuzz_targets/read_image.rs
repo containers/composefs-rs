@@ -5,10 +5,6 @@
 //! - All reader methods should return errors or handle gracefully on
 //!   malformed data rather than panicking via unwrap/expect.
 //! - Errors are fine; panics are bugs.
-//!
-//! The EROFS reader currently has several unwrap() calls on untrusted
-//! data. Each panic the fuzzer finds is a real bug that should be fixed
-//! by converting the unwrap to proper error handling.
 
 #![no_main]
 
@@ -20,7 +16,9 @@ use composefs_erofs::reader::{Image, InodeHeader, InodeOps};
 ///
 /// Any panic here is a real bug — the fuzzer will capture it as a crash.
 fn exercise_image(data: &[u8]) {
-    let image = Image::open(data);
+    let Ok(image) = Image::open(data) else {
+        return;
+    };
 
     // Read superblock fields
     let _ = image.blkszbits;
@@ -32,7 +30,9 @@ fn exercise_image(data: &[u8]) {
     let _ = image.sb.blocks.get();
 
     // Read root inode and exercise header methods
-    let root = image.root();
+    let Ok(root) = image.root() else {
+        return;
+    };
 
     let _ = root.mode();
     let _ = root.size();
@@ -46,20 +46,25 @@ fn exercise_image(data: &[u8]) {
     let _ = root.xattr_size();
 
     // Xattr iteration
-    if let Some(xattrs) = root.xattrs() {
-        for id in xattrs.shared() {
-            let xattr = image.shared_xattr(id.get());
-            let _ = xattr.suffix();
-            let _ = xattr.value();
-            let _ = xattr.padding();
-            let _ = xattr.header.name_index;
-            let _ = xattr.header.name_len;
-            let _ = xattr.header.value_size;
+    if let Ok(Some(xattrs)) = root.xattrs() {
+        if let Ok(shared) = xattrs.shared() {
+            for id in shared {
+                if let Ok(xattr) = image.shared_xattr(id.get()) {
+                    let _ = xattr.suffix();
+                    let _ = xattr.value();
+                    let _ = xattr.padding();
+                    let _ = xattr.header.name_index;
+                    let _ = xattr.header.name_len;
+                    let _ = xattr.header.value_size;
+                }
+            }
         }
         for xattr in xattrs.local() {
-            let _ = xattr.suffix();
-            let _ = xattr.value();
-            let _ = xattr.padding();
+            if let Ok(xattr) = xattr {
+                let _ = xattr.suffix();
+                let _ = xattr.value();
+                let _ = xattr.padding();
+            }
         }
     }
 
@@ -67,18 +72,25 @@ fn exercise_image(data: &[u8]) {
     let _ = root.inline();
 
     // Block iteration
-    let blocks = root.blocks(image.blkszbits);
+    let Ok(blocks) = root.blocks(image.blkszbits) else {
+        return;
+    };
     for blkid in blocks {
         let _ = image.block(blkid);
         let _ = image.data_block(blkid);
 
-        let db = image.directory_block(blkid);
+        let Ok(db) = image.directory_block(blkid) else {
+            continue;
+        };
         for entry in db.entries() {
+            let Ok(entry) = entry else { continue };
             let _ = entry.name;
             let nid = entry.nid();
 
             // Read child inodes
-            let child = image.inode(nid);
+            let Ok(child) = image.inode(nid) else {
+                continue;
+            };
             let _ = child.mode();
             let _ = child.size();
             let _ = child.inline();

@@ -112,19 +112,21 @@ fn print_escaped<W: Write>(out: &mut W, s: &[u8]) -> std::io::Result<()> {
 }
 
 /// Get the backing file path from overlay.metacopy xattr if present.
-fn get_backing_path(img: &Image, inode: &InodeType) -> Option<String> {
-    let xattrs = inode.xattrs()?;
+fn get_backing_path(img: &Image, inode: &InodeType) -> Result<Option<String>> {
+    let Some(xattrs) = inode.xattrs()? else {
+        return Ok(None);
+    };
 
     // Check shared xattrs
-    for id in xattrs.shared() {
-        let attr = img.shared_xattr(id.get());
+    for id in xattrs.shared()? {
+        let attr = img.shared_xattr(id.get())?;
         // trusted. prefix has name_index == 4
         if attr.header.name_index == 4 && attr.suffix() == b"overlay.metacopy" {
             if let Ok(metacopy) = OverlayMetacopy::<Sha256HashValue>::read_from_bytes(attr.value())
             {
                 if metacopy.valid() {
                     let hex = metacopy.digest.to_hex();
-                    return Some(format!("{}/{}", &hex[..2], &hex[2..]));
+                    return Ok(Some(format!("{}/{}", &hex[..2], &hex[2..])));
                 }
             }
         }
@@ -132,18 +134,19 @@ fn get_backing_path(img: &Image, inode: &InodeType) -> Option<String> {
 
     // Check local xattrs
     for attr in xattrs.local() {
+        let attr = attr?;
         if attr.header.name_index == 4 && attr.suffix() == b"overlay.metacopy" {
             if let Ok(metacopy) = OverlayMetacopy::<Sha256HashValue>::read_from_bytes(attr.value())
             {
                 if metacopy.valid() {
                     let hex = metacopy.digest.to_hex();
-                    return Some(format!("{}/{}", &hex[..2], &hex[2..]));
+                    return Ok(Some(format!("{}/{}", &hex[..2], &hex[2..])));
                 }
             }
         }
     }
 
-    None
+    Ok(None)
 }
 
 /// Get symlink target from inode inline data.
@@ -179,22 +182,23 @@ impl<'a> CollectContext<'a> {
     }
 
     /// Walk directory tree and collect all entries.
-    fn collect(&mut self, nid: u64, path_prefix: &[u8], depth: usize) {
+    fn collect(&mut self, nid: u64, path_prefix: &[u8], depth: usize) -> Result<()> {
         if !self.visited_dirs.insert(nid) {
-            return; // Already visited directory (prevents infinite recursion)
+            return Ok(()); // Already visited directory (prevents infinite recursion)
         }
 
-        let inode = self.img.inode(nid);
+        let inode = self.img.inode(nid)?;
         if !inode.mode().is_dir() {
-            return;
+            return Ok(());
         }
 
         // Collect directory entries from blocks and inline data
         let mut dir_entries: Vec<(Vec<u8>, u64)> = Vec::new();
 
-        for blkid in inode.blocks(self.img.blkszbits) {
-            let block = self.img.directory_block(blkid);
+        for blkid in inode.blocks(self.img.blkszbits)? {
+            let block = self.img.directory_block(blkid)?;
             for entry in block.entries() {
+                let entry = entry?;
                 if entry.name != b"." && entry.name != b".." {
                     dir_entries.push((entry.name.to_vec(), entry.header.inode_offset.get()));
                 }
@@ -205,6 +209,7 @@ impl<'a> CollectContext<'a> {
             if !inline.is_empty() {
                 if let Ok(inline_block) = DirectoryBlock::ref_from_bytes(inline) {
                     for entry in inline_block.entries() {
+                        let entry = entry?;
                         if entry.name != b"." && entry.name != b".." {
                             dir_entries
                                 .push((entry.name.to_vec(), entry.header.inode_offset.get()));
@@ -218,7 +223,7 @@ impl<'a> CollectContext<'a> {
         dir_entries.sort_by(|a, b| a.0.cmp(&b.0));
 
         for (name, child_nid) in dir_entries {
-            let child_inode = self.img.inode(child_nid);
+            let child_inode = self.img.inode(child_nid)?;
 
             // Skip whiteout entries (internal to composefs, e.g., xattr hash table buckets)
             if is_whiteout(&child_inode) {
@@ -249,9 +254,11 @@ impl<'a> CollectContext<'a> {
 
             // Recurse into subdirectories
             if child_inode.mode().is_dir() {
-                self.collect(child_nid, &full_path, depth + 1);
+                self.collect(child_nid, &full_path, depth + 1)?;
             }
         }
+
+        Ok(())
     }
 }
 
@@ -262,14 +269,14 @@ fn cmd_ls(cli: &Cli, images: &[PathBuf]) -> Result<()> {
 
     for image_path in images {
         let image_data = read_image(image_path)?;
-        let img = Image::open(&image_data);
+        let img = Image::open(&image_data)?;
 
         let root_nid = img.sb.root_nid.get() as u64;
         let mut ctx = CollectContext::new(&img, &cli.filter);
-        ctx.collect(root_nid, b"", 0);
+        ctx.collect(root_nid, b"", 0)?;
 
         for entry in ctx.entries {
-            let inode = img.inode(entry.nid);
+            let inode = img.inode(entry.nid)?;
             let mode = inode.mode().0.get();
             let file_type = mode & S_IFMT;
 
@@ -291,7 +298,7 @@ fn cmd_ls(cli: &Cli, images: &[PathBuf]) -> Result<()> {
                 S_IFREG => {
                     // Regular file: check for backing path (but not for hardlinks)
                     if !entry.is_hardlink {
-                        if let Some(backing_path) = get_backing_path(&img, &inode) {
+                        if let Some(backing_path) = get_backing_path(&img, &inode)? {
                             write!(out, "\t@ ")?;
                             print_escaped(&mut out, backing_path.as_bytes())?;
                         }

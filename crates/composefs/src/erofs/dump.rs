@@ -182,12 +182,13 @@ impl<'img> DumpContext<'img> {
 
     /// Collects xattrs from an inode, returning (name, value) pairs in the order
     /// they appear in the EROFS image (inline/local first, then shared).
-    fn collect_xattrs(&self, inode: &InodeType<'_>) -> Vec<(Vec<u8>, Vec<u8>)> {
+    fn collect_xattrs(&self, inode: &InodeType<'_>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut xattrs = Vec::new();
 
-        if let Some(inode_xattrs) = inode.xattrs() {
+        if let Some(inode_xattrs) = inode.xattrs()? {
             // Local (inline) xattrs first - matches C implementation order
             for xattr in inode_xattrs.local() {
+                let xattr = xattr?;
                 let full_name = xattr_full_name(xattr.header.name_index, xattr.suffix());
                 if let Some(pair) = self.transform_xattr(&full_name, xattr.value()) {
                     xattrs.push(pair);
@@ -195,8 +196,8 @@ impl<'img> DumpContext<'img> {
             }
 
             // Shared xattrs second
-            for id in inode_xattrs.shared() {
-                let xattr = self.image.shared_xattr(id.get());
+            for id in inode_xattrs.shared()? {
+                let xattr = self.image.shared_xattr(id.get())?;
                 let full_name = xattr_full_name(xattr.header.name_index, xattr.suffix());
                 if let Some(pair) = self.transform_xattr(&full_name, xattr.value()) {
                     xattrs.push(pair);
@@ -206,29 +207,32 @@ impl<'img> DumpContext<'img> {
 
         // Note: We do NOT sort xattrs - we preserve the order from the EROFS image
         // to match the C implementation behavior
-        xattrs
+        Ok(xattrs)
     }
 
     /// Extracts overlay.metacopy xattr to get fsverity digest for external files
-    fn get_metacopy_digest(&self, inode: &InodeType<'_>) -> Option<Sha256HashValue> {
-        let inode_xattrs = inode.xattrs()?;
+    fn get_metacopy_digest(&self, inode: &InodeType<'_>) -> Result<Option<Sha256HashValue>> {
+        let Some(inode_xattrs) = inode.xattrs()? else {
+            return Ok(None);
+        };
 
         // Check shared xattrs
-        for id in inode_xattrs.shared() {
-            let xattr = self.image.shared_xattr(id.get());
+        for id in inode_xattrs.shared()? {
+            let xattr = self.image.shared_xattr(id.get())?;
             if let Some(digest) = self.check_metacopy_xattr(xattr) {
-                return Some(digest);
+                return Ok(Some(digest));
             }
         }
 
         // Check local xattrs
         for xattr in inode_xattrs.local() {
+            let xattr = xattr?;
             if let Some(digest) = self.check_metacopy_xattr(xattr) {
-                return Some(digest);
+                return Ok(Some(digest));
             }
         }
 
-        None
+        Ok(None)
     }
 
     fn check_metacopy_xattr(&self, xattr: &XAttr) -> Option<Sha256HashValue> {
@@ -249,41 +253,42 @@ impl<'img> DumpContext<'img> {
 
     /// Checks if an inode has the escaped whiteout xattr (trusted.overlay.overlay.whiteout)
     /// This is used to transform regular files into character device whiteouts
-    fn has_escaped_whiteout_xattr(&self, inode: &InodeType<'_>) -> bool {
-        let Some(inode_xattrs) = inode.xattrs() else {
-            return false;
+    fn has_escaped_whiteout_xattr(&self, inode: &InodeType<'_>) -> Result<bool> {
+        let Some(inode_xattrs) = inode.xattrs()? else {
+            return Ok(false);
         };
 
         // Check local xattrs
         for xattr in inode_xattrs.local() {
+            let xattr = xattr?;
             let full_name = xattr_full_name(xattr.header.name_index, xattr.suffix());
             if full_name == OVERLAY_XATTR_ESCAPED_WHITEOUT {
-                return true;
+                return Ok(true);
             }
         }
 
         // Check shared xattrs
-        for id in inode_xattrs.shared() {
-            let xattr = self.image.shared_xattr(id.get());
+        for id in inode_xattrs.shared()? {
+            let xattr = self.image.shared_xattr(id.get())?;
             let full_name = xattr_full_name(xattr.header.name_index, xattr.suffix());
             if full_name == OVERLAY_XATTR_ESCAPED_WHITEOUT {
-                return true;
+                return Ok(true);
             }
         }
 
-        false
+        Ok(false)
     }
 
     /// Reads file content from blocks and optional inline tail
     /// This handles FlatPlain (blocks only) and FlatInline (blocks + tail) layouts
-    fn read_file_content(&self, inode: &InodeType<'_>) -> Vec<u8> {
+    fn read_file_content(&self, inode: &InodeType<'_>) -> Result<Vec<u8>> {
         let size = inode.size() as usize;
         if size == 0 {
-            return vec![];
+            return Ok(vec![]);
         }
 
-        let layout = inode.data_layout();
-        let blocks: Vec<u64> = inode.blocks(self.image.blkszbits).collect();
+        let layout = inode.data_layout()?;
+        let blocks: Vec<u64> = inode.blocks(self.image.blkszbits)?.collect();
         let block_size = self.image.block_size;
 
         match layout {
@@ -291,17 +296,17 @@ impl<'img> DumpContext<'img> {
                 // All data in blocks, no inline tail
                 let mut content = Vec::with_capacity(size);
                 for blkid in blocks {
-                    content.extend_from_slice(self.image.block(blkid));
+                    content.extend_from_slice(self.image.block(blkid)?);
                 }
                 content.truncate(size);
-                content
+                Ok(content)
             }
             DataLayout::FlatInline => {
                 // Data in blocks + inline tail
                 let n_blocks = blocks.len();
                 let mut content = Vec::with_capacity(size);
                 for blkid in blocks {
-                    content.extend_from_slice(self.image.block(blkid));
+                    content.extend_from_slice(self.image.block(blkid)?);
                 }
                 // Add inline tail
                 if let Some(inline_data) = inode.inline() {
@@ -312,23 +317,18 @@ impl<'img> DumpContext<'img> {
                 if inline_size > 0 {
                     content.truncate(n_blocks * block_size + inline_size);
                 }
-                content
+                Ok(content)
             }
             DataLayout::ChunkBased => {
                 // External file - no inline content
-                vec![]
+                Ok(vec![])
             }
         }
     }
 
     /// Writes a dump entry for an inode
-    fn write_entry(
-        &mut self,
-        output: &mut String,
-        path: &Path,
-        nid: u64,
-    ) -> Result<(), fmt::Error> {
-        let inode = self.image.inode(nid);
+    fn write_entry(&mut self, output: &mut String, path: &Path, nid: u64) -> Result<()> {
+        let inode = self.image.inode(nid)?;
         let mut mode = inode.mode().0.get();
         let mut ifmt = mode & S_IFMT;
         let nlink = inode.nlink();
@@ -351,7 +351,7 @@ impl<'img> DumpContext<'img> {
 
         // Check if this is an escaped whiteout (regular file with trusted.overlay.overlay.whiteout)
         // These need to be transformed back to character device whiteouts
-        let is_escaped_whiteout = ifmt == S_IFREG && self.has_escaped_whiteout_xattr(&inode);
+        let is_escaped_whiteout = ifmt == S_IFREG && self.has_escaped_whiteout_xattr(&inode)?;
         if is_escaped_whiteout {
             // Transform to character device with rdev=0
             mode = (mode & !S_IFMT) | S_IFCHR;
@@ -385,26 +385,26 @@ impl<'img> DumpContext<'img> {
             match ifmt {
                 S_IFREG => {
                     // Regular file
-                    if let Some(metacopy_digest) = self.get_metacopy_digest(&inode) {
+                    if let Some(metacopy_digest) = self.get_metacopy_digest(&inode)? {
                         // External file with fsverity digest
                         let hex = metacopy_digest.to_hex();
                         let object_path = format!("{}/{}", &hex[..2], &hex[2..]);
                         (object_path.into_bytes(), vec![], Some(hex))
                     } else {
                         // Inline or FlatPlain file - read content from blocks + tail
-                        let content = self.read_file_content(&inode);
+                        let content = self.read_file_content(&inode)?;
                         (vec![], content, None)
                     }
                 }
                 S_IFLNK => {
                     // Symlink - target can be inline (short) or in blocks (long)
                     let size = inode.size() as usize;
-                    let blocks: Vec<u64> = inode.blocks(self.image.blkszbits).collect();
+                    let blocks: Vec<u64> = inode.blocks(self.image.blkszbits)?.collect();
                     if !blocks.is_empty() {
                         // Long symlink: data is in blocks
                         let mut target = Vec::with_capacity(size);
                         for blkid in blocks {
-                            target.extend_from_slice(self.image.block(blkid));
+                            target.extend_from_slice(self.image.block(blkid)?);
                         }
                         target.truncate(size);
                         (target, vec![], None)
@@ -454,7 +454,7 @@ impl<'img> DumpContext<'img> {
         }
 
         // Write xattrs
-        let xattrs = self.collect_xattrs(&inode);
+        let xattrs = self.collect_xattrs(&inode)?;
         for (name, value) in xattrs {
             write!(output, " ")?;
             write_escaped_xattr(output, &name)?;
@@ -477,7 +477,7 @@ impl<'img> DumpContext<'img> {
         nid: u64,
         depth: usize,
     ) -> Result<()> {
-        let inode = self.image.inode(nid);
+        let inode = self.image.inode(nid)?;
 
         // Write this directory's entry first
         let mut entry = String::with_capacity(256);
@@ -492,6 +492,7 @@ impl<'img> DumpContext<'img> {
             if !inline.is_empty() {
                 if let Ok(inline_block) = DirectoryBlock::ref_from_bytes(inline) {
                     for entry in inline_block.entries() {
+                        let entry = entry?;
                         if entry.name != b"." && entry.name != b".." {
                             children.push((entry.name.to_vec(), entry.header.inode_offset.get()));
                         }
@@ -501,9 +502,10 @@ impl<'img> DumpContext<'img> {
         }
 
         // Block directory entries
-        for blkid in inode.blocks(self.image.blkszbits) {
-            let block = self.image.directory_block(blkid);
+        for blkid in inode.blocks(self.image.blkszbits)? {
+            let block = self.image.directory_block(blkid)?;
             for entry in block.entries() {
+                let entry = entry?;
                 if entry.name != b"." && entry.name != b".." {
                     children.push((entry.name.to_vec(), entry.header.inode_offset.get()));
                 }
@@ -515,7 +517,7 @@ impl<'img> DumpContext<'img> {
 
         // Process children
         for (name, child_nid) in children {
-            let child_inode = self.image.inode(child_nid);
+            let child_inode = self.image.inode(child_nid)?;
 
             // Skip whiteout entries (internal to composefs)
             if is_whiteout(&child_inode) {
@@ -556,7 +558,7 @@ impl<'img> DumpContext<'img> {
 /// match one of the filter strings will be included in the output (along with
 /// the root directory itself).
 pub fn dump_erofs(output: &mut impl Write, image_data: &[u8], filters: &[String]) -> Result<()> {
-    let image = Image::open(image_data);
+    let image = Image::open(image_data)?;
     let mut ctx = DumpContext::new(&image, filters);
 
     let root_nid = image.sb.root_nid.get() as u64;

@@ -15,7 +15,7 @@ mod tests {
 
     /// Helper to validate that directory entries can be read correctly
     fn validate_directory_entries(img: &Image, nid: u64, expected_names: &[&str]) {
-        let inode = img.inode(nid);
+        let inode = img.inode(nid).unwrap();
         assert!(inode.mode().is_dir(), "Expected directory inode");
 
         let mut found_names = Vec::new();
@@ -24,15 +24,17 @@ mod tests {
         if let Some(inline) = inode.inline() {
             let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
             for entry in inline_block.entries() {
+                let entry = entry.unwrap();
                 let name = std::str::from_utf8(entry.name).unwrap();
                 found_names.push(name.to_string());
             }
         }
 
         // Read block entries
-        for blkid in inode.blocks(img.blkszbits) {
-            let block = img.directory_block(blkid);
+        for blkid in inode.blocks(img.blkszbits).unwrap() {
+            let block = img.directory_block(blkid).unwrap();
             for entry in block.entries() {
+                let entry = entry.unwrap();
                 let name = std::str::from_utf8(entry.name).unwrap();
                 found_names.push(name.to_string());
             }
@@ -58,27 +60,29 @@ mod tests {
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
         let image = mkfs_erofs_default(&fs);
-        let img = Image::open(&image);
+        let img = Image::open(&image).unwrap();
 
         // Root should have . and .. and empty_dir
         let root_nid = img.sb.root_nid.get() as u64;
         validate_directory_entries(&img, root_nid, &[".", "..", "empty_dir"]);
 
         // Find empty_dir entry
-        let root_inode = img.root();
+        let root_inode = img.root().unwrap();
         let mut empty_dir_nid = None;
         if let Some(inline) = root_inode.inline() {
             let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
             for entry in inline_block.entries() {
+                let entry = entry.unwrap();
                 if entry.name == b"empty_dir" {
                     empty_dir_nid = Some(entry.nid());
                     break;
                 }
             }
         }
-        for blkid in root_inode.blocks(img.blkszbits) {
-            let block = img.directory_block(blkid);
+        for blkid in root_inode.blocks(img.blkszbits).unwrap() {
+            let block = img.directory_block(blkid).unwrap();
             for entry in block.entries() {
+                let entry = entry.unwrap();
                 if entry.name == b"empty_dir" {
                     empty_dir_nid = Some(entry.nid());
                     break;
@@ -101,23 +105,25 @@ mod tests {
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
         let image = mkfs_erofs_default(&fs);
-        let img = Image::open(&image);
+        let img = Image::open(&image).unwrap();
 
         // Find dir1
-        let root_inode = img.root();
+        let root_inode = img.root().unwrap();
         let mut dir1_nid = None;
         if let Some(inline) = root_inode.inline() {
             let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
             for entry in inline_block.entries() {
+                let entry = entry.unwrap();
                 if entry.name == b"dir1" {
                     dir1_nid = Some(entry.nid());
                     break;
                 }
             }
         }
-        for blkid in root_inode.blocks(img.blkszbits) {
-            let block = img.directory_block(blkid);
+        for blkid in root_inode.blocks(img.blkszbits).unwrap() {
+            let block = img.directory_block(blkid).unwrap();
             for entry in block.entries() {
+                let entry = entry.unwrap();
                 if entry.name == b"dir1" {
                     dir1_nid = Some(entry.nid());
                     break;
@@ -144,23 +150,25 @@ mod tests {
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(&dumpfile).unwrap();
         let image = mkfs_erofs_default(&fs);
-        let img = Image::open(&image);
+        let img = Image::open(&image).unwrap();
 
         // Find bigdir
-        let root_inode = img.root();
+        let root_inode = img.root().unwrap();
         let mut bigdir_nid = None;
         if let Some(inline) = root_inode.inline() {
             let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
             for entry in inline_block.entries() {
+                let entry = entry.unwrap();
                 if entry.name == b"bigdir" {
                     bigdir_nid = Some(entry.nid());
                     break;
                 }
             }
         }
-        for blkid in root_inode.blocks(img.blkszbits) {
-            let block = img.directory_block(blkid);
+        for blkid in root_inode.blocks(img.blkszbits).unwrap() {
+            let block = img.directory_block(blkid).unwrap();
             for entry in block.entries() {
+                let entry = entry.unwrap();
                 if entry.name == b"bigdir" {
                     bigdir_nid = Some(entry.nid());
                     break;
@@ -192,7 +200,7 @@ mod tests {
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
         let image = mkfs_erofs_default(&fs);
-        let img = Image::open(&image);
+        let img = Image::open(&image).unwrap();
 
         // Navigate through the structure
         let root_nid = img.sb.root_nid.get() as u64;
@@ -200,20 +208,22 @@ mod tests {
 
         // Helper to find a directory entry by name
         let find_entry = |parent_nid: u64, name: &[u8]| -> u64 {
-            let inode = img.inode(parent_nid);
+            let inode = img.inode(parent_nid).unwrap();
 
             if let Some(inline) = inode.inline() {
                 let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
                 for entry in inline_block.entries() {
+                    let entry = entry.unwrap();
                     if entry.name == name {
                         return entry.nid();
                     }
                 }
             }
 
-            for blkid in inode.blocks(img.blkszbits) {
-                let block = img.directory_block(blkid);
+            for blkid in inode.blocks(img.blkszbits).unwrap() {
+                let block = img.directory_block(blkid).unwrap();
                 for entry in block.entries() {
+                    let entry = entry.unwrap();
                     if entry.name == name {
                         return entry.nid();
                     }
@@ -245,22 +255,24 @@ mod tests {
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
         let image = mkfs_erofs_default(&fs);
-        let img = Image::open(&image);
+        let img = Image::open(&image).unwrap();
 
-        let root_inode = img.root();
+        let root_inode = img.root().unwrap();
         let mut mixed_nid = None;
         if let Some(inline) = root_inode.inline() {
             let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
             for entry in inline_block.entries() {
+                let entry = entry.unwrap();
                 if entry.name == b"mixed" {
                     mixed_nid = Some(entry.nid());
                     break;
                 }
             }
         }
-        for blkid in root_inode.blocks(img.blkszbits) {
-            let block = img.directory_block(blkid);
+        for blkid in root_inode.blocks(img.blkszbits).unwrap() {
+            let block = img.directory_block(blkid).unwrap();
             for entry in block.entries() {
+                let entry = entry.unwrap();
                 if entry.name == b"mixed" {
                     mixed_nid = Some(entry.nid());
                     break;
@@ -366,7 +378,7 @@ mod tests {
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
         let image = mkfs_erofs_default(&fs);
-        let img = Image::open(&image);
+        let img = Image::open(&image).unwrap();
 
         // Verify root entries
         let root_nid = img.sb.root_nid.get() as u64;
@@ -374,18 +386,20 @@ mod tests {
 
         // Collect all entries and verify structure
         let mut entries_map: HashMap<Vec<u8>, u64> = HashMap::new();
-        let root_inode = img.root();
+        let root_inode = img.root().unwrap();
 
         if let Some(inline) = root_inode.inline() {
             let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
             for entry in inline_block.entries() {
+                let entry = entry.unwrap();
                 entries_map.insert(entry.name.to_vec(), entry.nid());
             }
         }
 
-        for blkid in root_inode.blocks(img.blkszbits) {
-            let block = img.directory_block(blkid);
+        for blkid in root_inode.blocks(img.blkszbits).unwrap() {
+            let block = img.directory_block(blkid).unwrap();
             for entry in block.entries() {
+                let entry = entry.unwrap();
                 entries_map.insert(entry.name.to_vec(), entry.nid());
             }
         }
@@ -394,7 +408,7 @@ mod tests {
         let file1_nid = entries_map
             .get(b"file1".as_slice())
             .expect("file1 not found");
-        let file1_inode = img.inode(*file1_nid);
+        let file1_inode = img.inode(*file1_nid).unwrap();
         assert!(!file1_inode.mode().is_dir());
         assert_eq!(file1_inode.size(), 5);
 

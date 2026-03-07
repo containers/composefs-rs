@@ -150,13 +150,17 @@ fn hexdump(f: &mut impl fmt::Write, data: &[u8], rel: usize) -> fmt::Result {
 impl fmt::Debug for XAttr {
     // Injective (ie: accounts for every byte in the input)
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let prefix = format::XATTR_PREFIXES
+            .get(self.header.name_index as usize)
+            .and_then(|p| std::str::from_utf8(p).ok())
+            .unwrap_or("?");
         write!(
             f,
             "({} {} {}) {}{} = {}",
             self.header.name_index,
             self.header.name_len,
             self.header.value_size,
-            std::str::from_utf8(format::XATTR_PREFIXES[self.header.name_index as usize]).unwrap(),
+            prefix,
             utf8_or_hex(self.suffix()),
             utf8_or_hex(self.value()),
         )?;
@@ -172,14 +176,17 @@ impl<T: fmt::Debug + InodeHeader> fmt::Debug for Inode<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Debug::fmt(&self.header, f)?;
 
-        if let Some(xattrs) = self.xattrs() {
+        if let Some(xattrs) = self.xattrs().map_err(|_| fmt::Error)? {
             write_fields!(f, self, xattrs.header, name_filter; shared_count; reserved);
 
-            if !xattrs.shared().is_empty() {
-                write_with_offset!(f, self, "shared xattrs", xattrs.shared())?;
+            if let Ok(shared) = xattrs.shared() {
+                if !shared.is_empty() {
+                    write_with_offset!(f, self, "shared xattrs", shared)?;
+                }
             }
 
             for xattr in xattrs.local() {
+                let xattr = xattr.map_err(|_| fmt::Error)?;
                 write_with_offset!(f, self, "xattr", xattr)?;
             }
         }
@@ -196,12 +203,13 @@ impl<T: fmt::Debug + InodeHeader> fmt::Debug for Inode<T> {
 
         // Directory dump
         if self.header.mode().is_dir() {
-            let dir = DirectoryBlock::ref_from_bytes(inline).unwrap();
-            let offset = addr!(dir) - addr!(self);
-            return write!(
-                f,
-                "     +{offset:02x} --- inline directory entries ---{dir:#?}"
-            );
+            if let Ok(dir) = DirectoryBlock::ref_from_bytes(inline) {
+                let offset = addr!(dir) - addr!(self);
+                return write!(
+                    f,
+                    "     +{offset:02x} --- inline directory entries ---{dir:#?}"
+                );
+            }
         }
 
         // Small string (<= 128 bytes, utf8, no control characters).
@@ -219,6 +227,7 @@ impl<T: fmt::Debug + InodeHeader> fmt::Debug for Inode<T> {
 impl fmt::Debug for DirectoryBlock {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         for entry in self.entries() {
+            let entry = entry.map_err(|_| fmt::Error)?;
             writeln!(f)?;
             write_fields!(f, self, entry.header, inode_offset; name_offset; file_type; reserved);
             writeln!(
@@ -323,8 +332,9 @@ impl<'img> ImageVisitor<'img> {
         }
     }
 
-    fn visit_directory_block(&mut self, block: &DirectoryBlock, path: &Path) {
+    fn visit_directory_block(&mut self, block: &DirectoryBlock, path: &Path) -> Result<()> {
         for entry in block.entries() {
+            let entry = entry?;
             if entry.name == b"." || entry.name == b".." {
                 // TODO: maybe we want to follow those and let deduplication happen
                 continue;
@@ -332,12 +342,13 @@ impl<'img> ImageVisitor<'img> {
             self.visit_inode(
                 entry.header.inode_offset.get(),
                 &path.join(OsStr::from_bytes(entry.name)),
-            );
+            )?;
         }
+        Ok(())
     }
 
-    fn visit_inode(&mut self, id: u64, path: &Path) {
-        let inode = self.image.inode(id);
+    fn visit_inode(&mut self, id: u64, path: &Path) -> Result<()> {
+        let inode = self.image.inode(id)?;
         let segment = match inode {
             InodeType::Compact(inode) => SegmentType::CompactInode(inode),
             InodeType::Extended(inode) => SegmentType::ExtendedInode(inode),
@@ -345,13 +356,13 @@ impl<'img> ImageVisitor<'img> {
         if self.note(segment, Some(path)) {
             // TODO: maybe we want to throw an error if we detect loops
             /* already processed */
-            return;
+            return Ok(());
         }
 
-        if let Some(xattrs) = inode.xattrs() {
-            for id in xattrs.shared() {
+        if let Some(xattrs) = inode.xattrs()? {
+            for id in xattrs.shared()? {
                 self.note(
-                    SegmentType::XAttr(self.image.shared_xattr(id.get())),
+                    SegmentType::XAttr(self.image.shared_xattr(id.get())?),
                     Some(path),
                 );
             }
@@ -359,34 +370,37 @@ impl<'img> ImageVisitor<'img> {
 
         if inode.mode().is_dir() {
             if let Some(inline) = inode.inline() {
-                let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
-                self.visit_directory_block(inline_block, path);
+                if let Ok(inline_block) = DirectoryBlock::ref_from_bytes(inline) {
+                    self.visit_directory_block(inline_block, path)?;
+                }
             }
 
-            for id in inode.blocks(self.image.blkszbits) {
-                let block = self.image.directory_block(id);
-                self.visit_directory_block(block, path);
+            for id in inode.blocks(self.image.blkszbits)? {
+                let block = self.image.directory_block(id)?;
+                self.visit_directory_block(block, path)?;
                 self.note(SegmentType::DirectoryBlock(block), Some(path));
             }
         } else {
-            for id in inode.blocks(self.image.blkszbits) {
-                let block = self.image.data_block(id);
+            for id in inode.blocks(self.image.blkszbits)? {
+                let block = self.image.data_block(id)?;
                 self.note(SegmentType::DataBlock(block), Some(path));
             }
         }
+
+        Ok(())
     }
 
     fn visit_image(
         image: &'img Image<'img>,
-    ) -> BTreeMap<usize, (SegmentType<'img>, Vec<Box<Path>>)> {
+    ) -> Result<BTreeMap<usize, (SegmentType<'img>, Vec<Box<Path>>)>> {
         let mut this = Self {
             image,
             visited: BTreeMap::new(),
         };
         this.note(SegmentType::Header(image.header), None);
         this.note(SegmentType::Superblock(image.sb), None);
-        this.visit_inode(image.sb.root_nid.get() as u64, &PathBuf::from("/"));
-        this.visited
+        this.visit_inode(image.sb.root_nid.get() as u64, &PathBuf::from("/"))?;
+        Ok(this.visited)
     }
 }
 
@@ -429,8 +443,8 @@ pub fn dump_unassigned(
 /// Walks the entire image structure, outputting formatted information about
 /// all inodes, blocks, xattrs, and padding. Also produces space usage statistics.
 pub fn debug_img(output: &mut impl std::io::Write, data: &[u8]) -> Result<()> {
-    let image = Image::open(data);
-    let visited = ImageVisitor::visit_image(&image);
+    let image = Image::open(data)?;
+    let visited = ImageVisitor::visit_image(&image)?;
 
     let inode_start = (image.sb.meta_blkaddr.get() as usize) << image.sb.blkszbits;
     let xattr_start = (image.sb.xattr_blkaddr.get() as usize) << image.sb.blkszbits;
