@@ -1248,7 +1248,8 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         std::fs::File::from(image)
             .read_to_end(&mut data)
             .context("Reading image data")?;
-        crate::erofs::reader::collect_objects(&data)
+        crate::erofs::reader::collect_objects(&data, &[])
+            .map_err(|e| anyhow::anyhow!(e))
             .context("Collecting objects from erofs image data")
     }
 

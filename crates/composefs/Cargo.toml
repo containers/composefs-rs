@@ -17,7 +17,9 @@ test = ["tempfile"]
 
 [dependencies]
 anyhow = { version = "1.0.87", default-features = false }
+composefs-erofs = { workspace = true }
 composefs-ioctls = { workspace = true }
+composefs-types = { workspace = true }
 fn-error-context = "0.2"
 hex = { version = "0.4.0", default-features = false, features = ["std"] }
 log = { version = "0.4.8", default-features = false }
@@ -34,6 +36,7 @@ rand = { version = "0.9.1", default-features = true }
 
 [dev-dependencies]
 insta = "1.42.2"
+proptest = "1.6.0"
 similar-asserts = "1.7.0"
 tempfile = { version = "3.8.0", default-features = false }
 test-with = { version = "0.14", default-features = false, features = ["executable", "runtime"] }

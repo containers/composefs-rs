@@ -1,0 +1,43 @@
+[package]
+name = "composefs-erofs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Separate workspace from the parent — required by cargo-fuzz.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.composefs-erofs]
+path = ".."
+
+# composefs-types is needed for the FsVerityHashValue type parameter
+[dependencies.composefs-types]
+path = "../../composefs-types"
+
+# composefs is needed by the corpus generator to build valid EROFS images
+[dependencies.composefs]
+path = "../../composefs"
+
+[[bin]]
+name = "read_image"
+path = "fuzz_targets/read_image.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "debug_image"
+path = "fuzz_targets/debug_image.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "generate-corpus"
+path = "generate_corpus.rs"

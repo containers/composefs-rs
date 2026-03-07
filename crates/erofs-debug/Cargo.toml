@@ -12,7 +12,7 @@ version.workspace = true
 
 [dependencies]
 clap = { version = "4.0.1", default-features = false, features = ["std", "help", "usage", "derive"] }
-composefs = { workspace = true }
+composefs-erofs = { workspace = true }
 
 [lints]
 workspace = true

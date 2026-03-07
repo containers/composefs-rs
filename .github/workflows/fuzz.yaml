@@ -1,0 +1,66 @@
+name: Fuzz
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Install just
+        uses: taiki-e/install-action@just
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/composefs-erofs/fuzz
+      - name: Generate corpus
+        run: just generate-corpus
+      - name: Run fuzz targets
+        run: just fuzz-all
+      - name: Upload fuzz artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: |
+            crates/composefs-erofs/fuzz/artifacts/
+            target/fuzz-logs/
+
+  fuzz-extended:
+    if: github.event_name == 'push'
+    needs: fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Install just
+        uses: taiki-e/install-action@just
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/composefs-erofs/fuzz
+      - name: Generate corpus
+        run: just generate-corpus
+      - name: Run extended fuzz targets
+        run: just fuzz-all 900
+      - name: Upload fuzz artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-extended
+          path: |
+            crates/composefs-erofs/fuzz/artifacts/
+            target/fuzz-logs/
