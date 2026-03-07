@@ -107,7 +107,7 @@ fn main() -> Result<()> {
 
     // Check for unimplemented features
     if args.threads.is_some() {
-        todo!("--threads is not yet implemented");
+        bail!("--threads is not yet implemented");
     }
 
     // Determine format version based on min/max version flags

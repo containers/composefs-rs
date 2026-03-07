@@ -1,12 +1,14 @@
 //! Fuzz target: feed arbitrary bytes into the EROFS reader.
 //!
 //! Invariants under test:
-//! - `Image::open()` must never panic on any input — it should return
-//!   an error or be caught.  (Currently it uses unwrap/expect internally,
-//!   so crashes here are real bugs to fix.)
-//! - After successfully opening an image, all accessor methods (root inode,
-//!   directory iteration, xattr reading, block access, etc.) must not panic.
+//! - The reader must never panic on any input.
+//! - All reader methods should return errors or handle gracefully on
+//!   malformed data rather than panicking via unwrap/expect.
 //! - Errors are fine; panics are bugs.
+//!
+//! The EROFS reader currently has several unwrap() calls on untrusted
+//! data. Each panic the fuzzer finds is a real bug that should be fixed
+//! by converting the unwrap to proper error handling.
 
 #![no_main]
 
@@ -16,11 +18,8 @@ use composefs_erofs::reader::{Image, InodeHeader, InodeOps};
 
 /// Exercise every reader API we can reach from an opened image.
 ///
-/// Any `Result::Err` is silently ignored — only panics count as failures.
+/// Any panic here is a real bug — the fuzzer will capture it as a crash.
 fn exercise_image(data: &[u8]) {
-    // Image::open() currently panics on invalid data; that's what we want
-    // the fuzzer to find.  Once those are fixed to return Result, we can
-    // just use `?` instead.
     let image = Image::open(data);
 
     // Read superblock fields
@@ -32,11 +31,9 @@ fn exercise_image(data: &[u8]) {
     let _ = image.sb.blkszbits;
     let _ = image.sb.blocks.get();
 
-    // Try to read the root inode
-    let root = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| image.root()));
-    let Ok(root) = root else { return };
+    // Read root inode and exercise header methods
+    let root = image.root();
 
-    // Exercise inode header methods
     let _ = root.mode();
     let _ = root.size();
     let _ = root.uid();
@@ -48,20 +45,16 @@ fn exercise_image(data: &[u8]) {
     let _ = root.xattr_icount();
     let _ = root.xattr_size();
 
-    // Try xattrs
+    // Xattr iteration
     if let Some(xattrs) = root.xattrs() {
         for id in xattrs.shared() {
-            let xattr = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                image.shared_xattr(id.get())
-            }));
-            if let Ok(xattr) = xattr {
-                let _ = xattr.suffix();
-                let _ = xattr.value();
-                let _ = xattr.padding();
-                let _ = xattr.header.name_index;
-                let _ = xattr.header.name_len;
-                let _ = xattr.header.value_size;
-            }
+            let xattr = image.shared_xattr(id.get());
+            let _ = xattr.suffix();
+            let _ = xattr.value();
+            let _ = xattr.padding();
+            let _ = xattr.header.name_index;
+            let _ = xattr.header.name_len;
+            let _ = xattr.header.value_size;
         }
         for xattr in xattrs.local() {
             let _ = xattr.suffix();
@@ -70,54 +63,30 @@ fn exercise_image(data: &[u8]) {
         }
     }
 
-    // Try inline data
+    // Inline data
     let _ = root.inline();
 
-    // Try blocks
+    // Block iteration
     let blocks = root.blocks(image.blkszbits);
     for blkid in blocks {
-        let block = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| image.block(blkid)));
-        if block.is_err() {
-            continue;
-        }
+        let _ = image.block(blkid);
+        let _ = image.data_block(blkid);
 
-        // Try interpreting as directory or data block
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let db = image.directory_block(blkid);
-            for entry in db.entries() {
-                let _ = entry.name;
-                let _ = entry.nid();
-            }
-        }));
+        let db = image.directory_block(blkid);
+        for entry in db.entries() {
+            let _ = entry.name;
+            let nid = entry.nid();
 
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = image.data_block(blkid);
-        }));
-    }
-
-    // If root is a directory, try iterating it
-    if root.mode().is_dir() {
-        let dir_blocks = root.blocks(image.blkszbits);
-        for blkid in dir_blocks {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let db = image.directory_block(blkid);
-                for entry in db.entries() {
-                    let _ = entry.name;
-                    let nid = entry.nid();
-                    // Try to read the child inode
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let child = image.inode(nid);
-                        let _ = child.mode();
-                        let _ = child.size();
-                        let _ = child.inline();
-                        let _ = child.xattrs();
-                    }));
-                }
-            }));
+            // Read child inodes
+            let child = image.inode(nid);
+            let _ = child.mode();
+            let _ = child.size();
+            let _ = child.inline();
+            let _ = child.xattrs();
         }
     }
 
-    // Try collect_objects (the high-level API)
+    // High-level API
     let _ = composefs_erofs::reader::collect_objects::<composefs_types::fsverity::Sha256HashValue>(
         data,
         &[],
