@@ -9,7 +9,7 @@ use composefs::{
     dumpfile::dumpfile_to_filesystem,
     erofs::{
         reader::{collect_objects, DirectoryBlock, Image, InodeHeader, InodeOps},
-        writer::mkfs_erofs,
+        writer::mkfs_erofs_default,
     },
     fsverity::Sha256HashValue,
 };
@@ -59,7 +59,7 @@ fn test_empty_directory() {
 "#;
 
     let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-    let image = mkfs_erofs(&fs);
+    let image = mkfs_erofs_default(&fs);
     let img = Image::open(&image);
 
     // Root should have . and .. and empty_dir
@@ -102,7 +102,7 @@ fn test_directory_with_inline_entries() {
 "#;
 
     let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-    let image = mkfs_erofs(&fs);
+    let image = mkfs_erofs_default(&fs);
     let img = Image::open(&image);
 
     // Find dir1
@@ -145,7 +145,7 @@ fn test_directory_with_many_entries() {
     }
 
     let fs = dumpfile_to_filesystem::<Sha256HashValue>(&dumpfile).unwrap();
-    let image = mkfs_erofs(&fs);
+    let image = mkfs_erofs_default(&fs);
     let img = Image::open(&image);
 
     // Find bigdir
@@ -193,7 +193,7 @@ fn test_nested_directories() {
 "#;
 
     let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-    let image = mkfs_erofs(&fs);
+    let image = mkfs_erofs_default(&fs);
     let img = Image::open(&image);
 
     // Navigate through the structure
@@ -246,7 +246,7 @@ fn test_mixed_entry_types() {
 "#;
 
     let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-    let image = mkfs_erofs(&fs);
+    let image = mkfs_erofs_default(&fs);
     let img = Image::open(&image);
 
     let root_inode = img.root();
@@ -290,10 +290,10 @@ fn test_collect_objects_traversal() {
 "#;
 
     let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-    let image = mkfs_erofs(&fs);
+    let image = mkfs_erofs_default(&fs);
 
     // This should traverse all directories without error
-    let result = collect_objects::<Sha256HashValue>(&image);
+    let result = collect_objects::<Sha256HashValue>(&image, &[]);
     assert!(
         result.is_ok(),
         "Failed to collect objects: {:?}",
@@ -301,6 +301,7 @@ fn test_collect_objects_traversal() {
     );
 }
 
+#[test_with::executable(mkcomposefs)]
 #[test]
 fn test_pr188_empty_inline_directory() -> anyhow::Result<()> {
     // Regression test for https://github.com/containers/composefs-rs/pull/188
@@ -349,7 +350,7 @@ fn test_pr188_empty_inline_directory() -> anyhow::Result<()> {
     let image = std::fs::read(&erofs_path).expect("Failed to read generated erofs");
 
     // The C mkcomposefs creates directories with empty inline sections.
-    let r = collect_objects::<Sha256HashValue>(&image).unwrap();
+    let r = collect_objects::<Sha256HashValue>(&image, &[]).unwrap();
     assert_eq!(r.len(), 0);
 
     Ok(())
@@ -366,7 +367,7 @@ fn test_round_trip_basic() {
 "#;
 
     let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-    let image = mkfs_erofs(&fs);
+    let image = mkfs_erofs_default(&fs);
     let img = Image::open(&image);
 
     // Verify root entries
