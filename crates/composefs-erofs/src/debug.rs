@@ -307,19 +307,26 @@ struct ImageVisitor<'img> {
 }
 
 impl<'img> ImageVisitor<'img> {
-    fn note(&mut self, segment: SegmentType<'img>, path: Option<&Path>) -> bool {
+    fn note(&mut self, segment: SegmentType<'img>, path: Option<&Path>) -> Result<bool> {
         let offset = segment.addr() - self.image.image.as_ptr() as usize;
         match self.visited.entry(offset) {
             std::collections::btree_map::Entry::Occupied(mut e) => {
                 let (existing, paths) = e.get_mut();
-                // TODO: figure out pointer value equality...
-                assert_eq!(discriminant(existing), discriminant(&segment));
-                assert_eq!(existing.addr(), segment.addr());
-                assert_eq!(existing.size(), segment.size());
+                if discriminant(existing) != discriminant(&segment)
+                    || existing.addr() != segment.addr()
+                    || existing.size() != segment.size()
+                {
+                    anyhow::bail!(
+                        "conflicting segments at offset {offset:#x}: \
+                         existing {:?} vs new {:?}",
+                        discriminant(existing),
+                        discriminant(&segment)
+                    );
+                }
                 if let Some(path) = path {
                     paths.push(Box::from(path));
                 }
-                true
+                Ok(true)
             }
             std::collections::btree_map::Entry::Vacant(e) => {
                 let mut paths = vec![];
@@ -327,7 +334,7 @@ impl<'img> ImageVisitor<'img> {
                     paths.push(Box::from(path));
                 }
                 e.insert((segment, paths));
-                false
+                Ok(false)
             }
         }
     }
@@ -353,7 +360,7 @@ impl<'img> ImageVisitor<'img> {
             InodeType::Compact(inode) => SegmentType::CompactInode(inode),
             InodeType::Extended(inode) => SegmentType::ExtendedInode(inode),
         };
-        if self.note(segment, Some(path)) {
+        if self.note(segment, Some(path))? {
             // TODO: maybe we want to throw an error if we detect loops
             /* already processed */
             return Ok(());
@@ -364,7 +371,7 @@ impl<'img> ImageVisitor<'img> {
                 self.note(
                     SegmentType::XAttr(self.image.shared_xattr(id.get())?),
                     Some(path),
-                );
+                )?;
             }
         }
 
@@ -378,12 +385,12 @@ impl<'img> ImageVisitor<'img> {
             for id in inode.blocks(self.image.blkszbits)? {
                 let block = self.image.directory_block(id)?;
                 self.visit_directory_block(block, path)?;
-                self.note(SegmentType::DirectoryBlock(block), Some(path));
+                self.note(SegmentType::DirectoryBlock(block), Some(path))?;
             }
         } else {
             for id in inode.blocks(self.image.blkszbits)? {
                 let block = self.image.data_block(id)?;
-                self.note(SegmentType::DataBlock(block), Some(path));
+                self.note(SegmentType::DataBlock(block), Some(path))?;
             }
         }
 
@@ -397,8 +404,8 @@ impl<'img> ImageVisitor<'img> {
             image,
             visited: BTreeMap::new(),
         };
-        this.note(SegmentType::Header(image.header), None);
-        this.note(SegmentType::Superblock(image.sb), None);
+        this.note(SegmentType::Header(image.header), None)?;
+        this.note(SegmentType::Superblock(image.sb), None)?;
         this.visit_inode(image.sb.root_nid.get() as u64, &PathBuf::from("/"))?;
         Ok(this.visited)
     }
