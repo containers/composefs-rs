@@ -1,0 +1,195 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  nightly:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+    - uses: actions-rs/toolchain@v1
+      with:
+        toolchain: nightly
+    - uses: actions/checkout@v4
+    - run: cargo +nightly -Z package-workspace package
+
+  fedora:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    container:
+      image: quay.io/fedora/fedora:41
+      options: "--privileged --pid=host -v /var/tmp:/var/tmp --tmpfs /tmp:rw,exec,nosuid,nodev -v /:/run/host"
+
+    steps:
+    - run: dnf -y install cargo clippy composefs-devel e2fsprogs rustfmt
+    - name: Enable fs-verity on /
+      run: tune2fs -O verity $(findmnt -vno SOURCE /run/host)
+    - uses: actions/checkout@v4
+    - run: cargo build --verbose
+    - run: cargo fmt --check
+    - run: cargo clippy -- -Dwarnings
+    - run: env CFS_TEST_TMPDIR=/run/host/var/tmp cargo test --verbose
+
+  # Fast smoke test — catches basic breakage before spending time on
+  # container builds and VM boots.  Runs only the unprivileged tests
+  # directly on the runner (no container image, no root required).
+  smoke:
+    name: Unprivileged smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: extractions/setup-just@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: just integration-unprivileged
+
+  # Full integration tests: builds a bootc container image, runs all
+  # tests (both unprivileged and privileged).  Privileged tests execute
+  # inside bcvk ephemeral VMs booted from the container image.
+  integration:
+    name: Integration tests (${{ matrix.name }})
+    needs: smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: centos
+            base_image: quay.io/centos-bootc/centos-bootc:stream10
+          - name: debian
+            base_image: ghcr.io/bootcrew/debian-bootc:latest
+    env:
+      COMPOSEFS_BASE_IMAGE: ${{ matrix.base_image }}
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: extractions/setup-just@v2
+
+      - name: Setup
+        uses: bootc-dev/actions/bootc-ubuntu-setup@main
+        with:
+          libvirt: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run integration tests (unprivileged + privileged via VM)
+        run: just integration-container
+
+  examples:
+    name: Example tests (${{ matrix.example.dir }}/${{ matrix.example.os }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    strategy:
+      matrix:
+        example:
+          - { dir: 'bls', os: 'arch' }
+          - { dir: 'bls', os: 'fedora' }
+          - { dir: 'bls', os: 'fedora-compat' }
+          # This one is currently failing, needs debugging
+          # - { dir: 'bls', os: 'rawhide' }
+          - { dir: 'bls', os: 'rhel9' }
+          # This one is currently failing, needs debugging
+          # https://github.com/containers/composefs-rs/pull/168#pullrequestreview-3088673152
+          # We believe it's mount API changes causing /sysroot to be mounted
+          # at the wrong place.
+          # - { dir: 'bls', os: 'ubuntu' }
+          - { dir: 'uki', os: 'arch' }
+          - { dir: 'uki', os: 'fedora' }
+          - { dir: 'unified', os: 'fedora' }
+          - { dir: 'unified-secureboot', os: 'fedora' }
+          - { dir: 'bls', os: 'arch', fsfmt: 'ext4', verity: 'none' }
+          - { dir: 'bls', os: 'arch', fsfmt: 'xfs', verity: 'none' }
+      fail-fast: false
+
+    steps:
+    - name: Enable fs-verity on /
+      run: sudo tune2fs -O verity $(findmnt -vno SOURCE /)
+
+    - name: Setup /dev/kvm
+      run: |
+        set -eux
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+        echo 'KERNEL=="vhost-vsock", GROUP="kvm", MODE="0666", OPTIONS+="static_node=vhost-vsock"' | sudo tee /etc/udev/rules.d/99-vhost-vsock.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --settle
+        ls -l /dev/kvm /dev/vhost-vsock
+
+    - name: Install dependencies
+      run: |
+        echo 'deb-src http://azure.archive.ubuntu.com/ubuntu noble main' | sudo tee /etc/apt/sources.list.d/debsrc.list
+
+        sudo apt-get update
+        sudo apt-get install -y \
+          erofs-utils \
+          fsverity \
+          mtools \
+          python3-pytest-asyncio \
+          qemu-kvm \
+          systemd-boot-efi
+
+    - name: Get a newer podman for heredoc support (from plucky)
+      run: |
+        echo 'deb http://azure.archive.ubuntu.com/ubuntu plucky universe main' | sudo tee /etc/apt/sources.list.d/plucky.list
+        sudo apt update
+        sudo apt install -y crun/plucky podman/plucky
+
+    - uses: actions/checkout@v4
+
+    - name: Check cache for patched tools
+      uses: actions/cache@v3
+      with:
+        path: ~/bin
+        key: patched-tools-bin-${{ hashFiles('examples/common/install-patched-tools') }}
+
+    - name: Ensure patched tools are installed
+      run: |
+        set -eux
+        if [ ! -x "$HOME/bin/mkfs.ext4" ]; then
+          sudo apt-get build-dep systemd e2fsprogs
+          mkdir ~/bin
+          examples/common/install-patched-tools ~/bin
+        fi
+
+    - name: Install systemd-ssh-proxy polyfill
+      run: sudo cp examples/bls/test-thing.workarounds/systemd-ssh-proxy /usr/lib/systemd
+
+    - name: Run example tests
+      run: |
+        export PATH="${HOME}/bin:${PATH}"
+        export FS_FORMAT=${{ matrix.example.fsfmt }}
+        export FS_VERITY_MODE=${{ matrix.example.verity }}
+        examples/test/run ${{ matrix.example.dir }} ${{ matrix.example.os }}
+
+  # Sentinel job for required checks — configure this job name in
+  # repository settings as the single required status check.
+  required-checks:
+    if: always()
+    needs: [nightly, fedora, smoke, integration, examples]
+    runs-on: ubuntu-latest
+    steps:
+      - run: exit 1
+        if: >-
+          needs.nightly.result != 'success' ||
+          needs.fedora.result != 'success' ||
+          needs.smoke.result != 'success' ||
+          needs.integration.result != 'success' ||
+          needs.examples.result != 'success'
