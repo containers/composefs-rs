@@ -29,7 +29,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     container:
-      image: quay.io/fedora/fedora:41
+      image: quay.io/fedora/fedora:latest
       options: "--privileged --pid=host -v /var/tmp:/var/tmp --tmpfs /tmp:rw,exec,nosuid,nodev -v /:/run/host"
 
     steps:
