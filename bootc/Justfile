@@ -53,16 +53,15 @@ patch: clone
 
     echo "Patching bootc Cargo.toml to use $_COMPOSEFS_SRC"
 
-    # Add [patch] section with the real local path
+    # Add [patch] section with the real local path.
+    # bootc only depends on `cfsctl` which re-exports the other composefs-rs crates.
     # bootc's Justfile will auto-detect this via `cargo xtask local-rust-deps`
     # and bind-mount it into the container build (mapping /home -> /var/home as needed)
     {
         echo ''
         echo '# Patched by composefs-rs CI to test against local composefs-rs'
-        echo '[patch."https://github.com/containers/composefs-rs"]'
-        echo "composefs = { path = \"$_COMPOSEFS_SRC/crates/composefs\" }"
-        echo "composefs-boot = { path = \"$_COMPOSEFS_SRC/crates/composefs-boot\" }"
-        echo "composefs-oci = { path = \"$_COMPOSEFS_SRC/crates/composefs-oci\" }"
+        echo '[patch."https://github.com/composefs/composefs-rs"]'
+        echo "cfsctl = { path = \"$_COMPOSEFS_SRC/crates/cfsctl\" }"
     } >> Cargo.toml
 
     # Patch the workspace lints to allow missing_docs for composefs-rs crates
@@ -70,7 +69,7 @@ patch: clone
     sed -i 's/missing_docs = "deny"/missing_docs = "allow"/' Cargo.toml
 
     # Update Cargo.lock so the patch is recognized by cargo xtask local-rust-deps
-    cargo update composefs composefs-boot composefs-oci
+    cargo update cfsctl
 
     echo "bootc patched successfully"
 
@@ -85,12 +84,13 @@ build: patch
 
 # Run bootc composefs tests using local composefs-rs
 # Since the patch uses real local paths, no symlinks or special env vars needed
-test: build
+# Parameters match bootc's test-composefs target signature
+test bootloader="systemd" filesystem="ext4" boot_type="uki" seal_state="sealed": build
     #!/bin/bash
     set -euo pipefail
     cd "$COMPOSEFS_BOOTC_PATH"
-    echo "Running bootc composefs tests..."
-    just test-composefs
+    echo "Running bootc composefs tests (bootloader={{bootloader}}, filesystem={{filesystem}}, boot_type={{boot_type}}, seal_state={{seal_state}})..."
+    just test-composefs {{bootloader}} {{filesystem}} {{boot_type}} {{seal_state}}
 
 # Clean the bootc checkout and any patches
 clean:
@@ -119,6 +119,11 @@ config:
       COMPOSEFS_BOOTC_PATH - Override bootc checkout path
       COMPOSEFS_BOOTC_REF  - Override bootc git ref (branch/tag/PR)
       COMPOSEFS_BOOTC_REPO - Override bootc git repository
+
+    Test Parameters:
+      just bootc/test                                        # Default: systemd + ext4 + uki + sealed
+      just bootc/test grub ext4 bls unsealed                 # grub + ext4 + BLS (unsealed)
+      just bootc/test systemd btrfs uki sealed               # systemd-boot + btrfs + UKI (sealed)
 
     Example Usage:
       just bootc/build                                      # Clone main, patch, and build
