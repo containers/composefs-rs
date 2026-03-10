@@ -738,4 +738,54 @@ mod tests {
         assert_eq!(out, out2);
         Ok(())
     }
+
+    mod proptest_tests {
+        use super::*;
+        use crate::fsverity::Sha512HashValue;
+        use crate::test::proptest_strategies::{build_filesystem, filesystem_spec};
+        use proptest::prelude::*;
+
+        /// Serialize filesystem to dumpfile bytes, returning None if the
+        /// output contains non-UTF-8 data (binary filenames) which the
+        /// text-based dumpfile parser cannot round-trip.
+        fn dumpfile_bytes<ObjectID: FsVerityHashValue>(
+            fs: &FileSystem<ObjectID>,
+        ) -> Option<Vec<u8>> {
+            let mut bytes = Vec::new();
+            write_dumpfile(&mut bytes, fs).unwrap();
+            // dumpfile_to_filesystem requires &str, so reject non-UTF-8
+            std::str::from_utf8(&bytes).ok()?;
+            Some(bytes)
+        }
+
+        fn round_trip_dumpfile<ObjectID: FsVerityHashValue>(orig_bytes: &[u8]) {
+            let orig_str = std::str::from_utf8(orig_bytes).unwrap();
+            let fs_rt = dumpfile_to_filesystem::<ObjectID>(orig_str).unwrap();
+
+            let mut rt_bytes = Vec::new();
+            write_dumpfile(&mut rt_bytes, &fs_rt).unwrap();
+
+            assert_eq!(orig_bytes, &rt_bytes);
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(64))]
+
+            #[test]
+            fn test_dumpfile_round_trip_sha256(spec in filesystem_spec()) {
+                let fs = build_filesystem::<Sha256HashValue>(spec);
+                let bytes = dumpfile_bytes(&fs);
+                prop_assume!(bytes.is_some(), "dumpfile can't round-trip binary names");
+                round_trip_dumpfile::<Sha256HashValue>(&bytes.unwrap());
+            }
+
+            #[test]
+            fn test_dumpfile_round_trip_sha512(spec in filesystem_spec()) {
+                let fs = build_filesystem::<Sha512HashValue>(spec);
+                let bytes = dumpfile_bytes(&fs);
+                prop_assume!(bytes.is_some(), "dumpfile can't round-trip binary names");
+                round_trip_dumpfile::<Sha512HashValue>(&bytes.unwrap());
+            }
+        }
+    }
 }
