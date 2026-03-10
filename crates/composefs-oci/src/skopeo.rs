@@ -17,7 +17,7 @@ use containers_image_proxy::oci_spec::image::{
     Descriptor, Digest as OciDigest, ImageConfiguration, MediaType,
 };
 use containers_image_proxy::{
-    ConvertedLayerInfo, ImageProxy, ImageProxyConfig, OpenedImage, Transport,
+    ConvertedLayerInfo, ImageProxy, ImageProxyConfig, ImageReference, OpenedImage, Transport,
 };
 use fn_error_context::context;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -83,15 +83,14 @@ struct ImageOp<ObjectID: FsVerityHashValue> {
 impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
     async fn new(
         repo: &Arc<Repository<ObjectID>>,
-        imgref: &str,
+        image_ref: &ImageReference,
         img_proxy_config: Option<ImageProxyConfig>,
     ) -> Result<Self> {
         // Fail fast if the repository is not writable, before starting
         // the image proxy or doing any network I/O.
         repo.ensure_writable()?;
 
-        // Detect transport from image reference
-        let transport = Transport::try_from(imgref).context("Failed to get image transport")?;
+        let transport = image_ref.transport;
 
         // See https://github.com/containers/skopeo/issues/2563
         let skopeo_cmd = if transport == Transport::ContainerStorage && !geteuid().is_root() {
@@ -103,10 +102,22 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
         };
 
         // See https://github.com/containers/skopeo/issues/2750
-        let imgref = if let Some(hash) = imgref.strip_prefix("containers-storage:sha256:") {
-            &format!("containers-storage:{hash}") // yay temporary lifetime extension!
+        // ImageReference.name for containers-storage: is already without the
+        // transport prefix (e.g. "sha256:abc" not "containers-storage:sha256:abc").
+        // Skopeo expects "abc" without the "sha256:" prefix for digest references.
+        let fixup_ref;
+        let image_ref = if transport == Transport::ContainerStorage {
+            if let Some(hash) = image_ref.name.strip_prefix("sha256:") {
+                fixup_ref = ImageReference {
+                    transport,
+                    name: hash.to_string(),
+                };
+                &fixup_ref
+            } else {
+                image_ref
+            }
         } else {
-            imgref
+            image_ref
         };
 
         let config = match img_proxy_config {
@@ -130,7 +141,10 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
         let proxy = containers_image_proxy::ImageProxy::new_with_config(config)
             .await
             .context("Creating ImageProxy")?;
-        let img = proxy.open_image(imgref).await.context("Opening image")?;
+        let img = proxy
+            .open_image_ref(image_ref)
+            .await
+            .context("Opening image")?;
         let progress = MultiProgress::new();
         Ok(ImageOp {
             repo: Arc::clone(repo),
@@ -442,7 +456,10 @@ pub async fn pull_image<ObjectID: FsVerityHashValue>(
     reference: Option<&str>,
     img_proxy_config: Option<ImageProxyConfig>,
 ) -> Result<(PullResult<ObjectID>, ImportStats)> {
-    let op = Arc::new(ImageOp::new(repo, imgref, img_proxy_config).await?);
+    let image_ref =
+        ImageReference::try_from(imgref).context("Parsing image reference transport")?;
+
+    let op = Arc::new(ImageOp::new(repo, &image_ref, img_proxy_config).await?);
     let (result, stats) = op
         .pull()
         .await
