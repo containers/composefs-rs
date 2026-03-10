@@ -18,6 +18,7 @@ pub mod cstor;
 pub mod image;
 pub mod layer;
 pub mod oci_image;
+pub mod oci_layout;
 pub mod skopeo;
 pub mod tar;
 
