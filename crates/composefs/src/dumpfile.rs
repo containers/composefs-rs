@@ -31,14 +31,47 @@ fn write_empty(writer: &mut impl fmt::Write) -> fmt::Result {
     writer.write_str("-")
 }
 
+/// Escape a byte slice for a space-delimited dumpfile field.
+///
+/// This corresponds to `print_escaped_optional` in the C composefs
+/// `composefs-info.c`, combining `ESCAPE_STANDARD | ESCAPE_LONE_DASH`.
+/// Empty values map to `-` (the "none" sentinel), and a bare `-` is
+/// hex-escaped so it is not confused with the sentinel.
+///
+/// Not appropriate for xattr values — use [`write_escaped_raw`] instead.
 fn write_escaped(writer: &mut impl fmt::Write, bytes: &[u8]) -> fmt::Result {
     if bytes.is_empty() {
         return write_empty(writer);
     }
 
+    // Matches C ESCAPE_LONE_DASH: a bare `-` must be escaped because
+    // the parser uses `-` as the sentinel for "empty/none".
+    if bytes == b"-" {
+        return writer.write_str("\\x2d");
+    }
+
+    write_escaped_raw(writer, bytes)
+}
+
+/// Escape a byte slice without the `-` sentinel logic.
+///
+/// This corresponds to `print_escaped` with `ESCAPE_EQUAL` (but without
+/// `ESCAPE_LONE_DASH`) in the C composefs `composefs-info.c`.  Used for
+/// xattr values where `-` and empty are valid literal values, not
+/// sentinels.
+///
+/// Note: we unconditionally escape `=` in all fields, whereas the C code
+/// only uses `ESCAPE_EQUAL` for xattr keys and values.  This is harmless
+/// since `\x3d` round-trips correctly, but means our output for paths
+/// containing `=` is slightly more verbose than the C output.
+fn write_escaped_raw(writer: &mut impl fmt::Write, bytes: &[u8]) -> fmt::Result {
     for c in bytes {
         let c = *c;
 
+        // The set of hex-escaped characters matches C `!isgraph(c)` in the
+        // POSIX locale (i.e. outside 0x21..=0x7E), plus `=` and `\`.
+        // The C code uses named escapes for `\\`, `\n`, `\r`, `\t` while
+        // we hex-escape everything uniformly; both forms parse correctly.
         if c < b'!' || c == b'=' || c == b'\\' || c > b'~' {
             write!(writer, "\\x{c:02x}")?;
         } else {
@@ -86,7 +119,9 @@ fn write_entry(
         write!(writer, " ")?;
         write_escaped(writer, key.as_bytes())?;
         write!(writer, "=")?;
-        write_escaped(writer, value)?;
+        // Xattr values don't use the `-` sentinel — they're always present
+        // when the key=value pair exists, and empty or `-` are valid values.
+        write_escaped_raw(writer, value)?;
     }
 
     Ok(())
@@ -218,7 +253,10 @@ pub fn write_leaf(
 /// Writes a hardlink entry to the dumpfile format.
 ///
 /// Creates a special entry that links the given path to an existing target path
-/// that was already written to the dumpfile.
+/// that was already written to the dumpfile.  The nlink/uid/gid/rdev/mtime
+/// fields are written as `-` (ignored); both the C and Rust parsers detect
+/// the `@` hardlink prefix on the mode field and skip parsing the remaining
+/// numeric fields.
 pub fn write_hardlink(writer: &mut impl fmt::Write, path: &Path, target: &OsStr) -> fmt::Result {
     write_escaped(writer, path.as_os_str().as_bytes())?;
     write!(writer, " 0 @120000 - - - - 0.0 ")?;
@@ -525,11 +563,14 @@ mod tests {
 
     #[test]
     fn test_hardlinks() -> Result<()> {
+        // The nlink/uid/gid/rdev fields on hardlink lines use `-` here,
+        // matching the C composefs writer convention.  The parser must
+        // accept these without trying to parse them as integers.
         let dumpfile = r#"/ 4096 40755 2 0 0 0 1000.0 - - -
 /original 11 100644 2 0 0 0 1000.0 - hello_world -
-/hardlink1 0 @120000 2 0 0 0 0.0 /original - -
+/hardlink1 0 @120000 - - - - 0.0 /original - -
 /dir1 4096 40755 2 0 0 0 1000.0 - - -
-/dir1/hardlink2 0 @120000 2 0 0 0 0.0 /original - -
+/dir1/hardlink2 0 @120000 - - - - 0.0 /original - -
 "#;
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile)?;
@@ -570,6 +611,131 @@ mod tests {
             panic!("Expected inline regular file");
         }
 
+        Ok(())
+    }
+
+    /// Verify that a symlink whose target is literally "-" survives a
+    /// write → parse → write round-trip.  Previously `write_escaped`
+    /// did not escape a bare "-", so the parser treated it as "none".
+    #[test]
+    fn test_symlink_target_dash_round_trip() -> Result<()> {
+        let dumpfile = "/ 0 40755 2 0 0 0 0.0 - - -\n\
+                         /link 1 120777 1 0 0 0 0.0 \\x2d - -\n";
+        let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile)?;
+        let link = fs.root.lookup(OsStr::new("link")).unwrap();
+        match link {
+            Inode::Leaf(ref l) => match &l.content {
+                LeafContent::Symlink(target) => assert_eq!(target.as_ref(), OsStr::new("-")),
+                other => panic!("expected symlink, got {other:?}"),
+            },
+            _ => panic!("expected leaf"),
+        }
+
+        // Re-serialize and verify it round-trips
+        let mut out = Vec::new();
+        write_dumpfile(&mut out, &fs)?;
+        let out_str = std::str::from_utf8(&out).unwrap();
+        let fs2 = dumpfile_to_filesystem::<Sha256HashValue>(out_str)?;
+        let mut out2 = Vec::new();
+        write_dumpfile(&mut out2, &fs2)?;
+        assert_eq!(out, out2);
+        Ok(())
+    }
+
+    /// Verify that xattrs with empty values and with a value of "-"
+    /// both survive a round-trip.  Previously `write_escaped` used
+    /// the "-" sentinel for empty bytes, which the xattr parser does
+    /// not treat specially.
+    #[test]
+    fn test_xattr_empty_and_dash_values_round_trip() -> Result<()> {
+        use std::cell::RefCell;
+        use std::collections::BTreeMap;
+
+        let mut xattrs = BTreeMap::new();
+        xattrs.insert(
+            Box::from(OsStr::new("user.empty")),
+            Vec::new().into_boxed_slice(),
+        );
+        xattrs.insert(
+            Box::from(OsStr::new("user.dash")),
+            vec![b'-'].into_boxed_slice(),
+        );
+
+        let mut fs = FileSystem::<Sha256HashValue>::new(Stat {
+            st_mode: 0o755,
+            st_uid: 0,
+            st_gid: 0,
+            st_mtim_sec: 0,
+            xattrs: RefCell::new(BTreeMap::new()),
+        });
+        let leaf = std::rc::Rc::new(Leaf {
+            stat: Stat {
+                st_mode: 0o644,
+                st_uid: 0,
+                st_gid: 0,
+                st_mtim_sec: 0,
+                xattrs: RefCell::new(xattrs),
+            },
+            content: LeafContent::Regular(RegularFile::Inline(b"test".to_vec().into())),
+        });
+        fs.root.insert(OsStr::new("f"), Inode::Leaf(leaf));
+
+        let mut out = Vec::new();
+        write_dumpfile(&mut out, &fs)?;
+        let out_str = std::str::from_utf8(&out).unwrap();
+        let fs2 = dumpfile_to_filesystem::<Sha256HashValue>(out_str)?;
+        let mut out2 = Vec::new();
+        write_dumpfile(&mut out2, &fs2)?;
+        assert_eq!(out, out2, "xattr round-trip mismatch:\n{out_str}");
+        Ok(())
+    }
+
+    /// Verify that write_dumpfile → dumpfile_to_filesystem round-trips
+    /// hardlinks correctly.
+    #[test]
+    fn test_hardlink_write_round_trip() -> Result<()> {
+        use std::cell::RefCell;
+        use std::collections::BTreeMap;
+
+        let stat = || Stat {
+            st_mode: 0o644,
+            st_uid: 0,
+            st_gid: 0,
+            st_mtim_sec: 0,
+            xattrs: RefCell::new(BTreeMap::new()),
+        };
+
+        let mut fs = FileSystem::<Sha256HashValue>::new(Stat {
+            st_mode: 0o755,
+            ..stat()
+        });
+        let leaf = std::rc::Rc::new(Leaf {
+            stat: stat(),
+            content: LeafContent::Regular(RegularFile::Inline(b"data".to_vec().into())),
+        });
+        // Insert original + hardlink (same Rc)
+        fs.root
+            .insert(OsStr::new("original"), Inode::Leaf(leaf.clone()));
+        fs.root.insert(OsStr::new("link"), Inode::Leaf(leaf));
+
+        let mut out = Vec::new();
+        write_dumpfile(&mut out, &fs)?;
+        let out_str = std::str::from_utf8(&out).unwrap();
+
+        let fs2 = dumpfile_to_filesystem::<Sha256HashValue>(out_str)?;
+
+        // Verify the hardlink is preserved
+        let orig = fs2.root.lookup(OsStr::new("original")).unwrap();
+        let link = fs2.root.lookup(OsStr::new("link")).unwrap();
+        match (orig, link) {
+            (Inode::Leaf(a), Inode::Leaf(b)) => assert!(Rc::ptr_eq(a, b)),
+            _ => panic!("expected both to be leaves"),
+        }
+
+        // And re-serialization is stable
+        let mut out2 = Vec::new();
+        write_dumpfile(&mut out2, &fs2)?;
+        assert_eq!(out, out2);
         Ok(())
     }
 }
