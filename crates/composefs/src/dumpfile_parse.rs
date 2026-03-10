@@ -270,6 +270,15 @@ enum EscapeMode {
 }
 
 /// Escape a byte array according to the composefs dump file text format.
+///
+/// Note: this function unconditionally maps empty → `-` and escapes a
+/// bare `-`.  That matches C `ESCAPE_LONE_DASH` and is correct for
+/// space-delimited fields (path, payload, content), but the C code does
+/// NOT set `ESCAPE_LONE_DASH` for xattr values — there, `-` and empty
+/// are valid literals.  The `Entry` Display impl currently uses this for
+/// xattr values via `EscapeMode::Standard`, which diverges from C.
+/// The `write_dumpfile` writer in `dumpfile.rs` avoids this by using
+/// a separate `write_escaped_raw` for xattr values.
 fn escape<W: std::fmt::Write>(out: &mut W, s: &[u8], mode: EscapeMode) -> std::fmt::Result {
     // Empty content must be represented by `-`
     if s.is_empty() {
@@ -369,6 +378,34 @@ impl<'p> Entry<'p> {
         } else {
             (false, u32::from_str_radix(modeval, 8)?)
         };
+
+        // For hardlinks, the C parser skips the remaining numeric fields
+        // (nlink, uid, gid, rdev, mtime) and only reads the payload (target
+        // path).  We match that: consume the tokens without parsing them as
+        // integers, so values like `-` are accepted.
+        if is_hardlink {
+            let ty = FileType::from_raw_mode(mode);
+            if ty == FileType::Directory {
+                anyhow::bail!("Invalid hardlinked directory");
+            }
+            // Skip nlink, uid, gid, rdev, mtime
+            for field in ["nlink", "uid", "gid", "rdev", "mtime"] {
+                next(field)?;
+            }
+            let payload = optional_str(next("payload")?);
+            let target =
+                unescape_to_path_canonical(payload.ok_or_else(|| anyhow!("Missing payload"))?)?;
+            return Ok(Entry {
+                path,
+                uid: 0,
+                gid: 0,
+                mode,
+                mtime: Mtime { sec: 0, nsec: 0 },
+                item: Item::Hardlink { target },
+                xattrs: Vec::new(),
+            });
+        }
+
         let nlink = u32::from_str(next("nlink")?)?;
         let uid = u32::from_str(next("uid")?)?;
         let gid = u32::from_str(next("gid")?)?;
@@ -391,15 +428,7 @@ impl<'p> Entry<'p> {
             .0;
 
         let ty = FileType::from_raw_mode(mode);
-        let item = if is_hardlink {
-            if ty == FileType::Directory {
-                anyhow::bail!("Invalid hardlinked directory");
-            }
-            let target =
-                unescape_to_path_canonical(payload.ok_or_else(|| anyhow!("Missing payload"))?)?;
-            // TODO: the dumpfile format suggests to retain all the metadata on hardlink lines
-            Item::Hardlink { target }
-        } else {
+        let item = {
             match ty {
                 FileType::RegularFile => {
                     Self::check_rdev(rdev)?;
@@ -568,6 +597,12 @@ impl Display for Entry<'_> {
             f.write_char(' ')?;
             escape(f, xattr.key.as_bytes(), EscapeMode::XattrKey)?;
             f.write_char('=')?;
+            // NOTE: the C code uses ESCAPE_EQUAL (not ESCAPE_LONE_DASH)
+            // for xattr values, meaning it does not escape bare `-` or
+            // map empty to `-`.  Using `Standard` mode here is slightly
+            // inconsistent with C but harmless since `\x2d` parses back
+            // to `-`.  The `write_dumpfile` writer uses `write_escaped_raw`
+            // which matches C more closely.
             escape(f, &xattr.value, EscapeMode::Standard)?;
         }
         std::fmt::Result::Ok(())
