@@ -5,9 +5,14 @@
 //! reference collection for garbage collection.
 
 use core::mem::size_of;
-use std::collections::{BTreeSet, HashSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ffi::OsStr;
 use std::ops::Range;
+use std::os::unix::ffi::OsStrExt;
+use std::rc::Rc;
 
+use anyhow::Context;
 use thiserror::Error;
 use zerocopy::{little_endian::U32, FromBytes, Immutable, KnownLayout};
 
@@ -15,10 +20,12 @@ use super::{
     composefs::OverlayMetacopy,
     format::{
         CompactInodeHeader, ComposefsHeader, DataLayout, DirectoryEntryHeader, ExtendedInodeHeader,
-        InodeXAttrHeader, ModeField, Superblock, XAttrHeader,
+        InodeXAttrHeader, ModeField, Superblock, XAttrHeader, S_IFBLK, S_IFCHR, S_IFIFO, S_IFLNK,
+        S_IFMT, S_IFREG, S_IFSOCK, XATTR_PREFIXES,
     },
 };
 use crate::fsverity::FsVerityHashValue;
+use crate::tree;
 
 /// Rounds up a value to the nearest multiple of `to`
 pub fn round_up(n: usize, to: usize) -> usize {
@@ -675,11 +682,277 @@ pub fn collect_objects<ObjectID: FsVerityHashValue>(image: &[u8]) -> ReadResult<
     Ok(this.objects)
 }
 
+/// Construct the full xattr name from a prefix index and suffix.
+fn construct_xattr_name(xattr: &XAttr) -> Vec<u8> {
+    let prefix = XATTR_PREFIXES[xattr.header.name_index as usize];
+    let suffix = xattr.suffix();
+    let mut full_name = Vec::with_capacity(prefix.len() + suffix.len());
+    full_name.extend_from_slice(prefix);
+    full_name.extend_from_slice(suffix);
+    full_name
+}
+
+/// Build a `tree::Stat` from an erofs inode, reversing the xattr namespace
+/// transformations applied by the writer:
+/// - Strips `trusted.overlay.metacopy` and `trusted.overlay.redirect`
+/// - Unescapes `trusted.overlay.overlay.X` back to `trusted.overlay.X`
+fn stat_from_inode_for_tree(img: &Image, inode: &InodeType) -> tree::Stat {
+    let (st_mode, st_uid, st_gid, st_mtim_sec) = match inode {
+        InodeType::Compact(inode) => (
+            inode.header.mode.0.get() as u32 & 0o7777,
+            inode.header.uid.get() as u32,
+            inode.header.gid.get() as u32,
+            // Compact inodes don't store mtime; the writer uses build_time
+            // but for round-trip purposes, 0 matches what was written for
+            // compact headers (the writer always uses ExtendedInodeHeader)
+            0i64,
+        ),
+        InodeType::Extended(inode) => (
+            inode.header.mode.0.get() as u32 & 0o7777,
+            inode.header.uid.get(),
+            inode.header.gid.get(),
+            inode.header.mtime.get() as i64,
+        ),
+    };
+
+    let mut xattrs = BTreeMap::new();
+
+    if let Some(xattrs_section) = inode.xattrs() {
+        // Process shared xattrs
+        for id in xattrs_section.shared() {
+            let xattr = img.shared_xattr(id.get());
+            if let Some((name, value)) = transform_xattr(xattr) {
+                xattrs.insert(name, value);
+            }
+        }
+        // Process local xattrs
+        for xattr in xattrs_section.local() {
+            if let Some((name, value)) = transform_xattr(xattr) {
+                xattrs.insert(name, value);
+            }
+        }
+    }
+
+    tree::Stat {
+        st_mode,
+        st_uid,
+        st_gid,
+        st_mtim_sec,
+        xattrs: RefCell::new(xattrs),
+    }
+}
+
+/// Transform a single xattr, reversing writer escaping.
+/// Returns None for internal overlay xattrs that should be stripped.
+fn transform_xattr(xattr: &XAttr) -> Option<(Box<OsStr>, Box<[u8]>)> {
+    let full_name = construct_xattr_name(xattr);
+
+    // Skip internal overlay xattrs added by the writer
+    if full_name == b"trusted.overlay.metacopy" || full_name == b"trusted.overlay.redirect" {
+        return None;
+    }
+
+    // Unescape: trusted.overlay.overlay.X -> trusted.overlay.X
+    let final_name = if let Some(rest) = full_name.strip_prefix(b"trusted.overlay.overlay.") {
+        let mut unescaped = b"trusted.overlay.".to_vec();
+        unescaped.extend_from_slice(rest);
+        unescaped
+    } else {
+        full_name
+    };
+
+    let name = Box::from(OsStr::from_bytes(&final_name));
+    let value = Box::from(xattr.value());
+    Some((name, value))
+}
+
+/// Extract file data from an inode (inline and block data combined).
+fn extract_all_file_data(img: &Image, inode: &InodeType) -> Vec<u8> {
+    let file_size = inode.size() as usize;
+    if file_size == 0 {
+        return Vec::new();
+    }
+
+    let mut data = Vec::with_capacity(file_size);
+
+    // Read block data first
+    for blkid in inode.blocks(img.blkszbits) {
+        let block = img.block(blkid);
+        data.extend_from_slice(block);
+    }
+
+    // Read inline data
+    if let Some(inline) = inode.inline() {
+        data.extend_from_slice(inline);
+    }
+
+    data.truncate(file_size);
+    data
+}
+
+/// Try to extract a metacopy digest from an inode's xattrs.
+fn extract_metacopy_digest<ObjectID: FsVerityHashValue>(
+    img: &Image,
+    inode: &InodeType,
+) -> Option<ObjectID> {
+    let xattrs_section = inode.xattrs()?;
+
+    for id in xattrs_section.shared() {
+        let xattr = img.shared_xattr(id.get());
+        if let Some(digest) = check_metacopy_xattr(xattr) {
+            return Some(digest);
+        }
+    }
+    for xattr in xattrs_section.local() {
+        if let Some(digest) = check_metacopy_xattr(xattr) {
+            return Some(digest);
+        }
+    }
+    None
+}
+
+/// Check if a single xattr is a valid overlay.metacopy and return the digest.
+fn check_metacopy_xattr<ObjectID: FsVerityHashValue>(xattr: &XAttr) -> Option<ObjectID> {
+    // name_index 4 = "trusted.", suffix = "overlay.metacopy"
+    if xattr.header.name_index != 4 {
+        return None;
+    }
+    if xattr.suffix() != b"overlay.metacopy" {
+        return None;
+    }
+    if let Ok(value) = OverlayMetacopy::<ObjectID>::read_from_bytes(xattr.value()) {
+        if value.valid() {
+            return Some(value.digest.clone());
+        }
+    }
+    None
+}
+
+/// Iterate over directory entries from an inode, yielding (name_bytes, nid) pairs.
+/// Skips "." and "..".
+fn dir_entries<'a>(
+    img: &'a Image<'a>,
+    dir_inode: &'a InodeType<'a>,
+) -> impl Iterator<Item = (&'a [u8], u64)> {
+    // Block-based entries
+    let block_entries = dir_inode.blocks(img.blkszbits).flat_map(move |blkid| {
+        img.directory_block(blkid)
+            .entries()
+            .filter(|e| e.name != b"." && e.name != b"..")
+            .map(|e| (e.name, e.nid()))
+    });
+
+    // Inline entries
+    let inline_entries = dir_inode
+        .inline()
+        .and_then(|data| DirectoryBlock::ref_from_bytes(data).ok())
+        .into_iter()
+        .flat_map(|block| {
+            block
+                .entries()
+                .filter(|e| e.name != b"." && e.name != b"..")
+                .map(|e| (e.name, e.nid()))
+        });
+
+    block_entries.chain(inline_entries)
+}
+
+/// Recursively populate a `tree::Directory` from an erofs directory inode.
+fn populate_directory<ObjectID: FsVerityHashValue>(
+    img: &Image,
+    dir_inode: &InodeType,
+    dir: &mut tree::Directory<ObjectID>,
+    hardlinks: &mut HashMap<u64, Rc<tree::Leaf<ObjectID>>>,
+) -> anyhow::Result<()> {
+    for (name_bytes, nid) in dir_entries(img, dir_inode) {
+        let name = OsStr::from_bytes(name_bytes);
+        let child_inode = img.inode(nid);
+
+        if child_inode.mode().is_dir() {
+            let child_stat = stat_from_inode_for_tree(img, &child_inode);
+            let mut child_dir = tree::Directory::new(child_stat);
+            populate_directory(img, &child_inode, &mut child_dir, hardlinks)
+                .with_context(|| format!("reading directory {:?}", name))?;
+            dir.insert(name, tree::Inode::Directory(Box::new(child_dir)));
+        } else {
+            // Check if this is a hardlink (same nid seen before)
+            if let Some(existing_leaf) = hardlinks.get(&nid) {
+                dir.insert(name, tree::Inode::Leaf(Rc::clone(existing_leaf)));
+                continue;
+            }
+
+            let stat = stat_from_inode_for_tree(img, &child_inode);
+            let mode = child_inode.mode().0.get();
+            let file_type = mode & S_IFMT;
+
+            let content = match file_type {
+                S_IFREG => {
+                    if let Some(digest) = extract_metacopy_digest::<ObjectID>(img, &child_inode) {
+                        tree::LeafContent::Regular(tree::RegularFile::External(
+                            digest,
+                            child_inode.size(),
+                        ))
+                    } else {
+                        let data = extract_all_file_data(img, &child_inode);
+                        tree::LeafContent::Regular(tree::RegularFile::Inline(data.into()))
+                    }
+                }
+                S_IFLNK => {
+                    let target_data = child_inode.inline().unwrap_or(&[]);
+                    let target = OsStr::from_bytes(target_data);
+                    tree::LeafContent::Symlink(Box::from(target))
+                }
+                S_IFBLK => tree::LeafContent::BlockDevice(child_inode.u() as u64),
+                S_IFCHR => tree::LeafContent::CharacterDevice(child_inode.u() as u64),
+                S_IFIFO => tree::LeafContent::Fifo,
+                S_IFSOCK => tree::LeafContent::Socket,
+                _ => anyhow::bail!("unknown file type {:#o} for {:?}", file_type, name),
+            };
+
+            let leaf = Rc::new(tree::Leaf { stat, content });
+
+            // Track for hardlink detection if nlink > 1
+            if child_inode.nlink() > 1 {
+                hardlinks.insert(nid, Rc::clone(&leaf));
+            }
+
+            dir.insert(name, tree::Inode::Leaf(leaf));
+        }
+    }
+
+    Ok(())
+}
+
+/// Converts an EROFS image into a `tree::FileSystem`.
+///
+/// This is the inverse of `mkfs_erofs`: it reads an EROFS image and
+/// reconstructs the tree structure, including proper handling of hardlinks
+/// (via `Rc` sharing), xattr namespace transformations, and metacopy-based
+/// external file references.
+pub fn erofs_to_filesystem<ObjectID: FsVerityHashValue>(
+    image_data: &[u8],
+) -> anyhow::Result<tree::FileSystem<ObjectID>> {
+    let img = Image::open(image_data);
+    let root_inode = img.root();
+
+    let root_stat = stat_from_inode_for_tree(&img, &root_inode);
+    let mut fs = tree::FileSystem::new(root_stat);
+
+    let mut hardlinks: HashMap<u64, Rc<tree::Leaf<ObjectID>>> = HashMap::new();
+
+    populate_directory(&img, &root_inode, &mut fs.root, &mut hardlinks)
+        .context("reading root directory")?;
+
+    Ok(fs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        dumpfile::dumpfile_to_filesystem, erofs::writer::mkfs_erofs, fsverity::Sha256HashValue,
+        dumpfile::{dumpfile_to_filesystem, write_dumpfile},
+        erofs::writer::mkfs_erofs,
+        fsverity::Sha256HashValue,
     };
     use std::collections::HashMap;
 
@@ -1069,5 +1342,195 @@ mod tests {
 
         let inline_data = file1_inode.inline();
         assert_eq!(inline_data, Some(b"hello".as_slice()));
+    }
+
+    /// Helper: round-trip a dumpfile through erofs and compare the result.
+    fn round_trip_dumpfile(input: &str) -> (String, String) {
+        let fs_orig = dumpfile_to_filesystem::<Sha256HashValue>(input).unwrap();
+
+        let mut orig_output = Vec::new();
+        write_dumpfile(&mut orig_output, &fs_orig).unwrap();
+        let orig_str = String::from_utf8(orig_output).unwrap();
+
+        let image = mkfs_erofs(&fs_orig);
+        let fs_rt = erofs_to_filesystem::<Sha256HashValue>(&image).unwrap();
+
+        let mut rt_output = Vec::new();
+        write_dumpfile(&mut rt_output, &fs_rt).unwrap();
+        let rt_str = String::from_utf8(rt_output).unwrap();
+
+        (orig_str, rt_str)
+    }
+
+    #[test]
+    fn test_erofs_to_filesystem_empty_root() {
+        let dumpfile = "/ 4096 40755 2 0 0 0 1000.0 - - -\n";
+        let (orig, rt) = round_trip_dumpfile(dumpfile);
+        assert_eq!(orig, rt);
+    }
+
+    #[test]
+    fn test_erofs_to_filesystem_inline_files() {
+        let dumpfile = r#"/ 4096 40755 2 0 0 0 1000.0 - - -
+/empty 0 100644 1 0 0 0 1000.0 - - -
+/hello 5 100644 1 0 0 0 1000.0 - hello -
+/world 6 100644 1 0 0 0 1000.0 - world! -
+"#;
+        let (orig, rt) = round_trip_dumpfile(dumpfile);
+        assert_eq!(orig, rt);
+    }
+
+    #[test]
+    fn test_erofs_to_filesystem_symlinks() {
+        let dumpfile = r#"/ 4096 40755 2 0 0 0 1000.0 - - -
+/link1 7 120777 1 0 0 0 1000.0 /target - -
+/link2 11 120777 1 0 0 0 1000.0 /other/path - -
+"#;
+        let (orig, rt) = round_trip_dumpfile(dumpfile);
+        assert_eq!(orig, rt);
+    }
+
+    #[test]
+    fn test_erofs_to_filesystem_nested_dirs() {
+        let dumpfile = r#"/ 4096 40755 3 0 0 0 1000.0 - - -
+/a 4096 40755 3 0 0 0 1000.0 - - -
+/a/b 4096 40755 3 0 0 0 1000.0 - - -
+/a/b/c 4096 40755 2 0 0 0 1000.0 - - -
+/a/b/c/file.txt 5 100644 1 0 0 0 1000.0 - hello -
+/a/b/other 3 100644 1 0 0 0 1000.0 - abc -
+"#;
+        let (orig, rt) = round_trip_dumpfile(dumpfile);
+        assert_eq!(orig, rt);
+    }
+
+    #[test]
+    fn test_erofs_to_filesystem_devices_and_fifos() {
+        let dumpfile = r#"/ 4096 40755 2 0 0 0 1000.0 - - -
+/blk 0 60660 1 0 0 2049 1000.0 - - -
+/chr 0 20666 1 0 0 1025 1000.0 - - -
+/fifo 0 10644 1 0 0 0 1000.0 - - -
+"#;
+        let (orig, rt) = round_trip_dumpfile(dumpfile);
+        assert_eq!(orig, rt);
+    }
+
+    #[test]
+    fn test_erofs_to_filesystem_xattrs() {
+        let dumpfile =
+            "/ 4096 40755 2 0 0 0 1000.0 - - - security.selinux=system_u:object_r:root_t:s0\n\
+             /file 5 100644 1 0 0 0 1000.0 - hello - user.myattr=myvalue\n";
+        let (orig, rt) = round_trip_dumpfile(dumpfile);
+        assert_eq!(orig, rt);
+    }
+
+    #[test]
+    fn test_erofs_to_filesystem_escaped_overlay_xattrs() {
+        // The writer escapes trusted.overlay.X to trusted.overlay.overlay.X.
+        // Round-tripping must preserve the original xattr name.
+        let dumpfile = "/ 4096 40755 2 0 0 0 1000.0 - - -\n\
+             /file 5 100644 1 0 0 0 1000.0 - hello - trusted.overlay.custom=val\n";
+        let (orig, rt) = round_trip_dumpfile(dumpfile);
+        assert_eq!(orig, rt);
+    }
+
+    #[test]
+    fn test_erofs_to_filesystem_external_file() {
+        // External file with a known fsverity digest
+        let digest = "a".repeat(64);
+        let pathname = format!("{}/{}", &digest[..2], &digest[2..]);
+        let dumpfile = format!(
+            "/ 4096 40755 2 0 0 0 1000.0 - - -\n\
+             /ext 1024 100644 1 0 0 0 1000.0 {pathname} - {digest}\n"
+        );
+        let (orig, rt) = round_trip_dumpfile(&dumpfile);
+        assert_eq!(orig, rt);
+    }
+
+    #[test]
+    fn test_erofs_to_filesystem_hardlinks() {
+        let dumpfile = r#"/ 4096 40755 2 0 0 0 1000.0 - - -
+/original 11 100644 2 0 0 0 1000.0 - hello_world -
+/hardlink 0 @120000 2 0 0 0 0.0 /original - -
+"#;
+
+        let fs_orig = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
+        let image = mkfs_erofs(&fs_orig);
+        let fs_rt = erofs_to_filesystem::<Sha256HashValue>(&image).unwrap();
+
+        // Verify hardlink Rc sharing (scope the extra refs so strong_count
+        // is correct when write_dumpfile checks nlink)
+        {
+            let orig_leaf = fs_rt.root.ref_leaf(OsStr::new("original")).unwrap();
+            let hardlink_leaf = fs_rt.root.ref_leaf(OsStr::new("hardlink")).unwrap();
+            assert!(
+                Rc::ptr_eq(&orig_leaf, &hardlink_leaf),
+                "hardlink entries should share the same Rc"
+            );
+        }
+
+        // Verify dumpfile round-trips correctly
+        let mut orig_output = Vec::new();
+        write_dumpfile(&mut orig_output, &fs_orig).unwrap();
+        let orig_str = String::from_utf8(orig_output).unwrap();
+
+        let mut rt_output = Vec::new();
+        write_dumpfile(&mut rt_output, &fs_rt).unwrap();
+        let rt_str = String::from_utf8(rt_output).unwrap();
+        assert_eq!(orig_str, rt_str);
+    }
+
+    #[test]
+    fn test_erofs_to_filesystem_mixed_types() {
+        let dumpfile = r#"/ 4096 40755 3 0 0 0 1000.0 - - -
+/blk 0 60660 1 0 6 259 1000.0 - - -
+/chr 0 20666 1 0 6 1025 1000.0 - - -
+/dir 4096 40755 2 42 42 0 2000.0 - - -
+/dir/nested 3 100644 1 42 42 0 2000.0 - abc -
+/fifo 0 10644 1 0 0 0 1000.0 - - -
+/hello 5 100644 1 1000 1000 0 1500.0 - hello -
+/link 7 120777 1 0 0 0 1000.0 /target - -
+"#;
+        let (orig, rt) = round_trip_dumpfile(dumpfile);
+        assert_eq!(orig, rt);
+    }
+
+    mod proptest_tests {
+        use super::*;
+        use crate::fsverity::Sha512HashValue;
+        use crate::test::proptest_strategies::{build_filesystem, filesystem_spec};
+        use proptest::prelude::*;
+
+        /// Round-trip a FileSystem through erofs with a given ObjectID type
+        /// and compare dumpfile output before and after.
+        fn round_trip_filesystem<ObjectID: FsVerityHashValue>(
+            fs_orig: &tree::FileSystem<ObjectID>,
+        ) {
+            let mut orig_output = Vec::new();
+            write_dumpfile(&mut orig_output, fs_orig).unwrap();
+
+            let image = mkfs_erofs(fs_orig);
+            let fs_rt = erofs_to_filesystem::<ObjectID>(&image).unwrap();
+
+            let mut rt_output = Vec::new();
+            write_dumpfile(&mut rt_output, &fs_rt).unwrap();
+
+            assert_eq!(orig_output, rt_output);
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(64))]
+
+            #[test]
+            fn test_erofs_round_trip_sha256(spec in filesystem_spec()) {
+                let fs = build_filesystem::<Sha256HashValue>(spec);
+                round_trip_filesystem(&fs);
+            }
+
+            #[test]
+            fn test_erofs_round_trip_sha512(spec in filesystem_spec()) {
+                let fs = build_filesystem::<Sha512HashValue>(spec);
+                round_trip_filesystem(&fs);
+            }
+        }
     }
 }
