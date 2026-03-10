@@ -37,6 +37,8 @@ pub trait InodeHeader {
     fn size(&self) -> u64;
     /// Returns the union field value (block address, device number, etc.)
     fn u(&self) -> u32;
+    /// Returns the number of hard links
+    fn nlink(&self) -> u32;
 
     /// Calculates the number of additional bytes after the header
     fn additional_bytes(&self, blkszbits: u8) -> usize {
@@ -78,6 +80,10 @@ impl InodeHeader for ExtendedInodeHeader {
     fn u(&self) -> u32 {
         self.u.get()
     }
+
+    fn nlink(&self) -> u32 {
+        self.nlink.get()
+    }
 }
 
 impl InodeHeader for CompactInodeHeader {
@@ -99,6 +105,10 @@ impl InodeHeader for CompactInodeHeader {
 
     fn u(&self) -> u32 {
         self.u.get()
+    }
+
+    fn nlink(&self) -> u32 {
+        self.nlink.get().into()
     }
 }
 
@@ -192,6 +202,10 @@ impl<Header: InodeHeader> InodeHeader for &Inode<Header> {
     fn u(&self) -> u32 {
         self.header.u()
     }
+
+    fn nlink(&self) -> u32 {
+        self.header.nlink()
+    }
 }
 
 impl<Header: InodeHeader> InodeOps for &Inode<Header> {
@@ -275,6 +289,13 @@ impl InodeHeader for InodeType<'_> {
         match self {
             Self::Compact(inode) => inode.mode(),
             Self::Extended(inode) => inode.mode(),
+        }
+    }
+
+    fn nlink(&self) -> u32 {
+        match self {
+            Self::Compact(inode) => inode.nlink(),
+            Self::Extended(inode) => inode.nlink(),
         }
     }
 }
