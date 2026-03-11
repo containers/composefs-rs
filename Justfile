@@ -20,6 +20,12 @@ test:
 clippy:
     cargo clippy --workspace -- -D warnings
 
+# Verify cfsctl builds with each optional feature combination
+check-feature-combos:
+    cargo clippy -p cfsctl --no-default-features -- -D warnings
+    cargo clippy -p cfsctl --no-default-features --features oci -- -D warnings
+    cargo clippy -p cfsctl --no-default-features --features http -- -D warnings
+
 # Run rustfmt check
 fmt-check:
     cargo fmt --all -- --check
@@ -29,7 +35,7 @@ fmt:
     cargo fmt --all
 
 # Run all checks (clippy + fmt + test)
-check: clippy fmt-check test
+check: clippy check-feature-combos fmt-check test
 
 # Base image for test container builds.
 # Override to test on different distros:

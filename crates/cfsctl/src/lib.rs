@@ -22,29 +22,34 @@ pub use composefs_http;
 #[cfg(feature = "oci")]
 pub use composefs_oci;
 
-use std::{
-    ffi::OsString,
-    fs::create_dir_all,
-    io::{IsTerminal, Read},
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::io::Read;
+use std::{ffi::OsString, path::PathBuf};
+
+#[cfg(feature = "oci")]
+use std::{fs::create_dir_all, io::IsTerminal, path::Path};
+
+#[cfg(any(feature = "oci", feature = "http"))]
+use std::sync::Arc;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+#[cfg(feature = "oci")]
 use comfy_table::{presets::UTF8_FULL, Table};
 
 use rustix::fs::CWD;
 
-use composefs_boot::{write_boot, BootOps};
+#[cfg(feature = "oci")]
+use composefs_boot::write_boot;
+use composefs_boot::BootOps;
 
+#[cfg(feature = "oci")]
+use composefs::shared_internals::IO_BUF_CAPACITY;
 use composefs::{
     dumpfile::{dump_single_dir, dump_single_file},
     erofs::reader::erofs_to_filesystem,
     fsverity::{FsVerityHashValue, Sha256HashValue, Sha512HashValue},
     generic_tree::{FileSystem, Inode},
     repository::Repository,
-    shared_internals::IO_BUF_CAPACITY,
     tree::RegularFile,
 };
 
@@ -336,6 +341,7 @@ where
     }
 }
 
+#[cfg(feature = "oci")]
 fn verity_opt<ObjectID>(opt: &Option<String>) -> Result<Option<ObjectID>>
 where
     ObjectID: FsVerityHashValue,
@@ -368,6 +374,7 @@ where
     Ok(repo)
 }
 
+#[cfg(feature = "oci")]
 fn load_filesystem_from_oci_image<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     opts: OCIConfigFilesystemOptions,
