@@ -353,7 +353,7 @@ fn test_oci_pull_and_inspect() -> Result<()> {
 integration_test!(test_oci_pull_and_inspect);
 
 fn test_oci_layer_inspect() -> Result<()> {
-    use composefs::dumpfile_parse::{Entry, Item};
+    use composefs_oci::composefs::dumpfile_parse::{Entry, Item};
     use std::io::Read;
     use std::path::Path;
 
