@@ -33,14 +33,13 @@ jobs:
       options: "--privileged --pid=host -v /var/tmp:/var/tmp --tmpfs /tmp:rw,exec,nosuid,nodev -v /:/run/host"
 
     steps:
-    - run: dnf -y install cargo clippy composefs-devel e2fsprogs rustfmt
+    - run: dnf -y install cargo clippy composefs-devel e2fsprogs just rustfmt
     - name: Enable fs-verity on /
       run: tune2fs -O verity $(findmnt -vno SOURCE /run/host)
     - uses: actions/checkout@v4
-    - run: cargo build --verbose
-    - run: cargo fmt --check
-    - run: cargo clippy -- -Dwarnings
-    - run: env CFS_TEST_TMPDIR=/run/host/var/tmp cargo test --verbose
+    - run: just build
+    - run: just check
+    - run: env CFS_TEST_TMPDIR=/run/host/var/tmp just test
 
   # Fast smoke test — catches basic breakage before spending time on
   # container builds and VM boots.  Runs only the unprivileged tests
@@ -51,7 +50,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
-      - uses: extractions/setup-just@v2
+      - uses: bootc-dev/actions/bootc-ubuntu-setup@main
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: just integration-unprivileged
@@ -77,7 +76,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
-      - uses: extractions/setup-just@v2
 
       - name: Setup
         uses: bootc-dev/actions/bootc-ubuntu-setup@main
