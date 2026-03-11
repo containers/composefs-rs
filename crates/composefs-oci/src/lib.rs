@@ -17,6 +17,9 @@ pub mod oci_image;
 pub mod skopeo;
 pub mod tar;
 
+// Re-export the composefs crate for consumers who only need composefs-oci
+pub use composefs;
+
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{bail, ensure, Context, Result};
