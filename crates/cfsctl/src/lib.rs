@@ -25,7 +25,7 @@ pub use composefs_oci;
 use std::{
     ffi::OsString,
     fs::create_dir_all,
-    io::IsTerminal,
+    io::{IsTerminal, Read},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -39,9 +39,13 @@ use rustix::fs::CWD;
 use composefs_boot::{write_boot, BootOps};
 
 use composefs::{
+    dumpfile::{dump_single_dir, dump_single_file},
+    erofs::reader::erofs_to_filesystem,
     fsverity::{FsVerityHashValue, Sha256HashValue, Sha512HashValue},
+    generic_tree::{FileSystem, Inode},
     repository::Repository,
     shared_internals::IO_BUF_CAPACITY,
+    tree::RegularFile,
 };
 
 /// cfsctl
@@ -293,6 +297,20 @@ enum Command {
         /// the name of the image to read, either an object ID digest or prefixed with 'ref/'
         name: String,
     },
+    /// Extract file information from a composefs image for specified files or directories
+    ///
+    /// By default, outputs information in composefs dumpfile format
+    DumpFiles {
+        /// The name of the composefs image to read from, either an object ID digest or prefixed with 'ref/'
+        image_name: String,
+        /// File or directory paths to process. If a path is a directory, its contents will be listed.
+        files: Vec<PathBuf>,
+        /// Show backing path information instead of dumpfile format
+        /// For each file, prints either "inline" for files stored within the image,
+        /// or a path relative to the object store for files stored extrenally
+        #[clap(long)]
+        backing_path_only: bool,
+    },
     #[cfg(feature = "http")]
     Fetch { url: String, name: String },
 }
@@ -347,6 +365,63 @@ where
     repo.set_insecure(args.insecure);
 
     Ok(repo)
+}
+
+fn dump_file_impl(
+    fs: FileSystem<RegularFile<impl FsVerityHashValue>>,
+    files: &Vec<PathBuf>,
+    backing_path_only: bool,
+) -> Result<()> {
+    let mut out = Vec::new();
+
+    for file_path in files {
+        let (dir, file) = fs.root.split(file_path.as_os_str())?;
+
+        let (_, file) = dir
+            .entries()
+            .find(|ent| ent.0 == file)
+            .ok_or_else(|| anyhow::anyhow!("{} not found", file_path.display()))?;
+
+        match &file {
+            Inode::Directory(directory) => {
+                if backing_path_only {
+                    anyhow::bail!("{} is a directory", file_path.display());
+                }
+
+                dump_single_dir(&mut out, directory, file_path.clone())?
+            }
+
+            Inode::Leaf(leaf) => {
+                use composefs::generic_tree::LeafContent::*;
+                use composefs::tree::RegularFile::*;
+
+                if backing_path_only {
+                    match &leaf.content {
+                        Regular(f) => match f {
+                            Inline(..) => println!("{} inline", file_path.display()),
+                            External(id, _) => {
+                                println!("{} {}", file_path.display(), id.to_object_pathname());
+                            }
+                        },
+                        _ => {
+                            println!("{} inline", file_path.display())
+                        }
+                    }
+
+                    continue;
+                }
+
+                dump_single_file(&mut out, leaf, file_path.clone())?
+            }
+        };
+    }
+
+    if !out.is_empty() {
+        let out_str = std::str::from_utf8(&out).unwrap();
+        println!("{}", out_str);
+    }
+
+    Ok(())
 }
 
 /// Run with cmd
@@ -693,6 +768,30 @@ where
                     result.images_pruned, result.streams_pruned
                 );
             }
+        }
+        Command::DumpFiles {
+            image_name,
+            files,
+            backing_path_only,
+        } => {
+            let (img_fd, _) = repo.open_image(&image_name)?;
+
+            let mut img_buf = Vec::new();
+            std::fs::File::from(img_fd).read_to_end(&mut img_buf)?;
+
+            match args.hash {
+                HashType::Sha256 => dump_file_impl(
+                    erofs_to_filesystem::<Sha256HashValue>(&img_buf)?,
+                    &files,
+                    backing_path_only,
+                )?,
+
+                HashType::Sha512 => dump_file_impl(
+                    erofs_to_filesystem::<Sha512HashValue>(&img_buf)?,
+                    &files,
+                    backing_path_only,
+                )?,
+            };
         }
         #[cfg(feature = "http")]
         Command::Fetch { url, name } => {

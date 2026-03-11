@@ -348,13 +348,39 @@ pub fn write_dumpfile(
     writer: &mut impl Write,
     fs: &FileSystem<impl FsVerityHashValue>,
 ) -> Result<()> {
+    let path = PathBuf::from("/");
+    dump_single_dir(writer, &fs.root, path)
+}
+
+/// Write a single dir
+pub fn dump_single_dir(
+    writer: &mut impl Write,
+    dir: &Directory<impl FsVerityHashValue>,
+    mut path: PathBuf,
+) -> Result<()> {
     // default pipe capacity on Linux is 16 pages (65536 bytes), but
     // sometimes the BufWriter will write more than its capacity...
     let mut buffer = BufWriter::with_capacity(32768, writer);
     let mut dfw = DumpfileWriter::new(&mut buffer);
-    let mut path = PathBuf::from("/");
 
-    dfw.write_dir(&mut path, &fs.root)?;
+    dfw.write_dir(&mut path, dir)?;
+    buffer.flush()?;
+
+    Ok(())
+}
+
+/// Write a single file
+pub fn dump_single_file(
+    writer: &mut impl Write,
+    file: &Rc<Leaf<impl FsVerityHashValue>>,
+    path: PathBuf,
+) -> Result<()> {
+    // default pipe capacity on Linux is 16 pages (65536 bytes), but
+    // sometimes the BufWriter will write more than its capacity...
+    let mut buffer = BufWriter::with_capacity(32768, writer);
+    let mut dfw = DumpfileWriter::new(&mut buffer);
+
+    dfw.write_leaf(&path, file)?;
     buffer.flush()?;
 
     Ok(())

@@ -877,7 +877,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// Returns the fd of the image and whether or not verity should be
     /// enabled when mounting it.
     #[context("Opening image '{name}'")]
-    fn open_image(&self, name: &str) -> Result<(OwnedFd, bool)> {
+    pub fn open_image(&self, name: &str) -> Result<(OwnedFd, bool)> {
         let image = self
             .openat(&format!("images/{name}"), OFlags::RDONLY)
             .with_context(|| format!("Opening ref 'images/{name}'"))?;
