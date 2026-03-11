@@ -1,23 +1,48 @@
 //! Command-line control utility for composefs repositories and images.
 //!
-//! `cfsctl` provides a comprehensive interface for managing composefs repositories,
-//! creating and mounting filesystem images, handling OCI containers, and performing
-//! repository maintenance operations like garbage collection.
+//! `cfsctl` is a multi-call binary: when invoked as `mkcomposefs` or
+//! `composefs-info` (via symlink or hardlink), it dispatches to the
+//! corresponding tool. Otherwise it runs the normal `cfsctl` interface.
 
-use cfsctl::{open_repo, run_cmd_with_repo, App, HashType};
+use std::path::Path;
 
 use anyhow::Result;
-use clap::Parser;
-use composefs::fsverity::{Sha256HashValue, Sha512HashValue};
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    env_logger::init();
+mod composefs_info;
+mod mkcomposefs;
 
-    let args = App::parse();
+/// Extract the binary name from argv[0], stripping any directory prefix.
+fn binary_name() -> Option<String> {
+    std::env::args_os().next().and_then(|arg0| {
+        Path::new(&arg0)
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+    })
+}
 
-    match args.hash {
-        HashType::Sha256 => run_cmd_with_repo(open_repo::<Sha256HashValue>(&args)?, args).await,
-        HashType::Sha512 => run_cmd_with_repo(open_repo::<Sha512HashValue>(&args)?, args).await,
+fn main() -> Result<()> {
+    match binary_name().as_deref() {
+        Some("mkcomposefs") => mkcomposefs::run(),
+        Some("composefs-info") => composefs_info::run(),
+        _ => {
+            use cfsctl::{open_repo, run_cmd_with_repo, App, HashType};
+            use clap::Parser;
+            use composefs::fsverity::{Sha256HashValue, Sha512HashValue};
+
+            env_logger::init();
+
+            let rt = tokio::runtime::Runtime::new()?;
+            let args = App::parse();
+            rt.block_on(async {
+                match args.hash {
+                    HashType::Sha256 => {
+                        run_cmd_with_repo(open_repo::<Sha256HashValue>(&args)?, args).await
+                    }
+                    HashType::Sha512 => {
+                        run_cmd_with_repo(open_repo::<Sha512HashValue>(&args)?, args).await
+                    }
+                }
+            })
+        }
     }
 }
