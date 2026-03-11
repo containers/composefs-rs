@@ -6,6 +6,7 @@
 //! smoke tests.
 
 use anyhow::Result;
+use rustix::path::Arg;
 use xshell::{cmd, Shell};
 
 use crate::{cfsctl, create_test_rootfs, integration_test};
@@ -454,3 +455,65 @@ fn test_oci_layer_inspect() -> Result<()> {
     Ok(())
 }
 integration_test!(test_oci_layer_inspect);
+
+fn test_dump_files() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let rootfs = create_test_rootfs(fixture_dir.path())?;
+
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} create-image {rootfs} my-image"
+    )
+    .read()?;
+
+    // should be of the form /usr/bin/hello <path>
+    let output = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} dump-files refs/my-image /usr/bin/hello --backing-path-only"
+    )
+    .read()?;
+
+    let path = output.split_whitespace().nth(1).unwrap();
+
+    assert!(
+        path != "inline",
+        "usr/bin/hello should've been large enough to be stored in objects directory"
+    );
+
+    let path = path.strip_prefix("/").unwrap_or(path);
+
+    let full_path = repo.join("objects").join(path);
+
+    assert!(full_path.exists());
+
+    let file_hash = cmd!(sh, "sha512sum")
+        .arg(rootfs.join("usr/bin/hello").as_str()?)
+        .read()?;
+
+    let file_hash = file_hash.split_whitespace().next().unwrap().trim();
+
+    let obj_file_hash = cmd!(sh, "sha512sum").arg(full_path.as_str()?).read()?;
+    let obj_file_hash = obj_file_hash.split_whitespace().next().unwrap().trim();
+
+    assert_eq!(file_hash, obj_file_hash);
+
+    let output = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} dump-files refs/my-image /usr/lib/readme.txt --backing-path-only"
+    )
+    .read()?;
+
+    let path = output.split_whitespace().nth(1).unwrap();
+
+    assert!(
+        path == "inline",
+        "usr/lib/readme.txt should've been stored inline"
+    );
+
+    Ok(())
+}
+integration_test!(test_dump_files);

@@ -76,8 +76,8 @@ pub struct App {
     cmd: Command,
 }
 
+/// The Hash algorithm used for FsVerity computation
 #[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum, Default)]
-/// TODO: Hash type
 pub enum HashType {
     /// Sha256
     Sha256,
@@ -99,7 +99,8 @@ struct OCIConfigFilesystemOptions {
 /// Common options for operations using OCI config manifest streams
 #[derive(Debug, Parser)]
 struct OCIConfigOptions {
-    /// the name of the target OCI manifest stream, either a stream ID in format oci-config-<hash_type>:<hash_digest> or a reference in 'ref/'
+    /// the name of the target OCI manifest stream,
+    /// either a stream ID in format oci-config-<hash_type>:<hash_digest> or a reference in 'ref/'
     config_name: String,
     /// verity digest for the manifest stream to be verified against
     config_verity: Option<String>,
@@ -367,6 +368,37 @@ where
     Ok(repo)
 }
 
+fn load_filesystem_from_oci_image<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    opts: OCIConfigFilesystemOptions,
+) -> Result<FileSystem<RegularFile<ObjectID>>> {
+    let verity = verity_opt(&opts.base_config.config_verity)?;
+    let mut fs = composefs_oci::image::create_filesystem(
+        repo,
+        &opts.base_config.config_name,
+        verity.as_ref(),
+    )?;
+    if opts.bootable {
+        fs.transform_for_boot(repo)?;
+    }
+    Ok(fs)
+}
+
+fn load_filesystem_from_ondisk_fs<ObjectID: FsVerityHashValue>(
+    fs_opts: &FsReadOptions,
+    repo: &Repository<ObjectID>,
+) -> Result<FileSystem<RegularFile<ObjectID>>> {
+    let mut fs = if fs_opts.no_propagate_usr_to_root {
+        composefs::fs::read_filesystem(CWD, &fs_opts.path, Some(repo))?
+    } else {
+        composefs::fs::read_container_root(CWD, &fs_opts.path, Some(repo))?
+    };
+    if fs_opts.bootable {
+        fs.transform_for_boot(repo)?;
+    }
+    Ok(fs)
+}
+
 fn dump_file_impl(
     fs: FileSystem<RegularFile<impl FsVerityHashValue>>,
     files: &Vec<PathBuf>,
@@ -459,63 +491,20 @@ where
             OciCommand::LsLayer { name } => {
                 composefs_oci::ls_layer(&repo, &name)?;
             }
-            OciCommand::Dump {
-                config_opts:
-                    OCIConfigFilesystemOptions {
-                        base_config:
-                            OCIConfigOptions {
-                                ref config_name,
-                                ref config_verity,
-                            },
-                        bootable,
-                    },
-            } => {
-                let verity = verity_opt(config_verity)?;
-                let mut fs =
-                    composefs_oci::image::create_filesystem(&repo, config_name, verity.as_ref())?;
-                if bootable {
-                    fs.transform_for_boot(&repo)?;
-                }
+            OciCommand::Dump { config_opts } => {
+                let fs = load_filesystem_from_oci_image(&repo, config_opts)?;
                 fs.print_dumpfile()?;
             }
-            OciCommand::ComputeId {
-                config_opts:
-                    OCIConfigFilesystemOptions {
-                        base_config:
-                            OCIConfigOptions {
-                                ref config_name,
-                                ref config_verity,
-                            },
-                        bootable,
-                    },
-            } => {
-                let verity = verity_opt(config_verity)?;
-                let mut fs =
-                    composefs_oci::image::create_filesystem(&repo, config_name, verity.as_ref())?;
-                if bootable {
-                    fs.transform_for_boot(&repo)?;
-                }
+            OciCommand::ComputeId { config_opts } => {
+                let fs = load_filesystem_from_oci_image(&repo, config_opts)?;
                 let id = fs.compute_image_id();
                 println!("{}", id.to_hex());
             }
             OciCommand::CreateImage {
-                config_opts:
-                    OCIConfigFilesystemOptions {
-                        base_config:
-                            OCIConfigOptions {
-                                ref config_name,
-                                ref config_verity,
-                            },
-                        bootable,
-                    },
+                config_opts,
                 ref image_name,
             } => {
-                let verity = verity_opt(config_verity)?;
-                let mut fs =
-                    composefs_oci::image::create_filesystem(&repo, config_name, verity.as_ref())?;
-                if bootable {
-                    fs.transform_for_boot(&repo)?;
-                }
+                let fs = load_filesystem_from_oci_image(&repo, config_opts)?;
                 let image_id = fs.commit_image(&repo, image_name.as_deref())?;
                 println!("{}", image_id.to_id());
             }
@@ -702,14 +691,7 @@ where
             }
         },
         Command::ComputeId { fs_opts } => {
-            let mut fs = if fs_opts.no_propagate_usr_to_root {
-                composefs::fs::read_filesystem(CWD, &fs_opts.path, Some(&repo))?
-            } else {
-                composefs::fs::read_container_root(CWD, &fs_opts.path, Some(&repo))?
-            };
-            if fs_opts.bootable {
-                fs.transform_for_boot(&repo)?;
-            }
+            let fs = load_filesystem_from_ondisk_fs(&fs_opts, &repo)?;
             let id = fs.compute_image_id();
             println!("{}", id.to_hex());
         }
@@ -717,26 +699,12 @@ where
             fs_opts,
             ref image_name,
         } => {
-            let mut fs = if fs_opts.no_propagate_usr_to_root {
-                composefs::fs::read_filesystem(CWD, &fs_opts.path, Some(&repo))?
-            } else {
-                composefs::fs::read_container_root(CWD, &fs_opts.path, Some(&repo))?
-            };
-            if fs_opts.bootable {
-                fs.transform_for_boot(&repo)?;
-            }
+            let fs = load_filesystem_from_ondisk_fs(&fs_opts, &repo)?;
             let id = fs.commit_image(&repo, image_name.as_deref())?;
             println!("{}", id.to_id());
         }
         Command::CreateDumpfile { fs_opts } => {
-            let mut fs = if fs_opts.no_propagate_usr_to_root {
-                composefs::fs::read_filesystem(CWD, &fs_opts.path, Some(&repo))?
-            } else {
-                composefs::fs::read_container_root(CWD, &fs_opts.path, Some(&repo))?
-            };
-            if fs_opts.bootable {
-                fs.transform_for_boot(&repo)?;
-            }
+            let fs = load_filesystem_from_ondisk_fs(&fs_opts, &repo)?;
             fs.print_dumpfile()?;
         }
         Command::Mount { name, mountpoint } => {
