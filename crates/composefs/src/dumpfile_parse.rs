@@ -219,48 +219,44 @@ fn unescape_to_path(s: &str) -> Result<Cow<'_, Path>> {
     Ok(r)
 }
 
-/// Like [`unescape_to_path`], but also ensures the path is in "canonical"
-/// form; this has the same semantics as Rust https://doc.rust-lang.org/std/path/struct.Path.html#method.components
-/// which in particular removes `.` and extra `//`.
+/// Like [`unescape_to_path`], but also ensures the path is in canonical
+/// form: absolute, no `.` or `..` components, no empty components
+/// (from `//` or trailing `/`).
 ///
-/// We also deny uplinks `..` and empty paths.
+/// Unlike Rust's `Path::components()` which silently normalizes these
+/// away, we reject them as invalid to match the C mkcomposefs parser.
 fn unescape_to_path_canonical(s: &str) -> Result<Cow<'_, Path>> {
     let p = unescape_to_path(s)?;
-    let mut components = p.components();
-    let mut r = std::path::PathBuf::new();
-    let Some(first) = components.next() else {
-        anyhow::bail!("Invalid empty path");
-    };
-    if first != std::path::Component::RootDir {
+    let path_bytes = p.as_os_str().as_bytes();
+
+    // Must be absolute
+    if !path_bytes.starts_with(b"/") {
         anyhow::bail!("Invalid non-absolute path");
     }
-    r.push(first);
-    for component in components {
+
+    // Validate each component by splitting on '/'. The first element
+    // from split will be empty (before the leading '/'), which we skip.
+    // Any other empty element means '//' or trailing '/'.
+    for (i, component) in path_bytes.split(|&b| b == b'/').enumerate() {
+        if i == 0 {
+            // Before the leading '/' — must be empty for absolute paths
+            continue;
+        }
         match component {
-            // Prefix is a windows thing; I don't think RootDir or CurDir are reachable
-            // after the first component has been RootDir.
-            std::path::Component::Prefix(_)
-            | std::path::Component::RootDir
-            | std::path::Component::CurDir => {
-                anyhow::bail!("Internal error in unescape_to_path_canonical");
+            b"" => {
+                // Only valid for root path (i.e. single trailing empty after "/")
+                if !(i == 1 && path_bytes == b"/") {
+                    anyhow::bail!("Empty path component (// or trailing /)");
+                }
             }
-            std::path::Component::ParentDir => {
-                anyhow::bail!("Invalid \"..\" in path");
-            }
-            std::path::Component::Normal(_) => {
-                r.push(component);
-            }
+            b"." => anyhow::bail!("Invalid path component '.'"),
+            b".." => anyhow::bail!("Invalid path component '..'"),
+            _ => {}
         }
     }
-    // If the input was already in normal form,
-    // then we can just return the original version, which
-    // may itself be a Cow::Borrowed, and hence we free our malloc buffer.
-    if r.as_os_str().as_bytes() == p.as_os_str().as_bytes() {
-        Ok(p)
-    } else {
-        // Otherwise return our copy.
-        Ok(r.into())
-    }
+
+    // Path is already validated as canonical; return as-is
+    Ok(p)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -784,6 +780,18 @@ mod tests {
         assert!(unescape_to_path_canonical("../blah").is_err());
         assert!(unescape_to_path_canonical("/foo/..").is_err());
         assert!(unescape_to_path_canonical("/foo/../blah").is_err());
+
+        // Invalid: dot components must be rejected (not normalized)
+        assert!(unescape_to_path_canonical("/.").is_err());
+        assert!(unescape_to_path_canonical("/foo/.").is_err());
+        assert!(unescape_to_path_canonical("/./foo").is_err());
+
+        // Invalid: empty components must be rejected (not normalized)
+        assert!(unescape_to_path_canonical("//").is_err());
+        assert!(unescape_to_path_canonical("/foo//bar").is_err());
+        assert!(unescape_to_path_canonical("///foo").is_err());
+        assert!(unescape_to_path_canonical("/foo/").is_err());
+
         // Verify that we return borrowed input where possible
         assert!(matches!(
             unescape_to_path_canonical("/foo").unwrap(),
@@ -794,16 +802,16 @@ mod tests {
             unescape_to_path_canonical(r#"/\x66oo"#).unwrap(),
             Cow::Owned(v) if v.to_str() == Some("/foo")
         ));
-        // Test successful normalization
+        // Valid paths
         assert_eq!(
-            unescape_to_path_canonical("///foo/bar//baz")
+            unescape_to_path_canonical("/foo/bar/baz")
                 .unwrap()
                 .to_str()
                 .unwrap(),
             "/foo/bar/baz"
         );
         assert_eq!(
-            unescape_to_path_canonical("/.").unwrap().to_str().unwrap(),
+            unescape_to_path_canonical("/").unwrap().to_str().unwrap(),
             "/"
         );
     }
