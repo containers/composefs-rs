@@ -122,6 +122,37 @@ fn dump_image(img: &[u8]) -> String {
     String::from_utf8(dump).unwrap()
 }
 
+#[test]
+fn test_erofs_digest_stability() {
+    // Pin digests for each test case — any change to the EROFS writer that
+    // alters byte-level output will break these, which is the point: composefs
+    // image digest stability is critical for the bootc sealed UKI trust chain.
+    let cases: &[(&str, fn(&mut FileSystem<Sha256HashValue>), &str)] = &[
+        (
+            "empty",
+            empty,
+            "086b702a519b57d6ef5aea6f8b3f2be24355cd1fb835cd80fb4e3d388b24d5a5",
+        ),
+        (
+            "simple",
+            simple,
+            "a8fcd41f8b313bede69f462f2af0a38d64b99a6333f5df884ea9ab4037fac722",
+        ),
+    ];
+
+    for (name, case, expected_digest) in cases {
+        let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
+        case(&mut fs);
+        let image = mkfs_erofs(&fs);
+        let digest = composefs::fsverity::compute_verity::<Sha256HashValue>(&image);
+        let hex = digest.to_hex();
+        assert_eq!(
+            &hex, expected_digest,
+            "{name}: EROFS digest changed — if this is intentional, update the pinned value"
+        );
+    }
+}
+
 #[should_panic]
 #[test_with::executable(mkcomposefs)]
 fn test_vs_mkcomposefs() {

@@ -11,6 +11,12 @@ use xshell::{cmd, Shell};
 
 use crate::{cfsctl, create_test_rootfs, integration_test};
 
+// Pinned composefs image ID for the deterministic OCI layout built by
+// create_oci_layout() (single layer with usr/ dir + hello.txt, mtime=1234567890).
+const OCI_LAYOUT_COMPOSEFS_ID: &str =
+    "f26c6eb439749b82f0d1520e83455bb21766572fb2b5cfe009dd7749a61caf74e0c42c56f1a2cbd9d\
+     359e7d172c8e2c65641666c9a18cc484a8b0f6e4e6d47ab";
+
 fn test_gc_empty_repo() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
@@ -223,8 +229,19 @@ fn create_oci_layout(parent: &std::path::Path) -> Result<std::path::PathBuf> {
         .rootfs(rootfs)
         .build()?;
 
-    // Create a simple layer with one file
+    // Create a simple layer with a usr/ directory and one file
     let mut layer_builder = ocidir.create_layer(None)?;
+    {
+        let mut dir_header = tar::Header::new_gnu();
+        dir_header.set_entry_type(tar::EntryType::Directory);
+        dir_header.set_size(0);
+        dir_header.set_mode(0o755);
+        dir_header.set_uid(0);
+        dir_header.set_gid(0);
+        dir_header.set_mtime(1234567890);
+        dir_header.set_cksum();
+        layer_builder.append_data(&mut dir_header, "usr/", &[] as &[u8])?;
+    }
     {
         let data = b"hello from test layer\n";
         let mut header = tar::Header::new_gnu();
@@ -332,6 +349,23 @@ fn test_oci_pull_and_inspect() -> Result<()> {
     assert_eq!(config["architecture"], "amd64");
     assert_eq!(config["os"], "linux");
 
+    // Verify composefs image digest stability.
+    let config_digest = pull_output
+        .lines()
+        .find_map(|l| l.strip_prefix("config").map(|s| s.trim().to_string()))
+        .expect("config digest in pull output");
+    let image_id = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci compute-id {config_digest}"
+    )
+    .read()?;
+    assert_eq!(
+        image_id.trim(),
+        OCI_LAYOUT_COMPOSEFS_ID,
+        "OCI layout composefs image ID changed — the EROFS writer produced \
+         different output for the same deterministic OCI image"
+    );
+
     Ok(())
 }
 integration_test!(test_oci_pull_and_inspect);
@@ -380,8 +414,8 @@ fn test_oci_layer_inspect() -> Result<()> {
     assert!(info["size"].as_u64().unwrap() > 0, "expected non-zero size");
     assert_eq!(
         info["entryCount"].as_u64().unwrap(),
-        1,
-        "expected exactly 1 entry (hello.txt)"
+        2,
+        "expected exactly 2 entries (usr/ + hello.txt)"
     );
     // Check splitstream metadata
     let splitstream = info
