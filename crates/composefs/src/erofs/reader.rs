@@ -27,7 +27,7 @@ use super::{
 };
 use crate::fsverity::FsVerityHashValue;
 use crate::tree;
-use crate::INLINE_CONTENT_MAX;
+use crate::MAX_INLINE_CONTENT;
 
 /// Rounds up a value to the nearest multiple of `to`
 pub fn round_up(n: usize, to: usize) -> usize {
@@ -478,7 +478,7 @@ impl<'img> Image<'img> {
     ///   stored within the image itself.  ChunkBased (external) files are
     ///   exempt because their `size` reflects the real file on the
     ///   underlying filesystem.
-    /// - Inline regular files must be ≤ `INLINE_CONTENT_MAX` (64 bytes)
+    /// - Inline regular files must be ≤ `MAX_INLINE_CONTENT` (512 bytes)
     /// - Metacopy xattrs must be well-formed when present
     pub fn restrict_to_composefs(mut self) -> Result<Self, ErofsReaderError> {
         // Validate composefs header
@@ -1267,10 +1267,10 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
                     } else {
                         if img.composefs_restricted {
                             let size = child_inode.size();
-                            if size > INLINE_CONTENT_MAX as u64 {
+                            if size > MAX_INLINE_CONTENT as u64 {
                                 anyhow::bail!(
                                     "inline regular file {:?} has size {} \
-                                     (max {INLINE_CONTENT_MAX})",
+                                     (max {MAX_INLINE_CONTENT})",
                                     name,
                                     size,
                                 );
