@@ -218,8 +218,12 @@ pub trait InodeOps {
     fn xattrs(&self) -> Result<Option<&InodeXAttrs>, ErofsReaderError>;
     /// Returns the inline data portion
     fn inline(&self) -> Option<&[u8]>;
-    /// Returns the range of block IDs used by this inode
-    fn blocks(&self, blkszbits: u8) -> Result<Range<u64>, ErofsReaderError>;
+    /// Returns the raw range of block IDs used by this inode without
+    /// validating against the image size.
+    ///
+    /// Callers that iterate blocks should prefer [`Image::inode_blocks`] which
+    /// validates the range.
+    fn raw_blocks(&self, blkszbits: u8) -> Result<Range<u64>, ErofsReaderError>;
 }
 
 impl<Header: InodeHeader> InodeHeader for &Inode<Header> {
@@ -271,7 +275,7 @@ impl<Header: InodeHeader> InodeOps for &Inode<Header> {
         Some(data)
     }
 
-    fn blocks(&self, blkszbits: u8) -> Result<Range<u64>, ErofsReaderError> {
+    fn raw_blocks(&self, blkszbits: u8) -> Result<Range<u64>, ErofsReaderError> {
         let size = self.header.size();
         let block_size: u64 = 1u64
             .checked_shl(blkszbits.into())
@@ -367,10 +371,10 @@ impl InodeOps for InodeType<'_> {
         }
     }
 
-    fn blocks(&self, blkszbits: u8) -> Result<Range<u64>, ErofsReaderError> {
+    fn raw_blocks(&self, blkszbits: u8) -> Result<Range<u64>, ErofsReaderError> {
         match self {
-            Self::Compact(inode) => inode.blocks(blkszbits),
-            Self::Extended(inode) => inode.blocks(blkszbits),
+            Self::Compact(inode) => inode.raw_blocks(blkszbits),
+            Self::Extended(inode) => inode.raw_blocks(blkszbits),
         }
     }
 }
@@ -394,9 +398,25 @@ pub struct Image<'i> {
     pub xattrs: &'i [u8],
 }
 
+/// Default maximum image size (1 GiB). Composefs images are metadata-only
+/// and should never approach this in practice.
+pub const DEFAULT_MAX_IMAGE_SIZE: usize = 1 << 30;
+
 impl<'img> Image<'img> {
-    /// Opens an EROFS image from raw bytes
+    /// Opens an EROFS image from raw bytes, rejecting images larger than
+    /// [`DEFAULT_MAX_IMAGE_SIZE`].
     pub fn open(image: &'img [u8]) -> Result<Self, ErofsReaderError> {
+        Self::open_max_size(image, DEFAULT_MAX_IMAGE_SIZE)
+    }
+
+    /// Opens an EROFS image with a caller-specified maximum size.
+    pub fn open_max_size(image: &'img [u8], max_size: usize) -> Result<Self, ErofsReaderError> {
+        if image.len() > max_size {
+            return Err(ErofsReaderError::InvalidImage(format!(
+                "image size {} exceeds maximum {max_size}",
+                image.len(),
+            )));
+        }
         let header = ComposefsHeader::ref_from_prefix(image)
             .map_err(|_| ErofsReaderError::InvalidImage("cannot parse header".into()))?
             .0;
@@ -531,6 +551,24 @@ impl<'img> Image<'img> {
         self.inode(self.sb.root_nid.get() as u64)
     }
 
+    /// Returns the block range for an inode, validated against the image size.
+    ///
+    /// This prevents crafted images from producing astronomically large block
+    /// ranges that would cause iteration timeouts.
+    pub fn inode_blocks(&self, inode: &InodeType) -> Result<Range<u64>, ErofsReaderError> {
+        let range = inode.raw_blocks(self.blkszbits)?;
+        if !range.is_empty() {
+            let max_block = (self.image.len() / self.block_size) as u64;
+            if range.end > max_block {
+                return Err(ErofsReaderError::InvalidImage(format!(
+                    "inode block range {}..{} exceeds image ({max_block} blocks)",
+                    range.start, range.end,
+                )));
+            }
+        }
+        Ok(range)
+    }
+
     /// Finds a child directory entry by name within a directory inode.
     ///
     /// Returns the nid (inode number) of the child if found.
@@ -550,7 +588,7 @@ impl<'img> Image<'img> {
                 }
             }
         }
-        for blkid in inode.blocks(self.blkszbits)? {
+        for blkid in self.inode_blocks(&inode)? {
             let block = self.directory_block(blkid)?;
             for entry in block.entries()? {
                 let entry = entry?;
@@ -835,7 +873,7 @@ impl<ObjectID: FsVerityHashValue> ObjectCollector<ObjectID> {
         }
 
         if inode.mode().is_dir() {
-            for blkid in inode.blocks(img.sb.blkszbits)? {
+            for blkid in img.inode_blocks(&inode)? {
                 self.visit_directory_block(img.directory_block(blkid)?)?;
             }
 
@@ -981,7 +1019,7 @@ fn extract_all_file_data(img: &Image, inode: &InodeType) -> anyhow::Result<Vec<u
     let mut data = Vec::with_capacity(file_size);
 
     // Read block data first
-    for blkid in inode.blocks(img.blkszbits)? {
+    for blkid in img.inode_blocks(inode)? {
         let block = img.block(blkid)?;
         data.extend_from_slice(block);
     }
@@ -1047,7 +1085,7 @@ fn dir_entries<'a>(
     let mut entries = Vec::new();
 
     // Block-based entries
-    for blkid in dir_inode.blocks(img.blkszbits)? {
+    for blkid in img.inode_blocks(dir_inode)? {
         let block = img.directory_block(blkid)?;
         for entry in block.entries()? {
             let entry = entry?;
@@ -1198,7 +1236,7 @@ mod tests {
         }
 
         // Read block entries
-        for blkid in inode.blocks(img.blkszbits).unwrap() {
+        for blkid in img.inode_blocks(&inode).unwrap() {
             let block = img.directory_block(blkid).unwrap();
             for entry in block.entries().unwrap() {
                 let entry = entry.unwrap();
@@ -1246,7 +1284,7 @@ mod tests {
                 }
             }
         }
-        for blkid in root_inode.blocks(img.blkszbits).unwrap() {
+        for blkid in img.inode_blocks(&root_inode).unwrap() {
             let block = img.directory_block(blkid).unwrap();
             for entry in block.entries().unwrap() {
                 let entry = entry.unwrap();
@@ -1287,7 +1325,7 @@ mod tests {
                 }
             }
         }
-        for blkid in root_inode.blocks(img.blkszbits).unwrap() {
+        for blkid in img.inode_blocks(&root_inode).unwrap() {
             let block = img.directory_block(blkid).unwrap();
             for entry in block.entries().unwrap() {
                 let entry = entry.unwrap();
@@ -1332,7 +1370,7 @@ mod tests {
                 }
             }
         }
-        for blkid in root_inode.blocks(img.blkszbits).unwrap() {
+        for blkid in img.inode_blocks(&root_inode).unwrap() {
             let block = img.directory_block(blkid).unwrap();
             for entry in block.entries().unwrap() {
                 let entry = entry.unwrap();
@@ -1419,7 +1457,7 @@ mod tests {
                 }
             }
         }
-        for blkid in root_inode.blocks(img.blkszbits).unwrap() {
+        for blkid in img.inode_blocks(&root_inode).unwrap() {
             let block = img.directory_block(blkid).unwrap();
             for entry in block.entries().unwrap() {
                 let entry = entry.unwrap();
@@ -1545,7 +1583,7 @@ mod tests {
             }
         }
 
-        for blkid in root_inode.blocks(img.blkszbits).unwrap() {
+        for blkid in img.inode_blocks(&root_inode).unwrap() {
             let block = img.directory_block(blkid).unwrap();
             for entry in block.entries().unwrap() {
                 let entry = entry.unwrap();
@@ -1713,6 +1751,54 @@ mod tests {
 "#;
         let (orig, rt) = round_trip_dumpfile(dumpfile);
         assert_eq!(orig, rt);
+    }
+
+    #[test]
+    fn test_inode_blocks_rejects_oversized_range() {
+        // Build a minimal valid EROFS image, then corrupt the root inode's
+        // size field to an astronomically large value.  blocks() must
+        // reject it instead of producing a trillion-element iterator.
+        //
+        // The corrupted size must be a multiple of block_size so that
+        // additional_bytes() (which uses `size % block_size` for FlatInline)
+        // stays the same and the inode still parses successfully.
+        let dumpfile = "/ 4096 40755 1 0 0 0 0.0 - - -\n";
+        let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
+        let mut image = mkfs_erofs(&fs);
+
+        let img = Image::open(&image).unwrap();
+        let root_nid = img.sb.root_nid.get() as usize;
+        let block_size = img.block_size;
+        let meta_start = img.sb.meta_blkaddr.get() as usize * block_size;
+        let inode_offset = meta_start + root_nid * 32;
+        // Determine inode layout from the first byte
+        let is_extended = image[inode_offset] & 1 != 0;
+        drop(img);
+
+        // Use a huge size that is a multiple of block_size (4096) so inline
+        // tail size stays 0 and the inode remains parseable.
+        let huge_size: u64 = (block_size as u64) * 1_000_000_000;
+
+        if is_extended {
+            // ExtendedInodeHeader.size is a U64 at byte offset 8
+            let size_offset = inode_offset + 8;
+            image[size_offset..size_offset + 8].copy_from_slice(&huge_size.to_le_bytes());
+        } else {
+            // CompactInodeHeader.size is a U32 at byte offset 8
+            let size_offset = inode_offset + 8;
+            let truncated = huge_size as u32;
+            image[size_offset..size_offset + 4].copy_from_slice(&truncated.to_le_bytes());
+        }
+
+        let img = Image::open(&image).unwrap();
+        let root = img.root().unwrap();
+        let result = img.inode_blocks(&root);
+        assert!(
+            result.is_err(),
+            "blocks() should reject oversized block range"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("exceeds image"), "unexpected error: {err}");
     }
 
     mod proptest_tests {
