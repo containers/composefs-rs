@@ -1,3 +1,7 @@
 /Cargo.lock
 /target/
 /vendor/
+# Fuzz sub-workspaces have their own target directories
+**/fuzz/target/
+**/fuzz/corpus/
+**/fuzz/artifacts/
