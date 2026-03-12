@@ -20,16 +20,10 @@ use anyhow::Context;
 use anyhow::{anyhow, Result};
 use rustix::fs::FileType;
 
+use crate::MAX_INLINE_CONTENT;
+
 /// https://github.com/torvalds/linux/blob/47ac09b91befbb6a235ab620c32af719f8208399/include/uapi/linux/limits.h#L13
 const PATH_MAX: u32 = 4096;
-/// Maximum size accepted for inline content in dumpfiles.
-///
-/// This is intentionally higher than `INLINE_CONTENT_MAX` (64 bytes) to allow
-/// for future increases to the inline threshold (see
-/// <https://github.com/composefs/composefs-rs/issues/107>), while still
-/// bounding the size to prevent abuse.  The composefs writer decides the actual
-/// inline-vs-external cutoff; this limit is just a parsing safety bound.
-const MAX_INLINE_CONTENT: usize = 512;
 /// https://github.com/torvalds/linux/blob/47ac09b91befbb6a235ab620c32af719f8208399/include/uapi/linux/limits.h#L15
 /// This isn't exposed in libc/rustix, and in any case we should be conservative...if this ever
 /// gets bumped it'd be a hazard.

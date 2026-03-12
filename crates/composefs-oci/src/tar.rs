@@ -39,7 +39,7 @@ use composefs::{
     shared_internals::IO_BUF_CAPACITY,
     splitstream::{SplitStreamBuilder, SplitStreamData, SplitStreamReader},
     tree::{LeafContent, RegularFile, Stat},
-    INLINE_CONTENT_MAX,
+    INLINE_CONTENT_MAX_V0,
 };
 
 use crate::ImportStats;
@@ -145,7 +145,7 @@ async fn stream_large_file<ObjectID: FsVerityHashValue>(
 /// Concurrency is limited to `available_parallelism()` to avoid overwhelming the
 /// system with too many concurrent I/O operations.
 ///
-/// Files larger than `INLINE_CONTENT_MAX` are stored externally in the object store,
+/// Files larger than `INLINE_CONTENT_MAX_V0` are stored externally in the object store,
 /// while smaller files and metadata are stored inline in the split stream.
 ///
 /// # Arguments
@@ -200,7 +200,8 @@ pub async fn split_async<ObjectID: FsVerityHashValue>(
             ParseEvent::Entry { consumed, entry } => {
                 // Extract what we need before mutating buf
                 let actual_size = entry.size as usize;
-                let is_large_file = entry.entry_type.is_file() && actual_size > INLINE_CONTENT_MAX;
+                let is_large_file =
+                    entry.entry_type.is_file() && actual_size > INLINE_CONTENT_MAX_V0;
 
                 // Write all header bytes (including extension headers) inline
                 builder.push_inline(&buf.split_to(consumed));
@@ -363,7 +364,7 @@ pub fn get_entry<ObjectID: FsVerityHashValue>(
                         SplitStreamData::External(id) => match entry.entry_type {
                             EntryType::Regular | EntryType::Continuous => {
                                 ensure!(
-                                    size as usize > INLINE_CONTENT_MAX,
+                                    size as usize > INLINE_CONTENT_MAX_V0,
                                     "Splitstream incorrectly stored a small ({size} byte) file external"
                                 );
                                 TarItem::Leaf(LeafContent::Regular(RegularFile::External(id, size)))
@@ -377,7 +378,7 @@ pub fn get_entry<ObjectID: FsVerityHashValue>(
                             EntryType::Directory => TarItem::Directory,
                             EntryType::Regular | EntryType::Continuous => {
                                 ensure!(
-                                    content.len() <= INLINE_CONTENT_MAX,
+                                    content.len() <= INLINE_CONTENT_MAX_V0,
                                     "Splitstream incorrectly stored a large ({} byte) file inline",
                                     content.len()
                                 );
@@ -630,12 +631,12 @@ mod tests {
             let mut builder = Builder::new(&mut tar_data);
 
             // File exactly at the threshold should be inline
-            let threshold_content = vec![b'X'; INLINE_CONTENT_MAX];
+            let threshold_content = vec![b'X'; INLINE_CONTENT_MAX_V0];
             let header1 =
                 append_file(&mut builder, "threshold_file.txt", &threshold_content).unwrap();
 
             // File just over threshold should be external
-            let over_threshold_content = vec![b'Y'; INLINE_CONTENT_MAX + 1];
+            let over_threshold_content = vec![b'Y'; INLINE_CONTENT_MAX_V0 + 1];
             let header2 = append_file(
                 &mut builder,
                 "over_threshold_file.txt",
@@ -687,7 +688,7 @@ mod tests {
         if let TarItem::Leaf(LeafContent::Regular(RegularFile::Inline(ref content))) =
             entries[0].item
         {
-            assert_eq!(content.len(), INLINE_CONTENT_MAX);
+            assert_eq!(content.len(), INLINE_CONTENT_MAX_V0);
             assert_eq!(content[0], b'X');
         } else {
             panic!("Expected inline regular file for threshold file");
@@ -702,7 +703,7 @@ mod tests {
         );
         if let TarItem::Leaf(LeafContent::Regular(RegularFile::External(_, size))) = entries[1].item
         {
-            assert_eq!(size, (INLINE_CONTENT_MAX + 1) as u64);
+            assert_eq!(size, (INLINE_CONTENT_MAX_V0 + 1) as u64);
         } else {
             panic!("Expected external regular file for over-threshold file");
         }
@@ -720,7 +721,7 @@ mod tests {
             let header1 = append_file(&mut builder, "small.txt", small_content).unwrap();
 
             // Add a large file
-            let large_content = vec![b'L'; INLINE_CONTENT_MAX + 100];
+            let large_content = vec![b'L'; INLINE_CONTENT_MAX_V0 + 100];
             let header2 = append_file(&mut builder, "large.txt", &large_content).unwrap();
 
             builder.finish().unwrap();
@@ -782,14 +783,14 @@ mod tests {
         if let TarItem::Leaf(LeafContent::Regular(RegularFile::External(ref id, size))) =
             entries[1].item
         {
-            assert_eq!(size, (INLINE_CONTENT_MAX + 100) as u64);
+            assert_eq!(size, (INLINE_CONTENT_MAX_V0 + 100) as u64);
             // Verify the external content matches
             use std::io::Read;
             let mut external_data = Vec::new();
             std::fs::File::from(repo.open_object(id).unwrap())
                 .read_to_end(&mut external_data)
                 .unwrap();
-            let expected_content = vec![b'L'; INLINE_CONTENT_MAX + 100];
+            let expected_content = vec![b'L'; INLINE_CONTENT_MAX_V0 + 100];
             assert_eq!(
                 external_data, expected_content,
                 "External file content should match"
@@ -1008,7 +1009,7 @@ mod tests {
             append_file(&mut builder, "small.txt", small_content).unwrap();
 
             // Large file (should be external/streamed)
-            let large_content = vec![b'L'; INLINE_CONTENT_MAX + 100];
+            let large_content = vec![b'L'; INLINE_CONTENT_MAX_V0 + 100];
             append_file(&mut builder, "large.txt", &large_content).unwrap();
 
             // Another small file
@@ -1068,13 +1069,13 @@ mod tests {
         if let TarItem::Leaf(LeafContent::Regular(RegularFile::External(ref id, size))) =
             entries[1].item
         {
-            assert_eq!(size, (INLINE_CONTENT_MAX + 100) as u64);
+            assert_eq!(size, (INLINE_CONTENT_MAX_V0 + 100) as u64);
             // Verify the external content matches
             let mut external_data = Vec::new();
             std::fs::File::from(repo.open_object(id).unwrap())
                 .read_to_end(&mut external_data)
                 .unwrap();
-            let expected_content = vec![b'L'; INLINE_CONTENT_MAX + 100];
+            let expected_content = vec![b'L'; INLINE_CONTENT_MAX_V0 + 100];
             assert_eq!(
                 external_data, expected_content,
                 "External file content should match"
@@ -1103,7 +1104,7 @@ mod tests {
 
             // Three large files to test parallel streaming
             for i in 0..3 {
-                let content = vec![(i + 0x41) as u8; INLINE_CONTENT_MAX + 1000]; // 'A', 'B', 'C'
+                let content = vec![(i + 0x41) as u8; INLINE_CONTENT_MAX_V0 + 1000]; // 'A', 'B', 'C'
                 let filename = format!("file{}.bin", i);
                 append_file(&mut builder, &filename, &content).unwrap();
             }
@@ -1152,12 +1153,12 @@ mod tests {
             if let TarItem::Leaf(LeafContent::Regular(RegularFile::External(ref id, size))) =
                 entry.item
             {
-                assert_eq!(size, (INLINE_CONTENT_MAX + 1000) as u64);
+                assert_eq!(size, (INLINE_CONTENT_MAX_V0 + 1000) as u64);
                 let mut external_data = Vec::new();
                 std::fs::File::from(repo.open_object(id).unwrap())
                     .read_to_end(&mut external_data)
                     .unwrap();
-                let expected_content = vec![(i + 0x41) as u8; INLINE_CONTENT_MAX + 1000];
+                let expected_content = vec![(i + 0x41) as u8; INLINE_CONTENT_MAX_V0 + 1000];
                 assert_eq!(
                     external_data, expected_content,
                     "External file {} content should match",
@@ -1477,15 +1478,15 @@ mod tests {
 
         /// Strategy for generating a file size that exercises both the inline and
         /// external code paths, with emphasis on the boundary region around
-        /// INLINE_CONTENT_MAX (64 bytes) and 512-byte block alignment edges.
+        /// INLINE_CONTENT_MAX_V0 (64 bytes) and 512-byte block alignment edges.
         fn file_size_strategy() -> impl Strategy<Value = usize> {
             prop_oneof![
-                3 => 0..=INLINE_CONTENT_MAX,                    // inline (small)
-                2 => (INLINE_CONTENT_MAX + 1)..=(INLINE_CONTENT_MAX + 2048), // just over threshold
-                1 => (INLINE_CONTENT_MAX + 2048)..=100_000usize, // comfortably large
+                3 => 0..=INLINE_CONTENT_MAX_V0,                    // inline (small)
+                2 => (INLINE_CONTENT_MAX_V0 + 1)..=(INLINE_CONTENT_MAX_V0 + 2048), // just over threshold
+                1 => (INLINE_CONTENT_MAX_V0 + 2048)..=100_000usize, // comfortably large
                 // Boundary-focused: sizes near 512-byte block alignment
                 2 => prop::sample::select(vec![
-                    0, 1, 63, 64, 65,               // around INLINE_CONTENT_MAX
+                    0, 1, 63, 64, 65,               // around INLINE_CONTENT_MAX_V0
                     511, 512, 513,                   // around one block
                     1023, 1024, 1025,                // around two blocks
                 ]),
