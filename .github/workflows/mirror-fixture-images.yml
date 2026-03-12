@@ -1,0 +1,39 @@
+name: Mirror CI fixture images
+
+# Copies pinned container images listed in ci/fixture-images.txt to
+# ghcr.io/composefs/ci-fixture-* so CI tests don't depend on upstream
+# registries keeping old builds around forever.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ci/fixture-images.txt
+      - .github/workflows/mirror-fixture-images.yml
+  workflow_dispatch: {}  # allow manual trigger
+
+permissions:
+  packages: write
+
+jobs:
+  mirror:
+    name: Mirror images to ghcr.io
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to ghcr.io
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Copy images
+        run: |
+          set -euo pipefail
+          copied=0
+          while read -r src dst rest; do
+            echo "::group::Copying $src -> $dst"
+            skopeo copy --all "$src" "$dst"
+            echo "::endgroup::"
+            copied=$((copied + 1))
+          done < <(grep -v '^\s*#' ci/fixture-images.txt | grep -v '^\s*$')
+          echo "Mirrored $copied image(s)."
