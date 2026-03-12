@@ -173,17 +173,24 @@ impl XAttr {
 
     /// Returns the attribute name suffix
     pub fn suffix(&self) -> &[u8] {
-        &self.data[..self.header.name_len as usize]
+        self.data
+            .get(..self.header.name_len as usize)
+            .unwrap_or(&[])
     }
 
     /// Returns the attribute value
     pub fn value(&self) -> &[u8] {
-        &self.data[self.header.name_len as usize..][..self.header.value_size.get() as usize]
+        let name_len = self.header.name_len as usize;
+        let value_size = self.header.value_size.get() as usize;
+        self.data
+            .get(name_len..name_len + value_size)
+            .unwrap_or(&[])
     }
 
     /// Returns the padding bytes after the value
     pub fn padding(&self) -> &[u8] {
-        &self.data[self.header.name_len as usize + self.header.value_size.get() as usize..]
+        let end = self.header.name_len as usize + self.header.value_size.get() as usize;
+        self.data.get(end..).unwrap_or(&[])
     }
 }
 
@@ -232,7 +239,7 @@ impl<Header: InodeHeader> InodeOps for &Inode<Header> {
     }
 
     fn inline(&self) -> Option<&[u8]> {
-        let data = &self.data[self.header.xattr_size()..];
+        let data = self.data.get(self.header.xattr_size()..)?;
 
         if data.is_empty() {
             return None;
@@ -764,13 +771,13 @@ pub fn collect_objects<ObjectID: FsVerityHashValue>(image: &[u8]) -> ReadResult<
 }
 
 /// Construct the full xattr name from a prefix index and suffix.
-fn construct_xattr_name(xattr: &XAttr) -> Vec<u8> {
-    let prefix = XATTR_PREFIXES[xattr.header.name_index as usize];
+fn construct_xattr_name(xattr: &XAttr) -> Option<Vec<u8>> {
+    let prefix = *XATTR_PREFIXES.get(xattr.header.name_index as usize)?;
     let suffix = xattr.suffix();
     let mut full_name = Vec::with_capacity(prefix.len() + suffix.len());
     full_name.extend_from_slice(prefix);
     full_name.extend_from_slice(suffix);
-    full_name
+    Some(full_name)
 }
 
 /// Build a `tree::Stat` from an erofs inode, reversing the xattr namespace
@@ -826,7 +833,7 @@ fn stat_from_inode_for_tree(img: &Image, inode: &InodeType) -> anyhow::Result<tr
 /// Transform a single xattr, reversing writer escaping.
 /// Returns None for internal overlay xattrs that should be stripped.
 fn transform_xattr(xattr: &XAttr) -> Option<(Box<OsStr>, Box<[u8]>)> {
-    let full_name = construct_xattr_name(xattr);
+    let full_name = construct_xattr_name(xattr)?;
 
     // Skip internal overlay xattrs added by the writer
     if full_name == b"trusted.overlay.metacopy" || full_name == b"trusted.overlay.redirect" {
