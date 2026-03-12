@@ -35,7 +35,7 @@ pub fn round_up(n: usize, to: usize) -> usize {
 /// Common interface for accessing inode header fields across different layouts
 pub trait InodeHeader {
     /// Returns the data layout method used by this inode
-    fn data_layout(&self) -> DataLayout;
+    fn data_layout(&self) -> Result<DataLayout, ErofsReaderError>;
     /// Returns the extended attribute inode count
     fn xattr_icount(&self) -> u16;
     /// Returns the file mode
@@ -63,7 +63,7 @@ pub trait InodeHeader {
         let block_size: usize = 1usize
             .checked_shl(blkszbits.into())
             .ok_or_else(|| ErofsReaderError::InvalidImage("blkszbits overflow".into()))?;
-        let data_layout = self.data_layout();
+        let data_layout = self.data_layout()?;
         Ok(self.xattr_size()
             + match data_layout {
                 DataLayout::FlatPlain => 0,
@@ -87,8 +87,10 @@ pub trait InodeHeader {
 }
 
 impl InodeHeader for ExtendedInodeHeader {
-    fn data_layout(&self) -> DataLayout {
-        self.format.try_into().unwrap()
+    fn data_layout(&self) -> Result<DataLayout, ErofsReaderError> {
+        self.format.try_into().map_err(|_| {
+            ErofsReaderError::InvalidImage("invalid data layout in inode format".into())
+        })
     }
 
     fn xattr_icount(&self) -> u16 {
@@ -113,8 +115,10 @@ impl InodeHeader for ExtendedInodeHeader {
 }
 
 impl InodeHeader for CompactInodeHeader {
-    fn data_layout(&self) -> DataLayout {
-        self.format.try_into().unwrap()
+    fn data_layout(&self) -> Result<DataLayout, ErofsReaderError> {
+        self.format.try_into().map_err(|_| {
+            ErofsReaderError::InvalidImage("invalid data layout in inode format".into())
+        })
     }
 
     fn xattr_icount(&self) -> u16 {
@@ -177,9 +181,12 @@ impl XAttrHeader {
 
 impl XAttr {
     /// Parses an xattr from a byte slice, returning the xattr and remaining bytes
-    pub fn from_prefix(data: &[u8]) -> (&XAttr, &[u8]) {
-        let header = XAttrHeader::ref_from_bytes(&data[..4]).unwrap();
-        Self::ref_from_prefix_with_elems(data, header.calculate_n_elems()).unwrap()
+    pub fn from_prefix(data: &[u8]) -> Result<(&XAttr, &[u8]), ErofsReaderError> {
+        let header =
+            XAttrHeader::ref_from_bytes(data.get(..4).ok_or(ErofsReaderError::OutOfBounds)?)
+                .map_err(|_| ErofsReaderError::OutOfBounds)?;
+        Self::ref_from_prefix_with_elems(data, header.calculate_n_elems())
+            .map_err(|_| ErofsReaderError::OutOfBounds)
     }
 
     /// Returns the attribute name suffix
@@ -208,7 +215,7 @@ impl XAttr {
 /// Operations on inode data
 pub trait InodeOps {
     /// Returns the extended attributes section if present
-    fn xattrs(&self) -> Option<&InodeXAttrs>;
+    fn xattrs(&self) -> Result<Option<&InodeXAttrs>, ErofsReaderError>;
     /// Returns the inline data portion
     fn inline(&self) -> Option<&[u8]>;
     /// Returns the range of block IDs used by this inode
@@ -216,7 +223,7 @@ pub trait InodeOps {
 }
 
 impl<Header: InodeHeader> InodeHeader for &Inode<Header> {
-    fn data_layout(&self) -> DataLayout {
+    fn data_layout(&self) -> Result<DataLayout, ErofsReaderError> {
         self.header.data_layout()
     }
 
@@ -242,10 +249,15 @@ impl<Header: InodeHeader> InodeHeader for &Inode<Header> {
 }
 
 impl<Header: InodeHeader> InodeOps for &Inode<Header> {
-    fn xattrs(&self) -> Option<&InodeXAttrs> {
+    fn xattrs(&self) -> Result<Option<&InodeXAttrs>, ErofsReaderError> {
         match self.header.xattr_size() {
-            0 => None,
-            n => Some(InodeXAttrs::ref_from_bytes(&self.data[..n]).unwrap()),
+            0 => Ok(None),
+            n => {
+                let data = self.data.get(..n).ok_or(ErofsReaderError::OutOfBounds)?;
+                Ok(Some(
+                    InodeXAttrs::ref_from_bytes(data).map_err(|_| ErofsReaderError::OutOfBounds)?,
+                ))
+            }
         }
     }
 
@@ -265,7 +277,7 @@ impl<Header: InodeHeader> InodeOps for &Inode<Header> {
             .checked_shl(blkszbits.into())
             .ok_or_else(|| ErofsReaderError::InvalidImage("blkszbits overflow".into()))?;
         let start = self.header.u() as u64;
-        let data_layout = self.header.data_layout();
+        let data_layout = self.header.data_layout()?;
 
         Ok(match data_layout {
             DataLayout::FlatPlain => Range {
@@ -318,7 +330,7 @@ impl InodeHeader for InodeType<'_> {
         }
     }
 
-    fn data_layout(&self) -> DataLayout {
+    fn data_layout(&self) -> Result<DataLayout, ErofsReaderError> {
         match self {
             Self::Compact(inode) => inode.data_layout(),
             Self::Extended(inode) => inode.data_layout(),
@@ -341,7 +353,7 @@ impl InodeHeader for InodeType<'_> {
 }
 
 impl InodeOps for InodeType<'_> {
-    fn xattrs(&self) -> Option<&InodeXAttrs> {
+    fn xattrs(&self) -> Result<Option<&InodeXAttrs>, ErofsReaderError> {
         match self {
             Self::Compact(inode) => inode.xattrs(),
             Self::Extended(inode) => inode.xattrs(),
@@ -530,7 +542,8 @@ impl<'img> Image<'img> {
         let inode = self.inode(parent_nid)?;
         if let Some(inline) = inode.inline() {
             if let Ok(block) = DirectoryBlock::ref_from_bytes(inline) {
-                for entry in block.entries() {
+                for entry in block.entries()? {
+                    let entry = entry?;
                     if entry.name == name {
                         return Ok(Some(entry.nid()));
                     }
@@ -539,7 +552,8 @@ impl<'img> Image<'img> {
         }
         for blkid in inode.blocks(self.blkszbits)? {
             let block = self.directory_block(blkid)?;
-            for entry in block.entries() {
+            for entry in block.entries()? {
+                let entry = entry?;
                 if entry.name == name {
                     return Ok(Some(entry.nid()));
                 }
@@ -556,18 +570,25 @@ struct Array<T>([T]);
 
 impl InodeXAttrs {
     /// Returns the array of shared xattr IDs
-    pub fn shared(&self) -> &[U32] {
-        &Array::ref_from_prefix_with_elems(&self.data, self.header.shared_count as usize)
-            .unwrap()
-            .0
-             .0
+    pub fn shared(&self) -> Result<&[U32], ErofsReaderError> {
+        Ok(
+            &Array::ref_from_prefix_with_elems(&self.data, self.header.shared_count as usize)
+                .map_err(|_| ErofsReaderError::OutOfBounds)?
+                .0
+                 .0,
+        )
     }
 
     /// Returns an iterator over local (non-shared) xattrs
-    pub fn local(&self) -> XAttrIter<'_> {
-        XAttrIter {
-            data: &self.data[self.header.shared_count as usize * 4..],
-        }
+    pub fn local(&self) -> Result<XAttrIter<'_>, ErofsReaderError> {
+        let offset = (self.header.shared_count as usize)
+            .checked_mul(4)
+            .ok_or(ErofsReaderError::OutOfBounds)?;
+        let data = self
+            .data
+            .get(offset..)
+            .ok_or(ErofsReaderError::OutOfBounds)?;
+        Ok(XAttrIter { data })
     }
 }
 
@@ -578,13 +599,20 @@ pub struct XAttrIter<'img> {
 }
 
 impl<'img> Iterator for XAttrIter<'img> {
-    type Item = &'img XAttr;
+    type Item = Result<&'img XAttr, ErofsReaderError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if !self.data.is_empty() {
-            let (result, rest) = XAttr::from_prefix(self.data);
-            self.data = rest;
-            Some(result)
+            match XAttr::from_prefix(self.data) {
+                Ok((result, rest)) => {
+                    self.data = rest;
+                    Some(Ok(result))
+                }
+                Err(e) => {
+                    self.data = &[]; // stop iteration on error
+                    Some(Err(e))
+                }
+            }
         } else {
             None
         }
@@ -603,36 +631,49 @@ pub struct DirectoryBlock(pub [u8]);
 
 impl DirectoryBlock {
     /// Returns the directory entry header at the given index
-    pub fn get_entry_header(&self, n: usize) -> &DirectoryEntryHeader {
-        let entry_data = &self.0
-            [n * size_of::<DirectoryEntryHeader>()..(n + 1) * size_of::<DirectoryEntryHeader>()];
-        DirectoryEntryHeader::ref_from_bytes(entry_data).unwrap()
+    pub fn get_entry_header(&self, n: usize) -> Result<&DirectoryEntryHeader, ErofsReaderError> {
+        let start = n
+            .checked_mul(size_of::<DirectoryEntryHeader>())
+            .ok_or(ErofsReaderError::OutOfBounds)?;
+        let end = start
+            .checked_add(size_of::<DirectoryEntryHeader>())
+            .ok_or(ErofsReaderError::OutOfBounds)?;
+        let entry_data = self
+            .0
+            .get(start..end)
+            .ok_or(ErofsReaderError::OutOfBounds)?;
+        DirectoryEntryHeader::ref_from_bytes(entry_data).map_err(|_| ErofsReaderError::OutOfBounds)
     }
 
     /// Returns all directory entry headers as a slice
-    pub fn get_entry_headers(&self) -> &[DirectoryEntryHeader] {
-        &Array::ref_from_prefix_with_elems(&self.0, self.n_entries())
-            .unwrap()
+    pub fn get_entry_headers(&self) -> Result<&[DirectoryEntryHeader], ErofsReaderError> {
+        let n = self.n_entries()?;
+        Ok(&Array::ref_from_prefix_with_elems(&self.0, n)
+            .map_err(|_| ErofsReaderError::OutOfBounds)?
             .0
-             .0
+             .0)
     }
 
     /// Returns the number of entries in this directory block
-    pub fn n_entries(&self) -> usize {
-        let first = self.get_entry_header(0);
+    pub fn n_entries(&self) -> Result<usize, ErofsReaderError> {
+        let first = self.get_entry_header(0)?;
         let offset = first.name_offset.get();
-        assert!(offset != 0);
-        assert!(offset.is_multiple_of(12));
-        offset as usize / 12
+        if offset == 0 || !offset.is_multiple_of(12) {
+            return Err(ErofsReaderError::InvalidImage(
+                "invalid directory entry name_offset".into(),
+            ));
+        }
+        Ok(offset as usize / 12)
     }
 
     /// Returns an iterator over directory entries
-    pub fn entries(&self) -> DirectoryEntries<'_> {
-        DirectoryEntries {
+    pub fn entries(&self) -> Result<DirectoryEntries<'_>, ErofsReaderError> {
+        let length = self.n_entries()?;
+        Ok(DirectoryEntries {
             block: self,
-            length: self.n_entries(),
+            length,
             position: 0,
-        }
+        })
     }
 }
 
@@ -662,25 +703,42 @@ pub struct DirectoryEntries<'d> {
 }
 
 impl<'d> Iterator for DirectoryEntries<'d> {
-    type Item = DirectoryEntry<'d>;
+    type Item = Result<DirectoryEntry<'d>, ErofsReaderError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.position < self.length {
-            let header = self.block.get_entry_header(self.position);
-            let name_start = header.name_offset.get() as usize;
-            self.position += 1;
+            let result = (|| {
+                let header = self.block.get_entry_header(self.position)?;
+                let name_start = header.name_offset.get() as usize;
+                self.position += 1;
 
-            let name = if self.position == self.length {
-                let with_padding = &self.block.0[name_start..];
-                let end = with_padding.partition_point(|c| *c != 0);
-                &with_padding[..end]
-            } else {
-                let next = self.block.get_entry_header(self.position);
-                let name_end = next.name_offset.get() as usize;
-                &self.block.0[name_start..name_end]
-            };
+                let name = if self.position == self.length {
+                    let with_padding = self
+                        .block
+                        .0
+                        .get(name_start..)
+                        .ok_or(ErofsReaderError::OutOfBounds)?;
+                    let end = with_padding.partition_point(|c| *c != 0);
+                    with_padding
+                        .get(..end)
+                        .ok_or(ErofsReaderError::OutOfBounds)?
+                } else {
+                    let next = self.block.get_entry_header(self.position)?;
+                    let name_end = next.name_offset.get() as usize;
+                    self.block
+                        .0
+                        .get(name_start..name_end)
+                        .ok_or(ErofsReaderError::OutOfBounds)?
+                };
 
-            Some(DirectoryEntry { header, name })
+                Ok(DirectoryEntry { header, name })
+            })();
+
+            if result.is_err() {
+                // Stop iteration on error
+                self.position = self.length;
+            }
+            Some(result)
         } else {
             None
         }
@@ -744,17 +802,18 @@ impl<ObjectID: FsVerityHashValue> ObjectCollector<ObjectID> {
     }
 
     fn visit_xattrs(&mut self, img: &Image, xattrs: &InodeXAttrs) -> ReadResult<()> {
-        for id in xattrs.shared() {
+        for id in xattrs.shared()? {
             self.visit_xattr(img.shared_xattr(id.get())?)?;
         }
-        for attr in xattrs.local() {
-            self.visit_xattr(attr)?;
+        for attr in xattrs.local()? {
+            self.visit_xattr(attr?)?;
         }
         Ok(())
     }
 
-    fn visit_directory_block(&mut self, block: &DirectoryBlock) {
-        for entry in block.entries() {
+    fn visit_directory_block(&mut self, block: &DirectoryBlock) -> ReadResult<()> {
+        for entry in block.entries()? {
+            let entry = entry?;
             if entry.name != b"." && entry.name != b".." {
                 let nid = entry.nid();
                 if !self.visited_nids.contains(&nid) {
@@ -762,6 +821,7 @@ impl<ObjectID: FsVerityHashValue> ObjectCollector<ObjectID> {
                 }
             }
         }
+        Ok(())
     }
 
     fn visit_nid(&mut self, img: &Image, nid: u64) -> ReadResult<()> {
@@ -770,18 +830,19 @@ impl<ObjectID: FsVerityHashValue> ObjectCollector<ObjectID> {
 
         let inode = img.inode(nid)?;
 
-        if let Some(xattrs) = inode.xattrs() {
+        if let Some(xattrs) = inode.xattrs()? {
             self.visit_xattrs(img, xattrs)?;
         }
 
         if inode.mode().is_dir() {
             for blkid in inode.blocks(img.sb.blkszbits)? {
-                self.visit_directory_block(img.directory_block(blkid)?);
+                self.visit_directory_block(img.directory_block(blkid)?)?;
             }
 
             if let Some(inline) = inode.inline() {
-                let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
-                self.visit_directory_block(inline_block);
+                let inline_block = DirectoryBlock::ref_from_bytes(inline)
+                    .map_err(|_| ErofsReaderError::OutOfBounds)?;
+                self.visit_directory_block(inline_block)?;
             }
         }
 
@@ -854,16 +915,17 @@ fn stat_from_inode_for_tree(img: &Image, inode: &InodeType) -> anyhow::Result<tr
 
     let mut xattrs = BTreeMap::new();
 
-    if let Some(xattrs_section) = inode.xattrs() {
+    if let Some(xattrs_section) = inode.xattrs()? {
         // Process shared xattrs
-        for id in xattrs_section.shared() {
+        for id in xattrs_section.shared()? {
             let xattr = img.shared_xattr(id.get())?;
             if let Some((name, value)) = transform_xattr(xattr)? {
                 xattrs.insert(name, value);
             }
         }
         // Process local xattrs
-        for xattr in xattrs_section.local() {
+        for xattr in xattrs_section.local()? {
+            let xattr = xattr?;
             if let Some((name, value)) = transform_xattr(xattr)? {
                 xattrs.insert(name, value);
             }
@@ -938,17 +1000,18 @@ fn extract_metacopy_digest<ObjectID: FsVerityHashValue>(
     img: &Image,
     inode: &InodeType,
 ) -> anyhow::Result<Option<ObjectID>> {
-    let Some(xattrs_section) = inode.xattrs() else {
+    let Some(xattrs_section) = inode.xattrs()? else {
         return Ok(None);
     };
 
-    for id in xattrs_section.shared() {
+    for id in xattrs_section.shared()? {
         let xattr = img.shared_xattr(id.get())?;
         if let Some(digest) = check_metacopy_xattr(xattr)? {
             return Ok(Some(digest));
         }
     }
-    for xattr in xattrs_section.local() {
+    for xattr in xattrs_section.local()? {
+        let xattr = xattr?;
         if let Some(digest) = check_metacopy_xattr(xattr)? {
             return Ok(Some(digest));
         }
@@ -986,7 +1049,8 @@ fn dir_entries<'a>(
     // Block-based entries
     for blkid in dir_inode.blocks(img.blkszbits)? {
         let block = img.directory_block(blkid)?;
-        for entry in block.entries() {
+        for entry in block.entries()? {
+            let entry = entry?;
             if entry.name != b"." && entry.name != b".." {
                 entries.push((entry.name, entry.nid()));
             }
@@ -996,7 +1060,8 @@ fn dir_entries<'a>(
     // Inline entries
     if let Some(data) = dir_inode.inline() {
         if let Ok(block) = DirectoryBlock::ref_from_bytes(data) {
-            for entry in block.entries() {
+            for entry in block.entries()? {
+                let entry = entry?;
                 if entry.name != b"." && entry.name != b".." {
                     entries.push((entry.name, entry.nid()));
                 }
@@ -1125,7 +1190,8 @@ mod tests {
         // Read inline entries if present
         if let Some(inline) = inode.inline() {
             let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
-            for entry in inline_block.entries() {
+            for entry in inline_block.entries().unwrap() {
+                let entry = entry.unwrap();
                 let name = std::str::from_utf8(entry.name).unwrap();
                 found_names.push(name.to_string());
             }
@@ -1134,7 +1200,8 @@ mod tests {
         // Read block entries
         for blkid in inode.blocks(img.blkszbits).unwrap() {
             let block = img.directory_block(blkid).unwrap();
-            for entry in block.entries() {
+            for entry in block.entries().unwrap() {
+                let entry = entry.unwrap();
                 let name = std::str::from_utf8(entry.name).unwrap();
                 found_names.push(name.to_string());
             }
@@ -1171,7 +1238,8 @@ mod tests {
         let mut empty_dir_nid = None;
         if let Some(inline) = root_inode.inline() {
             let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
-            for entry in inline_block.entries() {
+            for entry in inline_block.entries().unwrap() {
+                let entry = entry.unwrap();
                 if entry.name == b"empty_dir" {
                     empty_dir_nid = Some(entry.nid());
                     break;
@@ -1180,7 +1248,8 @@ mod tests {
         }
         for blkid in root_inode.blocks(img.blkszbits).unwrap() {
             let block = img.directory_block(blkid).unwrap();
-            for entry in block.entries() {
+            for entry in block.entries().unwrap() {
+                let entry = entry.unwrap();
                 if entry.name == b"empty_dir" {
                     empty_dir_nid = Some(entry.nid());
                     break;
@@ -1210,7 +1279,8 @@ mod tests {
         let mut dir1_nid = None;
         if let Some(inline) = root_inode.inline() {
             let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
-            for entry in inline_block.entries() {
+            for entry in inline_block.entries().unwrap() {
+                let entry = entry.unwrap();
                 if entry.name == b"dir1" {
                     dir1_nid = Some(entry.nid());
                     break;
@@ -1219,7 +1289,8 @@ mod tests {
         }
         for blkid in root_inode.blocks(img.blkszbits).unwrap() {
             let block = img.directory_block(blkid).unwrap();
-            for entry in block.entries() {
+            for entry in block.entries().unwrap() {
+                let entry = entry.unwrap();
                 if entry.name == b"dir1" {
                     dir1_nid = Some(entry.nid());
                     break;
@@ -1253,7 +1324,8 @@ mod tests {
         let mut bigdir_nid = None;
         if let Some(inline) = root_inode.inline() {
             let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
-            for entry in inline_block.entries() {
+            for entry in inline_block.entries().unwrap() {
+                let entry = entry.unwrap();
                 if entry.name == b"bigdir" {
                     bigdir_nid = Some(entry.nid());
                     break;
@@ -1262,7 +1334,8 @@ mod tests {
         }
         for blkid in root_inode.blocks(img.blkszbits).unwrap() {
             let block = img.directory_block(blkid).unwrap();
-            for entry in block.entries() {
+            for entry in block.entries().unwrap() {
+                let entry = entry.unwrap();
                 if entry.name == b"bigdir" {
                     bigdir_nid = Some(entry.nid());
                     break;
@@ -1338,7 +1411,8 @@ mod tests {
         let mut mixed_nid = None;
         if let Some(inline) = root_inode.inline() {
             let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
-            for entry in inline_block.entries() {
+            for entry in inline_block.entries().unwrap() {
+                let entry = entry.unwrap();
                 if entry.name == b"mixed" {
                     mixed_nid = Some(entry.nid());
                     break;
@@ -1347,7 +1421,8 @@ mod tests {
         }
         for blkid in root_inode.blocks(img.blkszbits).unwrap() {
             let block = img.directory_block(blkid).unwrap();
-            for entry in block.entries() {
+            for entry in block.entries().unwrap() {
+                let entry = entry.unwrap();
                 if entry.name == b"mixed" {
                     mixed_nid = Some(entry.nid());
                     break;
@@ -1464,14 +1539,16 @@ mod tests {
 
         if let Some(inline) = root_inode.inline() {
             let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
-            for entry in inline_block.entries() {
+            for entry in inline_block.entries().unwrap() {
+                let entry = entry.unwrap();
                 entries_map.insert(entry.name.to_vec(), entry.nid());
             }
         }
 
         for blkid in root_inode.blocks(img.blkszbits).unwrap() {
             let block = img.directory_block(blkid).unwrap();
-            for entry in block.entries() {
+            for entry in block.entries().unwrap() {
+                let entry = entry.unwrap();
                 entries_map.insert(entry.name.to_vec(), entry.nid());
             }
         }
