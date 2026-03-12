@@ -19,7 +19,6 @@ permissions:
 jobs:
   nightly:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
     steps:
     - uses: dtolnay/rust-toolchain@nightly
     - uses: actions/checkout@v4
@@ -27,7 +26,6 @@ jobs:
 
   fedora:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
     container:
       image: quay.io/fedora/fedora:latest
       options: "--privileged --pid=host -v /var/tmp:/var/tmp --tmpfs /tmp:rw,exec,nosuid,nodev -v /:/run/host"
@@ -47,7 +45,6 @@ jobs:
   smoke:
     name: Unprivileged smoke test
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: bootc-dev/actions/bootc-ubuntu-setup@main
@@ -60,7 +57,6 @@ jobs:
   fuzz:
     name: Fuzz smoke test
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -90,7 +86,6 @@ jobs:
     name: Integration tests (${{ matrix.name }})
     needs: smoke
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -120,7 +115,6 @@ jobs:
   examples:
     name: Example tests (${{ matrix.example.dir }}/${{ matrix.example.os }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
 
     strategy:
       matrix:
