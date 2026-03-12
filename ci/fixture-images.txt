@@ -1,0 +1,18 @@
+# Container images mirrored to ghcr.io/composefs for CI fixture use.
+#
+# These images are pinned by digest or immutable tag and used in tests
+# (e.g. EROFS digest stability tests).  Mirroring them under our own
+# namespace ensures they remain available even if the upstream registry
+# garbage-collects old builds.
+#
+# Format: <source> <destination>
+# Lines starting with # and blank lines are ignored.
+# The workflow uses `skopeo copy --all` to preserve multi-arch manifests.
+
+# RHEL UBI 10.1, build 1772441712 (amd64).
+# Used in: crates/integration-tests/src/tests/digest_stability.rs
+docker://registry.access.redhat.com/ubi10/ubi:10.1-1772441712 docker://ghcr.io/composefs/ci-fixture-ubi10:10.1-1772441712
+
+# centos-bootc stream10, pinned by manifest digest.
+# Used in: crates/integration-tests/src/tests/digest_stability.rs
+docker://quay.io/centos-bootc/centos-bootc@sha256:d1913e3d616b9acb7fc2e3331be8baf844048bca2681a23d34e53e75eb18f3d0 docker://ghcr.io/composefs/ci-fixture-centos-bootc:stream10-d1913e3d
