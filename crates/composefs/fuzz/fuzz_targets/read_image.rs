@@ -42,21 +42,27 @@ fn exercise_image(data: &[u8]) {
     let _ = root.xattr_size();
 
     // Xattr iteration
-    if let Some(xattrs) = root.xattrs() {
-        for id in xattrs.shared() {
-            if let Ok(xattr) = image.shared_xattr(id.get()) {
-                let _ = xattr.suffix();
-                let _ = xattr.value();
-                let _ = xattr.padding();
-                let _ = xattr.header.name_index;
-                let _ = xattr.header.name_len;
-                let _ = xattr.header.value_size;
+    if let Ok(Some(xattrs)) = root.xattrs() {
+        if let Ok(shared) = xattrs.shared() {
+            for id in shared {
+                if let Ok(xattr) = image.shared_xattr(id.get()) {
+                    let _ = xattr.suffix();
+                    let _ = xattr.value();
+                    let _ = xattr.padding();
+                    let _ = xattr.header.name_index;
+                    let _ = xattr.header.name_len;
+                    let _ = xattr.header.value_size;
+                }
             }
         }
-        for xattr in xattrs.local() {
-            let _ = xattr.suffix();
-            let _ = xattr.value();
-            let _ = xattr.padding();
+        if let Ok(local) = xattrs.local() {
+            for xattr in local {
+                if let Ok(xattr) = xattr {
+                    let _ = xattr.suffix();
+                    let _ = xattr.value();
+                    let _ = xattr.padding();
+                }
+            }
         }
     }
 
@@ -74,7 +80,13 @@ fn exercise_image(data: &[u8]) {
         let Ok(db) = image.directory_block(blkid) else {
             continue;
         };
-        for entry in db.entries() {
+        let Ok(entries) = db.entries() else {
+            continue;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                continue;
+            };
             let _ = entry.name;
             let nid = entry.nid();
 
