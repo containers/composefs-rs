@@ -19,10 +19,10 @@ use zerocopy::{little_endian::U32, FromBytes, Immutable, KnownLayout};
 use super::{
     composefs::OverlayMetacopy,
     format::{
-        CompactInodeHeader, ComposefsHeader, DataLayout, DirectoryEntryHeader, ExtendedInodeHeader,
-        InodeXAttrHeader, ModeField, Superblock, XAttrHeader, BLOCK_BITS, COMPOSEFS_MAGIC,
-        MAGIC_V1, S_IFBLK, S_IFCHR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, VERSION,
-        XATTR_PREFIXES,
+        self, CompactInodeHeader, ComposefsHeader, DataLayout, DirectoryEntryHeader,
+        ExtendedInodeHeader, InodeXAttrHeader, ModeField, Superblock, XAttrHeader, BLOCK_BITS,
+        COMPOSEFS_MAGIC, MAGIC_V1, S_IFBLK, S_IFCHR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK,
+        VERSION, XATTR_PREFIXES,
     },
 };
 use crate::fsverity::FsVerityHashValue;
@@ -469,15 +469,14 @@ impl<'img> Image<'img> {
     ///
     /// Checked eagerly (in this method):
     /// - Composefs header magic and version fields
-    /// - EROFS superblock magic
-    /// - `blkszbits` must be 12 (4096-byte blocks)
+    /// - EROFS superblock magic and `blkszbits == 12`
+    /// - No unsupported EROFS features (compression, multi-device,
+    ///   fragments, 48-bit addressing, metabox, etc.)
+    /// - `meta_blkaddr == 0`, `extslots == 0`, `packed_nid == 0`
+    /// - No custom xattr prefixes
     ///
     /// Checked during inode traversal (`inode_blocks`, `erofs_to_filesystem`):
-    /// - For non-ChunkBased inodes (directories, inline files, symlinks,
-    ///   devices), `size` must not exceed the image size — their data is
-    ///   stored within the image itself.  ChunkBased (external) files are
-    ///   exempt because their `size` reflects the real file on the
-    ///   underlying filesystem.
+    /// - For non-ChunkBased inodes, `size` must not exceed the image size
     /// - Inline regular files must be ≤ `MAX_INLINE_CONTENT` (512 bytes)
     /// - Metacopy xattrs must be well-formed when present
     pub fn restrict_to_composefs(mut self) -> Result<Self, ErofsReaderError> {
@@ -498,6 +497,7 @@ impl<'img> Image<'img> {
         }
         // Note: we don't enforce composefs_version here because C mkcomposefs
         // writes version 0 while the Rust writer uses version 2.  Both are valid.
+
         // Validate EROFS superblock magic
         if self.sb.magic != MAGIC_V1 {
             return Err(ErofsReaderError::InvalidImage(format!(
@@ -512,6 +512,74 @@ impl<'img> Image<'img> {
                 self.blkszbits,
             )));
         }
+
+        // Reject unknown or unsupported feature_compat flags.
+        let compat = self.sb.feature_compat.get();
+        let unknown_compat = compat & !format::FEATURE_COMPAT_SUPPORTED;
+        if unknown_compat != 0 {
+            return Err(ErofsReaderError::InvalidImage(format!(
+                "unsupported feature_compat flags: {unknown_compat:#x}",
+            )));
+        }
+
+        // Reject all feature_incompat flags except CHUNKED_FILE (used for
+        // external files).  This blocks compression, multi-device, fragments,
+        // 48-bit addressing, metabox, and any future features.
+        let incompat = self.sb.feature_incompat.get();
+        let unsupported_incompat = incompat & !format::FEATURE_INCOMPAT_CHUNKED_FILE;
+        if unsupported_incompat != 0 {
+            return Err(ErofsReaderError::InvalidImage(format!(
+                "unsupported feature_incompat flags: {unsupported_incompat:#x}",
+            )));
+        }
+
+        // composefs is uncompressed
+        if self.sb.available_compr_algs.get() != 0 {
+            return Err(ErofsReaderError::InvalidImage(
+                "composefs does not support compression".into(),
+            ));
+        }
+
+        // No multi-device support
+        if self.sb.extra_devices.get() != 0 {
+            return Err(ErofsReaderError::InvalidImage(format!(
+                "composefs does not support multi-device (extra_devices={})",
+                self.sb.extra_devices.get(),
+            )));
+        }
+
+        // No superblock extension slots
+        if self.sb.extslots != 0 {
+            return Err(ErofsReaderError::InvalidImage(format!(
+                "composefs does not support extslots (extslots={})",
+                self.sb.extslots,
+            )));
+        }
+
+        // No packed/fragment inode
+        if self.sb.packed_nid.get() != 0 {
+            return Err(ErofsReaderError::InvalidImage(format!(
+                "composefs does not support packed inodes (packed_nid={})",
+                self.sb.packed_nid.get(),
+            )));
+        }
+
+        // Inodes start in block 0 (shared with the superblock)
+        if self.sb.meta_blkaddr.get() != 0 {
+            return Err(ErofsReaderError::InvalidImage(format!(
+                "composefs requires meta_blkaddr=0, got {}",
+                self.sb.meta_blkaddr.get(),
+            )));
+        }
+
+        // No custom xattr prefixes
+        if self.sb.xattr_prefix_count != 0 {
+            return Err(ErofsReaderError::InvalidImage(format!(
+                "composefs does not support custom xattr prefixes (count={})",
+                self.sb.xattr_prefix_count,
+            )));
+        }
+
         self.composefs_restricted = true;
         Ok(self)
     }
@@ -1876,6 +1944,130 @@ mod tests {
 "#;
         let (orig, rt) = round_trip_dumpfile(dumpfile);
         assert_eq!(orig, rt);
+    }
+
+    #[test]
+    fn test_restrict_to_composefs_rejects_unsupported_features() {
+        // Build a minimal valid composefs image (just a root directory).
+        let dumpfile = "/ 4096 40755 2 0 0 0 1000.0 - - -\n";
+        let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
+        let base_image = mkfs_erofs(&fs);
+
+        // Sanity: the unmodified image passes restrict_to_composefs().
+        Image::open(&base_image)
+            .unwrap()
+            .restrict_to_composefs()
+            .expect("unmodified image should be accepted");
+
+        // Superblock starts at byte 1024 in the image.
+        const SB_OFFSET: usize = 1024;
+
+        // Field offsets within the Superblock struct (repr(C), all LE).
+        const FEATURE_COMPAT: usize = SB_OFFSET + 8; // U32
+        const EXTSLOTS: usize = SB_OFFSET + 13; // u8
+        const FEATURE_INCOMPAT: usize = SB_OFFSET + 80; // U32
+        const AVAILABLE_COMPR_ALGS: usize = SB_OFFSET + 84; // U16
+        const EXTRA_DEVICES: usize = SB_OFFSET + 86; // U16
+        const META_BLKADDR: usize = SB_OFFSET + 40; // U32
+        const XATTR_PREFIX_COUNT: usize = SB_OFFSET + 91; // u8
+        const PACKED_NID: usize = SB_OFFSET + 96; // U64
+
+        /// A mutation to apply to the image bytes before calling
+        /// restrict_to_composefs().
+        enum Mutation {
+            U8(usize, u8),
+            U16(usize, u16),
+            U32(usize, u32),
+            U64(usize, u64),
+        }
+
+        struct Case {
+            name: &'static str,
+            mutation: Mutation,
+            expected_substr: &'static str,
+        }
+
+        let cases = [
+            Case {
+                name: "feature_incompat: LZ4_0PADDING",
+                mutation: Mutation::U32(FEATURE_INCOMPAT, 0x1),
+                expected_substr: "unsupported feature_incompat",
+            },
+            Case {
+                name: "feature_incompat: DEVICE_TABLE",
+                mutation: Mutation::U32(FEATURE_INCOMPAT, 0x8),
+                expected_substr: "unsupported feature_incompat",
+            },
+            Case {
+                name: "feature_incompat: FRAGMENTS",
+                mutation: Mutation::U32(FEATURE_INCOMPAT, 0x20),
+                expected_substr: "unsupported feature_incompat",
+            },
+            Case {
+                name: "feature_compat: unknown bit",
+                mutation: Mutation::U32(FEATURE_COMPAT, 0x100),
+                expected_substr: "unsupported feature_compat",
+            },
+            Case {
+                name: "available_compr_algs != 0",
+                mutation: Mutation::U16(AVAILABLE_COMPR_ALGS, 1),
+                expected_substr: "compression",
+            },
+            Case {
+                name: "extra_devices != 0",
+                mutation: Mutation::U16(EXTRA_DEVICES, 1),
+                expected_substr: "multi-device",
+            },
+            Case {
+                name: "extslots != 0",
+                mutation: Mutation::U8(EXTSLOTS, 1),
+                expected_substr: "extslots",
+            },
+            Case {
+                name: "packed_nid != 0",
+                mutation: Mutation::U64(PACKED_NID, 1),
+                expected_substr: "packed",
+            },
+            Case {
+                name: "meta_blkaddr != 0",
+                mutation: Mutation::U32(META_BLKADDR, 1),
+                expected_substr: "meta_blkaddr",
+            },
+            Case {
+                name: "xattr_prefix_count != 0",
+                mutation: Mutation::U8(XATTR_PREFIX_COUNT, 1),
+                expected_substr: "xattr prefixes",
+            },
+        ];
+
+        for case in &cases {
+            let mut image = base_image.clone();
+            match case.mutation {
+                Mutation::U8(off, val) => image[off] = val,
+                Mutation::U16(off, val) => {
+                    image[off..off + 2].copy_from_slice(&val.to_le_bytes());
+                }
+                Mutation::U32(off, val) => {
+                    image[off..off + 4].copy_from_slice(&val.to_le_bytes());
+                }
+                Mutation::U64(off, val) => {
+                    image[off..off + 8].copy_from_slice(&val.to_le_bytes());
+                }
+            }
+
+            // Image::open() may itself reject certain mutations (e.g.
+            // meta_blkaddr pointing past the image), so accept errors
+            // from either open() or restrict_to_composefs().
+            let result = Image::open(&image).and_then(|img| img.restrict_to_composefs());
+            let err = result.expect_err(&format!("{}: should have been rejected", case.name,));
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(case.expected_substr),
+                "{}: expected error containing {:?}, got: {msg}",
+                case.name,
+                case.expected_substr,
+            );
+        }
     }
 
     #[test]

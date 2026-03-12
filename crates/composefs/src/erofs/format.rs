@@ -299,10 +299,41 @@ pub struct ComposefsHeader {
 
 /// EROFS version 1 magic number
 pub const MAGIC_V1: U32 = U32::new(0xE0F5E1E2);
-/// Feature flag for mtime support
-pub const FEATURE_COMPAT_MTIME: U32 = U32::new(2);
-/// Feature flag for xattr filtering support
-pub const FEATURE_COMPAT_XATTR_FILTER: U32 = U32::new(4);
+
+// feature_compat flags
+/// Superblock CRC32C checksum present
+pub const FEATURE_COMPAT_SB_CHKSUM: u32 = 0x0000_0001;
+/// Inode mtime support
+pub const FEATURE_COMPAT_MTIME: u32 = 0x0000_0002;
+/// xattr name filter (bloom filter) support
+pub const FEATURE_COMPAT_XATTR_FILTER: u32 = 0x0000_0004;
+/// Mask of feature_compat bits supported by composefs.
+///
+/// The kernel defines additional compat flags (shared EA in metabox,
+/// plain xattr prefixes, ishare xattrs) that composefs does not use.
+/// Unknown compat bits are rejected by `restrict_to_composefs()`.
+pub const FEATURE_COMPAT_SUPPORTED: u32 =
+    FEATURE_COMPAT_SB_CHKSUM | FEATURE_COMPAT_MTIME | FEATURE_COMPAT_XATTR_FILTER;
+
+// feature_incompat flags
+/// LZ4 zero-padding for decompression
+pub const FEATURE_INCOMPAT_LZ4_0PADDING: u32 = 0x0000_0001;
+/// Compression configs / big physical clusters
+pub const FEATURE_INCOMPAT_COMPR_CFGS: u32 = 0x0000_0002;
+/// Chunk-based file data (used by composefs for external files)
+pub const FEATURE_INCOMPAT_CHUNKED_FILE: u32 = 0x0000_0004;
+/// Multi-device support / compression head type 2
+pub const FEATURE_INCOMPAT_DEVICE_TABLE: u32 = 0x0000_0008;
+/// Compressed tail packing
+pub const FEATURE_INCOMPAT_ZTAILPACKING: u32 = 0x0000_0010;
+/// Fragment / dedup support
+pub const FEATURE_INCOMPAT_FRAGMENTS: u32 = 0x0000_0020;
+/// Custom xattr name prefixes
+pub const FEATURE_INCOMPAT_XATTR_PREFIXES: u32 = 0x0000_0040;
+/// 48-bit block addressing
+pub const FEATURE_INCOMPAT_48BIT: u32 = 0x0000_0080;
+/// Metabox inodes
+pub const FEATURE_INCOMPAT_METABOX: u32 = 0x0000_0100;
 
 /// EROFS filesystem superblock structure
 #[derive(Default, FromBytes, Immutable, IntoBytes, KnownLayout)]
