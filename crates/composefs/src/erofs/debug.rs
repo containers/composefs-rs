@@ -179,14 +179,16 @@ impl<T: fmt::Debug + InodeHeader> fmt::Debug for Inode<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Debug::fmt(&self.header, f)?;
 
-        if let Some(xattrs) = self.xattrs() {
+        if let Some(xattrs) = self.xattrs().map_err(|_| fmt::Error)? {
             write_fields!(f, self, xattrs.header, name_filter; shared_count; reserved);
 
-            if !xattrs.shared().is_empty() {
-                write_with_offset!(f, self, "shared xattrs", xattrs.shared())?;
+            let shared = xattrs.shared().map_err(|_| fmt::Error)?;
+            if !shared.is_empty() {
+                write_with_offset!(f, self, "shared xattrs", shared)?;
             }
 
-            for xattr in xattrs.local() {
+            for xattr in xattrs.local().map_err(|_| fmt::Error)? {
+                let xattr = xattr.map_err(|_| fmt::Error)?;
                 write_with_offset!(f, self, "xattr", xattr)?;
             }
         }
@@ -203,7 +205,7 @@ impl<T: fmt::Debug + InodeHeader> fmt::Debug for Inode<T> {
 
         // Directory dump
         if self.header.mode().is_dir() {
-            let dir = DirectoryBlock::ref_from_bytes(inline).unwrap();
+            let dir = DirectoryBlock::ref_from_bytes(inline).map_err(|_| fmt::Error)?;
             let offset = addr!(dir) - addr!(self);
             return write!(
                 f,
@@ -225,7 +227,8 @@ impl<T: fmt::Debug + InodeHeader> fmt::Debug for Inode<T> {
 
 impl fmt::Debug for DirectoryBlock {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        for entry in self.entries() {
+        for entry in self.entries().map_err(|_| fmt::Error)? {
+            let entry = entry.map_err(|_| fmt::Error)?;
             writeln!(f)?;
             write_fields!(f, self, entry.header, inode_offset; name_offset; file_type; reserved);
             writeln!(
@@ -338,7 +341,8 @@ impl<'img> ImageVisitor<'img> {
     }
 
     fn visit_directory_block(&mut self, block: &DirectoryBlock, path: &Path) -> Result<()> {
-        for entry in block.entries() {
+        for entry in block.entries()? {
+            let entry = entry?;
             if entry.name == b"." || entry.name == b".." {
                 // TODO: maybe we want to follow those and let deduplication happen
                 continue;
@@ -363,8 +367,8 @@ impl<'img> ImageVisitor<'img> {
             return Ok(());
         }
 
-        if let Some(xattrs) = inode.xattrs() {
-            for id in xattrs.shared() {
+        if let Some(xattrs) = inode.xattrs()? {
+            for id in xattrs.shared()? {
                 self.note(
                     SegmentType::XAttr(self.image.shared_xattr(id.get())?),
                     Some(path),
@@ -374,7 +378,8 @@ impl<'img> ImageVisitor<'img> {
 
         if inode.mode().is_dir() {
             if let Some(inline) = inode.inline() {
-                let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
+                let inline_block = DirectoryBlock::ref_from_bytes(inline)
+                    .map_err(|_| anyhow::anyhow!("invalid inline directory block"))?;
                 self.visit_directory_block(inline_block, path)?;
             }
 
