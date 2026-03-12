@@ -23,10 +23,27 @@ pub mod generic_tree;
 #[cfg(any(test, feature = "test"))]
 pub mod test;
 
-/// All files that contain 64 or fewer bytes (size <= INLINE_CONTENT_MAX) should be stored inline
-/// in the erofs image (and also in splitstreams).  All files with 65 or more bytes (size > MAX)
-/// should be written to the object storage and referred to from the image (and splitstreams).
-pub const INLINE_CONTENT_MAX: usize = 64;
+/// Files with this many bytes or fewer are stored inline in the erofs image
+/// (and in splitstreams).  Files above this threshold are written to object
+/// storage and referenced via overlay metacopy xattrs.
+///
+/// Changing this value is effectively a format break: it affects which files
+/// get fs-verity checksums (external) vs. which are stored directly (inline),
+/// so images produced with different thresholds are not interchangeable.
+/// A future composefs format version may change this size
+/// (see <https://github.com/composefs/composefs-rs/issues/107>).
+///
+/// For the *parsing* safety bound enforced when reading untrusted input, see
+/// [`MAX_INLINE_CONTENT`].
+pub const INLINE_CONTENT_MAX_V0: usize = 64;
+
+/// Maximum inline content size accepted when parsing untrusted input (dumpfiles,
+/// EROFS images in composefs-restricted mode).
+///
+/// This is intentionally higher than [`INLINE_CONTENT_MAX_V0`] to allow for future
+/// increases to the inline threshold (see
+/// <https://github.com/composefs/composefs-rs/issues/107>).
+pub const MAX_INLINE_CONTENT: usize = 512;
 
 /// Internal constants shared across workspace crates.
 ///
