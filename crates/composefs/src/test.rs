@@ -101,7 +101,7 @@ pub(crate) mod proptest_strategies {
     use crate::{
         fsverity::FsVerityHashValue,
         tree::{self, RegularFile},
-        INLINE_CONTENT_MAX,
+        INLINE_CONTENT_MAX_V0,
     };
 
     /// Maximum filename length (single directory entry name) on Linux.
@@ -245,11 +245,11 @@ pub(crate) mod proptest_strategies {
     fn leaf_content_spec() -> impl Strategy<Value = LeafContentSpec> {
         // Generate 64 random bytes — enough for both Sha256 (32) and Sha512 (64).
         // build_filesystem will truncate to the right size.
-        // Inline file data is capped at INLINE_CONTENT_MAX (64 bytes) to match
+        // Inline file data is capped at INLINE_CONTENT_MAX_V0 (64 bytes) to match
         // the composefs invariant: larger files must be external (ChunkBased).
         (
             0..10u8,
-            prop::collection::vec(any::<u8>(), 0..=INLINE_CONTENT_MAX),
+            prop::collection::vec(any::<u8>(), 0..=INLINE_CONTENT_MAX_V0),
             symlink_target(),
             prop::collection::vec(any::<u8>(), 64..=64),
             1..=1_000_000u64,

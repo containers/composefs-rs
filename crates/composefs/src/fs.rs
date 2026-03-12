@@ -34,7 +34,7 @@ use crate::{
     repository::Repository,
     tree::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
     util::proc_self_fd,
-    INLINE_CONTENT_MAX,
+    INLINE_CONTENT_MAX_V0,
 };
 
 /// Attempt to use O_TMPFILE + rename to atomically set file contents.
@@ -234,7 +234,7 @@ impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
                 }
                 let buffer = Box::from(buffer);
 
-                if buf.st_size > INLINE_CONTENT_MAX as i64 {
+                if buf.st_size > INLINE_CONTENT_MAX_V0 as i64 {
                     let id = if let Some(repo) = self.repo {
                         repo.ensure_object(&buffer)?
                     } else {
