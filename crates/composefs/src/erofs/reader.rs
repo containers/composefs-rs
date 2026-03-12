@@ -20,8 +20,8 @@ use super::{
     composefs::OverlayMetacopy,
     format::{
         CompactInodeHeader, ComposefsHeader, DataLayout, DirectoryEntryHeader, ExtendedInodeHeader,
-        InodeXAttrHeader, ModeField, Superblock, XAttrHeader, S_IFBLK, S_IFCHR, S_IFIFO, S_IFLNK,
-        S_IFMT, S_IFREG, S_IFSOCK, XATTR_PREFIXES,
+        InodeXAttrHeader, ModeField, Superblock, XAttrHeader, BLOCK_BITS, S_IFBLK, S_IFCHR,
+        S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, XATTR_PREFIXES,
     },
 };
 use crate::fsverity::FsVerityHashValue;
@@ -396,6 +396,8 @@ pub struct Image<'i> {
     pub inodes: &'i [u8],
     /// Extended attributes region
     pub xattrs: &'i [u8],
+    /// When true, enforce composefs-specific invariants.
+    composefs_restricted: bool,
 }
 
 /// Default maximum image size (1 GiB). Composefs images are metadata-only
@@ -454,7 +456,30 @@ impl<'img> Image<'img> {
             sb,
             inodes,
             xattrs,
+            composefs_restricted: false,
         })
+    }
+
+    /// Enable composefs-specific validation.
+    ///
+    /// Composefs images are metadata-only EROFS images with well-known
+    /// structural constraints.  When enabled, the parser enforces:
+    ///
+    /// - `blkszbits` must be 12 (4096-byte blocks)
+    /// - For non-ChunkBased inodes (directories, inline files, symlinks,
+    ///   devices), `size` must not exceed the image size — their data is
+    ///   stored within the image itself.  ChunkBased (external) files are
+    ///   exempt because their `size` reflects the real file on the
+    ///   underlying filesystem.
+    pub fn restrict_to_composefs(mut self) -> Result<Self, ErofsReaderError> {
+        if self.blkszbits != BLOCK_BITS {
+            return Err(ErofsReaderError::InvalidImage(format!(
+                "composefs requires blkszbits={BLOCK_BITS}, got {}",
+                self.blkszbits,
+            )));
+        }
+        self.composefs_restricted = true;
+        Ok(self)
     }
 
     /// Returns an inode by its ID
@@ -556,6 +581,22 @@ impl<'img> Image<'img> {
     /// This prevents crafted images from producing astronomically large block
     /// ranges that would cause iteration timeouts.
     pub fn inode_blocks(&self, inode: &InodeType) -> Result<Range<u64>, ErofsReaderError> {
+        // In composefs mode, non-ChunkBased inodes store all their data
+        // within the image (inline or in data blocks), so their size
+        // cannot exceed the image size.  ChunkBased (external) files are
+        // exempt — their size reflects the real file on the underlying fs.
+        if self.composefs_restricted {
+            let layout = inode.data_layout()?;
+            if !matches!(layout, DataLayout::ChunkBased) {
+                let size = inode.size();
+                if size > self.image.len() as u64 {
+                    return Err(ErofsReaderError::InvalidImage(format!(
+                        "inode size {size} exceeds image size {}",
+                        self.image.len(),
+                    )));
+                }
+            }
+        }
         let range = inode.raw_blocks(self.blkszbits)?;
         if !range.is_empty() {
             let max_block = (self.image.len() / self.block_size) as u64;
@@ -895,7 +936,7 @@ impl<ObjectID: FsVerityHashValue> ObjectCollector<ObjectID> {
 ///
 /// Returns a set of all referenced object IDs.
 pub fn collect_objects<ObjectID: FsVerityHashValue>(image: &[u8]) -> ReadResult<HashSet<ObjectID>> {
-    let img = Image::open(image)?;
+    let img = Image::open(image)?.restrict_to_composefs()?;
     let mut this = ObjectCollector {
         visited_nids: HashSet::new(),
         nids_to_visit: BTreeSet::new(),
@@ -1194,7 +1235,7 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
 pub fn erofs_to_filesystem<ObjectID: FsVerityHashValue>(
     image_data: &[u8],
 ) -> anyhow::Result<tree::FileSystem<ObjectID>> {
-    let img = Image::open(image_data)?;
+    let img = Image::open(image_data)?.restrict_to_composefs()?;
     let root_inode = img.root()?;
 
     let root_stat = stat_from_inode_for_tree(&img, &root_inode)?;
@@ -1694,12 +1735,16 @@ mod tests {
 
     #[test]
     fn test_erofs_to_filesystem_external_file() {
-        // External file with a known fsverity digest
+        // External file with a known fsverity digest.
+        // Use a size much larger than the image to verify that
+        // restrict_to_composefs() allows large sizes for ChunkBased
+        // (external) files — their size reflects the real file on
+        // the underlying filesystem, not data stored in the image.
         let digest = "a".repeat(64);
         let pathname = format!("{}/{}", &digest[..2], &digest[2..]);
         let dumpfile = format!(
             "/ 4096 40755 2 0 0 0 1000.0 - - -\n\
-             /ext 1024 100644 1 0 0 0 1000.0 {pathname} - {digest}\n"
+             /ext 1000000000 100644 1 0 0 0 1000.0 {pathname} - {digest}\n"
         );
         let (orig, rt) = round_trip_dumpfile(&dumpfile);
         assert_eq!(orig, rt);
