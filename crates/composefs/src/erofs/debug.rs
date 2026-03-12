@@ -383,13 +383,13 @@ impl<'img> ImageVisitor<'img> {
                 self.visit_directory_block(inline_block, path)?;
             }
 
-            for id in inode.blocks(self.image.blkszbits)? {
+            for id in self.image.inode_blocks(&inode)? {
                 let block = self.image.directory_block(id)?;
                 self.visit_directory_block(block, path)?;
                 self.note(SegmentType::DirectoryBlock(block), Some(path))?;
             }
         } else {
-            for id in inode.blocks(self.image.blkszbits)? {
+            for id in self.image.inode_blocks(&inode)? {
                 let block = self.image.data_block(id)?;
                 self.note(SegmentType::DataBlock(block), Some(path))?;
             }
