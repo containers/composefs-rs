@@ -345,7 +345,7 @@ impl<'img> ImageVisitor<'img> {
     }
 
     fn visit_inode(&mut self, id: u64, path: &Path) -> Result<()> {
-        let inode = self.image.inode(id);
+        let inode = self.image.inode(id)?;
         let segment = match inode {
             InodeType::Compact(inode) => SegmentType::CompactInode(inode),
             InodeType::Extended(inode) => SegmentType::ExtendedInode(inode),
@@ -359,7 +359,7 @@ impl<'img> ImageVisitor<'img> {
         if let Some(xattrs) = inode.xattrs() {
             for id in xattrs.shared() {
                 self.note(
-                    SegmentType::XAttr(self.image.shared_xattr(id.get())),
+                    SegmentType::XAttr(self.image.shared_xattr(id.get())?),
                     Some(path),
                 )?;
             }
@@ -371,14 +371,14 @@ impl<'img> ImageVisitor<'img> {
                 self.visit_directory_block(inline_block, path)?;
             }
 
-            for id in inode.blocks(self.image.blkszbits) {
-                let block = self.image.directory_block(id);
+            for id in inode.blocks(self.image.blkszbits)? {
+                let block = self.image.directory_block(id)?;
                 self.visit_directory_block(block, path)?;
                 self.note(SegmentType::DirectoryBlock(block), Some(path))?;
             }
         } else {
-            for id in inode.blocks(self.image.blkszbits) {
-                let block = self.image.data_block(id);
+            for id in inode.blocks(self.image.blkszbits)? {
+                let block = self.image.data_block(id)?;
                 self.note(SegmentType::DataBlock(block), Some(path))?;
             }
         }
@@ -439,11 +439,15 @@ pub fn dump_unassigned(
 /// Walks the entire image structure, outputting formatted information about
 /// all inodes, blocks, xattrs, and padding. Also produces space usage statistics.
 pub fn debug_img(output: &mut impl std::io::Write, data: &[u8]) -> Result<()> {
-    let image = Image::open(data);
+    let image = Image::open(data)?;
     let visited = ImageVisitor::visit_image(&image)?;
 
-    let inode_start = (image.sb.meta_blkaddr.get() as usize) << image.sb.blkszbits;
-    let xattr_start = (image.sb.xattr_blkaddr.get() as usize) << image.sb.blkszbits;
+    let inode_start = (image.sb.meta_blkaddr.get() as usize)
+        .checked_mul(image.block_size)
+        .ok_or_else(|| anyhow::anyhow!("inode start offset overflow"))?;
+    let xattr_start = (image.sb.xattr_blkaddr.get() as usize)
+        .checked_mul(image.block_size)
+        .ok_or_else(|| anyhow::anyhow!("xattr start offset overflow"))?;
 
     let mut space_stats = BTreeMap::new();
     let mut padding_stats = BTreeMap::new();
@@ -490,15 +494,19 @@ pub fn debug_img(output: &mut impl std::io::Write, data: &[u8]) -> Result<()> {
                 writeln!(output, "{offset:08x} {sb:?}")?;
             }
             SegmentType::CompactInode(inode) => {
-                writeln!(output, "# nid #{}", (offset - inode_start) / 32)?;
+                writeln!(output, "# nid #{}", offset.saturating_sub(inode_start) / 32)?;
                 writeln!(output, "{offset:08x} {inode:#?}")?;
             }
             SegmentType::ExtendedInode(inode) => {
-                writeln!(output, "# nid #{}", (offset - inode_start) / 32)?;
+                writeln!(output, "# nid #{}", offset.saturating_sub(inode_start) / 32)?;
                 writeln!(output, "{offset:08x} {inode:#?}")?;
             }
             SegmentType::XAttr(xattr) => {
-                writeln!(output, "# xattr #{}", (offset - xattr_start) / 4)?;
+                writeln!(
+                    output,
+                    "# xattr #{}",
+                    offset.saturating_sub(xattr_start) / 4
+                )?;
                 writeln!(output, "{offset:08x} {xattr:?}")?;
             }
             SegmentType::DirectoryBlock(block) => {
