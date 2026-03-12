@@ -150,13 +150,17 @@ fn hexdump(f: &mut impl fmt::Write, data: &[u8], rel: usize) -> fmt::Result {
 impl fmt::Debug for XAttr {
     // Injective (ie: accounts for every byte in the input)
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let prefix = format::XATTR_PREFIXES
+            .get(self.header.name_index as usize)
+            .and_then(|p| std::str::from_utf8(p).ok())
+            .unwrap_or("?");
         write!(
             f,
             "({} {} {}) {}{} = {}",
             self.header.name_index,
             self.header.name_len,
             self.header.value_size,
-            std::str::from_utf8(format::XATTR_PREFIXES[self.header.name_index as usize]).unwrap(),
+            prefix,
             utf8_or_hex(self.suffix()),
             utf8_or_hex(self.value()),
         )?;
@@ -460,12 +464,14 @@ pub fn debug_img(output: &mut impl std::io::Write, data: &[u8]) -> Result<()> {
 
         match offset.cmp(&start) {
             Ordering::Less => {
-                dump_unassigned(output, offset, &data[offset..start])?;
-                addto(
-                    &mut padding_stats,
-                    &(last_segment_type, segment_type),
-                    start - offset,
-                );
+                if let Some(unassigned) = data.get(offset..start) {
+                    dump_unassigned(output, offset, unassigned)?;
+                    addto(
+                        &mut padding_stats,
+                        &(last_segment_type, segment_type),
+                        start - offset,
+                    );
+                }
                 offset = start;
             }
             Ordering::Greater => {
