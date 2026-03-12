@@ -229,7 +229,7 @@ pub(crate) mod proptest_strategies {
     ///
     /// External file references store raw hash bytes rather than a concrete
     /// `ObjectID` type, so the same spec works with any hash algorithm.
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub enum LeafContentSpec {
         Inline(Vec<u8>),
         /// External file: random hash bytes (truncated to hash size at build time) and size.
@@ -265,7 +265,7 @@ pub(crate) mod proptest_strategies {
     }
 
     /// A hash-type-agnostic leaf node specification.
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub struct LeafSpec {
         pub stat: tree::Stat,
         pub content: LeafContentSpec,
@@ -287,7 +287,7 @@ pub(crate) mod proptest_strategies {
     }
 
     /// Description of a directory to be built, including potential hardlinks.
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub struct DirSpec {
         /// Stat metadata for this directory.
         pub stat: tree::Stat,
@@ -298,7 +298,7 @@ pub(crate) mod proptest_strategies {
     }
 
     /// Description of a filesystem to be built, with hardlink info.
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub struct FsSpec {
         /// Root directory specification.
         pub root: DirSpec,

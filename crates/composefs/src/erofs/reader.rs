@@ -35,7 +35,7 @@ pub fn round_up(n: usize, to: usize) -> usize {
 /// Common interface for accessing inode header fields across different layouts
 pub trait InodeHeader {
     /// Returns the data layout method used by this inode
-    fn data_layout(&self) -> DataLayout;
+    fn data_layout(&self) -> Result<DataLayout, ErofsReaderError>;
     /// Returns the extended attribute inode count
     fn xattr_icount(&self) -> u16;
     /// Returns the file mode
@@ -47,15 +47,34 @@ pub trait InodeHeader {
     /// Returns the number of hard links
     fn nlink(&self) -> u32;
 
+    /// Returns the device number (alias for u())
+    fn rdev(&self) -> u32 {
+        self.u()
+    }
+
+    /// Returns true if this inode is a whiteout entry (character device with rdev == 0).
+    fn is_whiteout(&self) -> bool {
+        let mode = self.mode().0.get();
+        (mode & S_IFMT == S_IFCHR) && (self.rdev() == 0)
+    }
+
     /// Calculates the number of additional bytes after the header
-    fn additional_bytes(&self, blkszbits: u8) -> usize {
-        let block_size = 1 << blkszbits;
-        self.xattr_size()
-            + match self.data_layout() {
+    fn additional_bytes(&self, blkszbits: u8) -> Result<usize, ErofsReaderError> {
+        let block_size: usize = 1usize
+            .checked_shl(blkszbits.into())
+            .ok_or_else(|| ErofsReaderError::InvalidImage("blkszbits overflow".into()))?;
+        let data_layout = self.data_layout()?;
+        Ok(self.xattr_size()
+            + match data_layout {
                 DataLayout::FlatPlain => 0,
-                DataLayout::FlatInline => self.size() as usize % block_size,
+                DataLayout::FlatInline => {
+                    let size = usize::try_from(self.size()).map_err(|_| {
+                        ErofsReaderError::InvalidImage("inode size too large for platform".into())
+                    })?;
+                    size % block_size
+                }
                 DataLayout::ChunkBased => 4,
-            }
+            })
     }
 
     /// Calculates the size of the extended attributes section
@@ -68,8 +87,10 @@ pub trait InodeHeader {
 }
 
 impl InodeHeader for ExtendedInodeHeader {
-    fn data_layout(&self) -> DataLayout {
-        self.format.try_into().unwrap()
+    fn data_layout(&self) -> Result<DataLayout, ErofsReaderError> {
+        self.format.try_into().map_err(|_| {
+            ErofsReaderError::InvalidImage("invalid data layout in inode format".into())
+        })
     }
 
     fn xattr_icount(&self) -> u16 {
@@ -94,8 +115,10 @@ impl InodeHeader for ExtendedInodeHeader {
 }
 
 impl InodeHeader for CompactInodeHeader {
-    fn data_layout(&self) -> DataLayout {
-        self.format.try_into().unwrap()
+    fn data_layout(&self) -> Result<DataLayout, ErofsReaderError> {
+        self.format.try_into().map_err(|_| {
+            ErofsReaderError::InvalidImage("invalid data layout in inode format".into())
+        })
     }
 
     fn xattr_icount(&self) -> u16 {
@@ -158,39 +181,49 @@ impl XAttrHeader {
 
 impl XAttr {
     /// Parses an xattr from a byte slice, returning the xattr and remaining bytes
-    pub fn from_prefix(data: &[u8]) -> (&XAttr, &[u8]) {
-        let header = XAttrHeader::ref_from_bytes(&data[..4]).unwrap();
-        Self::ref_from_prefix_with_elems(data, header.calculate_n_elems()).unwrap()
+    pub fn from_prefix(data: &[u8]) -> Result<(&XAttr, &[u8]), ErofsReaderError> {
+        let header =
+            XAttrHeader::ref_from_bytes(data.get(..4).ok_or(ErofsReaderError::OutOfBounds)?)
+                .map_err(|_| ErofsReaderError::OutOfBounds)?;
+        Self::ref_from_prefix_with_elems(data, header.calculate_n_elems())
+            .map_err(|_| ErofsReaderError::OutOfBounds)
     }
 
     /// Returns the attribute name suffix
-    pub fn suffix(&self) -> &[u8] {
-        &self.data[..self.header.name_len as usize]
+    pub fn suffix(&self) -> Result<&[u8], ErofsReaderError> {
+        self.data
+            .get(..self.header.name_len as usize)
+            .ok_or(ErofsReaderError::OutOfBounds)
     }
 
     /// Returns the attribute value
-    pub fn value(&self) -> &[u8] {
-        &self.data[self.header.name_len as usize..][..self.header.value_size.get() as usize]
+    pub fn value(&self) -> Result<&[u8], ErofsReaderError> {
+        let name_len = self.header.name_len as usize;
+        let value_size = self.header.value_size.get() as usize;
+        self.data
+            .get(name_len..name_len + value_size)
+            .ok_or(ErofsReaderError::OutOfBounds)
     }
 
     /// Returns the padding bytes after the value
-    pub fn padding(&self) -> &[u8] {
-        &self.data[self.header.name_len as usize + self.header.value_size.get() as usize..]
+    pub fn padding(&self) -> Result<&[u8], ErofsReaderError> {
+        let end = self.header.name_len as usize + self.header.value_size.get() as usize;
+        self.data.get(end..).ok_or(ErofsReaderError::OutOfBounds)
     }
 }
 
 /// Operations on inode data
 pub trait InodeOps {
     /// Returns the extended attributes section if present
-    fn xattrs(&self) -> Option<&InodeXAttrs>;
+    fn xattrs(&self) -> Result<Option<&InodeXAttrs>, ErofsReaderError>;
     /// Returns the inline data portion
     fn inline(&self) -> Option<&[u8]>;
     /// Returns the range of block IDs used by this inode
-    fn blocks(&self, blkszbits: u8) -> Range<u64>;
+    fn blocks(&self, blkszbits: u8) -> Result<Range<u64>, ErofsReaderError>;
 }
 
 impl<Header: InodeHeader> InodeHeader for &Inode<Header> {
-    fn data_layout(&self) -> DataLayout {
+    fn data_layout(&self) -> Result<DataLayout, ErofsReaderError> {
         self.header.data_layout()
     }
 
@@ -216,15 +249,20 @@ impl<Header: InodeHeader> InodeHeader for &Inode<Header> {
 }
 
 impl<Header: InodeHeader> InodeOps for &Inode<Header> {
-    fn xattrs(&self) -> Option<&InodeXAttrs> {
+    fn xattrs(&self) -> Result<Option<&InodeXAttrs>, ErofsReaderError> {
         match self.header.xattr_size() {
-            0 => None,
-            n => Some(InodeXAttrs::ref_from_bytes(&self.data[..n]).unwrap()),
+            0 => Ok(None),
+            n => {
+                let data = self.data.get(..n).ok_or(ErofsReaderError::OutOfBounds)?;
+                Ok(Some(
+                    InodeXAttrs::ref_from_bytes(data).map_err(|_| ErofsReaderError::OutOfBounds)?,
+                ))
+            }
         }
     }
 
     fn inline(&self) -> Option<&[u8]> {
-        let data = &self.data[self.header.xattr_size()..];
+        let data = self.data.get(self.header.xattr_size()..)?;
 
         if data.is_empty() {
             return None;
@@ -233,22 +271,29 @@ impl<Header: InodeHeader> InodeOps for &Inode<Header> {
         Some(data)
     }
 
-    fn blocks(&self, blkszbits: u8) -> Range<u64> {
+    fn blocks(&self, blkszbits: u8) -> Result<Range<u64>, ErofsReaderError> {
         let size = self.header.size();
-        let block_size = 1 << blkszbits;
+        let block_size: u64 = 1u64
+            .checked_shl(blkszbits.into())
+            .ok_or_else(|| ErofsReaderError::InvalidImage("blkszbits overflow".into()))?;
         let start = self.header.u() as u64;
+        let data_layout = self.header.data_layout()?;
 
-        match self.header.data_layout() {
+        Ok(match data_layout {
             DataLayout::FlatPlain => Range {
                 start,
-                end: start + size.div_ceil(block_size),
+                end: start
+                    .checked_add(size.div_ceil(block_size))
+                    .ok_or_else(|| ErofsReaderError::InvalidImage("block range overflow".into()))?,
             },
             DataLayout::FlatInline => Range {
                 start,
-                end: start + size / block_size,
+                end: start
+                    .checked_add(size / block_size)
+                    .ok_or_else(|| ErofsReaderError::InvalidImage("block range overflow".into()))?,
             },
             DataLayout::ChunkBased => Range { start, end: start },
-        }
+        })
     }
 }
 
@@ -285,7 +330,7 @@ impl InodeHeader for InodeType<'_> {
         }
     }
 
-    fn data_layout(&self) -> DataLayout {
+    fn data_layout(&self) -> Result<DataLayout, ErofsReaderError> {
         match self {
             Self::Compact(inode) => inode.data_layout(),
             Self::Extended(inode) => inode.data_layout(),
@@ -308,7 +353,7 @@ impl InodeHeader for InodeType<'_> {
 }
 
 impl InodeOps for InodeType<'_> {
-    fn xattrs(&self) -> Option<&InodeXAttrs> {
+    fn xattrs(&self) -> Result<Option<&InodeXAttrs>, ErofsReaderError> {
         match self {
             Self::Compact(inode) => inode.xattrs(),
             Self::Extended(inode) => inode.xattrs(),
@@ -322,7 +367,7 @@ impl InodeOps for InodeType<'_> {
         }
     }
 
-    fn blocks(&self, blkszbits: u8) -> Range<u64> {
+    fn blocks(&self, blkszbits: u8) -> Result<Range<u64>, ErofsReaderError> {
         match self {
             Self::Compact(inode) => inode.blocks(blkszbits),
             Self::Extended(inode) => inode.blocks(blkszbits),
@@ -351,19 +396,37 @@ pub struct Image<'i> {
 
 impl<'img> Image<'img> {
     /// Opens an EROFS image from raw bytes
-    pub fn open(image: &'img [u8]) -> Self {
+    pub fn open(image: &'img [u8]) -> Result<Self, ErofsReaderError> {
         let header = ComposefsHeader::ref_from_prefix(image)
-            .expect("header err")
+            .map_err(|_| ErofsReaderError::InvalidImage("cannot parse header".into()))?
             .0;
-        let sb = Superblock::ref_from_prefix(&image[1024..])
-            .expect("superblock err")
+        let sb_data = image.get(1024..).ok_or_else(|| {
+            ErofsReaderError::InvalidImage("image too small for superblock".into())
+        })?;
+        let sb = Superblock::ref_from_prefix(sb_data)
+            .map_err(|_| ErofsReaderError::InvalidImage("cannot parse superblock".into()))?
             .0;
         let blkszbits = sb.blkszbits;
+        if blkszbits as u32 >= usize::BITS {
+            return Err(ErofsReaderError::InvalidImage(format!(
+                "blkszbits {blkszbits} >= platform word size {}",
+                usize::BITS
+            )));
+        }
         let block_size = 1usize << blkszbits;
-        assert!(block_size != 0);
-        let inodes = &image[sb.meta_blkaddr.get() as usize * block_size..];
-        let xattrs = &image[sb.xattr_blkaddr.get() as usize * block_size..];
-        Image {
+        let inodes_start = (sb.meta_blkaddr.get() as usize)
+            .checked_mul(block_size)
+            .ok_or(ErofsReaderError::OutOfBounds)?;
+        let xattrs_start = (sb.xattr_blkaddr.get() as usize)
+            .checked_mul(block_size)
+            .ok_or(ErofsReaderError::OutOfBounds)?;
+        let inodes = image
+            .get(inodes_start..)
+            .ok_or(ErofsReaderError::OutOfBounds)?;
+        let xattrs = image
+            .get(xattrs_start..)
+            .ok_or(ErofsReaderError::OutOfBounds)?;
+        Ok(Image {
             image,
             header,
             blkszbits,
@@ -371,62 +434,132 @@ impl<'img> Image<'img> {
             sb,
             inodes,
             xattrs,
-        }
+        })
     }
 
     /// Returns an inode by its ID
-    pub fn inode(&self, id: u64) -> InodeType<'_> {
-        let inode_data = &self.inodes[id as usize * 32..];
-        if inode_data[0] & 1 != 0 {
-            let header = ExtendedInodeHeader::ref_from_bytes(&inode_data[..64]).unwrap();
-            InodeType::Extended(
+    pub fn inode(&self, id: u64) -> Result<InodeType<'_>, ErofsReaderError> {
+        let offset = usize::try_from(id)
+            .ok()
+            .and_then(|id| id.checked_mul(32))
+            .ok_or(ErofsReaderError::InvalidInode(id))?;
+        let inode_data = self
+            .inodes
+            .get(offset..)
+            .ok_or(ErofsReaderError::InvalidInode(id))?;
+        let first_byte = *inode_data
+            .first()
+            .ok_or(ErofsReaderError::InvalidInode(id))?;
+        if first_byte & 1 != 0 {
+            let header = ExtendedInodeHeader::ref_from_bytes(
+                inode_data
+                    .get(..64)
+                    .ok_or(ErofsReaderError::InvalidInode(id))?,
+            )
+            .map_err(|_| ErofsReaderError::InvalidInode(id))?;
+            Ok(InodeType::Extended(
                 Inode::<ExtendedInodeHeader>::ref_from_prefix_with_elems(
                     inode_data,
-                    header.additional_bytes(self.blkszbits),
+                    header.additional_bytes(self.blkszbits)?,
                 )
-                .unwrap()
+                .map_err(|_| ErofsReaderError::InvalidInode(id))?
                 .0,
-            )
+            ))
         } else {
-            let header = CompactInodeHeader::ref_from_bytes(&inode_data[..32]).unwrap();
-            InodeType::Compact(
+            let header = CompactInodeHeader::ref_from_bytes(
+                inode_data
+                    .get(..32)
+                    .ok_or(ErofsReaderError::InvalidInode(id))?,
+            )
+            .map_err(|_| ErofsReaderError::InvalidInode(id))?;
+            Ok(InodeType::Compact(
                 Inode::<CompactInodeHeader>::ref_from_prefix_with_elems(
                     inode_data,
-                    header.additional_bytes(self.blkszbits),
+                    header.additional_bytes(self.blkszbits)?,
                 )
-                .unwrap()
+                .map_err(|_| ErofsReaderError::InvalidInode(id))?
                 .0,
-            )
+            ))
         }
     }
 
     /// Returns a shared extended attribute by its ID
-    pub fn shared_xattr(&self, id: u32) -> &XAttr {
-        let xattr_data = &self.xattrs[id as usize * 4..];
-        let header = XAttrHeader::ref_from_bytes(&xattr_data[..4]).unwrap();
-        XAttr::ref_from_prefix_with_elems(xattr_data, header.calculate_n_elems())
-            .unwrap()
-            .0
+    pub fn shared_xattr(&self, id: u32) -> Result<&XAttr, ErofsReaderError> {
+        let start = (id as usize)
+            .checked_mul(4)
+            .ok_or(ErofsReaderError::OutOfBounds)?;
+        let xattr_data = self
+            .xattrs
+            .get(start..)
+            .ok_or(ErofsReaderError::OutOfBounds)?;
+        let header =
+            XAttrHeader::ref_from_bytes(xattr_data.get(..4).ok_or(ErofsReaderError::OutOfBounds)?)
+                .map_err(|_| ErofsReaderError::OutOfBounds)?;
+        Ok(
+            XAttr::ref_from_prefix_with_elems(xattr_data, header.calculate_n_elems())
+                .map_err(|_| ErofsReaderError::OutOfBounds)?
+                .0,
+        )
     }
 
     /// Returns a data block by its ID
-    pub fn block(&self, id: u64) -> &[u8] {
-        &self.image[id as usize * self.block_size..][..self.block_size]
+    pub fn block(&self, id: u64) -> Result<&[u8], ErofsReaderError> {
+        let start = usize::try_from(id)
+            .ok()
+            .and_then(|id| id.checked_mul(self.block_size))
+            .ok_or(ErofsReaderError::OutOfBounds)?;
+        let end = start
+            .checked_add(self.block_size)
+            .ok_or(ErofsReaderError::OutOfBounds)?;
+        self.image
+            .get(start..end)
+            .ok_or(ErofsReaderError::OutOfBounds)
     }
 
     /// Returns a data block by its ID as a DataBlock reference
-    pub fn data_block(&self, id: u64) -> &DataBlock {
-        DataBlock::ref_from_bytes(self.block(id)).unwrap()
+    pub fn data_block(&self, id: u64) -> Result<&DataBlock, ErofsReaderError> {
+        DataBlock::ref_from_bytes(self.block(id)?).map_err(|_| ErofsReaderError::OutOfBounds)
     }
 
     /// Returns a directory block by its ID
-    pub fn directory_block(&self, id: u64) -> &DirectoryBlock {
-        DirectoryBlock::ref_from_bytes(self.block(id)).unwrap()
+    pub fn directory_block(&self, id: u64) -> Result<&DirectoryBlock, ErofsReaderError> {
+        DirectoryBlock::ref_from_bytes(self.block(id)?).map_err(|_| ErofsReaderError::OutOfBounds)
     }
 
     /// Returns the root directory inode
-    pub fn root(&self) -> InodeType<'_> {
+    pub fn root(&self) -> Result<InodeType<'_>, ErofsReaderError> {
         self.inode(self.sb.root_nid.get() as u64)
+    }
+
+    /// Finds a child directory entry by name within a directory inode.
+    ///
+    /// Returns the nid (inode number) of the child if found.
+    pub fn find_child_nid(
+        &self,
+        parent_nid: u64,
+        name: &[u8],
+    ) -> Result<Option<u64>, ErofsReaderError> {
+        let inode = self.inode(parent_nid)?;
+        if let Some(inline) = inode.inline() {
+            if let Ok(block) = DirectoryBlock::ref_from_bytes(inline) {
+                for entry in block.entries()? {
+                    let entry = entry?;
+                    if entry.name == name {
+                        return Ok(Some(entry.nid()));
+                    }
+                }
+            }
+        }
+        for blkid in inode.blocks(self.blkszbits)? {
+            let block = self.directory_block(blkid)?;
+            for entry in block.entries()? {
+                let entry = entry?;
+                if entry.name == name {
+                    return Ok(Some(entry.nid()));
+                }
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -437,18 +570,25 @@ struct Array<T>([T]);
 
 impl InodeXAttrs {
     /// Returns the array of shared xattr IDs
-    pub fn shared(&self) -> &[U32] {
-        &Array::ref_from_prefix_with_elems(&self.data, self.header.shared_count as usize)
-            .unwrap()
-            .0
-             .0
+    pub fn shared(&self) -> Result<&[U32], ErofsReaderError> {
+        Ok(
+            &Array::ref_from_prefix_with_elems(&self.data, self.header.shared_count as usize)
+                .map_err(|_| ErofsReaderError::OutOfBounds)?
+                .0
+                 .0,
+        )
     }
 
     /// Returns an iterator over local (non-shared) xattrs
-    pub fn local(&self) -> XAttrIter<'_> {
-        XAttrIter {
-            data: &self.data[self.header.shared_count as usize * 4..],
-        }
+    pub fn local(&self) -> Result<XAttrIter<'_>, ErofsReaderError> {
+        let offset = (self.header.shared_count as usize)
+            .checked_mul(4)
+            .ok_or(ErofsReaderError::OutOfBounds)?;
+        let data = self
+            .data
+            .get(offset..)
+            .ok_or(ErofsReaderError::OutOfBounds)?;
+        Ok(XAttrIter { data })
     }
 }
 
@@ -459,13 +599,20 @@ pub struct XAttrIter<'img> {
 }
 
 impl<'img> Iterator for XAttrIter<'img> {
-    type Item = &'img XAttr;
+    type Item = Result<&'img XAttr, ErofsReaderError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if !self.data.is_empty() {
-            let (result, rest) = XAttr::from_prefix(self.data);
-            self.data = rest;
-            Some(result)
+            match XAttr::from_prefix(self.data) {
+                Ok((result, rest)) => {
+                    self.data = rest;
+                    Some(Ok(result))
+                }
+                Err(e) => {
+                    self.data = &[]; // stop iteration on error
+                    Some(Err(e))
+                }
+            }
         } else {
             None
         }
@@ -484,36 +631,49 @@ pub struct DirectoryBlock(pub [u8]);
 
 impl DirectoryBlock {
     /// Returns the directory entry header at the given index
-    pub fn get_entry_header(&self, n: usize) -> &DirectoryEntryHeader {
-        let entry_data = &self.0
-            [n * size_of::<DirectoryEntryHeader>()..(n + 1) * size_of::<DirectoryEntryHeader>()];
-        DirectoryEntryHeader::ref_from_bytes(entry_data).unwrap()
+    pub fn get_entry_header(&self, n: usize) -> Result<&DirectoryEntryHeader, ErofsReaderError> {
+        let start = n
+            .checked_mul(size_of::<DirectoryEntryHeader>())
+            .ok_or(ErofsReaderError::OutOfBounds)?;
+        let end = start
+            .checked_add(size_of::<DirectoryEntryHeader>())
+            .ok_or(ErofsReaderError::OutOfBounds)?;
+        let entry_data = self
+            .0
+            .get(start..end)
+            .ok_or(ErofsReaderError::OutOfBounds)?;
+        DirectoryEntryHeader::ref_from_bytes(entry_data).map_err(|_| ErofsReaderError::OutOfBounds)
     }
 
     /// Returns all directory entry headers as a slice
-    pub fn get_entry_headers(&self) -> &[DirectoryEntryHeader] {
-        &Array::ref_from_prefix_with_elems(&self.0, self.n_entries())
-            .unwrap()
+    pub fn get_entry_headers(&self) -> Result<&[DirectoryEntryHeader], ErofsReaderError> {
+        let n = self.n_entries()?;
+        Ok(&Array::ref_from_prefix_with_elems(&self.0, n)
+            .map_err(|_| ErofsReaderError::OutOfBounds)?
             .0
-             .0
+             .0)
     }
 
     /// Returns the number of entries in this directory block
-    pub fn n_entries(&self) -> usize {
-        let first = self.get_entry_header(0);
+    pub fn n_entries(&self) -> Result<usize, ErofsReaderError> {
+        let first = self.get_entry_header(0)?;
         let offset = first.name_offset.get();
-        assert!(offset != 0);
-        assert!(offset.is_multiple_of(12));
-        offset as usize / 12
+        if offset == 0 || !offset.is_multiple_of(12) {
+            return Err(ErofsReaderError::InvalidImage(
+                "invalid directory entry name_offset".into(),
+            ));
+        }
+        Ok(offset as usize / 12)
     }
 
     /// Returns an iterator over directory entries
-    pub fn entries(&self) -> DirectoryEntries<'_> {
-        DirectoryEntries {
+    pub fn entries(&self) -> Result<DirectoryEntries<'_>, ErofsReaderError> {
+        let length = self.n_entries()?;
+        Ok(DirectoryEntries {
             block: self,
-            length: self.n_entries(),
+            length,
             position: 0,
-        }
+        })
     }
 }
 
@@ -528,7 +688,8 @@ pub struct DirectoryEntry<'a> {
 }
 
 impl DirectoryEntry<'_> {
-    fn nid(&self) -> u64 {
+    /// Returns the inode ID (nid) that this directory entry points to.
+    pub fn nid(&self) -> u64 {
         self.header.inode_offset.get()
     }
 }
@@ -542,25 +703,42 @@ pub struct DirectoryEntries<'d> {
 }
 
 impl<'d> Iterator for DirectoryEntries<'d> {
-    type Item = DirectoryEntry<'d>;
+    type Item = Result<DirectoryEntry<'d>, ErofsReaderError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.position < self.length {
-            let header = self.block.get_entry_header(self.position);
-            let name_start = header.name_offset.get() as usize;
-            self.position += 1;
+            let result = (|| {
+                let header = self.block.get_entry_header(self.position)?;
+                let name_start = header.name_offset.get() as usize;
+                self.position += 1;
 
-            let name = if self.position == self.length {
-                let with_padding = &self.block.0[name_start..];
-                let end = with_padding.partition_point(|c| *c != 0);
-                &with_padding[..end]
-            } else {
-                let next = self.block.get_entry_header(self.position);
-                let name_end = next.name_offset.get() as usize;
-                &self.block.0[name_start..name_end]
-            };
+                let name = if self.position == self.length {
+                    let with_padding = self
+                        .block
+                        .0
+                        .get(name_start..)
+                        .ok_or(ErofsReaderError::OutOfBounds)?;
+                    let end = with_padding.partition_point(|c| *c != 0);
+                    with_padding
+                        .get(..end)
+                        .ok_or(ErofsReaderError::OutOfBounds)?
+                } else {
+                    let next = self.block.get_entry_header(self.position)?;
+                    let name_end = next.name_offset.get() as usize;
+                    self.block
+                        .0
+                        .get(name_start..name_end)
+                        .ok_or(ErofsReaderError::OutOfBounds)?
+                };
 
-            Some(DirectoryEntry { header, name })
+                Ok(DirectoryEntry { header, name })
+            })();
+
+            if result.is_err() {
+                // Stop iteration on error
+                self.position = self.length;
+            }
+            Some(result)
         } else {
             None
         }
@@ -570,6 +748,15 @@ impl<'d> Iterator for DirectoryEntries<'d> {
 /// Errors that can occur when reading EROFS images
 #[derive(Error, Debug)]
 pub enum ErofsReaderError {
+    /// Invalid EROFS image data
+    #[error("Invalid image: {0}")]
+    InvalidImage(String),
+    /// Invalid inode ID
+    #[error("Invalid inode: {0}")]
+    InvalidInode(u64),
+    /// Offset or index out of bounds
+    #[error("Offset out of bounds")]
+    OutOfBounds,
     /// Directory has multiple hard links (not allowed)
     #[error("Hardlinked directories detected")]
     DirectoryHardlinks,
@@ -598,33 +785,35 @@ pub struct ObjectCollector<ObjectID: FsVerityHashValue> {
 }
 
 impl<ObjectID: FsVerityHashValue> ObjectCollector<ObjectID> {
-    fn visit_xattr(&mut self, attr: &XAttr) {
+    fn visit_xattr(&mut self, attr: &XAttr) -> Result<(), ErofsReaderError> {
         // This is the index of "trusted".  See XATTR_PREFIXES in format.rs.
         if attr.header.name_index != 4 {
-            return;
+            return Ok(());
         }
-        if attr.suffix() != b"overlay.metacopy" {
-            return;
+        if attr.suffix()? != b"overlay.metacopy" {
+            return Ok(());
         }
-        if let Ok(value) = OverlayMetacopy::read_from_bytes(attr.value()) {
+        if let Ok(value) = OverlayMetacopy::read_from_bytes(attr.value()?) {
             if value.valid() {
                 self.objects.insert(value.digest);
             }
         }
+        Ok(())
     }
 
     fn visit_xattrs(&mut self, img: &Image, xattrs: &InodeXAttrs) -> ReadResult<()> {
-        for id in xattrs.shared() {
-            self.visit_xattr(img.shared_xattr(id.get()));
+        for id in xattrs.shared()? {
+            self.visit_xattr(img.shared_xattr(id.get())?)?;
         }
-        for attr in xattrs.local() {
-            self.visit_xattr(attr);
+        for attr in xattrs.local()? {
+            self.visit_xattr(attr?)?;
         }
         Ok(())
     }
 
-    fn visit_directory_block(&mut self, block: &DirectoryBlock) {
-        for entry in block.entries() {
+    fn visit_directory_block(&mut self, block: &DirectoryBlock) -> ReadResult<()> {
+        for entry in block.entries()? {
+            let entry = entry?;
             if entry.name != b"." && entry.name != b".." {
                 let nid = entry.nid();
                 if !self.visited_nids.contains(&nid) {
@@ -632,26 +821,28 @@ impl<ObjectID: FsVerityHashValue> ObjectCollector<ObjectID> {
                 }
             }
         }
+        Ok(())
     }
 
     fn visit_nid(&mut self, img: &Image, nid: u64) -> ReadResult<()> {
         let first_time = self.visited_nids.insert(nid);
         assert!(first_time); // should not have been added to the "to visit" list otherwise
 
-        let inode = img.inode(nid);
+        let inode = img.inode(nid)?;
 
-        if let Some(xattrs) = inode.xattrs() {
+        if let Some(xattrs) = inode.xattrs()? {
             self.visit_xattrs(img, xattrs)?;
         }
 
         if inode.mode().is_dir() {
-            for blkid in inode.blocks(img.sb.blkszbits) {
-                self.visit_directory_block(img.directory_block(blkid));
+            for blkid in inode.blocks(img.sb.blkszbits)? {
+                self.visit_directory_block(img.directory_block(blkid)?)?;
             }
 
             if let Some(inline) = inode.inline() {
-                let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
-                self.visit_directory_block(inline_block);
+                let inline_block = DirectoryBlock::ref_from_bytes(inline)
+                    .map_err(|_| ErofsReaderError::OutOfBounds)?;
+                self.visit_directory_block(inline_block)?;
             }
         }
 
@@ -666,7 +857,7 @@ impl<ObjectID: FsVerityHashValue> ObjectCollector<ObjectID> {
 ///
 /// Returns a set of all referenced object IDs.
 pub fn collect_objects<ObjectID: FsVerityHashValue>(image: &[u8]) -> ReadResult<HashSet<ObjectID>> {
-    let img = Image::open(image);
+    let img = Image::open(image)?;
     let mut this = ObjectCollector {
         visited_nids: HashSet::new(),
         nids_to_visit: BTreeSet::new(),
@@ -683,29 +874,35 @@ pub fn collect_objects<ObjectID: FsVerityHashValue>(image: &[u8]) -> ReadResult<
 }
 
 /// Construct the full xattr name from a prefix index and suffix.
-fn construct_xattr_name(xattr: &XAttr) -> Vec<u8> {
-    let prefix = XATTR_PREFIXES[xattr.header.name_index as usize];
-    let suffix = xattr.suffix();
+fn construct_xattr_name(xattr: &XAttr) -> Result<Vec<u8>, ErofsReaderError> {
+    let prefix = *XATTR_PREFIXES
+        .get(xattr.header.name_index as usize)
+        .ok_or_else(|| {
+            ErofsReaderError::InvalidImage(format!(
+                "xattr name_index {} out of range",
+                xattr.header.name_index
+            ))
+        })?;
+    let suffix = xattr.suffix()?;
     let mut full_name = Vec::with_capacity(prefix.len() + suffix.len());
     full_name.extend_from_slice(prefix);
     full_name.extend_from_slice(suffix);
-    full_name
+    Ok(full_name)
 }
 
 /// Build a `tree::Stat` from an erofs inode, reversing the xattr namespace
 /// transformations applied by the writer:
 /// - Strips `trusted.overlay.metacopy` and `trusted.overlay.redirect`
 /// - Unescapes `trusted.overlay.overlay.X` back to `trusted.overlay.X`
-fn stat_from_inode_for_tree(img: &Image, inode: &InodeType) -> tree::Stat {
+fn stat_from_inode_for_tree(img: &Image, inode: &InodeType) -> anyhow::Result<tree::Stat> {
     let (st_mode, st_uid, st_gid, st_mtim_sec) = match inode {
         InodeType::Compact(inode) => (
             inode.header.mode.0.get() as u32 & 0o7777,
             inode.header.uid.get() as u32,
             inode.header.gid.get() as u32,
-            // Compact inodes don't store mtime; the writer uses build_time
-            // but for round-trip purposes, 0 matches what was written for
-            // compact headers (the writer always uses ExtendedInodeHeader)
-            0i64,
+            // Compact inodes don't store mtime; use superblock build_time
+            // (the writer sets build_time = min mtime across all inodes)
+            img.sb.build_time.get() as i64,
         ),
         InodeType::Extended(inode) => (
             inode.header.mode.0.get() as u32 & 0o7777,
@@ -717,67 +914,74 @@ fn stat_from_inode_for_tree(img: &Image, inode: &InodeType) -> tree::Stat {
 
     let mut xattrs = BTreeMap::new();
 
-    if let Some(xattrs_section) = inode.xattrs() {
+    if let Some(xattrs_section) = inode.xattrs()? {
         // Process shared xattrs
-        for id in xattrs_section.shared() {
-            let xattr = img.shared_xattr(id.get());
-            if let Some((name, value)) = transform_xattr(xattr) {
+        for id in xattrs_section.shared()? {
+            let xattr = img.shared_xattr(id.get())?;
+            if let Some((name, value)) = transform_xattr(xattr)? {
                 xattrs.insert(name, value);
             }
         }
         // Process local xattrs
-        for xattr in xattrs_section.local() {
-            if let Some((name, value)) = transform_xattr(xattr) {
+        for xattr in xattrs_section.local()? {
+            let xattr = xattr?;
+            if let Some((name, value)) = transform_xattr(xattr)? {
                 xattrs.insert(name, value);
             }
         }
     }
 
-    tree::Stat {
+    Ok(tree::Stat {
         st_mode,
         st_uid,
         st_gid,
         st_mtim_sec,
         xattrs: RefCell::new(xattrs),
-    }
+    })
 }
 
 /// Transform a single xattr, reversing writer escaping.
 /// Returns None for internal overlay xattrs that should be stripped.
-fn transform_xattr(xattr: &XAttr) -> Option<(Box<OsStr>, Box<[u8]>)> {
-    let full_name = construct_xattr_name(xattr);
+#[allow(clippy::type_complexity)]
+fn transform_xattr(xattr: &XAttr) -> anyhow::Result<Option<(Box<OsStr>, Box<[u8]>)>> {
+    let full_name = construct_xattr_name(xattr)?;
 
     // Skip internal overlay xattrs added by the writer
     if full_name == b"trusted.overlay.metacopy" || full_name == b"trusted.overlay.redirect" {
-        return None;
+        return Ok(None);
     }
 
     // Unescape: trusted.overlay.overlay.X -> trusted.overlay.X
-    let final_name = if let Some(rest) = full_name.strip_prefix(b"trusted.overlay.overlay.") {
+    if let Some(rest) = full_name.strip_prefix(b"trusted.overlay.overlay.") {
         let mut unescaped = b"trusted.overlay.".to_vec();
         unescaped.extend_from_slice(rest);
-        unescaped
-    } else {
-        full_name
-    };
+        let name = Box::from(OsStr::from_bytes(&unescaped));
+        let value = Box::from(xattr.value()?);
+        return Ok(Some((name, value)));
+    }
+    // Skip all other trusted.overlay.* xattrs (internal to composefs)
+    if full_name.starts_with(b"trusted.overlay.") {
+        return Ok(None);
+    }
 
-    let name = Box::from(OsStr::from_bytes(&final_name));
-    let value = Box::from(xattr.value());
-    Some((name, value))
+    // Keep all non-trusted.overlay.* xattrs
+    let name = Box::from(OsStr::from_bytes(&full_name));
+    let value = Box::from(xattr.value()?);
+    Ok(Some((name, value)))
 }
 
 /// Extract file data from an inode (inline and block data combined).
-fn extract_all_file_data(img: &Image, inode: &InodeType) -> Vec<u8> {
-    let file_size = inode.size() as usize;
+fn extract_all_file_data(img: &Image, inode: &InodeType) -> anyhow::Result<Vec<u8>> {
+    let file_size = (inode.size() as usize).min(img.image.len());
     if file_size == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let mut data = Vec::with_capacity(file_size);
 
     // Read block data first
-    for blkid in inode.blocks(img.blkszbits) {
-        let block = img.block(blkid);
+    for blkid in inode.blocks(img.blkszbits)? {
+        let block = img.block(blkid)?;
         data.extend_from_slice(block);
     }
 
@@ -787,75 +991,89 @@ fn extract_all_file_data(img: &Image, inode: &InodeType) -> Vec<u8> {
     }
 
     data.truncate(file_size);
-    data
+    Ok(data)
 }
 
 /// Try to extract a metacopy digest from an inode's xattrs.
 fn extract_metacopy_digest<ObjectID: FsVerityHashValue>(
     img: &Image,
     inode: &InodeType,
-) -> Option<ObjectID> {
-    let xattrs_section = inode.xattrs()?;
+) -> anyhow::Result<Option<ObjectID>> {
+    let Some(xattrs_section) = inode.xattrs()? else {
+        return Ok(None);
+    };
 
-    for id in xattrs_section.shared() {
-        let xattr = img.shared_xattr(id.get());
-        if let Some(digest) = check_metacopy_xattr(xattr) {
-            return Some(digest);
+    for id in xattrs_section.shared()? {
+        let xattr = img.shared_xattr(id.get())?;
+        if let Some(digest) = check_metacopy_xattr(xattr)? {
+            return Ok(Some(digest));
         }
     }
-    for xattr in xattrs_section.local() {
-        if let Some(digest) = check_metacopy_xattr(xattr) {
-            return Some(digest);
+    for xattr in xattrs_section.local()? {
+        let xattr = xattr?;
+        if let Some(digest) = check_metacopy_xattr(xattr)? {
+            return Ok(Some(digest));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Check if a single xattr is a valid overlay.metacopy and return the digest.
-fn check_metacopy_xattr<ObjectID: FsVerityHashValue>(xattr: &XAttr) -> Option<ObjectID> {
+fn check_metacopy_xattr<ObjectID: FsVerityHashValue>(
+    xattr: &XAttr,
+) -> anyhow::Result<Option<ObjectID>> {
     // name_index 4 = "trusted.", suffix = "overlay.metacopy"
     if xattr.header.name_index != 4 {
-        return None;
+        return Ok(None);
     }
-    if xattr.suffix() != b"overlay.metacopy" {
-        return None;
+    if xattr.suffix()? != b"overlay.metacopy" {
+        return Ok(None);
     }
-    if let Ok(value) = OverlayMetacopy::<ObjectID>::read_from_bytes(xattr.value()) {
+    if let Ok(value) = OverlayMetacopy::<ObjectID>::read_from_bytes(xattr.value()?) {
         if value.valid() {
-            return Some(value.digest.clone());
+            return Ok(Some(value.digest.clone()));
         }
     }
-    None
+    Ok(None)
 }
 
-/// Iterate over directory entries from an inode, yielding (name_bytes, nid) pairs.
+/// Collect directory entries from an inode, yielding (name_bytes, nid) pairs.
 /// Skips "." and "..".
 fn dir_entries<'a>(
     img: &'a Image<'a>,
     dir_inode: &'a InodeType<'a>,
-) -> impl Iterator<Item = (&'a [u8], u64)> {
+) -> anyhow::Result<Vec<(&'a [u8], u64)>> {
+    let mut entries = Vec::new();
+
     // Block-based entries
-    let block_entries = dir_inode.blocks(img.blkszbits).flat_map(move |blkid| {
-        img.directory_block(blkid)
-            .entries()
-            .filter(|e| e.name != b"." && e.name != b"..")
-            .map(|e| (e.name, e.nid()))
-    });
+    for blkid in dir_inode.blocks(img.blkszbits)? {
+        let block = img.directory_block(blkid)?;
+        for entry in block.entries()? {
+            let entry = entry?;
+            if entry.name != b"." && entry.name != b".." {
+                entries.push((entry.name, entry.nid()));
+            }
+        }
+    }
 
     // Inline entries
-    let inline_entries = dir_inode
-        .inline()
-        .and_then(|data| DirectoryBlock::ref_from_bytes(data).ok())
-        .into_iter()
-        .flat_map(|block| {
-            block
-                .entries()
-                .filter(|e| e.name != b"." && e.name != b"..")
-                .map(|e| (e.name, e.nid()))
-        });
+    if let Some(data) = dir_inode.inline() {
+        if let Ok(block) = DirectoryBlock::ref_from_bytes(data) {
+            for entry in block.entries()? {
+                let entry = entry?;
+                if entry.name != b"." && entry.name != b".." {
+                    entries.push((entry.name, entry.nid()));
+                }
+            }
+        }
+    }
 
-    block_entries.chain(inline_entries)
+    Ok(entries)
 }
+
+/// Maximum directory nesting depth. PATH_MAX is 4096 on Linux, and directory names
+/// must be at least 2 bytes (1 char + separator), so the theoretical max is PATH_MAX / 2.
+const MAX_DIRECTORY_DEPTH: usize = 4096 / 2;
 
 /// Recursively populate a `tree::Directory` from an erofs directory inode.
 fn populate_directory<ObjectID: FsVerityHashValue>(
@@ -863,15 +1081,20 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
     dir_inode: &InodeType,
     dir: &mut tree::Directory<ObjectID>,
     hardlinks: &mut HashMap<u64, Rc<tree::Leaf<ObjectID>>>,
+    depth: usize,
 ) -> anyhow::Result<()> {
-    for (name_bytes, nid) in dir_entries(img, dir_inode) {
+    if depth >= MAX_DIRECTORY_DEPTH {
+        return Err(ErofsReaderError::DepthExceeded.into());
+    }
+
+    for (name_bytes, nid) in dir_entries(img, dir_inode)? {
         let name = OsStr::from_bytes(name_bytes);
-        let child_inode = img.inode(nid);
+        let child_inode = img.inode(nid)?;
 
         if child_inode.mode().is_dir() {
-            let child_stat = stat_from_inode_for_tree(img, &child_inode);
+            let child_stat = stat_from_inode_for_tree(img, &child_inode)?;
             let mut child_dir = tree::Directory::new(child_stat);
-            populate_directory(img, &child_inode, &mut child_dir, hardlinks)
+            populate_directory(img, &child_inode, &mut child_dir, hardlinks, depth + 1)
                 .with_context(|| format!("reading directory {:?}", name))?;
             dir.insert(name, tree::Inode::Directory(Box::new(child_dir)));
         } else {
@@ -881,19 +1104,19 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
                 continue;
             }
 
-            let stat = stat_from_inode_for_tree(img, &child_inode);
+            let stat = stat_from_inode_for_tree(img, &child_inode)?;
             let mode = child_inode.mode().0.get();
             let file_type = mode & S_IFMT;
 
             let content = match file_type {
                 S_IFREG => {
-                    if let Some(digest) = extract_metacopy_digest::<ObjectID>(img, &child_inode) {
+                    if let Some(digest) = extract_metacopy_digest::<ObjectID>(img, &child_inode)? {
                         tree::LeafContent::Regular(tree::RegularFile::External(
                             digest,
                             child_inode.size(),
                         ))
                     } else {
-                        let data = extract_all_file_data(img, &child_inode);
+                        let data = extract_all_file_data(img, &child_inode)?;
                         tree::LeafContent::Regular(tree::RegularFile::Inline(data.into()))
                     }
                 }
@@ -932,15 +1155,15 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
 pub fn erofs_to_filesystem<ObjectID: FsVerityHashValue>(
     image_data: &[u8],
 ) -> anyhow::Result<tree::FileSystem<ObjectID>> {
-    let img = Image::open(image_data);
-    let root_inode = img.root();
+    let img = Image::open(image_data)?;
+    let root_inode = img.root()?;
 
-    let root_stat = stat_from_inode_for_tree(&img, &root_inode);
+    let root_stat = stat_from_inode_for_tree(&img, &root_inode)?;
     let mut fs = tree::FileSystem::new(root_stat);
 
     let mut hardlinks: HashMap<u64, Rc<tree::Leaf<ObjectID>>> = HashMap::new();
 
-    populate_directory(&img, &root_inode, &mut fs.root, &mut hardlinks)
+    populate_directory(&img, &root_inode, &mut fs.root, &mut hardlinks, 0)
         .context("reading root directory")?;
 
     Ok(fs)
@@ -958,7 +1181,7 @@ mod tests {
 
     /// Helper to validate that directory entries can be read correctly
     fn validate_directory_entries(img: &Image, nid: u64, expected_names: &[&str]) {
-        let inode = img.inode(nid);
+        let inode = img.inode(nid).unwrap();
         assert!(inode.mode().is_dir(), "Expected directory inode");
 
         let mut found_names = Vec::new();
@@ -966,16 +1189,18 @@ mod tests {
         // Read inline entries if present
         if let Some(inline) = inode.inline() {
             let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
-            for entry in inline_block.entries() {
+            for entry in inline_block.entries().unwrap() {
+                let entry = entry.unwrap();
                 let name = std::str::from_utf8(entry.name).unwrap();
                 found_names.push(name.to_string());
             }
         }
 
         // Read block entries
-        for blkid in inode.blocks(img.blkszbits) {
-            let block = img.directory_block(blkid);
-            for entry in block.entries() {
+        for blkid in inode.blocks(img.blkszbits).unwrap() {
+            let block = img.directory_block(blkid).unwrap();
+            for entry in block.entries().unwrap() {
+                let entry = entry.unwrap();
                 let name = std::str::from_utf8(entry.name).unwrap();
                 found_names.push(name.to_string());
             }
@@ -1001,27 +1226,29 @@ mod tests {
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
         let image = mkfs_erofs(&fs);
-        let img = Image::open(&image);
+        let img = Image::open(&image).unwrap();
 
         // Root should have . and .. and empty_dir
         let root_nid = img.sb.root_nid.get() as u64;
         validate_directory_entries(&img, root_nid, &[".", "..", "empty_dir"]);
 
         // Find empty_dir entry
-        let root_inode = img.root();
+        let root_inode = img.root().unwrap();
         let mut empty_dir_nid = None;
         if let Some(inline) = root_inode.inline() {
             let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
-            for entry in inline_block.entries() {
+            for entry in inline_block.entries().unwrap() {
+                let entry = entry.unwrap();
                 if entry.name == b"empty_dir" {
                     empty_dir_nid = Some(entry.nid());
                     break;
                 }
             }
         }
-        for blkid in root_inode.blocks(img.blkszbits) {
-            let block = img.directory_block(blkid);
-            for entry in block.entries() {
+        for blkid in root_inode.blocks(img.blkszbits).unwrap() {
+            let block = img.directory_block(blkid).unwrap();
+            for entry in block.entries().unwrap() {
+                let entry = entry.unwrap();
                 if entry.name == b"empty_dir" {
                     empty_dir_nid = Some(entry.nid());
                     break;
@@ -1044,23 +1271,25 @@ mod tests {
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
         let image = mkfs_erofs(&fs);
-        let img = Image::open(&image);
+        let img = Image::open(&image).unwrap();
 
         // Find dir1
-        let root_inode = img.root();
+        let root_inode = img.root().unwrap();
         let mut dir1_nid = None;
         if let Some(inline) = root_inode.inline() {
             let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
-            for entry in inline_block.entries() {
+            for entry in inline_block.entries().unwrap() {
+                let entry = entry.unwrap();
                 if entry.name == b"dir1" {
                     dir1_nid = Some(entry.nid());
                     break;
                 }
             }
         }
-        for blkid in root_inode.blocks(img.blkszbits) {
-            let block = img.directory_block(blkid);
-            for entry in block.entries() {
+        for blkid in root_inode.blocks(img.blkszbits).unwrap() {
+            let block = img.directory_block(blkid).unwrap();
+            for entry in block.entries().unwrap() {
+                let entry = entry.unwrap();
                 if entry.name == b"dir1" {
                     dir1_nid = Some(entry.nid());
                     break;
@@ -1087,23 +1316,25 @@ mod tests {
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(&dumpfile).unwrap();
         let image = mkfs_erofs(&fs);
-        let img = Image::open(&image);
+        let img = Image::open(&image).unwrap();
 
         // Find bigdir
-        let root_inode = img.root();
+        let root_inode = img.root().unwrap();
         let mut bigdir_nid = None;
         if let Some(inline) = root_inode.inline() {
             let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
-            for entry in inline_block.entries() {
+            for entry in inline_block.entries().unwrap() {
+                let entry = entry.unwrap();
                 if entry.name == b"bigdir" {
                     bigdir_nid = Some(entry.nid());
                     break;
                 }
             }
         }
-        for blkid in root_inode.blocks(img.blkszbits) {
-            let block = img.directory_block(blkid);
-            for entry in block.entries() {
+        for blkid in root_inode.blocks(img.blkszbits).unwrap() {
+            let block = img.directory_block(blkid).unwrap();
+            for entry in block.entries().unwrap() {
+                let entry = entry.unwrap();
                 if entry.name == b"bigdir" {
                     bigdir_nid = Some(entry.nid());
                     break;
@@ -1135,43 +1366,28 @@ mod tests {
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
         let image = mkfs_erofs(&fs);
-        let img = Image::open(&image);
+        let img = Image::open(&image).unwrap();
 
         // Navigate through the structure
         let root_nid = img.sb.root_nid.get() as u64;
         validate_directory_entries(&img, root_nid, &[".", "..", "a"]);
 
-        // Helper to find a directory entry by name
-        let find_entry = |parent_nid: u64, name: &[u8]| -> u64 {
-            let inode = img.inode(parent_nid);
-
-            if let Some(inline) = inode.inline() {
-                let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
-                for entry in inline_block.entries() {
-                    if entry.name == name {
-                        return entry.nid();
-                    }
-                }
-            }
-
-            for blkid in inode.blocks(img.blkszbits) {
-                let block = img.directory_block(blkid);
-                for entry in block.entries() {
-                    if entry.name == name {
-                        return entry.nid();
-                    }
-                }
-            }
-            panic!("Entry not found: {:?}", std::str::from_utf8(name));
-        };
-
-        let a_nid = find_entry(root_nid, b"a");
+        let a_nid = img
+            .find_child_nid(root_nid, b"a")
+            .unwrap()
+            .expect("a not found");
         validate_directory_entries(&img, a_nid, &[".", "..", "b"]);
 
-        let b_nid = find_entry(a_nid, b"b");
+        let b_nid = img
+            .find_child_nid(a_nid, b"b")
+            .unwrap()
+            .expect("b not found");
         validate_directory_entries(&img, b_nid, &[".", "..", "c"]);
 
-        let c_nid = find_entry(b_nid, b"c");
+        let c_nid = img
+            .find_child_nid(b_nid, b"c")
+            .unwrap()
+            .expect("c not found");
         validate_directory_entries(&img, c_nid, &[".", "..", "file.txt"]);
     }
 
@@ -1188,22 +1404,24 @@ mod tests {
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
         let image = mkfs_erofs(&fs);
-        let img = Image::open(&image);
+        let img = Image::open(&image).unwrap();
 
-        let root_inode = img.root();
+        let root_inode = img.root().unwrap();
         let mut mixed_nid = None;
         if let Some(inline) = root_inode.inline() {
             let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
-            for entry in inline_block.entries() {
+            for entry in inline_block.entries().unwrap() {
+                let entry = entry.unwrap();
                 if entry.name == b"mixed" {
                     mixed_nid = Some(entry.nid());
                     break;
                 }
             }
         }
-        for blkid in root_inode.blocks(img.blkszbits) {
-            let block = img.directory_block(blkid);
-            for entry in block.entries() {
+        for blkid in root_inode.blocks(img.blkszbits).unwrap() {
+            let block = img.directory_block(blkid).unwrap();
+            for entry in block.entries().unwrap() {
+                let entry = entry.unwrap();
                 if entry.name == b"mixed" {
                     mixed_nid = Some(entry.nid());
                     break;
@@ -1308,7 +1526,7 @@ mod tests {
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
         let image = mkfs_erofs(&fs);
-        let img = Image::open(&image);
+        let img = Image::open(&image).unwrap();
 
         // Verify root entries
         let root_nid = img.sb.root_nid.get() as u64;
@@ -1316,18 +1534,20 @@ mod tests {
 
         // Collect all entries and verify structure
         let mut entries_map: HashMap<Vec<u8>, u64> = HashMap::new();
-        let root_inode = img.root();
+        let root_inode = img.root().unwrap();
 
         if let Some(inline) = root_inode.inline() {
             let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
-            for entry in inline_block.entries() {
+            for entry in inline_block.entries().unwrap() {
+                let entry = entry.unwrap();
                 entries_map.insert(entry.name.to_vec(), entry.nid());
             }
         }
 
-        for blkid in root_inode.blocks(img.blkszbits) {
-            let block = img.directory_block(blkid);
-            for entry in block.entries() {
+        for blkid in root_inode.blocks(img.blkszbits).unwrap() {
+            let block = img.directory_block(blkid).unwrap();
+            for entry in block.entries().unwrap() {
+                let entry = entry.unwrap();
                 entries_map.insert(entry.name.to_vec(), entry.nid());
             }
         }
@@ -1336,7 +1556,7 @@ mod tests {
         let file1_nid = entries_map
             .get(b"file1".as_slice())
             .expect("file1 not found");
-        let file1_inode = img.inode(*file1_nid);
+        let file1_inode = img.inode(*file1_nid).unwrap();
         assert!(!file1_inode.mode().is_dir());
         assert_eq!(file1_inode.size(), 5);
 
@@ -1496,12 +1716,12 @@ mod tests {
 
     mod proptest_tests {
         use super::*;
+        use crate::erofs::{format::FormatVersion, writer::mkfs_erofs_versioned};
         use crate::fsverity::Sha512HashValue;
-        use crate::test::proptest_strategies::{build_filesystem, filesystem_spec};
+        use crate::test::proptest_strategies::{build_filesystem, filesystem_spec, FsSpec};
         use proptest::prelude::*;
 
-        /// Round-trip a FileSystem through erofs with a given ObjectID type
-        /// and compare dumpfile output before and after.
+        /// Round-trip a FileSystem through V2 erofs and compare dumpfile output.
         fn round_trip_filesystem<ObjectID: FsVerityHashValue>(
             fs_orig: &tree::FileSystem<ObjectID>,
         ) {
@@ -1517,6 +1737,50 @@ mod tests {
             assert_eq!(orig_output, rt_output);
         }
 
+        /// Round-trip a FileSystem through V1 erofs and compare dumpfile output.
+        ///
+        /// V1 uses compact inodes (when mtime matches the minimum), BFS ordering,
+        /// and includes overlay whiteout character device entries in the root.
+        /// The writer also adds `trusted.overlay.opaque` to the root, but the
+        /// reader strips it (as an internal overlay xattr), so the expected
+        /// filesystem should not include it.
+        fn round_trip_filesystem_v1<ObjectID: FsVerityHashValue>(spec: FsSpec) {
+            // Build two separate filesystems from the same spec so we avoid
+            // Rc::strong_count issues from sharing leaf Rcs.
+            let mut fs_write = build_filesystem::<ObjectID>(spec.clone());
+            let mut fs_expected = build_filesystem::<ObjectID>(spec);
+
+            // Add overlay whiteouts to both (the caller is responsible for this
+            // before calling mkfs_erofs_versioned with V1).
+            fs_write.add_overlay_whiteouts();
+            fs_expected.add_overlay_whiteouts();
+
+            // The writer internally adds trusted.overlay.opaque=y to root,
+            // but the reader strips all trusted.overlay.* xattrs that aren't
+            // escaped user xattrs. So the expected filesystem should NOT have it.
+
+            // Generate the V1 image from the write filesystem.
+            let image = mkfs_erofs_versioned(&fs_write, FormatVersion::V1);
+
+            // Read back from the image.
+            let fs_rt = erofs_to_filesystem::<ObjectID>(&image).unwrap();
+
+            // Compare via dumpfile serialization.
+            let mut expected_output = Vec::new();
+            write_dumpfile(&mut expected_output, &fs_expected).unwrap();
+
+            let mut rt_output = Vec::new();
+            write_dumpfile(&mut rt_output, &fs_rt).unwrap();
+
+            if expected_output != rt_output {
+                let expected_str = String::from_utf8_lossy(&expected_output);
+                let rt_str = String::from_utf8_lossy(&rt_output);
+                panic!(
+                    "V1 round-trip mismatch:\n--- expected ---\n{expected_str}\n--- got ---\n{rt_str}"
+                );
+            }
+        }
+
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -1530,6 +1794,16 @@ mod tests {
             fn test_erofs_round_trip_sha512(spec in filesystem_spec()) {
                 let fs = build_filesystem::<Sha512HashValue>(spec);
                 round_trip_filesystem(&fs);
+            }
+
+            #[test]
+            fn test_erofs_round_trip_v1_sha256(spec in filesystem_spec()) {
+                round_trip_filesystem_v1::<Sha256HashValue>(spec);
+            }
+
+            #[test]
+            fn test_erofs_round_trip_v1_sha512(spec in filesystem_spec()) {
+                round_trip_filesystem_v1::<Sha512HashValue>(spec);
             }
         }
     }

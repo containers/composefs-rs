@@ -34,6 +34,7 @@ hex = { version = "0.4.0", default-features = false }
 rustix = { version = "1.0.0", default-features = false, features = ["fs", "process"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 tokio = { version = "1.24.2", default-features = false, features = ["io-std", "io-util"] }
+zerocopy = { version = "0.8.0", default-features = false, features = ["derive", "std"] }
 
 [lints]
 workspace = true

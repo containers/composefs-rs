@@ -1,6 +1,7 @@
-//! Debug utilities for analyzing EROFS images.
+//! Debug implementations and utilities for EROFS on-disk format structures.
 //!
-//! This module provides tools for inspecting and debugging EROFS filesystem
+//! This module provides [`fmt::Debug`] implementations for EROFS format and
+//! reader types, as well as tools for inspecting and debugging EROFS filesystem
 //! images, including detailed structure dumping and space usage analysis.
 
 use std::{
@@ -16,9 +17,9 @@ use std::{
 use anyhow::Result;
 use zerocopy::FromBytes;
 
-use super::{
-    format::{self, CompactInodeHeader, ComposefsHeader, ExtendedInodeHeader, Superblock},
-    reader::{DataBlock, DirectoryBlock, Image, Inode, InodeHeader, InodeOps, InodeType, XAttr},
+use super::format::{self, CompactInodeHeader, ComposefsHeader, ExtendedInodeHeader, Superblock};
+use super::reader::{
+    DataBlock, DirectoryBlock, Image, Inode, InodeHeader, InodeOps, InodeType, XAttr,
 };
 
 /// Converts any reference to a thin pointer (as usize)
@@ -50,6 +51,50 @@ macro_rules! write_fields {
     }};
 }
 
+impl fmt::Debug for CompactInodeHeader {
+    // Injective (ie: accounts for every byte in the input)
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        writeln!(f, "CompactInodeHeader")?;
+        write_fields!(f, self, self,
+            format; xattr_icount; mode; reserved; size; u; ino; uid; gid; nlink; reserved2);
+        Ok(())
+    }
+}
+
+impl fmt::Debug for ExtendedInodeHeader {
+    // Injective (ie: accounts for every byte in the input)
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        writeln!(f, "ExtendedInodeHeader")?;
+        write_fields!(f, self, self,
+            format; xattr_icount; mode; reserved; size; u; ino; uid;
+            gid; mtime; mtime_nsec; nlink; reserved2);
+        Ok(())
+    }
+}
+
+impl fmt::Debug for ComposefsHeader {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        writeln!(f, "ComposefsHeader")?;
+        write_fields!(f, self, self,
+            magic; flags; version; composefs_version; unused
+        );
+        Ok(())
+    }
+}
+
+impl fmt::Debug for Superblock {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        writeln!(f, "Superblock")?;
+        write_fields!(f, self, self,
+            magic; checksum; feature_compat; blkszbits; extslots; root_nid; inos; build_time;
+            build_time_nsec; blocks; meta_blkaddr; xattr_blkaddr; uuid; volume_name;
+            feature_incompat; available_compr_algs; extra_devices; devt_slotoff; dirblkbits;
+            xattr_prefix_count; xattr_prefix_start; packed_nid; xattr_filter_reserved; reserved2
+        );
+        Ok(())
+    }
+}
+
 fn utf8_or_hex(data: &[u8]) -> String {
     if let Ok(string) = std::str::from_utf8(data) {
         format!("{string:?}")
@@ -58,7 +103,155 @@ fn utf8_or_hex(data: &[u8]) -> String {
     }
 }
 
+fn hexdump(f: &mut impl fmt::Write, data: &[u8], rel: usize) -> fmt::Result {
+    let start = match rel {
+        0 => 0,
+        ptr => data.as_ptr() as usize - ptr,
+    };
+    let end = start + data.len();
+    let start_row = start / 16;
+    let end_row = end.div_ceil(16);
+
+    for row in start_row..end_row {
+        let row_start = row * 16;
+        let row_end = row * 16 + 16;
+        write!(f, "{row_start:+8x}  ")?;
+
+        for idx in row_start..row_end {
+            if start <= idx && idx < end {
+                write!(f, "{:02x} ", data[idx - start])?;
+            } else {
+                write!(f, "   ")?;
+            }
+            if idx % 8 == 7 {
+                write!(f, " ")?;
+            }
+        }
+        write!(f, "|")?;
+
+        for idx in row_start..row_end {
+            if start <= idx && idx < end {
+                let c = data[idx - start];
+                if c.is_ascii() && !c.is_ascii_control() {
+                    write!(f, "{}", c as char)?;
+                } else {
+                    write!(f, ".")?;
+                }
+            } else {
+                write!(f, " ")?;
+            }
+        }
+        writeln!(f, "|")?;
+    }
+
+    Ok(())
+}
+
+impl fmt::Debug for XAttr {
+    // Injective (ie: accounts for every byte in the input)
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let prefix = format::XATTR_PREFIXES
+            .get(self.header.name_index as usize)
+            .and_then(|p| std::str::from_utf8(p).ok())
+            .unwrap_or("?");
+        let suffix = self.suffix().map_err(|_| fmt::Error)?;
+        let value = self.value().map_err(|_| fmt::Error)?;
+        let padding = self.padding().map_err(|_| fmt::Error)?;
+        write!(
+            f,
+            "({} {} {}) {}{} = {}",
+            self.header.name_index,
+            self.header.name_len,
+            self.header.value_size,
+            prefix,
+            utf8_or_hex(suffix),
+            utf8_or_hex(value),
+        )?;
+        if padding.iter().any(|c| *c != 0) {
+            write!(f, " {:?}", padding)?;
+        }
+        Ok(())
+    }
+}
+
+impl<T: fmt::Debug + InodeHeader> fmt::Debug for Inode<T> {
+    // Injective (ie: accounts for every byte in the input)
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Debug::fmt(&self.header, f)?;
+
+        if let Some(xattrs) = self.xattrs().map_err(|_| fmt::Error)? {
+            write_fields!(f, self, xattrs.header, name_filter; shared_count; reserved);
+
+            let shared = xattrs.shared().map_err(|_| fmt::Error)?;
+            if !shared.is_empty() {
+                write_with_offset!(f, self, "shared xattrs", shared)?;
+            }
+
+            for xattr in xattrs.local().map_err(|_| fmt::Error)? {
+                let xattr = xattr.map_err(|_| fmt::Error)?;
+                write_with_offset!(f, self, "xattr", xattr)?;
+            }
+        }
+
+        // We want to print one of four things for inline data:
+        //   - no data: print nothing
+        //   - directory data: dump the entries
+        //   - small inline text string: print it
+        //   - otherwise, hexdump
+        let Some(inline) = self.inline() else {
+            // No inline data
+            return Ok(());
+        };
+
+        // Directory dump
+        if self.header.mode().is_dir() {
+            let dir = DirectoryBlock::ref_from_bytes(inline).map_err(|_| fmt::Error)?;
+            let offset = addr!(dir) - addr!(self);
+            return write!(
+                f,
+                "     +{offset:02x} --- inline directory entries ---{dir:#?}"
+            );
+        }
+
+        // Small string (<= 128 bytes, utf8, no control characters).
+        if inline.len() <= 128 && !inline.iter().any(|c| c.is_ascii_control()) {
+            if let Ok(string) = std::str::from_utf8(inline) {
+                return write_with_offset!(f, self, "inline", string);
+            }
+        }
+
+        // Else, hexdump data block
+        hexdump(f, inline, &raw const self.header as usize)
+    }
+}
+
+impl fmt::Debug for DirectoryBlock {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        for entry in self.entries().map_err(|_| fmt::Error)? {
+            let entry = entry.map_err(|_| fmt::Error)?;
+            writeln!(f)?;
+            write_fields!(f, self, entry.header, inode_offset; name_offset; file_type; reserved);
+            writeln!(
+                f,
+                "{:+8x}     # name: {}",
+                entry.header.name_offset.get(),
+                utf8_or_hex(entry.name)
+            )?;
+        }
+        // TODO: trailing junk inside of st_size
+        // TODO: padding up to block or inode boundary
+        Ok(())
+    }
+}
+
+impl fmt::Debug for DataBlock {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        hexdump(f, &self.0, 0)
+    }
+}
+
 // This is basically just a fancy fat pointer type
+#[allow(missing_debug_implementations)]
 enum SegmentType<'img> {
     Header(&'img ComposefsHeader),
     Superblock(&'img Superblock),
@@ -108,25 +301,33 @@ impl SegmentType<'_> {
     }
 }
 
+#[allow(missing_debug_implementations)]
 struct ImageVisitor<'img> {
     image: &'img Image<'img>,
     visited: BTreeMap<usize, (SegmentType<'img>, Vec<Box<Path>>)>,
 }
 
 impl<'img> ImageVisitor<'img> {
-    fn note(&mut self, segment: SegmentType<'img>, path: Option<&Path>) -> bool {
+    fn note(&mut self, segment: SegmentType<'img>, path: Option<&Path>) -> Result<bool> {
         let offset = segment.addr() - self.image.image.as_ptr() as usize;
         match self.visited.entry(offset) {
             std::collections::btree_map::Entry::Occupied(mut e) => {
                 let (existing, paths) = e.get_mut();
-                // TODO: figure out pointer value equality...
-                assert_eq!(discriminant(existing), discriminant(&segment));
-                assert_eq!(existing.addr(), segment.addr());
-                assert_eq!(existing.size(), segment.size());
+                if discriminant(existing) != discriminant(&segment)
+                    || existing.addr() != segment.addr()
+                    || existing.size() != segment.size()
+                {
+                    anyhow::bail!(
+                        "conflicting segments at offset {offset:#x}: \
+                         existing {:?} vs new {:?}",
+                        discriminant(existing),
+                        discriminant(&segment)
+                    );
+                }
                 if let Some(path) = path {
                     paths.push(Box::from(path));
                 }
-                true
+                Ok(true)
             }
             std::collections::btree_map::Entry::Vacant(e) => {
                 let mut paths = vec![];
@@ -134,13 +335,14 @@ impl<'img> ImageVisitor<'img> {
                     paths.push(Box::from(path));
                 }
                 e.insert((segment, paths));
-                false
+                Ok(false)
             }
         }
     }
 
-    fn visit_directory_block(&mut self, block: &DirectoryBlock, path: &Path) {
-        for entry in block.entries() {
+    fn visit_directory_block(&mut self, block: &DirectoryBlock, path: &Path) -> Result<()> {
+        for entry in block.entries()? {
+            let entry = entry?;
             if entry.name == b"." || entry.name == b".." {
                 // TODO: maybe we want to follow those and let deduplication happen
                 continue;
@@ -148,242 +350,66 @@ impl<'img> ImageVisitor<'img> {
             self.visit_inode(
                 entry.header.inode_offset.get(),
                 &path.join(OsStr::from_bytes(entry.name)),
-            );
+            )?;
         }
+        Ok(())
     }
 
-    fn visit_inode(&mut self, id: u64, path: &Path) {
-        let inode = self.image.inode(id);
+    fn visit_inode(&mut self, id: u64, path: &Path) -> Result<()> {
+        let inode = self.image.inode(id)?;
         let segment = match inode {
             InodeType::Compact(inode) => SegmentType::CompactInode(inode),
             InodeType::Extended(inode) => SegmentType::ExtendedInode(inode),
         };
-        if self.note(segment, Some(path)) {
+        if self.note(segment, Some(path))? {
             // TODO: maybe we want to throw an error if we detect loops
             /* already processed */
-            return;
+            return Ok(());
         }
 
-        if let Some(xattrs) = inode.xattrs() {
-            for id in xattrs.shared() {
+        if let Some(xattrs) = inode.xattrs()? {
+            for id in xattrs.shared()? {
                 self.note(
-                    SegmentType::XAttr(self.image.shared_xattr(id.get())),
+                    SegmentType::XAttr(self.image.shared_xattr(id.get())?),
                     Some(path),
-                );
+                )?;
             }
         }
 
         if inode.mode().is_dir() {
             if let Some(inline) = inode.inline() {
-                let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
-                self.visit_directory_block(inline_block, path);
+                let inline_block = DirectoryBlock::ref_from_bytes(inline)
+                    .map_err(|_| anyhow::anyhow!("invalid inline directory block"))?;
+                self.visit_directory_block(inline_block, path)?;
             }
 
-            for id in inode.blocks(self.image.blkszbits) {
-                let block = self.image.directory_block(id);
-                self.visit_directory_block(block, path);
-                self.note(SegmentType::DirectoryBlock(block), Some(path));
+            for id in inode.blocks(self.image.blkszbits)? {
+                let block = self.image.directory_block(id)?;
+                self.visit_directory_block(block, path)?;
+                self.note(SegmentType::DirectoryBlock(block), Some(path))?;
             }
         } else {
-            for id in inode.blocks(self.image.blkszbits) {
-                let block = self.image.data_block(id);
-                self.note(SegmentType::DataBlock(block), Some(path));
+            for id in inode.blocks(self.image.blkszbits)? {
+                let block = self.image.data_block(id)?;
+                self.note(SegmentType::DataBlock(block), Some(path))?;
             }
         }
+
+        Ok(())
     }
 
+    #[allow(clippy::type_complexity)]
     fn visit_image(
         image: &'img Image<'img>,
-    ) -> BTreeMap<usize, (SegmentType<'img>, Vec<Box<Path>>)> {
+    ) -> Result<BTreeMap<usize, (SegmentType<'img>, Vec<Box<Path>>)>> {
         let mut this = Self {
             image,
             visited: BTreeMap::new(),
         };
-        this.note(SegmentType::Header(image.header), None);
-        this.note(SegmentType::Superblock(image.sb), None);
-        this.visit_inode(image.sb.root_nid.get() as u64, &PathBuf::from("/"));
-        this.visited
-    }
-}
-
-impl fmt::Debug for XAttr {
-    // Injective (ie: accounts for every byte in the input)
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "({} {} {}) {}{} = {}",
-            self.header.name_index,
-            self.header.name_len,
-            self.header.value_size,
-            std::str::from_utf8(format::XATTR_PREFIXES[self.header.name_index as usize]).unwrap(),
-            utf8_or_hex(self.suffix()),
-            utf8_or_hex(self.value()),
-        )?;
-        if self.padding().iter().any(|c| *c != 0) {
-            write!(f, " {:?}", self.padding())?;
-        }
-        Ok(())
-    }
-}
-
-impl fmt::Debug for CompactInodeHeader {
-    // Injective (ie: accounts for every byte in the input)
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "CompactInodeHeader")?;
-        write_fields!(f, self, self,
-            format; xattr_icount; mode; reserved; size; u; ino; uid; gid; nlink; reserved2);
-        Ok(())
-    }
-}
-
-impl fmt::Debug for ExtendedInodeHeader {
-    // Injective (ie: accounts for every byte in the input)
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "ExtendedInodeHeader")?;
-        write_fields!(f, self, self,
-            format; xattr_icount; mode; reserved; size; u; ino; uid;
-            gid; mtime; mtime_nsec; nlink; reserved2);
-        Ok(())
-    }
-}
-
-fn hexdump(f: &mut impl fmt::Write, data: &[u8], rel: usize) -> fmt::Result {
-    let start = match rel {
-        0 => 0,
-        ptr => data.as_ptr() as usize - ptr,
-    };
-    let end = start + data.len();
-    let start_row = start / 16;
-    let end_row = end.div_ceil(16);
-
-    for row in start_row..end_row {
-        let row_start = row * 16;
-        let row_end = row * 16 + 16;
-        write!(f, "{row_start:+8x}  ")?;
-
-        for idx in row_start..row_end {
-            if start <= idx && idx < end {
-                write!(f, "{:02x} ", data[idx - start])?;
-            } else {
-                write!(f, "   ")?;
-            }
-            if idx % 8 == 7 {
-                write!(f, " ")?;
-            }
-        }
-        write!(f, "|")?;
-
-        for idx in row_start..row_end {
-            if start <= idx && idx < end {
-                let c = data[idx - start];
-                if c.is_ascii() && !c.is_ascii_control() {
-                    write!(f, "{}", c as char)?;
-                } else {
-                    write!(f, ".")?;
-                }
-            } else {
-                write!(f, " ")?;
-            }
-        }
-        writeln!(f, "|")?;
-    }
-
-    Ok(())
-}
-
-impl<T: fmt::Debug + InodeHeader> fmt::Debug for Inode<T> {
-    // Injective (ie: accounts for every byte in the input)
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Debug::fmt(&self.header, f)?;
-
-        if let Some(xattrs) = self.xattrs() {
-            write_fields!(f, self, xattrs.header, name_filter; shared_count; reserved);
-
-            if !xattrs.shared().is_empty() {
-                write_with_offset!(f, self, "shared xattrs", xattrs.shared())?;
-            }
-
-            for xattr in xattrs.local() {
-                write_with_offset!(f, self, "xattr", xattr)?;
-            }
-        }
-
-        // We want to print one of four things for inline data:
-        //   - no data: print nothing
-        //   - directory data: dump the entries
-        //   - small inline text string: print it
-        //   - otherwise, hexdump
-        let Some(inline) = self.inline() else {
-            // No inline data
-            return Ok(());
-        };
-
-        // Directory dump
-        if self.header.mode().is_dir() {
-            let dir = DirectoryBlock::ref_from_bytes(inline).unwrap();
-            let offset = addr!(dir) - addr!(self);
-            return write!(
-                f,
-                "     +{offset:02x} --- inline directory entries ---{dir:#?}"
-            );
-        }
-
-        // Small string (<= 128 bytes, utf8, no control characters).
-        if inline.len() <= 128 && !inline.iter().any(|c| c.is_ascii_control()) {
-            if let Ok(string) = std::str::from_utf8(inline) {
-                return write_with_offset!(f, self, "inline", string);
-            }
-        }
-
-        // Else, hexdump data block
-        hexdump(f, inline, &raw const self.header as usize)
-    }
-}
-
-impl fmt::Debug for DirectoryBlock {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        for entry in self.entries() {
-            writeln!(f)?;
-            write_fields!(f, self, entry.header, inode_offset; name_offset; file_type; reserved);
-            writeln!(
-                f,
-                "{:+8x}     # name: {}",
-                entry.header.name_offset.get(),
-                utf8_or_hex(entry.name)
-            )?;
-        }
-        // TODO: trailing junk inside of st_size
-        // TODO: padding up to block or inode boundary
-        Ok(())
-    }
-}
-
-impl fmt::Debug for DataBlock {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        hexdump(f, &self.0, 0)
-    }
-}
-
-impl fmt::Debug for ComposefsHeader {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "ComposefsHeader")?;
-        write_fields!(f, self, self,
-            magic; flags; version; composefs_version; unused
-        );
-        Ok(())
-    }
-}
-
-impl fmt::Debug for Superblock {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "Superblock")?;
-        write_fields!(f, self, self,
-            magic; checksum; feature_compat; blkszbits; extslots; root_nid; inos; build_time;
-            build_time_nsec; blocks; meta_blkaddr; xattr_blkaddr; uuid; volume_name;
-            feature_incompat; available_compr_algs; extra_devices; devt_slotoff; dirblkbits;
-            xattr_prefix_count; xattr_prefix_start; packed_nid; xattr_filter_reserved; reserved2
-        );
-        Ok(())
+        this.note(SegmentType::Header(image.header), None)?;
+        this.note(SegmentType::Superblock(image.sb), None)?;
+        this.visit_inode(image.sb.root_nid.get() as u64, &PathBuf::from("/"))?;
+        Ok(this.visited)
     }
 }
 
@@ -395,7 +421,7 @@ fn addto<T: Clone + Eq + Ord>(map: &mut BTreeMap<T, usize>, key: &T, count: usiz
     }
 }
 
-/// Dumps unassigned or padding regions in the image
+/// Dumps unassigned or padding regions in the image.
 ///
 /// Distinguishes between zero-filled padding and unknown content.
 pub fn dump_unassigned(
@@ -421,16 +447,20 @@ pub fn dump_unassigned(
     Ok(())
 }
 
-/// Dumps a detailed debug view of an EROFS image
+/// Dumps a detailed debug view of an EROFS image.
 ///
 /// Walks the entire image structure, outputting formatted information about
 /// all inodes, blocks, xattrs, and padding. Also produces space usage statistics.
 pub fn debug_img(output: &mut impl std::io::Write, data: &[u8]) -> Result<()> {
-    let image = Image::open(data);
-    let visited = ImageVisitor::visit_image(&image);
+    let image = Image::open(data)?;
+    let visited = ImageVisitor::visit_image(&image)?;
 
-    let inode_start = (image.sb.meta_blkaddr.get() as usize) << image.sb.blkszbits;
-    let xattr_start = (image.sb.xattr_blkaddr.get() as usize) << image.sb.blkszbits;
+    let inode_start = (image.sb.meta_blkaddr.get() as usize)
+        .checked_mul(image.block_size)
+        .ok_or_else(|| anyhow::anyhow!("inode start offset overflow"))?;
+    let xattr_start = (image.sb.xattr_blkaddr.get() as usize)
+        .checked_mul(image.block_size)
+        .ok_or_else(|| anyhow::anyhow!("xattr start offset overflow"))?;
 
     let mut space_stats = BTreeMap::new();
     let mut padding_stats = BTreeMap::new();
@@ -443,12 +473,14 @@ pub fn debug_img(output: &mut impl std::io::Write, data: &[u8]) -> Result<()> {
 
         match offset.cmp(&start) {
             Ordering::Less => {
-                dump_unassigned(output, offset, &data[offset..start])?;
-                addto(
-                    &mut padding_stats,
-                    &(last_segment_type, segment_type),
-                    start - offset,
-                );
+                if let Some(unassigned) = data.get(offset..start) {
+                    dump_unassigned(output, offset, unassigned)?;
+                    addto(
+                        &mut padding_stats,
+                        &(last_segment_type, segment_type),
+                        start - offset,
+                    );
+                }
                 offset = start;
             }
             Ordering::Greater => {
@@ -477,15 +509,19 @@ pub fn debug_img(output: &mut impl std::io::Write, data: &[u8]) -> Result<()> {
                 writeln!(output, "{offset:08x} {sb:?}")?;
             }
             SegmentType::CompactInode(inode) => {
-                writeln!(output, "# nid #{}", (offset - inode_start) / 32)?;
+                writeln!(output, "# nid #{}", offset.saturating_sub(inode_start) / 32)?;
                 writeln!(output, "{offset:08x} {inode:#?}")?;
             }
             SegmentType::ExtendedInode(inode) => {
-                writeln!(output, "# nid #{}", (offset - inode_start) / 32)?;
+                writeln!(output, "# nid #{}", offset.saturating_sub(inode_start) / 32)?;
                 writeln!(output, "{offset:08x} {inode:#?}")?;
             }
             SegmentType::XAttr(xattr) => {
-                writeln!(output, "# xattr #{}", (offset - xattr_start) / 4)?;
+                writeln!(
+                    output,
+                    "# xattr #{}",
+                    offset.saturating_sub(xattr_start) / 4
+                )?;
                 writeln!(output, "{offset:08x} {xattr:?}")?;
             }
             SegmentType::DirectoryBlock(block) => {

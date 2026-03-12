@@ -19,7 +19,6 @@ permissions:
 jobs:
   nightly:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
     steps:
     - uses: dtolnay/rust-toolchain@nightly
     - uses: actions/checkout@v4
@@ -27,7 +26,6 @@ jobs:
 
   fedora:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
     container:
       image: quay.io/fedora/fedora:latest
       options: "--privileged --pid=host -v /var/tmp:/var/tmp --tmpfs /tmp:rw,exec,nosuid,nodev -v /:/run/host"
@@ -47,13 +45,39 @@ jobs:
   smoke:
     name: Unprivileged smoke test
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: bootc-dev/actions/bootc-ubuntu-setup@main
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: just test-integration
+
+  # Fuzz smoke test — runs each fuzz target briefly to catch panics
+  # on malformed input.  The extended run only fires on pushes to main.
+  fuzz:
+    name: Fuzz smoke test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: extractions/setup-just@v2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/composefs/fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Generate corpus
+        run: just generate-corpus
+      - name: Run fuzz targets
+        run: just fuzz-all
+      - name: Upload fuzz artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: |
+            crates/composefs/fuzz/artifacts/
+            target/fuzz-logs/
 
   # Full integration tests: builds a bootc container image, runs all
   # tests (both unprivileged and privileged).  Privileged tests execute
@@ -62,7 +86,6 @@ jobs:
     name: Integration tests (${{ matrix.name }})
     needs: smoke
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -92,7 +115,6 @@ jobs:
   examples:
     name: Example tests (${{ matrix.example.dir }}/${{ matrix.example.os }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
 
     strategy:
       matrix:
@@ -179,7 +201,7 @@ jobs:
   # repository settings as the single required status check.
   required-checks:
     if: always()
-    needs: [nightly, fedora, smoke, integration, examples]
+    needs: [nightly, fedora, smoke, fuzz, integration, examples]
     runs-on: ubuntu-latest
     steps:
       - run: exit 1
@@ -187,5 +209,6 @@ jobs:
           needs.nightly.result != 'success' ||
           needs.fedora.result != 'success' ||
           needs.smoke.result != 'success' ||
+          needs.fuzz.result != 'success' ||
           needs.integration.result != 'success' ||
           needs.examples.result != 'success'
