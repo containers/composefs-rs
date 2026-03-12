@@ -70,7 +70,7 @@ fn exercise_image(data: &[u8]) {
     let _ = root.inline();
 
     // Block iteration
-    let Ok(blocks) = root.blocks(image.blkszbits) else {
+    let Ok(blocks) = image.inode_blocks(&root) else {
         return;
     };
     for blkid in blocks {
