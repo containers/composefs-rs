@@ -20,12 +20,14 @@ use super::{
     composefs::OverlayMetacopy,
     format::{
         CompactInodeHeader, ComposefsHeader, DataLayout, DirectoryEntryHeader, ExtendedInodeHeader,
-        InodeXAttrHeader, ModeField, Superblock, XAttrHeader, BLOCK_BITS, S_IFBLK, S_IFCHR,
-        S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, XATTR_PREFIXES,
+        InodeXAttrHeader, ModeField, Superblock, XAttrHeader, BLOCK_BITS, COMPOSEFS_MAGIC,
+        MAGIC_V1, S_IFBLK, S_IFCHR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, VERSION,
+        XATTR_PREFIXES,
     },
 };
 use crate::fsverity::FsVerityHashValue;
 use crate::tree;
+use crate::INLINE_CONTENT_MAX;
 
 /// Rounds up a value to the nearest multiple of `to`
 pub fn round_up(n: usize, to: usize) -> usize {
@@ -465,13 +467,45 @@ impl<'img> Image<'img> {
     /// Composefs images are metadata-only EROFS images with well-known
     /// structural constraints.  When enabled, the parser enforces:
     ///
+    /// Checked eagerly (in this method):
+    /// - Composefs header magic and version fields
+    /// - EROFS superblock magic
     /// - `blkszbits` must be 12 (4096-byte blocks)
+    ///
+    /// Checked during inode traversal (`inode_blocks`, `erofs_to_filesystem`):
     /// - For non-ChunkBased inodes (directories, inline files, symlinks,
     ///   devices), `size` must not exceed the image size — their data is
     ///   stored within the image itself.  ChunkBased (external) files are
     ///   exempt because their `size` reflects the real file on the
     ///   underlying filesystem.
+    /// - Inline regular files must be ≤ `INLINE_CONTENT_MAX` (64 bytes)
+    /// - Metacopy xattrs must be well-formed when present
     pub fn restrict_to_composefs(mut self) -> Result<Self, ErofsReaderError> {
+        // Validate composefs header
+        if self.header.magic != COMPOSEFS_MAGIC {
+            return Err(ErofsReaderError::InvalidImage(format!(
+                "bad composefs magic: expected {:#x}, got {:#x}",
+                COMPOSEFS_MAGIC.get(),
+                self.header.magic.get(),
+            )));
+        }
+        if self.header.version != VERSION {
+            return Err(ErofsReaderError::InvalidImage(format!(
+                "bad EROFS format version in composefs header: expected {}, got {}",
+                VERSION.get(),
+                self.header.version.get(),
+            )));
+        }
+        // Note: we don't enforce composefs_version here because C mkcomposefs
+        // writes version 0 while the Rust writer uses version 2.  Both are valid.
+        // Validate EROFS superblock magic
+        if self.sb.magic != MAGIC_V1 {
+            return Err(ErofsReaderError::InvalidImage(format!(
+                "bad EROFS magic: expected {:#x}, got {:#x}",
+                MAGIC_V1.get(),
+                self.sb.magic.get(),
+            )));
+        }
         if self.blkszbits != BLOCK_BITS {
             return Err(ErofsReaderError::InvalidImage(format!(
                 "composefs requires blkszbits={BLOCK_BITS}, got {}",
@@ -1075,23 +1109,28 @@ fn extract_all_file_data(img: &Image, inode: &InodeType) -> anyhow::Result<Vec<u
 }
 
 /// Try to extract a metacopy digest from an inode's xattrs.
+///
+/// When `strict` is true (composefs-restricted mode), a
+/// `trusted.overlay.metacopy` xattr with an invalid format is an error
+/// rather than being silently ignored.
 fn extract_metacopy_digest<ObjectID: FsVerityHashValue>(
     img: &Image,
     inode: &InodeType,
 ) -> anyhow::Result<Option<ObjectID>> {
+    let strict = img.composefs_restricted;
     let Some(xattrs_section) = inode.xattrs()? else {
         return Ok(None);
     };
 
     for id in xattrs_section.shared()? {
         let xattr = img.shared_xattr(id.get())?;
-        if let Some(digest) = check_metacopy_xattr(xattr)? {
+        if let Some(digest) = check_metacopy_xattr(xattr, strict)? {
             return Ok(Some(digest));
         }
     }
     for xattr in xattrs_section.local()? {
         let xattr = xattr?;
-        if let Some(digest) = check_metacopy_xattr(xattr)? {
+        if let Some(digest) = check_metacopy_xattr(xattr, strict)? {
             return Ok(Some(digest));
         }
     }
@@ -1099,8 +1138,13 @@ fn extract_metacopy_digest<ObjectID: FsVerityHashValue>(
 }
 
 /// Check if a single xattr is a valid overlay.metacopy and return the digest.
+///
+/// When `strict` is true, a `trusted.overlay.metacopy` xattr that cannot be
+/// parsed or fails validation is an error.  In non-strict mode, such xattrs
+/// are silently ignored (returning `Ok(None)`).
 fn check_metacopy_xattr<ObjectID: FsVerityHashValue>(
     xattr: &XAttr,
+    strict: bool,
 ) -> anyhow::Result<Option<ObjectID>> {
     // name_index 4 = "trusted.", suffix = "overlay.metacopy"
     if xattr.header.name_index != 4 {
@@ -1109,10 +1153,35 @@ fn check_metacopy_xattr<ObjectID: FsVerityHashValue>(
     if xattr.suffix()? != b"overlay.metacopy" {
         return Ok(None);
     }
-    if let Ok(value) = OverlayMetacopy::<ObjectID>::read_from_bytes(xattr.value()?) {
-        if value.valid() {
-            return Ok(Some(value.digest.clone()));
+    // At this point we know the xattr is named trusted.overlay.metacopy.
+    let value_bytes = xattr.value()?;
+    let value = match OverlayMetacopy::<ObjectID>::read_from_bytes(value_bytes) {
+        Ok(v) => v,
+        Err(_) if strict => {
+            anyhow::bail!(
+                "malformed trusted.overlay.metacopy xattr: \
+                 expected {} bytes, got {}",
+                size_of::<OverlayMetacopy<ObjectID>>(),
+                value_bytes.len(),
+            );
         }
+        Err(_) => return Ok(None),
+    };
+    if value.valid() {
+        return Ok(Some(value.digest.clone()));
+    }
+    if strict {
+        anyhow::bail!(
+            "invalid trusted.overlay.metacopy: \
+             version={}, len={}, flags={}, digest_algo={} \
+             (expected version=0, len={}, flags=0, digest_algo={})",
+            value.version(),
+            value.len(),
+            value.flags(),
+            value.digest_algo(),
+            size_of::<OverlayMetacopy<ObjectID>>(),
+            ObjectID::ALGORITHM,
+        );
     }
     Ok(None)
 }
@@ -1196,6 +1265,17 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
                             child_inode.size(),
                         ))
                     } else {
+                        if img.composefs_restricted {
+                            let size = child_inode.size();
+                            if size > INLINE_CONTENT_MAX as u64 {
+                                anyhow::bail!(
+                                    "inline regular file {:?} has size {} \
+                                     (max {INLINE_CONTENT_MAX})",
+                                    name,
+                                    size,
+                                );
+                            }
+                        }
                         let data = extract_all_file_data(img, &child_inode)?;
                         tree::LeafContent::Regular(tree::RegularFile::Inline(data.into()))
                     }
