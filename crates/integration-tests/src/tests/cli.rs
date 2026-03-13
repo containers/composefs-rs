@@ -797,3 +797,432 @@ fn test_auto_detect_hash_for_operations() -> Result<()> {
     Ok(())
 }
 integration_test!(test_auto_detect_hash_for_operations);
+
+fn test_fsck_empty_repo() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+
+    let output = cmd!(sh, "{cfsctl} --insecure --repo {repo} fsck").read()?;
+    assert!(
+        output.contains("status: ok"),
+        "expected 'status: ok', got: {output}"
+    );
+    Ok(())
+}
+integration_test!(test_fsck_empty_repo);
+
+fn test_fsck_healthy_repo() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let rootfs = create_test_rootfs(fixture_dir.path())?;
+
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} create-image {rootfs} my-image"
+    )
+    .read()?;
+
+    let output = cmd!(sh, "{cfsctl} --insecure --repo {repo} fsck").read()?;
+    assert!(
+        output.contains("status: ok"),
+        "expected healthy fsck, got: {output}"
+    );
+    // Should have checked some objects
+    assert!(
+        output.contains("objects:"),
+        "expected objects line, got: {output}"
+    );
+    Ok(())
+}
+integration_test!(test_fsck_healthy_repo);
+
+fn test_fsck_detects_corrupted_object() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let rootfs = create_test_rootfs(fixture_dir.path())?;
+
+    // Create an image which stores objects
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} create-image {rootfs} my-image"
+    )
+    .read()?;
+
+    // Find an object file and corrupt it
+    let objects_dir = repo.join("objects");
+    let mut corrupted = false;
+    'outer: for entry in std::fs::read_dir(&objects_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        for obj_entry in std::fs::read_dir(entry.path())? {
+            let obj_entry = obj_entry?;
+            if obj_entry.file_type()?.is_file() {
+                let path = obj_entry.path();
+                // Delete and recreate with wrong content
+                std::fs::remove_file(&path)?;
+                std::fs::write(&path, b"CORRUPTED DATA")?;
+                corrupted = true;
+                break 'outer;
+            }
+        }
+    }
+    assert!(corrupted, "should have found an object to corrupt");
+
+    // fsck should fail
+    let result = cmd!(sh, "{cfsctl} --insecure --repo {repo} fsck")
+        .ignore_status()
+        .output()?;
+    let output = String::from_utf8_lossy(&result.stdout);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+
+    assert!(
+        !result.status.success(),
+        "fsck should have exited non-zero after corruption, stdout: {output}, stderr: {stderr}"
+    );
+    Ok(())
+}
+integration_test!(test_fsck_detects_corrupted_object);
+
+fn test_oci_fsck_healthy() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let oci_layout = create_oci_layout(fixture_dir.path())?;
+
+    // Pull an OCI image
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci pull oci:{oci_layout} test-image"
+    )
+    .read()?;
+
+    // OCI fsck should pass
+    let output = cmd!(sh, "{cfsctl} --insecure --repo {repo} oci fsck").read()?;
+    assert!(
+        output.contains("status: ok"),
+        "expected healthy oci fsck, got: {output}"
+    );
+    assert!(
+        output.contains("oci images: 1/1 ok"),
+        "expected 1 image checked, got: {output}"
+    );
+    Ok(())
+}
+integration_test!(test_oci_fsck_healthy);
+
+fn test_oci_fsck_detects_corrupted_manifest() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let oci_layout = create_oci_layout(fixture_dir.path())?;
+
+    // Pull an OCI image
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci pull oci:{oci_layout} test-image"
+    )
+    .read()?;
+
+    // Find the manifest stream symlink and corrupt its backing object
+    let streams_dir = repo.join("streams");
+    let mut corrupted = false;
+    for entry in std::fs::read_dir(&streams_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with("oci-manifest-") {
+            // Read the symlink target to find the object
+            let target = std::fs::read_link(entry.path())?;
+            let obj_path = streams_dir.join(&target);
+            if obj_path.exists() {
+                std::fs::remove_file(&obj_path)?;
+                std::fs::write(&obj_path, b"CORRUPTED MANIFEST DATA")?;
+                corrupted = true;
+                break;
+            }
+        }
+    }
+    assert!(corrupted, "should have found a manifest object to corrupt");
+
+    // OCI fsck should fail
+    let result = cmd!(sh, "{cfsctl} --insecure --repo {repo} oci fsck")
+        .ignore_status()
+        .output()?;
+    let output = String::from_utf8_lossy(&result.stdout);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+
+    assert!(
+        !result.status.success(),
+        "oci fsck should have exited non-zero after corruption, stdout: {output}, stderr: {stderr}"
+    );
+    Ok(())
+}
+integration_test!(test_oci_fsck_detects_corrupted_manifest);
+
+fn test_oci_fsck_single_image() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let oci_layout = create_oci_layout(fixture_dir.path())?;
+
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci pull oci:{oci_layout} test-image"
+    )
+    .read()?;
+
+    // Check a specific image by name
+    let output = cmd!(sh, "{cfsctl} --insecure --repo {repo} oci fsck test-image").read()?;
+    assert!(
+        output.contains("status: ok"),
+        "expected healthy oci fsck for specific image, got: {output}"
+    );
+    assert!(
+        output.contains("oci images: 1/1 ok"),
+        "expected 1 image checked, got: {output}"
+    );
+
+    // Check a nonexistent image
+    let result = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci fsck nonexistent-image"
+    )
+    .ignore_status()
+    .output()?;
+    assert!(
+        !result.status.success(),
+        "oci fsck should fail for nonexistent image"
+    );
+    Ok(())
+}
+integration_test!(test_oci_fsck_single_image);
+
+fn test_fsck_json_healthy() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let rootfs = create_test_rootfs(fixture_dir.path())?;
+
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} create-image {rootfs} my-image"
+    )
+    .read()?;
+
+    let output = cmd!(sh, "{cfsctl} --insecure --repo {repo} fsck --json").read()?;
+    let v: serde_json::Value = serde_json::from_str(&output)?;
+    assert_eq!(v["ok"], true, "expected ok=true, got: {output}");
+    assert!(
+        v["objectsChecked"].as_u64().unwrap() > 0,
+        "expected objectsChecked > 0"
+    );
+    assert_eq!(v["objectsCorrupted"], 0);
+    assert!(v["errors"].as_array().unwrap().is_empty());
+    Ok(())
+}
+integration_test!(test_fsck_json_healthy);
+
+fn test_fsck_json_corrupted_exits_zero() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let rootfs = create_test_rootfs(fixture_dir.path())?;
+
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} create-image {rootfs} my-image"
+    )
+    .read()?;
+
+    // Corrupt an object
+    let objects_dir = repo.join("objects");
+    let mut corrupted = false;
+    'outer: for entry in std::fs::read_dir(&objects_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        for obj_entry in std::fs::read_dir(entry.path())? {
+            let obj_entry = obj_entry?;
+            if obj_entry.file_type()?.is_file() {
+                let path = obj_entry.path();
+                std::fs::remove_file(&path)?;
+                std::fs::write(&path, b"CORRUPTED DATA")?;
+                corrupted = true;
+                break 'outer;
+            }
+        }
+    }
+    assert!(corrupted, "should have found an object to corrupt");
+
+    // --json should exit 0 even with corruption
+    let output = cmd!(sh, "{cfsctl} --insecure --repo {repo} fsck --json").read()?;
+    let v: serde_json::Value = serde_json::from_str(&output)?;
+    assert_eq!(v["ok"], false, "expected ok=false, got: {output}");
+    assert!(
+        v["objectsCorrupted"].as_u64().unwrap() > 0,
+        "expected corrupted > 0"
+    );
+    assert!(
+        !v["errors"].as_array().unwrap().is_empty(),
+        "expected errors"
+    );
+    Ok(())
+}
+integration_test!(test_fsck_json_corrupted_exits_zero);
+
+fn test_oci_fsck_json() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let oci_layout = create_oci_layout(fixture_dir.path())?;
+
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci pull oci:{oci_layout} test-image"
+    )
+    .read()?;
+
+    let output = cmd!(sh, "{cfsctl} --insecure --repo {repo} oci fsck --json").read()?;
+    let v: serde_json::Value = serde_json::from_str(&output)?;
+    assert_eq!(v["ok"], true, "expected ok=true, got: {output}");
+    assert_eq!(v["imagesChecked"], 1);
+    assert_eq!(v["imagesCorrupted"], 0);
+    Ok(())
+}
+integration_test!(test_oci_fsck_json);
+
+fn test_oci_fsck_json_with_corruption() -> Result<()> {
+    // Exercises the --json output path for oci fsck when corruption is
+    // present. The existing test_oci_fsck_json only tests the healthy case.
+    // With --json, oci fsck should exit 0 and report corruption in JSON.
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let oci_layout = create_oci_layout(fixture_dir.path())?;
+
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci pull oci:{oci_layout} test-image"
+    )
+    .read()?;
+
+    // Corrupt an object in the repository
+    let objects_dir = repo.join("objects");
+    let mut corrupted = false;
+    'outer: for entry in std::fs::read_dir(&objects_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        for obj_entry in std::fs::read_dir(entry.path())? {
+            let obj_entry = obj_entry?;
+            if obj_entry.file_type()?.is_file() {
+                let path = obj_entry.path();
+                std::fs::remove_file(&path)?;
+                std::fs::write(&path, b"CORRUPTED OCI DATA")?;
+                corrupted = true;
+                break 'outer;
+            }
+        }
+    }
+    assert!(corrupted, "should have found an object to corrupt");
+
+    // --json should exit 0 even with corruption, reporting it in the output
+    let output = cmd!(sh, "{cfsctl} --insecure --repo {repo} oci fsck --json").read()?;
+    let v: serde_json::Value = serde_json::from_str(&output)?;
+    assert_eq!(v["ok"], false, "expected ok=false, got: {output}");
+    // Should have repo-level or OCI-level errors
+    let has_repo_errors = v["repoResult"]["errors"]
+        .as_array()
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    let has_oci_errors = v["errors"]
+        .as_array()
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    let has_repo_corruption = v["repoResult"]["objectsCorrupted"].as_u64().unwrap_or(0) > 0;
+    assert!(
+        has_repo_errors || has_oci_errors || has_repo_corruption,
+        "expected some errors in JSON output, got: {output}"
+    );
+    Ok(())
+}
+integration_test!(test_oci_fsck_json_with_corruption);
+
+fn test_fsck_detects_broken_image_ref() -> Result<()> {
+    // Integration test: exercises fsck_refs_dir for image refs via the CLI.
+    // Creates an image with a ref name (stored in images/refs/), then
+    // breaks the ref chain by deleting the image symlink it points through.
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let rootfs = create_test_rootfs(fixture_dir.path())?;
+
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} create-image {rootfs} my-image"
+    )
+    .read()?;
+
+    // The ref "my-image" lives at images/refs/my-image -> ../HEXID
+    // where ../HEXID is the image symlink -> ../objects/XX/YY...
+    // Break it by removing the intermediate image symlink.
+    let refs_dir = repo.join("images/refs");
+    let mut broken = false;
+    if refs_dir.exists() {
+        for entry in std::fs::read_dir(&refs_dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_symlink() {
+                let target = std::fs::read_link(entry.path())?;
+                let resolved = refs_dir.join(&target);
+                // resolved should be the image symlink in images/
+                if resolved.symlink_metadata().is_ok() {
+                    std::fs::remove_file(&resolved)?;
+                    broken = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(broken, "should have found an image ref to break");
+
+    // fsck should detect the broken ref
+    let result = cmd!(sh, "{cfsctl} --insecure --repo {repo} fsck")
+        .ignore_status()
+        .output()?;
+    let output = String::from_utf8_lossy(&result.stdout);
+
+    assert!(
+        !result.status.success(),
+        "fsck should fail with broken image ref, stdout: {output}"
+    );
+    Ok(())
+}
+integration_test!(test_fsck_detects_broken_image_ref);
