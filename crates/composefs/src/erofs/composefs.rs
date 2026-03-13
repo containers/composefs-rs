@@ -35,4 +35,20 @@ impl<H: FsVerityHashValue> OverlayMetacopy<H> {
             && self.flags == 0
             && self.digest_algo == H::ALGORITHM
     }
+
+    pub(super) fn version(&self) -> u8 {
+        self.version
+    }
+
+    pub(super) fn len(&self) -> u8 {
+        self.len
+    }
+
+    pub(super) fn flags(&self) -> u8 {
+        self.flags
+    }
+
+    pub(super) fn digest_algo(&self) -> u8 {
+        self.digest_algo
+    }
 }

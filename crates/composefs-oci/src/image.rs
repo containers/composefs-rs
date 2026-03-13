@@ -252,7 +252,7 @@ mod test {
         append_tar_dir(&mut builder, "var");
         append_tar_dir(&mut builder, "var/log");
 
-        // Regular files — inline (<=64 bytes, the INLINE_CONTENT_MAX threshold)
+        // Regular files — inline (<=64 bytes, the INLINE_CONTENT_MAX_V0 threshold)
         append_tar_file(&mut builder, "etc/hostname", b"busybox-container\n");
         append_tar_file(
             &mut builder,
@@ -318,7 +318,7 @@ mod test {
     /// with `get_entry()`, and verify every entry type round-trips correctly.
     #[tokio::test]
     async fn test_build_baseimage_roundtrip() -> Result<()> {
-        use composefs::{repository::Repository, test::tempdir, INLINE_CONTENT_MAX};
+        use composefs::{repository::Repository, test::tempdir, INLINE_CONTENT_MAX_V0};
         use rustix::fs::CWD;
         use std::ffi::OsStr;
         use std::sync::Arc;
@@ -367,14 +367,14 @@ mod test {
             assert_eq!(entry.stat.st_mode, 0o755, "{dir} mode");
         }
 
-        // --- Inline files (<=INLINE_CONTENT_MAX bytes) ---
+        // --- Inline files (<=INLINE_CONTENT_MAX_V0 bytes) ---
         let hostname = by_path("/etc/hostname");
         match &hostname.item {
             TarItem::Leaf(LeafContent::Regular(RegularFile::Inline(data))) => {
                 assert_eq!(data.as_ref(), b"busybox-container\n");
                 assert!(
-                    data.len() <= INLINE_CONTENT_MAX,
-                    "hostname should be inline ({} bytes <= {INLINE_CONTENT_MAX})",
+                    data.len() <= INLINE_CONTENT_MAX_V0,
+                    "hostname should be inline ({} bytes <= {INLINE_CONTENT_MAX_V0})",
                     data.len()
                 );
             }
@@ -386,21 +386,21 @@ mod test {
             TarItem::Leaf(LeafContent::Regular(RegularFile::Inline(data))) => {
                 assert!(data.starts_with(b"nameserver"));
                 assert!(
-                    data.len() <= INLINE_CONTENT_MAX,
-                    "resolv.conf should be inline ({} bytes <= {INLINE_CONTENT_MAX})",
+                    data.len() <= INLINE_CONTENT_MAX_V0,
+                    "resolv.conf should be inline ({} bytes <= {INLINE_CONTENT_MAX_V0})",
                     data.len()
                 );
             }
             other => panic!("expected inline file for /etc/resolv.conf, got {other:?}"),
         }
 
-        // --- External files (>INLINE_CONTENT_MAX bytes) ---
+        // --- External files (>INLINE_CONTENT_MAX_V0 bytes) ---
         let passwd = by_path("/etc/passwd");
         match &passwd.item {
             TarItem::Leaf(LeafContent::Regular(RegularFile::External(_, size))) => {
                 assert!(
-                    *size as usize > INLINE_CONTENT_MAX,
-                    "passwd should be external ({size} bytes > {INLINE_CONTENT_MAX})"
+                    *size as usize > INLINE_CONTENT_MAX_V0,
+                    "passwd should be external ({size} bytes > {INLINE_CONTENT_MAX_V0})"
                 );
             }
             other => panic!("expected external file for /etc/passwd, got {other:?}"),
@@ -426,7 +426,7 @@ mod test {
         match &readme.item {
             TarItem::Leaf(LeafContent::Regular(RegularFile::External(_, size))) => {
                 assert!(
-                    *size as usize > INLINE_CONTENT_MAX,
+                    *size as usize > INLINE_CONTENT_MAX_V0,
                     "README should be external ({size} bytes)"
                 );
             }

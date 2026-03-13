@@ -600,7 +600,7 @@ fn write_erofs(
     output.write_struct(format::Superblock {
         magic: format::MAGIC_V1,
         blkszbits: format::BLOCK_BITS,
-        feature_compat: format::FEATURE_COMPAT_MTIME | format::FEATURE_COMPAT_XATTR_FILTER,
+        feature_compat: (format::FEATURE_COMPAT_MTIME | format::FEATURE_COMPAT_XATTR_FILTER).into(),
         root_nid: (output.get_nid(0) as u16).into(),
         inos: (inodes.len() as u64).into(),
         blocks: ((output.get(Offset::End, 0) / usize::from(format::BLOCK_SIZE)) as u32).into(),
