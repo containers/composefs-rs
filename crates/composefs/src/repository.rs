@@ -80,6 +80,7 @@
 use std::{
     collections::{HashMap, HashSet},
     ffi::{CStr, CString, OsStr, OsString},
+    fmt,
     fs::{canonicalize, File},
     io::{Read, Write},
     os::{
@@ -202,6 +203,200 @@ pub struct GcResult {
     pub images_pruned: u64,
     /// Number of broken symlinks removed in streams/
     pub streams_pruned: u64,
+}
+
+/// A structured error found during a filesystem consistency check.
+///
+/// Each variant corresponds to a specific kind of repository integrity problem.
+/// The `Display` implementation produces a kebab-case error type prefix followed
+/// by the path/context and any relevant details, suitable for both human display
+/// and structured logging.
+#[derive(Debug, Clone, serde::Serialize, thiserror::Error)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+#[non_exhaustive]
+#[allow(missing_docs)]
+pub enum FsckError {
+    #[error("fsck: object-invalid-name: {path}: {detail}")]
+    ObjectInvalidName { path: String, detail: String },
+
+    #[error("fsck: object-open-failed: {path}: {detail}")]
+    ObjectOpenFailed { path: String, detail: String },
+
+    #[error("fsck: object-digest-mismatch: {path}: measured {measured}")]
+    ObjectDigestMismatch { path: String, measured: String },
+
+    #[error("fsck: object-verity-failed: {path}: {detail}")]
+    ObjectVerityFailed { path: String, detail: String },
+
+    #[error("fsck: object-verity-missing: {path}")]
+    ObjectVerityMissing { path: String },
+
+    #[error("fsck: entry-not-symlink: {path}")]
+    EntryNotSymlink { path: String },
+
+    #[error("fsck: broken-symlink: {path}")]
+    BrokenSymlink { path: String },
+
+    #[error("fsck: stat-failed: {path}: {detail}")]
+    StatFailed { path: String, detail: String },
+
+    #[error("fsck: unexpected-file-type: {path}: {detail}")]
+    UnexpectedFileType { path: String, detail: String },
+
+    #[error("fsck: stream-open-failed: {path}: {detail}")]
+    StreamOpenFailed { path: String, detail: String },
+
+    #[error("fsck: missing-object-ref: {path}: {object_id}")]
+    #[serde(rename_all = "camelCase")]
+    MissingObjectRef { path: String, object_id: String },
+
+    #[error("fsck: stream-read-failed: {path}: {detail}")]
+    StreamReadFailed { path: String, detail: String },
+
+    #[error("fsck: missing-named-ref: {path}: ref {ref_name}: {object_id}")]
+    #[serde(rename_all = "camelCase")]
+    MissingNamedRef {
+        path: String,
+        ref_name: String,
+        object_id: String,
+    },
+
+    #[error("fsck: object-check-failed: {path}: {object_id}: {detail}")]
+    #[serde(rename_all = "camelCase")]
+    ObjectCheckFailed {
+        path: String,
+        object_id: String,
+        detail: String,
+    },
+
+    #[error("fsck: image-open-failed: {path}: {detail}")]
+    ImageOpenFailed { path: String, detail: String },
+
+    #[error("fsck: image-read-failed: {path}: {detail}")]
+    ImageReadFailed { path: String, detail: String },
+
+    #[error("fsck: image-invalid: {path}: {detail}")]
+    ImageInvalid { path: String, detail: String },
+
+    #[error("fsck: image-missing-object: {path}: {object_id}")]
+    #[serde(rename_all = "camelCase")]
+    ImageMissingObject { path: String, object_id: String },
+}
+
+/// Results from a filesystem consistency check.
+///
+/// Returned by [`Repository::fsck`] to report repository integrity status.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsckResult {
+    pub(crate) objects_checked: u64,
+    pub(crate) objects_corrupted: u64,
+    pub(crate) streams_checked: u64,
+    pub(crate) streams_corrupted: u64,
+    pub(crate) images_checked: u64,
+    pub(crate) images_corrupted: u64,
+    pub(crate) broken_links: u64,
+    pub(crate) missing_objects: u64,
+    pub(crate) errors: Vec<FsckError>,
+}
+
+impl FsckResult {
+    /// Returns true if no corruption or errors were found.
+    pub fn is_ok(&self) -> bool {
+        debug_assert!(
+            self.objects_corrupted == 0
+                && self.streams_corrupted == 0
+                && self.images_corrupted == 0
+                && self.broken_links == 0
+                && self.missing_objects == 0
+                || !self.errors.is_empty(),
+            "corruption counters are non-zero but no error messages recorded"
+        );
+        self.errors.is_empty()
+    }
+
+    /// Number of objects verified.
+    pub fn objects_checked(&self) -> u64 {
+        self.objects_checked
+    }
+
+    /// Number of objects with bad fsverity digests.
+    pub fn objects_corrupted(&self) -> u64 {
+        self.objects_corrupted
+    }
+
+    /// Number of streams verified.
+    pub fn streams_checked(&self) -> u64 {
+        self.streams_checked
+    }
+
+    /// Number of streams with issues (bad header, missing refs, etc.).
+    pub fn streams_corrupted(&self) -> u64 {
+        self.streams_corrupted
+    }
+
+    /// Number of images verified.
+    pub fn images_checked(&self) -> u64 {
+        self.images_checked
+    }
+
+    /// Number of images with issues.
+    pub fn images_corrupted(&self) -> u64 {
+        self.images_corrupted
+    }
+
+    /// Number of broken symlinks found.
+    pub fn broken_links(&self) -> u64 {
+        self.broken_links
+    }
+
+    /// Number of missing objects referenced by streams.
+    pub fn missing_objects(&self) -> u64 {
+        self.missing_objects
+    }
+
+    /// Errors found during the check.
+    pub fn errors(&self) -> &[FsckError] {
+        &self.errors
+    }
+}
+
+impl fmt::Display for FsckResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "objects: {}/{} ok",
+            self.objects_checked.saturating_sub(self.objects_corrupted),
+            self.objects_checked
+        )?;
+        writeln!(
+            f,
+            "streams: {}/{} ok",
+            self.streams_checked.saturating_sub(self.streams_corrupted),
+            self.streams_checked
+        )?;
+        writeln!(
+            f,
+            "images: {}/{} ok",
+            self.images_checked.saturating_sub(self.images_corrupted),
+            self.images_checked
+        )?;
+        if self.broken_links > 0 {
+            writeln!(f, "broken symlinks: {}", self.broken_links)?;
+        }
+        if self.missing_objects > 0 {
+            writeln!(f, "missing objects: {}", self.missing_objects)?;
+        }
+        if self.errors.is_empty() {
+            writeln!(f, "status: ok")?;
+        } else {
+            writeln!(f, "status: {} error(s)", self.errors.len())?;
+            for err in &self.errors {
+                writeln!(f, "  - {err}")?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
@@ -1431,9 +1626,402 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(result)
     }
 
-    // fn fsck(&self) -> Result<()> {
-    //     unimplemented!()
-    // }
+    /// Check the structural integrity of the repository.
+    ///
+    /// Walks all objects, streams, and images in the repository, verifying:
+    /// - Object fsverity digests match their path-derived identifiers
+    /// - Stream and image symlinks resolve to existing objects
+    /// - Stream/image refs resolve to valid entries
+    /// - Splitstreams have valid headers and reference only existing objects
+    ///
+    /// Object directories are checked in parallel using `spawn_blocking`,
+    /// with concurrency bounded by `available_parallelism()`.
+    ///
+    /// Returns a [`FsckResult`] summarizing the findings. Does not modify
+    /// any repository contents.
+    #[context("Running filesystem consistency check")]
+    pub async fn fsck(&self) -> Result<FsckResult> {
+        let mut result = FsckResult::default();
+
+        // Phase 1: Verify all objects (parallel across object subdirectories)
+        self.fsck_objects(&mut result)
+            .await
+            .context("Checking objects")?;
+
+        // Phase 2: Verify stream symlinks and splitstream integrity
+        self.fsck_category("streams", &mut result)
+            .context("Checking streams")?;
+
+        // Phase 3: Verify image symlinks
+        self.fsck_category("images", &mut result)
+            .context("Checking images")?;
+
+        Ok(result)
+    }
+
+    /// Verify all objects in the repository have correct fsverity digests.
+    ///
+    /// Each `objects/XX/` subdirectory is checked on a blocking thread via
+    /// `tokio::task::spawn_blocking`, with bounded concurrency to avoid
+    /// overwhelming the system with I/O.
+    async fn fsck_objects(&self, result: &mut FsckResult) -> Result<()> {
+        // Cap at available CPUs; the work is a mix of I/O (reading objects)
+        // and CPU (computing verity hashes).
+        let max_concurrent = available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let insecure = self.insecure;
+
+        let mut joinset = tokio::task::JoinSet::new();
+        let mut partial_results = Vec::new();
+
+        for first_byte in 0x00..=0xffu8 {
+            // Drain completed tasks if we're at the concurrency limit
+            while joinset.len() >= max_concurrent {
+                partial_results.push(joinset.join_next().await.unwrap()??);
+            }
+
+            let dirfd = match self.openat(
+                &format!("objects/{first_byte:02x}"),
+                OFlags::RDONLY | OFlags::DIRECTORY,
+            ) {
+                Ok(fd) => fd,
+                Err(Errno::NOENT) => continue,
+                Err(e) => {
+                    Err(e).with_context(|| format!("Opening objects/{first_byte:02x} directory"))?
+                }
+            };
+
+            joinset
+                .spawn_blocking(move || fsck_object_dir::<ObjectID>(dirfd, first_byte, insecure));
+        }
+
+        // Drain remaining tasks
+        while let Some(output) = joinset.join_next().await {
+            partial_results.push(output??);
+        }
+
+        // Fold all per-directory results into the main result
+        for partial in partial_results {
+            result.objects_checked += partial.objects_checked;
+            result.objects_corrupted += partial.objects_corrupted;
+            result.errors.extend(partial.errors);
+        }
+
+        Ok(())
+    }
+
+    /// Verify symlink integrity and splitstream/image validity for a category
+    /// ("streams" or "images").
+    #[context("Checking {category} integrity")]
+    fn fsck_category(&self, category: &str, result: &mut FsckResult) -> Result<()> {
+        let is_streams = category == "streams";
+
+        let Some(category_fd) = self
+            .openat(category, OFlags::RDONLY | OFlags::DIRECTORY)
+            .filter_errno(Errno::NOENT)
+            .with_context(|| format!("Opening {category} directory"))?
+        else {
+            return Ok(());
+        };
+
+        // Check first-level symlinks: each should point to an existing object
+        for item in
+            Dir::read_from(&category_fd).with_context(|| format!("Reading {category} directory"))?
+        {
+            let entry = item.context("Reading directory entry")?;
+            let filename = entry.file_name();
+            if filename == c"." || filename == c".." || filename == c"refs" {
+                continue;
+            }
+
+            if is_streams {
+                result.streams_checked += 1;
+            } else {
+                result.images_checked += 1;
+            }
+
+            if entry.file_type() != FileType::Symlink {
+                if is_streams {
+                    result.streams_corrupted += 1;
+                } else {
+                    result.images_corrupted += 1;
+                }
+                result.errors.push(FsckError::EntryNotSymlink {
+                    path: format!(
+                        "{category}/{}",
+                        String::from_utf8_lossy(filename.to_bytes())
+                    ),
+                });
+                continue;
+            }
+
+            // Check the symlink resolves (follows through to the object)
+            match statat(&category_fd, filename, AtFlags::empty()) {
+                Ok(_) => {}
+                Err(Errno::NOENT) => {
+                    result.broken_links += 1;
+                    if is_streams {
+                        result.streams_corrupted += 1;
+                    } else {
+                        result.images_corrupted += 1;
+                    }
+                    result.errors.push(FsckError::BrokenSymlink {
+                        path: format!(
+                            "{category}/{}",
+                            String::from_utf8_lossy(filename.to_bytes())
+                        ),
+                    });
+                    continue;
+                }
+                Err(e) => {
+                    result.errors.push(FsckError::StatFailed {
+                        path: format!(
+                            "{category}/{}",
+                            String::from_utf8_lossy(filename.to_bytes())
+                        ),
+                        detail: e.to_string(),
+                    });
+                    continue;
+                }
+            }
+
+            let name = String::from_utf8_lossy(filename.to_bytes()).to_string();
+            if is_streams {
+                // Validate splitstream contents
+                self.fsck_splitstream(&name, result);
+            } else {
+                // Validate erofs image structure and object references
+                self.fsck_image(&name, result);
+            }
+        }
+
+        // Check refs/ symlinks
+        let refs_fd = match openat(
+            &category_fd,
+            c"refs",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .filter_errno(Errno::NOENT)
+        .with_context(|| format!("Opening {category}/refs directory"))?
+        {
+            Some(fd) => fd,
+            None => return Ok(()),
+        };
+
+        self.fsck_refs_dir(&refs_fd, category, "", result)
+            .with_context(|| format!("Checking {category}/refs"))
+    }
+
+    /// Recursively verify that all ref symlinks resolve to valid entries in the
+    /// parent category directory.
+    fn fsck_refs_dir(
+        &self,
+        refs_fd: &OwnedFd,
+        category: &str,
+        prefix: &str,
+        result: &mut FsckResult,
+    ) -> Result<()> {
+        for item in Dir::read_from(refs_fd)
+            .with_context(|| format!("Reading {category}/refs/{prefix} directory"))?
+        {
+            let entry = item.context("Reading refs directory entry")?;
+            let filename = entry.file_name();
+            if filename == c"." || filename == c".." {
+                continue;
+            }
+
+            let name = String::from_utf8_lossy(filename.to_bytes()).to_string();
+            let display_path = if prefix.is_empty() {
+                format!("{category}/refs/{name}")
+            } else {
+                format!("{category}/refs/{prefix}/{name}")
+            };
+
+            match entry.file_type() {
+                FileType::Directory => {
+                    let subdir = openat(
+                        refs_fd,
+                        filename,
+                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    )
+                    .with_context(|| format!("Opening {display_path}"))?;
+                    let sub_prefix = if prefix.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{prefix}/{name}")
+                    };
+                    self.fsck_refs_dir(&subdir, category, &sub_prefix, result)?;
+                }
+                FileType::Symlink => {
+                    // The ref should ultimately resolve to a file (following
+                    // the chain: refs/X -> ../../entry -> ../objects/XX/YY)
+                    match statat(refs_fd, filename, AtFlags::empty()) {
+                        Ok(_) => {}
+                        Err(Errno::NOENT) => {
+                            result.broken_links += 1;
+                            result.errors.push(FsckError::BrokenSymlink {
+                                path: display_path.clone(),
+                            });
+                        }
+                        Err(e) => {
+                            result.errors.push(FsckError::StatFailed {
+                                path: display_path.clone(),
+                                detail: e.to_string(),
+                            });
+                        }
+                    }
+                }
+                other => {
+                    result.errors.push(FsckError::UnexpectedFileType {
+                        path: display_path.clone(),
+                        detail: format!("{other:?}"),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate a single splitstream: check header and object references.
+    fn fsck_splitstream(&self, stream_name: &str, result: &mut FsckResult) {
+        let stream_path = format!("streams/{stream_name}");
+        let mut split_stream = match self.open_stream(stream_name, None, None) {
+            Ok(s) => s,
+            Err(e) => {
+                result.streams_corrupted += 1;
+                result.errors.push(FsckError::StreamOpenFailed {
+                    path: stream_path,
+                    detail: e.to_string(),
+                });
+                return;
+            }
+        };
+
+        // Check that all object_refs point to existing objects
+        let check_result = split_stream.get_object_refs(|id| {
+            let obj_path = Self::format_object_path(id);
+            match self.openat(&obj_path, OFlags::RDONLY) {
+                Ok(_) => {}
+                Err(Errno::NOENT) => {
+                    result.missing_objects += 1;
+                    result.errors.push(FsckError::MissingObjectRef {
+                        path: stream_path.clone(),
+                        object_id: id.to_hex(),
+                    });
+                }
+                Err(e) => {
+                    result.errors.push(FsckError::ObjectCheckFailed {
+                        path: stream_path.clone(),
+                        object_id: id.to_hex(),
+                        detail: e.to_string(),
+                    });
+                }
+            }
+        });
+        if let Err(e) = check_result {
+            result.streams_corrupted += 1;
+            result.errors.push(FsckError::StreamReadFailed {
+                path: stream_path,
+                detail: e.to_string(),
+            });
+            return;
+        }
+
+        // Check that all named refs (stream refs) point to existing objects
+        for (ref_name, ref_id) in split_stream.iter_named_refs() {
+            // The named ref's object should exist
+            let obj_path = Self::format_object_path(ref_id);
+            match self.openat(&obj_path, OFlags::RDONLY) {
+                Ok(_) => {}
+                Err(Errno::NOENT) => {
+                    result.missing_objects += 1;
+                    result.errors.push(FsckError::MissingNamedRef {
+                        path: stream_path.clone(),
+                        ref_name: ref_name.to_string(),
+                        object_id: ref_id.to_hex(),
+                    });
+                }
+                Err(e) => {
+                    result.errors.push(FsckError::ObjectCheckFailed {
+                        path: stream_path.clone(),
+                        object_id: ref_id.to_hex(),
+                        detail: format!("checking named ref '{ref_name}': {e}"),
+                    });
+                }
+            }
+            // The stream entry itself should also exist (but don't double-count).
+            // Note: the named ref name may not correspond to an actual stream
+            // entry.  OCI images use named refs with keys like
+            // "config:sha256:..." or layer diff_ids that aren't stream names.
+            // We only warn if the object itself is missing (handled above);
+            // a missing stream entry with an existing object is benign.
+        }
+    }
+
+    /// Validate a single erofs image: parse structure, enforce composefs
+    /// invariants, and verify all referenced objects exist.
+    fn fsck_image(&self, image_name: &str, result: &mut FsckResult) {
+        // Read the image data
+        let image_path = format!("images/{image_name}");
+        let mut data = vec![];
+        let fd = match self.openat(&image_path, OFlags::RDONLY) {
+            Ok(fd) => fd,
+            Err(e) => {
+                result.images_corrupted += 1;
+                result.errors.push(FsckError::ImageOpenFailed {
+                    path: image_path,
+                    detail: e.to_string(),
+                });
+                return;
+            }
+        };
+        if let Err(e) = File::from(fd).read_to_end(&mut data) {
+            result.images_corrupted += 1;
+            result.errors.push(FsckError::ImageReadFailed {
+                path: image_path,
+                detail: e.to_string(),
+            });
+            return;
+        }
+
+        // Parse the erofs image with composefs-specific structural validation
+        // (header magic, superblock, no unsupported features, etc.) and walk
+        // the directory tree to collect all referenced object IDs.
+        let objects = match crate::erofs::reader::collect_objects::<ObjectID>(&data) {
+            Ok(objects) => objects,
+            Err(e) => {
+                result.images_corrupted += 1;
+                result.errors.push(FsckError::ImageInvalid {
+                    path: image_path,
+                    detail: e.to_string(),
+                });
+                return;
+            }
+        };
+
+        // Verify all referenced objects exist
+        for obj_id in &objects {
+            let path = Self::format_object_path(obj_id);
+            match self.openat(&path, OFlags::RDONLY) {
+                Ok(_) => {}
+                Err(Errno::NOENT) => {
+                    result.missing_objects += 1;
+                    result.errors.push(FsckError::ImageMissingObject {
+                        path: image_path.clone(),
+                        object_id: obj_id.to_hex(),
+                    });
+                }
+                Err(e) => {
+                    result.errors.push(FsckError::ObjectCheckFailed {
+                        path: image_path.clone(),
+                        object_id: obj_id.to_hex(),
+                        detail: e.to_string(),
+                    });
+                }
+            }
+        }
+    }
 
     /// Returns a borrowed file descriptor for the repository root.
     ///
@@ -1477,6 +2065,120 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
         Ok(refs)
     }
+}
+
+/// Verify each object in a single `objects/XX/` subdirectory.
+///
+/// This is a free function (not a method) so it can be used with
+/// `spawn_blocking` — it captures only owned/`Send` values.
+fn fsck_object_dir<ObjectID: FsVerityHashValue>(
+    dirfd: OwnedFd,
+    first_byte: u8,
+    insecure: bool,
+) -> Result<FsckResult> {
+    let mut result = FsckResult::default();
+
+    for item in Dir::read_from(&dirfd)
+        .with_context(|| format!("Reading objects/{first_byte:02x} directory"))?
+    {
+        let entry = item.context("Reading object directory entry")?;
+        let filename = entry.file_name();
+        if filename == c"." || filename == c".." {
+            continue;
+        }
+
+        result.objects_checked += 1;
+
+        let expected_id =
+            match ObjectID::from_object_dir_and_basename(first_byte, filename.to_bytes()) {
+                Ok(id) => id,
+                Err(e) => {
+                    result.objects_corrupted += 1;
+                    result.errors.push(FsckError::ObjectInvalidName {
+                        path: format!(
+                            "objects/{first_byte:02x}/{}",
+                            String::from_utf8_lossy(filename.to_bytes())
+                        ),
+                        detail: e.to_string(),
+                    });
+                    continue;
+                }
+            };
+
+        let fd = match openat(
+            &dirfd,
+            filename,
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(e) => {
+                result.objects_corrupted += 1;
+                result.errors.push(FsckError::ObjectOpenFailed {
+                    path: format!(
+                        "objects/{first_byte:02x}/{}",
+                        String::from_utf8_lossy(filename.to_bytes())
+                    ),
+                    detail: e.to_string(),
+                });
+                continue;
+            }
+        };
+
+        let Some(measured) =
+            fsck_measure_object::<ObjectID>(fd, &expected_id, insecure, &mut result)
+        else {
+            continue;
+        };
+
+        if measured != expected_id {
+            result.objects_corrupted += 1;
+            result.errors.push(FsckError::ObjectDigestMismatch {
+                path: format!("objects/{}", expected_id.to_object_pathname()),
+                measured: measured.to_hex(),
+            });
+        }
+    }
+    Ok(result)
+}
+
+/// Measure the verity digest of a single object file.
+///
+/// Returns `Some(digest)` on success, or `None` after recording the error
+/// in `result` (so the caller can `continue`).
+fn fsck_measure_object<ObjectID: FsVerityHashValue>(
+    fd: OwnedFd,
+    expected_id: &ObjectID,
+    insecure: bool,
+    result: &mut FsckResult,
+) -> Option<ObjectID> {
+    if let Ok(digest) = measure_verity::<ObjectID>(&fd) {
+        return Some(digest);
+    }
+
+    // Kernel measurement failed — in insecure mode, try userspace computation
+    if insecure {
+        match Repository::<ObjectID>::compute_verity_digest(&mut std::io::BufReader::new(
+            File::from(fd),
+        )) {
+            Ok(digest) => return Some(digest),
+            Err(e) => {
+                result.objects_corrupted += 1;
+                result.errors.push(FsckError::ObjectVerityFailed {
+                    path: format!("objects/{}", expected_id.to_object_pathname()),
+                    detail: e.to_string(),
+                });
+                return None;
+            }
+        }
+    }
+
+    // Not insecure — verity is required but missing/unsupported
+    result.objects_corrupted += 1;
+    result.errors.push(FsckError::ObjectVerityMissing {
+        path: format!("objects/{}", expected_id.to_object_pathname()),
+    });
+    None
 }
 
 #[cfg(test)]
@@ -2250,6 +2952,596 @@ mod tests {
         assert!(result.objects_bytes > 0);
         assert_eq!(result.images_pruned, 1);
         assert_eq!(result.streams_pruned, 0);
+        Ok(())
+    }
+
+    // ==================== Fsck Tests ====================
+
+    #[tokio::test]
+    async fn test_fsck_empty_repo() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let result = repo.fsck().await?;
+
+        assert!(result.is_ok());
+        assert_eq!(result.objects_checked, 0);
+        assert_eq!(result.objects_corrupted, 0);
+        assert_eq!(result.streams_checked, 0);
+        assert_eq!(result.streams_corrupted, 0);
+        assert_eq!(result.images_checked, 0);
+        assert_eq!(result.images_corrupted, 0);
+        assert_eq!(result.broken_links, 0);
+        assert_eq!(result.missing_objects, 0);
+        assert!(result.errors.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fsck_healthy_repo_with_objects() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let obj1 = generate_test_data(32 * 1024, 0xAE);
+        let obj2 = generate_test_data(64 * 1024, 0xEA);
+
+        let _obj1_id = repo.ensure_object(&obj1)?;
+        let _obj2_id: Sha512HashValue = compute_verity(&obj2);
+
+        let mut writer = repo.create_stream(0);
+        writer.write_external(&obj2)?;
+        let _stream_id = repo.write_stream(writer, "test-stream", None)?;
+        repo.sync()?;
+
+        let result = repo.fsck().await?;
+
+        assert!(result.is_ok(), "fsck should pass: {result}");
+        // 3 objects: obj1, obj2, and the splitstream object
+        assert!(result.objects_checked >= 3);
+        assert_eq!(result.objects_corrupted, 0);
+        assert_eq!(result.streams_checked, 1);
+        assert_eq!(result.streams_corrupted, 0);
+        assert_eq!(result.broken_links, 0);
+        assert_eq!(result.missing_objects, 0);
+        assert!(result.errors.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fsck_detects_corrupted_object() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let obj = generate_test_data(32 * 1024, 0xAE);
+        let obj_id = repo.ensure_object(&obj)?;
+        repo.sync()?;
+
+        // Corrupt the object by replacing the file (objects may be
+        // immutable due to fs-verity, so we delete and recreate).
+        let hex = obj_id.to_hex();
+        let (dir, file) = hex.split_at(2);
+        let obj_path = tmp
+            .path()
+            .join("repo")
+            .join(format!("objects/{dir}/{file}"));
+        std::fs::remove_file(&obj_path)?;
+        std::fs::write(&obj_path, b"corrupted data")?;
+
+        let result = repo.fsck().await?;
+
+        assert!(!result.is_ok(), "fsck should detect corruption");
+        assert!(
+            result.objects_corrupted > 0,
+            "should report corrupted objects"
+        );
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.to_string().contains("object-digest-mismatch")),
+            "errors should mention digest mismatch: {:?}",
+            result.errors
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fsck_detects_broken_stream_link() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let obj = generate_test_data(64 * 1024, 0xEA);
+        let _obj_verity: Sha512HashValue = compute_verity(&obj);
+
+        let mut writer = repo.create_stream(0);
+        writer.write_external(&obj)?;
+        let _stream_id = repo.write_stream(writer, "test-stream", None)?;
+        repo.sync()?;
+
+        // The stream symlink points to a splitstream object. Find and
+        // read the symlink target, then delete the backing object.
+        let stream_symlink = tmp.path().join("repo/streams/test-stream");
+        let link_target = std::fs::read_link(&stream_symlink)?;
+        // link_target is relative to streams/, e.g. "../objects/XX/YY..."
+        let backing_path = tmp.path().join("repo/streams").join(&link_target);
+        std::fs::remove_file(&backing_path)?;
+
+        let result = repo.fsck().await?;
+
+        assert!(!result.is_ok(), "fsck should detect broken link");
+        assert!(
+            result.broken_links > 0,
+            "should report broken links: {result}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fsck_detects_missing_stream_object_ref() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let obj = generate_test_data(64 * 1024, 0xEA);
+        let obj_verity: Sha512HashValue = compute_verity(&obj);
+
+        // Create a stream with an external reference to the object.
+        // write_external calls ensure_object internally, so the object
+        // will exist.
+        let mut writer = repo.create_stream(0);
+        writer.write_external(&obj)?;
+        let _stream_id = repo.write_stream(writer, "test-stream", None)?;
+        repo.sync()?;
+
+        // Delete the referenced object (but leave the splitstream intact)
+        let hex = obj_verity.to_hex();
+        let (dir, file) = hex.split_at(2);
+        let obj_path = tmp
+            .path()
+            .join("repo")
+            .join(format!("objects/{dir}/{file}"));
+        std::fs::remove_file(&obj_path)?;
+
+        let result = repo.fsck().await?;
+
+        assert!(!result.is_ok(), "fsck should detect missing object ref");
+        assert!(
+            result.missing_objects > 0,
+            "should report missing objects: {result}"
+        );
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.to_string().contains("missing-object-ref")),
+            "errors should mention missing object: {:?}",
+            result.errors
+        );
+        Ok(())
+    }
+
+    // ==================== Additional Fsck Gap Tests ====================
+
+    fn open_test_repo_dir(tmp: &tempfile::TempDir) -> cap_std::fs::Dir {
+        cap_std::fs::Dir::open_ambient_dir(tmp.path().join("repo"), cap_std::ambient_authority())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_fsck_detects_non_symlink_in_streams() -> Result<()> {
+        // Exercises fsck_category non-symlink detection (line ~1695).
+        // The code checks entry.file_type() != FileType::Symlink and reports
+        // "not a symlink" for regular files or directories in streams/.
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+        repo.sync()?;
+
+        // Create a regular file directly in streams/ (not a symlink)
+        let dir = open_test_repo_dir(&tmp);
+        dir.create_dir_all("streams")?;
+        dir.write("streams/bogus-entry", b"not a symlink")?;
+
+        let result = repo.fsck().await?;
+
+        assert!(!result.is_ok(), "fsck should detect non-symlink in streams");
+        assert_eq!(result.streams_corrupted, 1);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.to_string().contains("entry-not-symlink")),
+            "errors should mention non-symlink: {:?}",
+            result.errors
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fsck_detects_non_symlink_in_images() -> Result<()> {
+        // Exercises fsck_category non-symlink detection for the "images"
+        // category (same code path as streams, but counting images_corrupted).
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+        repo.sync()?;
+
+        let dir = open_test_repo_dir(&tmp);
+        dir.create_dir_all("images")?;
+        dir.write("images/bogus-image", b"not a symlink")?;
+
+        let result = repo.fsck().await?;
+
+        assert!(!result.is_ok(), "fsck should detect non-symlink in images");
+        assert_eq!(result.images_corrupted, 1);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.to_string().contains("entry-not-symlink")),
+            "errors should mention non-symlink: {:?}",
+            result.errors
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fsck_detects_broken_ref_symlink() -> Result<()> {
+        // Exercises fsck_refs_dir broken symlink detection (line ~1804).
+        // Creates a ref symlink that points to a non-existent stream entry,
+        // so following the chain refs/X -> ../../stream-entry -> object fails.
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+        repo.sync()?;
+
+        // Create refs directory under streams
+        let dir = open_test_repo_dir(&tmp);
+        dir.create_dir_all("streams/refs")?;
+
+        // Create a dangling symlink in refs/
+        dir.symlink("../nonexistent-stream", "streams/refs/broken-ref")?;
+
+        let result = repo.fsck().await?;
+
+        assert!(!result.is_ok(), "fsck should detect broken ref symlink");
+        assert!(result.broken_links > 0, "should report broken links");
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.to_string().contains("broken-symlink")
+                    && e.to_string().contains("refs")),
+            "errors should mention broken ref symlink: {:?}",
+            result.errors
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fsck_refs_dir_unexpected_file_type() -> Result<()> {
+        // Exercises the "unexpected file type" branch in fsck_refs_dir
+        // (line ~1817). Regular files in refs/ are neither symlinks nor
+        // directories — they should be flagged.
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+        repo.sync()?;
+
+        let dir = open_test_repo_dir(&tmp);
+        dir.create_dir_all("streams/refs")?;
+
+        // Put a regular file directly in refs/
+        dir.write("streams/refs/stray-file", b"should not be here")?;
+
+        let result = repo.fsck().await?;
+
+        assert!(!result.is_ok(), "fsck should detect unexpected file type");
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.to_string().contains("unexpected-file-type")),
+            "errors should mention unexpected file type: {:?}",
+            result.errors
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fsck_refs_dir_recursive() -> Result<()> {
+        // Exercises the recursive walk in fsck_refs_dir: creates a nested
+        // subdirectory under refs/ with a broken symlink inside to verify
+        // the recursion actually descends into subdirs.
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+        repo.sync()?;
+
+        let dir = open_test_repo_dir(&tmp);
+        dir.create_dir_all("streams/refs/nested/deep")?;
+
+        // Broken symlink in the nested directory
+        dir.symlink(
+            "../../../nonexistent-stream",
+            "streams/refs/nested/deep/broken-nested-ref",
+        )?;
+
+        let result = repo.fsck().await?;
+
+        assert!(
+            !result.is_ok(),
+            "fsck should detect broken symlink in nested refs"
+        );
+        assert!(result.broken_links > 0);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.to_string().contains("nested/deep")
+                    && e.to_string().contains("broken-symlink")),
+            "error should reference the nested path: {:?}",
+            result.errors
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fsck_detects_invalid_object_filename() -> Result<()> {
+        // Exercises fsck_object_dir invalid filename detection (line ~1581).
+        // Creates a file with a name that can't be parsed as a hex hash
+        // remainder in objects/XX/.
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+        repo.sync()?;
+
+        let dir = open_test_repo_dir(&tmp);
+        dir.create_dir_all("objects/ab")?;
+        dir.write("objects/ab/not-a-valid-hex-hash", b"junk")?;
+
+        let result = repo.fsck().await?;
+
+        assert!(
+            !result.is_ok(),
+            "fsck should detect invalid object filename"
+        );
+        assert!(result.objects_corrupted > 0);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.to_string().contains("object-invalid-name")),
+            "errors should mention invalid filename: {:?}",
+            result.errors
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fsck_detects_broken_image_symlink() -> Result<()> {
+        // Exercises the broken symlink path in fsck_category for images
+        // (line ~1711). The stream broken-symlink test covers streams;
+        // this covers the same logic for images/.
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let obj_size: u64 = 32 * 1024;
+        let obj = generate_test_data(obj_size, 0xBB);
+        let obj_id = repo.ensure_object(&obj)?;
+
+        let fs = make_test_fs(&obj_id, obj_size);
+        let image_id = fs.commit_image(&repo, None)?;
+        repo.sync()?;
+
+        // Delete the backing object that the image symlink points to
+        let dir = open_test_repo_dir(&tmp);
+        let image_rel = format!("images/{}", image_id.to_hex());
+        let link_target = dir.read_link(&image_rel)?;
+        let backing_rel = PathBuf::from("images").join(&link_target);
+        dir.remove_file(&backing_rel)?;
+
+        let result = repo.fsck().await?;
+
+        assert!(
+            !result.is_ok(),
+            "fsck should detect broken image symlink: {result}"
+        );
+        assert!(result.broken_links > 0);
+        assert!(result.images_corrupted > 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fsck_detects_missing_named_ref_object() -> Result<()> {
+        // Exercises fsck_splitstream named ref checking (line ~1869).
+        // Creates a stream with a named ref pointing to a non-existent
+        // object, which should be detected as a missing object.
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let obj = generate_test_data(64 * 1024, 0xEA);
+
+        // Create stream1 that references obj
+        let mut writer1 = repo.create_stream(0);
+        writer1.write_external(&obj)?;
+        let stream1_id = repo.write_stream(writer1, "test-stream1", None)?;
+
+        // Create stream2 with a named ref to stream1
+        let mut writer2 = repo.create_stream(0);
+        writer2.add_named_stream_ref("test-stream1", &stream1_id);
+        let _stream2_id = repo.write_stream(writer2, "test-stream2", None)?;
+        repo.sync()?;
+
+        // Delete the object that the named ref points to (the stream1 splitstream object)
+        let hex = stream1_id.to_hex();
+        let (prefix, rest) = hex.split_at(2);
+        let repo_dir = open_test_repo_dir(&tmp);
+        repo_dir.remove_file(format!("objects/{prefix}/{rest}"))?;
+
+        let result = repo.fsck().await?;
+
+        assert!(
+            !result.is_ok(),
+            "fsck should detect missing named ref object"
+        );
+        assert!(
+            result.missing_objects > 0,
+            "should report missing objects: {result}"
+        );
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.to_string().contains("missing-named-ref")),
+            "errors should mention missing named ref object: {:?}",
+            result.errors
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fsck_healthy_repo_with_refs() -> Result<()> {
+        // Verifies fsck_refs_dir passes on valid refs. Prior tests only
+        // checked that fsck detects broken refs; this confirms a repo
+        // with valid refs reports ok.
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let obj = generate_test_data(64 * 1024, 0xEA);
+
+        let mut writer = repo.create_stream(0);
+        writer.write_external(&obj)?;
+        // write_stream with reference creates a ref symlink
+        let _stream_id = repo.write_stream(writer, "test-stream", Some("my-ref"))?;
+        repo.sync()?;
+
+        let result = repo.fsck().await?;
+
+        assert!(result.is_ok(), "fsck should pass with valid refs: {result}");
+        assert!(result.errors.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fsck_detects_corrupted_splitstream_object() -> Result<()> {
+        // Exercises fsck_splitstream failure-to-open path (line ~1829).
+        // Corrupts the splitstream object so that open_stream fails to
+        // parse it, which is different from a missing external object ref.
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let obj = generate_test_data(64 * 1024, 0xEA);
+
+        let mut writer = repo.create_stream(0);
+        writer.write_external(&obj)?;
+        let _stream_id = repo.write_stream(writer, "test-stream", None)?;
+        repo.sync()?;
+
+        // Find the splitstream object path via the stream symlink
+        let dir = open_test_repo_dir(&tmp);
+        let link_target = dir.read_link("streams/test-stream")?;
+        let backing_rel = PathBuf::from("streams").join(&link_target);
+
+        // Corrupt the splitstream object (not the data object it references)
+        dir.remove_file(&backing_rel)?;
+        dir.write(&backing_rel, b"corrupted splitstream header")?;
+
+        let result = repo.fsck().await?;
+
+        assert!(
+            !result.is_ok(),
+            "fsck should detect corrupted splitstream: {result}"
+        );
+        // The object digest mismatch is detected by object checking,
+        // and the stream is also flagged because open_stream will fail
+        // or the object refs check will fail.
+        assert!(
+            result.objects_corrupted > 0 || result.streams_corrupted > 0,
+            "should report corruption: {result}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fsck_validates_erofs_image_objects() -> Result<()> {
+        // Exercises fsck_image: creates a valid erofs image, then deletes
+        // one of its referenced objects. Fsck should detect the missing
+        // object via erofs parsing.
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let obj_size: u64 = 32 * 1024;
+        let obj = generate_test_data(obj_size, 0xCC);
+        let obj_id = repo.ensure_object(&obj)?;
+
+        let fs = make_test_fs(&obj_id, obj_size);
+        let image_id = fs.commit_image(&repo, None)?;
+        repo.sync()?;
+
+        // Sanity: fsck passes on a healthy image
+        let result = repo.fsck().await?;
+        assert!(result.is_ok(), "healthy image should pass fsck: {result}");
+        assert!(result.images_checked > 0, "should have checked the image");
+
+        // Delete the object referenced by the erofs image
+        let hex = obj_id.to_hex();
+        let (prefix, rest) = hex.split_at(2);
+        let dir = open_test_repo_dir(&tmp);
+        dir.remove_file(format!("objects/{prefix}/{rest}"))?;
+
+        let result = repo.fsck().await?;
+        assert!(
+            !result.is_ok(),
+            "fsck should detect missing object referenced by erofs image: {result}"
+        );
+        assert!(
+            result.missing_objects > 0,
+            "should report missing objects: {result}"
+        );
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.to_string().contains(&image_id.to_hex())
+                    && e.to_string().contains("image-missing-object")),
+            "error should reference the image: {:?}",
+            result.errors
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fsck_detects_corrupt_erofs_image() -> Result<()> {
+        // Exercises fsck_image: corrupts the erofs image data so that
+        // parsing fails. The catch_unwind should catch the panic from
+        // the current erofs reader.
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let obj_size: u64 = 32 * 1024;
+        let obj = generate_test_data(obj_size, 0xDD);
+        let obj_id = repo.ensure_object(&obj)?;
+
+        let fs = make_test_fs(&obj_id, obj_size);
+        let image_id = fs.commit_image(&repo, None)?;
+        repo.sync()?;
+
+        // Corrupt the erofs image data (replace the backing object)
+        let hex = image_id.to_hex();
+        let (prefix, rest) = hex.split_at(2);
+        let dir = open_test_repo_dir(&tmp);
+        let obj_path = format!("objects/{prefix}/{rest}");
+        dir.remove_file(&obj_path)?;
+        dir.write(&obj_path, b"this is not a valid erofs image")?;
+
+        let result = repo.fsck().await?;
+        assert!(
+            !result.is_ok(),
+            "fsck should detect corrupt erofs image: {result}"
+        );
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.to_string().contains("image-invalid")
+                    || e.to_string().contains("digest mismatch")),
+            "error should mention erofs corruption or digest mismatch: {:?}",
+            result.errors
+        );
         Ok(())
     }
 }

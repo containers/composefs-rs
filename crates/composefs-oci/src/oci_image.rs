@@ -922,6 +922,421 @@ pub fn cleanup_dangling_referrers<ObjectID: FsVerityHashValue>(
 }
 
 // =============================================================================
+// Filesystem Consistency Checks (fsck)
+// =============================================================================
+
+/// A structured error found during an OCI-level consistency check.
+///
+/// Each variant corresponds to a specific kind of OCI metadata integrity
+/// problem. The `Display` implementation produces a kebab-case error type
+/// prefix followed by the image name/context and any relevant details.
+#[derive(Debug, Clone, serde::Serialize, thiserror::Error)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+#[non_exhaustive]
+#[allow(missing_docs)]
+pub enum OciFsckError {
+    #[error("fsck: manifest-read-failed: {name}: {detail}")]
+    ManifestReadFailed { name: String, detail: String },
+
+    #[error("fsck: manifest-digest-mismatch: {name}: expected {expected}, got {actual}")]
+    ManifestDigestMismatch {
+        name: String,
+        expected: String,
+        actual: String,
+    },
+
+    #[error("fsck: manifest-parse-failed: {name}: {detail}")]
+    ManifestParseFailed { name: String, detail: String },
+
+    #[error("fsck: config-ref-missing: {name}: {digest}")]
+    ConfigRefMissing { name: String, digest: String },
+
+    #[error("fsck: config-read-failed: {name}: {detail}")]
+    ConfigReadFailed { name: String, detail: String },
+
+    #[error("fsck: config-digest-mismatch: {name}: expected {expected}, got {actual}")]
+    ConfigDigestMismatch {
+        name: String,
+        expected: String,
+        actual: String,
+    },
+
+    #[error("fsck: config-parse-failed: {name}: {detail}")]
+    ConfigParseFailed { name: String, detail: String },
+
+    #[error("fsck: layer-ref-missing: {name}: {diff_id}")]
+    #[serde(rename_all = "camelCase")]
+    LayerRefMissing { name: String, diff_id: String },
+
+    #[error("fsck: layer-stream-missing: {name}: {diff_id}")]
+    #[serde(rename_all = "camelCase")]
+    LayerStreamMissing { name: String, diff_id: String },
+
+    #[error("fsck: layer-check-failed: {name}: {diff_id}: {detail}")]
+    #[serde(rename_all = "camelCase")]
+    LayerCheckFailed {
+        name: String,
+        diff_id: String,
+        detail: String,
+    },
+
+    #[error("fsck: layer-object-missing: {name}: {diff_id}: {detail}")]
+    #[serde(rename_all = "camelCase")]
+    LayerObjectMissing {
+        name: String,
+        diff_id: String,
+        detail: String,
+    },
+
+    #[error("fsck: seal-image-missing: {name}: {digest}: {detail}")]
+    SealImageMissing {
+        name: String,
+        digest: String,
+        detail: String,
+    },
+
+    #[error("fsck: artifact-layer-ref-missing: {name}: {digest}")]
+    ArtifactLayerRefMissing { name: String, digest: String },
+
+    #[error("fsck: artifact-layer-object-missing: {name}: {digest}: {detail}")]
+    ArtifactLayerObjectMissing {
+        name: String,
+        digest: String,
+        detail: String,
+    },
+
+    #[error("fsck: ref-resolve-failed: {name}: {detail}")]
+    RefResolveFailed { name: String, detail: String },
+}
+
+/// Results from an OCI-level filesystem consistency check.
+///
+/// Returned by [`oci_fsck`] and [`oci_fsck_image`] to report integrity status
+/// of OCI images stored in the repository. This includes checks at both the
+/// OCI metadata level (manifest/config digests, layer references) and the
+/// underlying repository level (object integrity, splitstream validity).
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OciFsckResult {
+    pub(crate) repo_result: composefs::repository::FsckResult,
+    pub(crate) images_checked: u64,
+    pub(crate) images_corrupted: u64,
+    pub(crate) errors: Vec<OciFsckError>,
+}
+
+impl OciFsckResult {
+    /// Returns true if no corruption or errors were found at any level.
+    pub fn is_ok(&self) -> bool {
+        debug_assert!(
+            self.images_corrupted == 0 || !self.errors.is_empty(),
+            "images_corrupted is non-zero but no OCI error messages recorded"
+        );
+        self.repo_result.is_ok() && self.errors.is_empty()
+    }
+
+    /// Results from the underlying repository fsck.
+    pub fn repo_result(&self) -> &composefs::repository::FsckResult {
+        &self.repo_result
+    }
+
+    /// Number of OCI images checked.
+    pub fn images_checked(&self) -> u64 {
+        self.images_checked
+    }
+
+    /// Number of OCI images with issues.
+    pub fn images_corrupted(&self) -> u64 {
+        self.images_corrupted
+    }
+
+    /// OCI-level errors found during the check.
+    pub fn errors(&self) -> &[OciFsckError] {
+        &self.errors
+    }
+}
+
+impl std::fmt::Display for OciFsckResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.repo_result)?;
+        writeln!(
+            f,
+            "oci images: {}/{} ok",
+            self.images_checked.saturating_sub(self.images_corrupted),
+            self.images_checked
+        )?;
+        if !self.errors.is_empty() {
+            writeln!(f, "oci errors: {}", self.errors.len())?;
+            for err in &self.errors {
+                writeln!(f, "  - {err}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Run a full OCI-aware consistency check on the repository.
+///
+/// This performs the underlying repository fsck (object integrity, splitstream
+/// validation, symlink checks) and then additionally validates all tagged OCI
+/// images: manifest digest verification, config digest verification, layer
+/// reference existence, and seal consistency.
+pub async fn oci_fsck<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+) -> Result<OciFsckResult> {
+    let repo_result = repo.fsck().await?;
+    let mut result = OciFsckResult {
+        repo_result,
+        ..Default::default()
+    };
+
+    // Check all tagged OCI images
+    let refs = list_refs(repo).context("listing OCI refs")?;
+    for (name, manifest_digest) in refs {
+        fsck_single_image(repo, &name, &manifest_digest, &mut result);
+    }
+
+    Ok(result)
+}
+
+/// Run an OCI-aware consistency check on a single image by tag name.
+///
+/// Performs the underlying repository fsck, then validates the specified image.
+pub async fn oci_fsck_image<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    name: &str,
+) -> Result<OciFsckResult> {
+    let repo_result = repo.fsck().await?;
+    let mut result = OciFsckResult {
+        repo_result,
+        ..Default::default()
+    };
+
+    let (manifest_digest, _verity) = match resolve_ref(repo, name) {
+        Ok(v) => v,
+        Err(e) => {
+            result.images_corrupted += 1;
+            result.images_checked += 1;
+            result.errors.push(OciFsckError::RefResolveFailed {
+                name: name.to_string(),
+                detail: e.to_string(),
+            });
+            return Ok(result);
+        }
+    };
+
+    fsck_single_image(repo, name, &manifest_digest, &mut result);
+    Ok(result)
+}
+
+/// Internal: validate a single OCI image's metadata integrity.
+fn fsck_single_image<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    name: &str,
+    manifest_digest: &str,
+    result: &mut OciFsckResult,
+) {
+    result.images_checked += 1;
+    let error_count_before = result.errors.len();
+
+    // 1. Verify manifest content hash
+    let manifest_id = manifest_identifier(manifest_digest);
+    let (manifest_data, manifest_named_refs) = match read_external_splitstream(
+        repo,
+        &manifest_id,
+        None,
+        Some(OCI_MANIFEST_CONTENT_TYPE),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            result.images_corrupted += 1;
+            result.errors.push(OciFsckError::ManifestReadFailed {
+                name: name.to_string(),
+                detail: e.to_string(),
+            });
+            return;
+        }
+    };
+
+    let computed_digest = hash(&manifest_data);
+    if manifest_digest != computed_digest {
+        result.images_corrupted += 1;
+        result.errors.push(OciFsckError::ManifestDigestMismatch {
+            name: name.to_string(),
+            expected: manifest_digest.to_string(),
+            actual: computed_digest,
+        });
+        return;
+    }
+
+    // 2. Parse manifest
+    let manifest = match ImageManifest::from_reader(&manifest_data[..]) {
+        Ok(m) => m,
+        Err(e) => {
+            result.images_corrupted += 1;
+            result.errors.push(OciFsckError::ManifestParseFailed {
+                name: name.to_string(),
+                detail: e.to_string(),
+            });
+            return;
+        }
+    };
+
+    // 3. Verify config reference exists in manifest's named refs
+    let config_digest = manifest.config().digest().to_string();
+    let config_key = format!("config:{config_digest}");
+    let config_verity = match manifest_named_refs.get(config_key.as_str()) {
+        Some(v) => v.clone(),
+        None => {
+            result.images_corrupted += 1;
+            result.errors.push(OciFsckError::ConfigRefMissing {
+                name: name.to_string(),
+                digest: config_digest,
+            });
+            return;
+        }
+    };
+
+    // 4. Verify config content hash
+    let config_id = crate::config_identifier(&config_digest);
+    let (config_data, config_named_refs) = match read_external_splitstream(
+        repo,
+        &config_id,
+        Some(&config_verity),
+        Some(OCI_CONFIG_CONTENT_TYPE),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            result.images_corrupted += 1;
+            result.errors.push(OciFsckError::ConfigReadFailed {
+                name: name.to_string(),
+                detail: e.to_string(),
+            });
+            return;
+        }
+    };
+
+    let computed_config = hash(&config_data);
+    if config_digest != computed_config {
+        result.images_corrupted += 1;
+        result.errors.push(OciFsckError::ConfigDigestMismatch {
+            name: name.to_string(),
+            expected: config_digest,
+            actual: computed_config,
+        });
+        return;
+    }
+
+    // 5. Parse config and verify layer references
+    let is_container = matches!(manifest.config().media_type(), MediaType::ImageConfig);
+
+    if is_container {
+        let config = match ImageConfiguration::from_reader(&config_data[..]) {
+            Ok(c) => c,
+            Err(e) => {
+                result.images_corrupted += 1;
+                result.errors.push(OciFsckError::ConfigParseFailed {
+                    name: name.to_string(),
+                    detail: e.to_string(),
+                });
+                return;
+            }
+        };
+
+        // Verify each layer diff_id has a corresponding named ref and stream
+        for diff_id in config.rootfs().diff_ids() {
+            let layer_verity = match config_named_refs.get(diff_id.as_str()) {
+                Some(v) => v,
+                None => {
+                    result.errors.push(OciFsckError::LayerRefMissing {
+                        name: name.to_string(),
+                        diff_id: diff_id.to_string(),
+                    });
+                    continue;
+                }
+            };
+
+            // Check the layer stream exists
+            let layer_id = crate::layer_identifier(diff_id);
+            match repo.has_stream(&layer_id) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    result.errors.push(OciFsckError::LayerStreamMissing {
+                        name: name.to_string(),
+                        diff_id: diff_id.to_string(),
+                    });
+                }
+                Err(e) => {
+                    result.errors.push(OciFsckError::LayerCheckFailed {
+                        name: name.to_string(),
+                        diff_id: diff_id.to_string(),
+                        detail: e.to_string(),
+                    });
+                }
+            }
+
+            // Verify the layer's object exists
+            match repo.open_object(layer_verity) {
+                Ok(_) => {}
+                Err(e) => {
+                    result.errors.push(OciFsckError::LayerObjectMissing {
+                        name: name.to_string(),
+                        diff_id: diff_id.to_string(),
+                        detail: e.to_string(),
+                    });
+                }
+            }
+        }
+
+        // 6. If sealed, verify the seal image exists
+        if let Some(seal_digest) = config.get_config_annotation("containers.composefs.fsverity") {
+            match repo.open_image(seal_digest) {
+                Ok(_) => {}
+                Err(e) => {
+                    result.errors.push(OciFsckError::SealImageMissing {
+                        name: name.to_string(),
+                        digest: seal_digest.to_string(),
+                        detail: e.to_string(),
+                    });
+                }
+            }
+        }
+    } else {
+        // Artifact: verify layer references from manifest named refs
+        for layer_desc in manifest.layers() {
+            let layer_digest = layer_desc.digest().to_string();
+            match manifest_named_refs.get(layer_digest.as_str()) {
+                Some(verity) => {
+                    // Verify the layer object exists
+                    match repo.open_object(verity) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            result
+                                .errors
+                                .push(OciFsckError::ArtifactLayerObjectMissing {
+                                    name: name.to_string(),
+                                    digest: layer_digest,
+                                    detail: e.to_string(),
+                                });
+                        }
+                    }
+                }
+                None => {
+                    result.errors.push(OciFsckError::ArtifactLayerRefMissing {
+                        name: name.to_string(),
+                        digest: layer_digest,
+                    });
+                }
+            }
+        }
+    }
+
+    // Count at most once per image
+    if result.errors.len() > error_count_before {
+        result.images_corrupted += 1;
+    }
+}
+
+// =============================================================================
 // Layer Inspection
 // =============================================================================
 
@@ -2585,5 +3000,567 @@ mod test {
 
         // Idempotent: calling again on an already-empty subject is fine
         remove_referrers_for_subject(repo, &subject_digest).unwrap();
+    }
+
+    // ==================== OCI Fsck Tests ====================
+
+    #[tokio::test]
+    async fn test_oci_fsck_healthy_image() {
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        create_test_image(repo, Some("healthy:v1"), "amd64");
+
+        let result = oci_fsck(repo).await.unwrap();
+
+        assert!(
+            result.is_ok(),
+            "oci_fsck should pass on healthy repo: {result}"
+        );
+        assert_eq!(result.images_checked, 1);
+        assert_eq!(result.images_corrupted, 0);
+        assert!(result.repo_result.is_ok());
+        assert!(result.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_oci_fsck_detects_corrupt_manifest() {
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        let (manifest_digest, manifest_verity, _) =
+            create_test_image(repo, Some("corrupt:v1"), "amd64");
+
+        // The manifest is stored as an external object in a splitstream.
+        // Find the object file that holds the manifest JSON and corrupt it.
+        let manifest_id = manifest_identifier(&manifest_digest);
+        let mut stream = repo
+            .open_stream(&manifest_id, Some(&manifest_verity), None)
+            .unwrap();
+
+        let mut object_refs: Vec<Sha256HashValue> = Vec::new();
+        stream
+            .get_object_refs(|id| object_refs.push(id.clone()))
+            .unwrap();
+        assert!(
+            !object_refs.is_empty(),
+            "manifest should have an external object ref"
+        );
+
+        // Corrupt the first (manifest JSON) object on disk.
+        // Objects may be immutable due to fs-verity, so delete and recreate.
+        let obj = &object_refs[0];
+        let hex = obj.to_hex();
+        let (dir, file) = hex.split_at(2);
+        let obj_path = test_repo.path().join(format!("objects/{dir}/{file}"));
+        std::fs::remove_file(&obj_path).unwrap();
+        std::fs::write(&obj_path, b"not valid manifest json").unwrap();
+
+        let result = oci_fsck(repo).await.unwrap();
+
+        // The underlying repo fsck should detect the corrupted object
+        assert!(
+            !result.is_ok(),
+            "oci_fsck should fail with corrupted manifest object: {result}"
+        );
+        assert!(
+            result.repo_result().objects_corrupted() > 0,
+            "repo fsck should detect corrupted object"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oci_fsck_detects_missing_layer() {
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        let (manifest_digest, manifest_verity, _) =
+            create_test_image(repo, Some("missing-layer:v1"), "amd64");
+
+        // Open the image to find the layer diff_id
+        let img = OciImage::open(repo, &manifest_digest, Some(&manifest_verity)).unwrap();
+        let diff_ids = img.layer_diff_ids();
+        assert_eq!(diff_ids.len(), 1);
+
+        // Find the layer stream and its backing splitstream object, then
+        // delete the stream symlink so the layer appears missing.
+        let layer_id = crate::layer_identifier(diff_ids[0]);
+        let stream_symlink = test_repo.path().join(format!("streams/{layer_id}"));
+        std::fs::remove_file(&stream_symlink).unwrap();
+
+        let result = oci_fsck(repo).await.unwrap();
+
+        assert!(
+            !result.is_ok(),
+            "oci_fsck should detect missing layer: {result}"
+        );
+        assert!(
+            result.images_corrupted > 0,
+            "should report corrupted OCI image"
+        );
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.to_string().contains("layer-stream-missing")),
+            "errors should mention missing layer stream: {:?}",
+            result.errors
+        );
+    }
+
+    // ==================== Additional OCI Fsck Gap Tests ====================
+
+    #[tokio::test]
+    async fn test_oci_fsck_detects_config_digest_mismatch() {
+        // Exercises fsck_single_image config digest mismatch (line ~1109).
+        // Corrupts the config JSON object so its sha256 hash no longer
+        // matches the digest recorded in the manifest.
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        let (manifest_digest, manifest_verity, config_digest) =
+            create_test_image(repo, Some("config-corrupt:v1"), "amd64");
+
+        // Open image to get config verity, then find and corrupt the config object
+        let img = OciImage::open(repo, &manifest_digest, Some(&manifest_verity)).unwrap();
+        let config_verity = img.config_verity.clone();
+        drop(img);
+
+        let config_id = crate::config_identifier(&config_digest);
+        let mut stream = repo
+            .open_stream(&config_id, Some(&config_verity), None)
+            .unwrap();
+        let mut config_obj_refs: Vec<Sha256HashValue> = Vec::new();
+        stream
+            .get_object_refs(|id| config_obj_refs.push(id.clone()))
+            .unwrap();
+        assert!(!config_obj_refs.is_empty());
+
+        // Corrupt the config object — replace with valid JSON that has
+        // a different hash
+        let obj = &config_obj_refs[0];
+        let hex = obj.to_hex();
+        let (prefix, rest) = hex.split_at(2);
+        let dir =
+            cap_std::fs::Dir::open_ambient_dir(test_repo.path(), cap_std::ambient_authority())
+                .unwrap();
+        let obj_rel = format!("objects/{prefix}/{rest}");
+        dir.remove_file(&obj_rel).unwrap();
+        // Write valid JSON config but with modified content
+        dir.write(
+            &obj_rel,
+            br#"{"architecture":"arm64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}"#,
+        )
+        .unwrap();
+
+        let result = oci_fsck(repo).await.unwrap();
+
+        // The repo-level fsck will flag the object digest mismatch,
+        // which makes the overall result not ok.
+        assert!(
+            !result.is_ok(),
+            "oci_fsck should detect config corruption: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oci_fsck_detects_missing_config_named_ref() {
+        // Exercises the "manifest missing config reference" branch (line ~1079).
+        // Deletes the config named ref from the manifest splitstream by
+        // rewriting the manifest splitstream without the config named ref.
+        //
+        // Approach: create a manifest splitstream that stores the manifest
+        // JSON externally but has NO named ref for the config, then point
+        // the oci ref to it.
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        // Build a valid manifest JSON
+        let layer_data = b"fake-layer-data";
+        let layer_digest = hash(layer_data);
+
+        let mut layer_stream = repo.create_stream(crate::skopeo::TAR_LAYER_CONTENT_TYPE);
+        layer_stream.write_external(layer_data).unwrap();
+        let layer_verity = repo
+            .write_stream(layer_stream, &crate::layer_identifier(&layer_digest), None)
+            .unwrap();
+
+        let rootfs = RootFsBuilder::default()
+            .typ("layers")
+            .diff_ids(vec![layer_digest.clone()])
+            .build()
+            .unwrap();
+        let cfg = ConfigBuilder::default().build().unwrap();
+        let config = ImageConfigurationBuilder::default()
+            .architecture("amd64")
+            .os("linux")
+            .rootfs(rootfs)
+            .config(cfg)
+            .build()
+            .unwrap();
+        let config_json = config.to_string().unwrap();
+        let config_digest = hash(config_json.as_bytes());
+
+        // Store config normally
+        let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+        config_stream.add_named_stream_ref(&layer_digest, &layer_verity);
+        config_stream
+            .write_external(config_json.as_bytes())
+            .unwrap();
+        let _config_verity = repo
+            .write_stream(
+                config_stream,
+                &crate::config_identifier(&config_digest),
+                None,
+            )
+            .unwrap();
+
+        let config_descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::ImageConfig)
+            .digest(OciDigest::from_str(&config_digest).unwrap())
+            .size(config_json.len() as u64)
+            .build()
+            .unwrap();
+        let layer_descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::ImageLayerGzip)
+            .digest(OciDigest::from_str(&layer_digest).unwrap())
+            .size(layer_data.len() as u64)
+            .build()
+            .unwrap();
+        let manifest = ImageManifestBuilder::default()
+            .schema_version(2u32)
+            .media_type(MediaType::ImageManifest)
+            .config(config_descriptor)
+            .layers(vec![layer_descriptor])
+            .build()
+            .unwrap();
+
+        let manifest_json = manifest.to_string().unwrap();
+        let manifest_digest = hash(manifest_json.as_bytes());
+
+        // Store manifest WITHOUT config named ref — this is the bug we test
+        let manifest_id = manifest_identifier(&manifest_digest);
+        let mut manifest_stream = repo.create_stream(OCI_MANIFEST_CONTENT_TYPE);
+        // Deliberately omit: manifest_stream.add_named_stream_ref(...)
+        manifest_stream
+            .write_external(manifest_json.as_bytes())
+            .unwrap();
+        let _manifest_verity = repo
+            .write_stream(manifest_stream, &manifest_id, None)
+            .unwrap();
+
+        // Create the OCI ref pointing to this manifest
+        let ref_path = oci_ref_path("no-config-ref:v1");
+        let stream_path = format!("streams/{manifest_id}");
+        repo.symlink(&format!("streams/refs/{ref_path}"), &stream_path)
+            .unwrap();
+
+        let result = oci_fsck_image(repo, "no-config-ref:v1").await.unwrap();
+
+        assert!(
+            !result.is_ok(),
+            "oci_fsck should detect missing config ref: {result}"
+        );
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.to_string().contains("config-ref-missing")),
+            "errors should mention missing config reference: {:?}",
+            result.errors
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oci_fsck_healthy_artifact() {
+        // Exercises the artifact validation path (line ~1183).
+        // Creates a non-container artifact and verifies oci_fsck passes.
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        // Create an artifact with non-ImageConfig media type
+        let blob_data = b"artifact-content-for-fsck-test";
+        let (blob_digest, blob_verity) = write_blob(repo, blob_data).unwrap();
+
+        let empty_config = b"{}";
+        let config_digest = hash(empty_config);
+        let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+        config_stream.write_external(empty_config).unwrap();
+        let config_verity = repo
+            .write_stream(
+                config_stream,
+                &crate::config_identifier(&config_digest),
+                None,
+            )
+            .unwrap();
+
+        let config_descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::EmptyJSON) // NOT ImageConfig
+            .digest(OciDigest::from_str(&config_digest).unwrap())
+            .size(empty_config.len() as u64)
+            .build()
+            .unwrap();
+        let layer_descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::Other("application/octet-stream".to_string()))
+            .digest(OciDigest::from_str(&blob_digest).unwrap())
+            .size(blob_data.len() as u64)
+            .build()
+            .unwrap();
+        let manifest = ImageManifestBuilder::default()
+            .schema_version(2u32)
+            .media_type(MediaType::ImageManifest)
+            .config(config_descriptor)
+            .layers(vec![layer_descriptor])
+            .build()
+            .unwrap();
+
+        let mut layer_verities = HashMap::new();
+        layer_verities.insert(blob_digest.clone().into_boxed_str(), blob_verity);
+
+        let manifest_json = manifest.to_string().unwrap();
+        let manifest_digest = hash(manifest_json.as_bytes());
+
+        write_manifest(
+            repo,
+            &manifest,
+            &manifest_digest,
+            &config_verity,
+            &layer_verities,
+            Some("artifact-fsck:v1"),
+        )
+        .unwrap();
+
+        let result = oci_fsck(repo).await.unwrap();
+        assert!(
+            result.is_ok(),
+            "oci_fsck should pass for healthy artifact: {result}"
+        );
+        assert_eq!(result.images_checked, 1);
+        assert_eq!(result.images_corrupted, 0);
+    }
+
+    #[tokio::test]
+    async fn test_oci_fsck_detects_missing_artifact_layer_ref() {
+        // Exercises the artifact "manifest missing layer reference" branch
+        // (line ~1198). Creates an artifact where the manifest named refs
+        // don't include the layer digest.
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        let blob_data = b"artifact-blob-missing-ref";
+        let (blob_digest, _blob_verity) = write_blob(repo, blob_data).unwrap();
+
+        let empty_config = b"{}";
+        let config_digest = hash(empty_config);
+        let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+        config_stream.write_external(empty_config).unwrap();
+        let config_verity = repo
+            .write_stream(
+                config_stream,
+                &crate::config_identifier(&config_digest),
+                None,
+            )
+            .unwrap();
+
+        let config_descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::EmptyJSON)
+            .digest(OciDigest::from_str(&config_digest).unwrap())
+            .size(empty_config.len() as u64)
+            .build()
+            .unwrap();
+        let layer_descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::Other("application/wasm".to_string()))
+            .digest(OciDigest::from_str(&blob_digest).unwrap())
+            .size(blob_data.len() as u64)
+            .build()
+            .unwrap();
+        let manifest = ImageManifestBuilder::default()
+            .schema_version(2u32)
+            .media_type(MediaType::ImageManifest)
+            .config(config_descriptor)
+            .layers(vec![layer_descriptor])
+            .build()
+            .unwrap();
+
+        // Deliberately pass empty layer_verities — no layer refs in manifest
+        let layer_verities: HashMap<Box<str>, Sha256HashValue> = HashMap::new();
+
+        let manifest_json = manifest.to_string().unwrap();
+        let manifest_digest = hash(manifest_json.as_bytes());
+
+        write_manifest(
+            repo,
+            &manifest,
+            &manifest_digest,
+            &config_verity,
+            &layer_verities,
+            Some("artifact-no-layer-ref:v1"),
+        )
+        .unwrap();
+
+        let result = oci_fsck(repo).await.unwrap();
+
+        assert!(
+            !result.is_ok(),
+            "oci_fsck should detect missing artifact layer ref: {result}"
+        );
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.to_string().contains("artifact-layer-ref-missing")),
+            "errors should mention missing layer reference: {:?}",
+            result.errors
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oci_fsck_image_unresolvable_ref() {
+        // Exercises oci_fsck_image with an unresolvable ref (line ~1011).
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        let result = oci_fsck_image(repo, "nonexistent:tag").await.unwrap();
+
+        assert!(!result.is_ok(), "should fail for nonexistent ref");
+        assert_eq!(result.images_checked, 1);
+        assert_eq!(result.images_corrupted, 1);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.to_string().contains("ref-resolve-failed")),
+            "errors should mention cannot resolve ref: {:?}",
+            result.errors
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oci_fsck_multiple_images_partial_corruption() {
+        // Verifies that oci_fsck checks ALL images and correctly counts
+        // corrupted vs healthy ones when there's a mix.
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        // Create two healthy images
+        create_test_image(repo, Some("healthy1:v1"), "amd64");
+        let (manifest_digest2, manifest_verity2, _) =
+            create_test_image(repo, Some("corrupt1:v1"), "arm64");
+
+        // Corrupt the second image's layer
+        let img = OciImage::open(repo, &manifest_digest2, Some(&manifest_verity2)).unwrap();
+        let diff_ids = img.layer_diff_ids();
+        let layer_id = crate::layer_identifier(diff_ids[0]);
+        let dir =
+            cap_std::fs::Dir::open_ambient_dir(test_repo.path(), cap_std::ambient_authority())
+                .unwrap();
+        dir.remove_file(format!("streams/{layer_id}")).unwrap();
+
+        let result = oci_fsck(repo).await.unwrap();
+
+        assert!(!result.is_ok(), "should detect corruption: {result}");
+        assert_eq!(result.images_checked, 2);
+        assert_eq!(
+            result.images_corrupted, 1,
+            "only one image should be corrupt"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oci_fsck_detects_missing_layer_named_ref_in_config() {
+        // Exercises the "config missing layer reference" branch (line ~1134).
+        // Creates a container image where the config splitstream is missing
+        // the named ref for a layer diff_id.
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        let layer_data = b"layer-for-missing-ref-test";
+        let layer_digest = hash(layer_data);
+
+        let mut layer_stream = repo.create_stream(crate::skopeo::TAR_LAYER_CONTENT_TYPE);
+        layer_stream.write_external(layer_data).unwrap();
+        let layer_verity = repo
+            .write_stream(layer_stream, &crate::layer_identifier(&layer_digest), None)
+            .unwrap();
+
+        let rootfs = RootFsBuilder::default()
+            .typ("layers")
+            .diff_ids(vec![layer_digest.clone()])
+            .build()
+            .unwrap();
+        let cfg = ConfigBuilder::default().build().unwrap();
+        let config = ImageConfigurationBuilder::default()
+            .architecture("amd64")
+            .os("linux")
+            .rootfs(rootfs)
+            .config(cfg)
+            .build()
+            .unwrap();
+        let config_json = config.to_string().unwrap();
+        let config_digest = hash(config_json.as_bytes());
+
+        // Store config WITHOUT the layer named ref — this is the bug
+        let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+        // Deliberately omit: config_stream.add_named_stream_ref(&layer_digest, &layer_verity);
+        config_stream
+            .write_external(config_json.as_bytes())
+            .unwrap();
+        let config_verity = repo
+            .write_stream(
+                config_stream,
+                &crate::config_identifier(&config_digest),
+                None,
+            )
+            .unwrap();
+
+        let config_descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::ImageConfig)
+            .digest(OciDigest::from_str(&config_digest).unwrap())
+            .size(config_json.len() as u64)
+            .build()
+            .unwrap();
+        let layer_descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::ImageLayerGzip)
+            .digest(OciDigest::from_str(&layer_digest).unwrap())
+            .size(layer_data.len() as u64)
+            .build()
+            .unwrap();
+        let manifest = ImageManifestBuilder::default()
+            .schema_version(2u32)
+            .media_type(MediaType::ImageManifest)
+            .config(config_descriptor)
+            .layers(vec![layer_descriptor])
+            .build()
+            .unwrap();
+
+        let mut layer_verities = HashMap::new();
+        layer_verities.insert(layer_digest.into_boxed_str(), layer_verity);
+        let manifest_json = manifest.to_string().unwrap();
+        let manifest_digest = hash(manifest_json.as_bytes());
+
+        write_manifest(
+            repo,
+            &manifest,
+            &manifest_digest,
+            &config_verity,
+            &layer_verities,
+            Some("missing-layer-ref:v1"),
+        )
+        .unwrap();
+
+        let result = oci_fsck(repo).await.unwrap();
+
+        assert!(
+            !result.is_ok(),
+            "oci_fsck should detect missing layer ref in config: {result}"
+        );
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.to_string().contains("layer-ref-missing")),
+            "errors should mention config missing layer reference: {:?}",
+            result.errors
+        );
     }
 }
