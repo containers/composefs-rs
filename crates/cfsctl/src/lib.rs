@@ -37,6 +37,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use comfy_table::{presets::UTF8_FULL, Table};
 
 use rustix::fs::CWD;
+use serde::Serialize;
 
 #[cfg(feature = "oci")]
 use composefs_boot::write_boot;
@@ -52,6 +53,23 @@ use composefs::{
     repository::Repository,
     tree::RegularFile,
 };
+
+/// JSON output wrapper for `cfsctl fsck --json`.
+#[derive(Serialize)]
+struct FsckJsonOutput {
+    ok: bool,
+    #[serde(flatten)]
+    result: composefs::repository::FsckResult,
+}
+
+/// JSON output wrapper for `cfsctl oci fsck --json`.
+#[cfg(feature = "oci")]
+#[derive(Serialize)]
+struct OciFsckJsonOutput {
+    ok: bool,
+    #[serde(flatten)]
+    result: composefs_oci::OciFsckResult,
+}
 
 /// cfsctl
 #[derive(Debug, Parser)]
@@ -229,6 +247,18 @@ enum OciCommand {
         #[clap(long)]
         cmdline: Vec<String>,
     },
+    /// Check integrity of OCI images in the repository
+    ///
+    /// Verifies manifest and config content digests, layer references, seal
+    /// consistency, and delegates to the underlying repository fsck for object
+    /// integrity and splitstream validation.
+    Fsck {
+        /// Check only the named image instead of all tagged images
+        image: Option<String>,
+        /// Output results as JSON (always exits 0 unless the check itself fails)
+        #[clap(long)]
+        json: bool,
+    },
 }
 
 /// Common options for reading a filesystem from a path
@@ -316,6 +346,16 @@ enum Command {
         /// or a path relative to the object store for files stored extrenally
         #[clap(long)]
         backing_path_only: bool,
+    },
+    /// Check repository integrity
+    ///
+    /// Verifies fsverity digests of all objects, validates stream and image
+    /// symlinks, and checks splitstream internal consistency. Exits with
+    /// a non-zero status if corruption is found.
+    Fsck {
+        /// Output results as JSON (always exits 0 unless the check itself fails)
+        #[clap(long)]
+        json: bool,
     },
     #[cfg(feature = "http")]
     Fetch { url: String, name: String },
@@ -696,6 +736,26 @@ where
                 create_dir_all(state.join("etc/upper"))?;
                 create_dir_all(state.join("etc/work"))?;
             }
+            OciCommand::Fsck { image, json } => {
+                let result = if let Some(ref name) = image {
+                    composefs_oci::oci_fsck_image(&repo, name)?
+                } else {
+                    composefs_oci::oci_fsck(&repo)?
+                };
+                if json {
+                    let output = OciFsckJsonOutput {
+                        ok: result.is_ok(),
+                        result,
+                    };
+                    serde_json::to_writer_pretty(std::io::stdout().lock(), &output)?;
+                    println!();
+                } else {
+                    print!("{result}");
+                    if !result.is_ok() {
+                        anyhow::bail!("OCI integrity check failed");
+                    }
+                }
+            }
         },
         Command::ComputeId { fs_opts } => {
             let fs = load_filesystem_from_ondisk_fs(&fs_opts, &repo)?;
@@ -767,6 +827,22 @@ where
                     backing_path_only,
                 )?,
             };
+        }
+        Command::Fsck { json } => {
+            let result = repo.fsck()?;
+            if json {
+                let output = FsckJsonOutput {
+                    ok: result.is_ok(),
+                    result,
+                };
+                serde_json::to_writer_pretty(std::io::stdout().lock(), &output)?;
+                println!();
+            } else {
+                print!("{result}");
+                if !result.is_ok() {
+                    anyhow::bail!("repository integrity check failed");
+                }
+            }
         }
         #[cfg(feature = "http")]
         Command::Fetch { url, name } => {
