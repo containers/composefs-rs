@@ -2,4 +2,6 @@
 
 pub mod cli;
 pub mod digest_stability;
+pub mod podman;
 pub mod privileged;
+pub mod signing;

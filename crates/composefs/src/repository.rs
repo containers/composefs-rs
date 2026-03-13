@@ -426,6 +426,7 @@ pub struct Repository<ObjectID: FsVerityHashValue> {
     objects: OnceCell<OwnedFd>,
     write_semaphore: OnceCell<Arc<Semaphore>>,
     insecure: bool,
+    privileged: bool,
     _data: std::marker::PhantomData<ObjectID>,
 }
 
@@ -435,6 +436,7 @@ impl<ObjectID: FsVerityHashValue> std::fmt::Debug for Repository<ObjectID> {
             .field("repository", &self.repository)
             .field("objects", &self.objects)
             .field("insecure", &self.insecure)
+            .field("privileged", &self.privileged)
             .finish_non_exhaustive()
     }
 }
@@ -698,6 +700,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             objects: OnceCell::new(),
             write_semaphore: OnceCell::new(),
             insecure: false,
+            privileged: true,
             _data: std::marker::PhantomData,
         })
     }
@@ -1020,6 +1023,25 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     pub fn set_insecure(&mut self, insecure: bool) -> &mut Self {
         self.insecure = insecure;
         self
+    }
+
+    /// Sets whether this repository operates in privileged mode.
+    ///
+    /// In privileged mode (default), kernel EROFS mounting and the `.fs-verity`
+    /// keyring are available. In unprivileged mode, callers should use FUSE
+    /// mounting with userspace verification instead.
+    ///
+    /// This is orthogonal to `insecure`: `insecure` controls whether fsverity
+    /// is available on the filesystem, while `privileged` controls whether
+    /// kernel mounting capabilities are available.
+    pub fn set_privileged(&mut self, privileged: bool) -> &mut Self {
+        self.privileged = privileged;
+        self
+    }
+
+    /// Returns whether this repository is in privileged mode.
+    pub fn is_privileged(&self) -> bool {
+        self.privileged
     }
 
     /// Creates a SplitStreamWriter for writing a split stream.
@@ -1365,6 +1387,11 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// be attached via e.g. `move_mount`.
     #[context("Mounting image '{name}'")]
     pub fn mount(&self, name: &str) -> Result<OwnedFd> {
+        ensure!(
+            self.privileged,
+            "kernel mounting requires privileged mode; use FUSE mounting for unprivileged operation"
+        );
+
         let (image, enable_verity) = self.open_image(name)?;
 
         composefs_fsmount(
@@ -3501,14 +3528,10 @@ mod tests {
 
     #[test]
     fn test_fsck_detects_non_symlink_in_streams() -> Result<()> {
-        // Exercises fsck_category non-symlink detection (line ~1695).
-        // The code checks entry.file_type() != FileType::Symlink and reports
-        // "not a symlink" for regular files or directories in streams/.
         let tmp = tempdir();
         let repo = create_test_repo(&tmp.path().join("repo"))?;
         repo.sync()?;
 
-        // Create a regular file directly in streams/ (not a symlink)
         let dir = open_test_repo_dir(&tmp);
         dir.create_dir_all("streams")?;
         dir.write("streams/bogus-entry", b"not a symlink")?;
@@ -3530,8 +3553,6 @@ mod tests {
 
     #[test]
     fn test_fsck_detects_non_symlink_in_images() -> Result<()> {
-        // Exercises fsck_category non-symlink detection for the "images"
-        // category (same code path as streams, but counting images_corrupted).
         let tmp = tempdir();
         let repo = create_test_repo(&tmp.path().join("repo"))?;
         repo.sync()?;
@@ -3557,18 +3578,13 @@ mod tests {
 
     #[test]
     fn test_fsck_detects_broken_ref_symlink() -> Result<()> {
-        // Exercises fsck_refs_dir broken symlink detection (line ~1804).
-        // Creates a ref symlink that points to a non-existent stream entry,
-        // so following the chain refs/X -> ../../stream-entry -> object fails.
         let tmp = tempdir();
         let repo = create_test_repo(&tmp.path().join("repo"))?;
         repo.sync()?;
 
-        // Create refs directory under streams
         let dir = open_test_repo_dir(&tmp);
         dir.create_dir_all("streams/refs")?;
 
-        // Create a dangling symlink in refs/
         dir.symlink("../nonexistent-stream", "streams/refs/broken-ref")?;
 
         let result = repo.fsck()?;
@@ -3589,9 +3605,6 @@ mod tests {
 
     #[test]
     fn test_fsck_refs_dir_unexpected_file_type() -> Result<()> {
-        // Exercises the "unexpected file type" branch in fsck_refs_dir
-        // (line ~1817). Regular files in refs/ are neither symlinks nor
-        // directories — they should be flagged.
         let tmp = tempdir();
         let repo = create_test_repo(&tmp.path().join("repo"))?;
         repo.sync()?;
@@ -3599,7 +3612,6 @@ mod tests {
         let dir = open_test_repo_dir(&tmp);
         dir.create_dir_all("streams/refs")?;
 
-        // Put a regular file directly in refs/
         dir.write("streams/refs/stray-file", b"should not be here")?;
 
         let result = repo.fsck()?;
@@ -3618,9 +3630,6 @@ mod tests {
 
     #[test]
     fn test_fsck_refs_dir_recursive() -> Result<()> {
-        // Exercises the recursive walk in fsck_refs_dir: creates a nested
-        // subdirectory under refs/ with a broken symlink inside to verify
-        // the recursion actually descends into subdirs.
         let tmp = tempdir();
         let repo = create_test_repo(&tmp.path().join("repo"))?;
         repo.sync()?;
@@ -3628,7 +3637,6 @@ mod tests {
         let dir = open_test_repo_dir(&tmp);
         dir.create_dir_all("streams/refs/nested/deep")?;
 
-        // Broken symlink in the nested directory
         dir.symlink(
             "../../../nonexistent-stream",
             "streams/refs/nested/deep/broken-nested-ref",
@@ -3659,10 +3667,8 @@ mod tests {
         let repo_path = tmp.path().join("repo");
         let repo = create_test_repo(&repo_path)?;
 
-        // No metadata initially
         assert!(repo.metadata()?.is_none());
 
-        // Write metadata via low-level function, then read via method
         let meta = RepoMetadata::for_hash::<Sha512HashValue>();
         write_repo_metadata(&repo.repo_fd(), &meta)?;
 
@@ -3685,16 +3691,12 @@ mod tests {
         let meta = RepoMetadata::for_hash::<Sha512HashValue>();
         write_repo_metadata(&repo_fd, &meta)?;
 
-        // Second write should fail (file already exists)
         assert!(write_repo_metadata(&repo_fd, &meta).is_err());
         Ok(())
     }
 
     #[test]
     fn test_fsck_detects_invalid_object_filename() -> Result<()> {
-        // Exercises fsck_object_dir invalid filename detection (line ~1581).
-        // Creates a file with a name that can't be parsed as a hex hash
-        // remainder in objects/XX/.
         let tmp = tempdir();
         let repo = create_test_repo(&tmp.path().join("repo"))?;
         repo.sync()?;
@@ -3723,9 +3725,6 @@ mod tests {
 
     #[test]
     fn test_fsck_detects_broken_image_symlink() -> Result<()> {
-        // Exercises the broken symlink path in fsck_category for images
-        // (line ~1711). The stream broken-symlink test covers streams;
-        // this covers the same logic for images/.
         let tmp = tempdir();
         let repo = create_test_repo(&tmp.path().join("repo"))?;
 
@@ -3737,7 +3736,6 @@ mod tests {
         let image_id = fs.commit_image(&repo, None)?;
         repo.sync()?;
 
-        // Delete the backing object that the image symlink points to
         let dir = open_test_repo_dir(&tmp);
         let image_rel = format!("images/{}", image_id.to_hex());
         let link_target = dir.read_link(&image_rel)?;
@@ -3757,26 +3755,20 @@ mod tests {
 
     #[test]
     fn test_fsck_detects_missing_named_ref_object() -> Result<()> {
-        // Exercises fsck_splitstream named ref checking (line ~1869).
-        // Creates a stream with a named ref pointing to a non-existent
-        // object, which should be detected as a missing object.
         let tmp = tempdir();
         let repo = create_test_repo(&tmp.path().join("repo"))?;
 
         let obj = generate_test_data(64 * 1024, 0xEA);
 
-        // Create stream1 that references obj
         let mut writer1 = repo.create_stream(0);
         writer1.write_external(&obj)?;
         let stream1_id = repo.write_stream(writer1, "test-stream1", None)?;
 
-        // Create stream2 with a named ref to stream1
         let mut writer2 = repo.create_stream(0);
         writer2.add_named_stream_ref("test-stream1", &stream1_id);
         let _stream2_id = repo.write_stream(writer2, "test-stream2", None)?;
         repo.sync()?;
 
-        // Delete the object that the named ref points to (the stream1 splitstream object)
         let hex = stream1_id.to_hex();
         let (prefix, rest) = hex.split_at(2);
         let repo_dir = open_test_repo_dir(&tmp);
@@ -3805,9 +3797,6 @@ mod tests {
 
     #[test]
     fn test_fsck_healthy_repo_with_refs() -> Result<()> {
-        // Verifies fsck_refs_dir passes on valid refs. Prior tests only
-        // checked that fsck detects broken refs; this confirms a repo
-        // with valid refs reports ok.
         let tmp = tempdir();
         let repo = create_test_repo(&tmp.path().join("repo"))?;
 
@@ -3815,7 +3804,6 @@ mod tests {
 
         let mut writer = repo.create_stream(0);
         writer.write_external(&obj)?;
-        // write_stream with reference creates a ref symlink
         let _stream_id = repo.write_stream(writer, "test-stream", Some("my-ref"))?;
         repo.sync()?;
 
@@ -3828,9 +3816,6 @@ mod tests {
 
     #[test]
     fn test_fsck_detects_corrupted_splitstream_object() -> Result<()> {
-        // Exercises fsck_splitstream failure-to-open path (line ~1829).
-        // Corrupts the splitstream object so that open_stream fails to
-        // parse it, which is different from a missing external object ref.
         let tmp = tempdir();
         let repo = create_test_repo(&tmp.path().join("repo"))?;
 
@@ -3841,12 +3826,10 @@ mod tests {
         let _stream_id = repo.write_stream(writer, "test-stream", None)?;
         repo.sync()?;
 
-        // Find the splitstream object path via the stream symlink
         let dir = open_test_repo_dir(&tmp);
         let link_target = dir.read_link("streams/test-stream")?;
         let backing_rel = PathBuf::from("streams").join(&link_target);
 
-        // Corrupt the splitstream object (not the data object it references)
         dir.remove_file(&backing_rel)?;
         dir.write(&backing_rel, b"corrupted splitstream header")?;
 
@@ -3856,9 +3839,6 @@ mod tests {
             !result.is_ok(),
             "fsck should detect corrupted splitstream: {result}"
         );
-        // The object digest mismatch is detected by object checking,
-        // and the stream is also flagged because open_stream will fail
-        // or the object refs check will fail.
         assert!(
             result.objects_corrupted > 0 || result.streams_corrupted > 0,
             "should report corruption: {result}"
@@ -3868,9 +3848,6 @@ mod tests {
 
     #[test]
     fn test_fsck_validates_erofs_image_objects() -> Result<()> {
-        // Exercises fsck_image: creates a valid erofs image, then deletes
-        // one of its referenced objects. Fsck should detect the missing
-        // object via erofs parsing.
         let tmp = tempdir();
         let repo = create_test_repo(&tmp.path().join("repo"))?;
 
@@ -3882,12 +3859,10 @@ mod tests {
         let image_id = fs.commit_image(&repo, None)?;
         repo.sync()?;
 
-        // Sanity: fsck passes on a healthy image
         let result = repo.fsck()?;
         assert!(result.is_ok(), "healthy image should pass fsck: {result}");
         assert!(result.images_checked > 0, "should have checked the image");
 
-        // Delete the object referenced by the erofs image
         let hex = obj_id.to_hex();
         let (prefix, rest) = hex.split_at(2);
         let dir = open_test_repo_dir(&tmp);
@@ -3916,9 +3891,6 @@ mod tests {
 
     #[test]
     fn test_fsck_detects_corrupt_erofs_image() -> Result<()> {
-        // Exercises fsck_image: corrupts the erofs image data so that
-        // parsing fails. The catch_unwind should catch the panic from
-        // the current erofs reader.
         let tmp = tempdir();
         let repo = create_test_repo(&tmp.path().join("repo"))?;
 
@@ -3930,7 +3902,6 @@ mod tests {
         let image_id = fs.commit_image(&repo, None)?;
         repo.sync()?;
 
-        // Corrupt the erofs image data (replace the backing object)
         let hex = image_id.to_hex();
         let (prefix, rest) = hex.split_at(2);
         let dir = open_test_repo_dir(&tmp);
@@ -3953,5 +3924,22 @@ mod tests {
             result.errors
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_privileged_flag() {
+        let tmp = tempdir();
+        let mut repo = Repository::<Sha512HashValue>::open_path(CWD, tmp.path()).unwrap();
+
+        // Default is privileged
+        assert!(repo.is_privileged());
+
+        // Can disable
+        repo.set_privileged(false);
+        assert!(!repo.is_privileged());
+
+        // Can re-enable
+        repo.set_privileged(true);
+        assert!(repo.is_privileged());
     }
 }

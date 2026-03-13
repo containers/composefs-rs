@@ -8,11 +8,14 @@
 //! - Pulling container images from registries using skopeo
 //! - Converting OCI image layers from tar format to composefs split streams
 //! - Creating mountable filesystems from OCI image configurations
+//! - Signing and verifying images using fs-verity PKCS#7 signatures
 #![forbid(unsafe_code)]
 
 pub mod boot;
 pub mod image;
 pub mod oci_image;
+pub mod signature;
+pub mod signing;
 pub mod skopeo;
 pub mod tar;
 
@@ -27,7 +30,7 @@ pub use composefs;
 
 use std::{collections::HashMap, sync::Arc};
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use containers_image_proxy::ImageProxyConfig;
 use oci_spec::image::ImageConfiguration;
 use sha2::{Digest, Sha256};
@@ -51,11 +54,16 @@ pub const BOOT_IMAGE_REF_KEY: &str = "composefs.image.boot";
 #[cfg(feature = "boot")]
 pub use boot::generate_boot_image;
 pub use boot::{boot_image, remove_boot_image, BOOT_IMAGE_REF_NAME};
+pub use image::{
+    compute_merged_digest, compute_per_layer_digests, generate_merged_image,
+    generate_per_layer_images,
+};
 pub use oci_image::{
-    add_referrer, layer_dumpfile, layer_info, layer_tar, list_images, list_referrers, list_refs,
-    oci_fsck, oci_fsck_image, remove_referrer, remove_referrers_for_subject, resolve_ref,
-    tag_image, untag_image, ImageInfo, LayerInfo, OciFsckError, OciFsckResult, OciImage,
-    SplitstreamInfo, OCI_REF_PREFIX,
+    add_referrer, export_image_to_oci_layout, export_referrers_to_oci_layout, layer_dumpfile,
+    layer_info, layer_tar, list_images, list_referrers, list_refs, oci_fsck, oci_fsck_image,
+    remove_referrer, remove_referrers_for_subject, resolve_ref, seal_image, tag_image,
+    untag_image, ImageInfo, LayerInfo, OciFsckError, OciFsckResult, OciImage, SplitstreamInfo,
+    OCI_REF_PREFIX,
 };
 pub use skopeo::pull_image;
 
@@ -491,6 +499,57 @@ fn ensure_oci_composefs_erofs_boot<ObjectID: FsVerityHashValue>(
     )?;
 
     Ok(Some(boot_erofs_id))
+}
+
+/// Seals a container by computing its fs-verity image ID and embedding it
+/// as a label in a new config. Returns the new (config_digest, config_verity).
+fn seal<ObjectID: FsVerityHashValue>(
+    repo: &Arc<Repository<ObjectID>>,
+    config_name: &str,
+    config_verity: Option<&ObjectID>,
+) -> Result<ContentAndVerity<ObjectID>> {
+    let OpenConfig {
+        mut config,
+        layer_refs,
+        image_ref,
+        boot_image_ref,
+    } = open_config(repo, config_name, config_verity)?;
+    let mut myconfig = config.config().clone().unwrap_or_default();
+    let labels = myconfig.labels_mut().get_or_insert_with(HashMap::new);
+    let fs = crate::image::create_filesystem(repo, config_name, config_verity)?;
+    let id = fs.compute_image_id();
+    labels.insert("containers.composefs.fsverity".to_string(), id.to_hex());
+    config.set_config(Some(myconfig));
+    write_config(repo, &config, layer_refs, image_ref.as_ref(), boot_image_ref.as_ref())
+}
+
+/// Mounts a sealed container filesystem at the specified mountpoint.
+///
+/// Reads the container configuration to extract the fs-verity hash from the
+/// "containers.composefs.fsverity" label, then mounts the corresponding filesystem.
+/// The container must have been previously sealed using `seal()`.
+///
+/// Returns an error if the container is not sealed or if mounting fails.
+pub fn mount<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    name: &str,
+    mountpoint: &str,
+    verity: Option<&ObjectID>,
+) -> Result<()> {
+    // Try to resolve tag names first. If name is a tag, open via the OCI
+    // image referencing path; otherwise fall back to direct config lookup
+    // for backward compatibility with raw config digests.
+    let config = if let Ok(img) = oci_image::OciImage::open_ref(repo, name) {
+        let config_digest = img.config_digest().to_string();
+        open_config(repo, &config_digest, None)?
+    } else {
+        open_config(repo, name, verity)?
+    };
+
+    let Some(id) = config.config.get_config_annotation("containers.composefs.fsverity") else {
+        bail!("Can only mount sealed containers");
+    };
+    repo.mount_at(id, mountpoint)
 }
 
 #[cfg(test)]
