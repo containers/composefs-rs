@@ -20,10 +20,10 @@ use anyhow::Context;
 use anyhow::{anyhow, Result};
 use rustix::fs::FileType;
 
+use crate::MAX_INLINE_CONTENT;
+
 /// https://github.com/torvalds/linux/blob/47ac09b91befbb6a235ab620c32af719f8208399/include/uapi/linux/limits.h#L13
 const PATH_MAX: u32 = 4096;
-/// Maximum size accepted for inline content.
-const MAX_INLINE_CONTENT: u16 = 5000;
 /// https://github.com/torvalds/linux/blob/47ac09b91befbb6a235ab620c32af719f8208399/include/uapi/linux/limits.h#L15
 /// This isn't exposed in libc/rustix, and in any case we should be conservative...if this ever
 /// gets bumped it'd be a hazard.
@@ -439,7 +439,7 @@ impl<'p> Entry<'p> {
                     } else {
                         // A dumpfile entry with no backing path or payload is treated as an empty file
                         let content = content.unwrap_or_default();
-                        let content = unescape_limited(content, MAX_INLINE_CONTENT.into())?;
+                        let content = unescape_limited(content, MAX_INLINE_CONTENT)?;
                         if fsverity_digest.is_some() {
                             anyhow::bail!("Inline file cannot have fsverity digest");
                         }
