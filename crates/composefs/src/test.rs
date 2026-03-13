@@ -67,6 +67,28 @@ impl<ObjectID: FsVerityHashValue> TestRepo<ObjectID> {
             _tempdir: dir,
         }
     }
+
+    /// Returns the filesystem path of the repository root.
+    ///
+    /// Useful in tests that need to manipulate the on-disk layout directly
+    /// (e.g. corruption tests for fsck).
+    pub fn path(&self) -> &std::path::Path {
+        self._tempdir.path()
+    }
+
+    /// Returns a capability-based directory handle for the repository root.
+    ///
+    /// Tests should use this instead of raw `std::fs` operations to ensure
+    /// all filesystem manipulation is scoped to the repository directory.
+    ///
+    /// Only available when compiling this crate's own tests (cap-std is a
+    /// dev-dependency). Cross-crate consumers should construct a
+    /// `cap_std::fs::Dir` from [`path()`](Self::path) directly.
+    #[cfg(test)]
+    pub fn dir(&self) -> cap_std::fs::Dir {
+        cap_std::fs::Dir::open_ambient_dir(self._tempdir.path(), cap_std::ambient_authority())
+            .unwrap()
+    }
 }
 
 impl<ObjectID: FsVerityHashValue> Default for TestRepo<ObjectID> {
