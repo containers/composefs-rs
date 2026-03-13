@@ -35,6 +35,8 @@ zstd = { version = "0.13.0", default-features = false }
 rand = { version = "0.9.1", default-features = true }
 
 [dev-dependencies]
+cap-std = { version = "3.4.5", default-features = false }
+cap-tempfile = { version = "3.4.5", default-features = false }
 insta = "1.42.2"
 proptest = "1"
 similar-asserts = "1.7.0"
