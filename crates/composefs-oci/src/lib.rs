@@ -10,6 +10,7 @@
 //! - Creating mountable filesystems from OCI image configurations
 #![forbid(unsafe_code)]
 
+pub mod boot;
 pub mod image;
 pub mod oci_image;
 pub mod skopeo;
@@ -43,7 +44,13 @@ use crate::tar::get_entry;
 /// Named ref key for the EROFS image derived from this OCI config.
 pub const IMAGE_REF_KEY: &str = "composefs.image";
 
+/// Named ref key for the boot EROFS image derived from this OCI config.
+pub const BOOT_IMAGE_REF_KEY: &str = "composefs.image.boot";
+
 // Re-export key types for convenience
+#[cfg(feature = "boot")]
+pub use boot::generate_boot_image;
+pub use boot::{boot_image, remove_boot_image, BOOT_IMAGE_REF_NAME};
 pub use oci_image::{
     add_referrer, layer_dumpfile, layer_info, layer_tar, list_images, list_referrers, list_refs,
     remove_referrer, remove_referrers_for_subject, resolve_ref, tag_image, untag_image, ImageInfo,
@@ -133,6 +140,8 @@ pub struct OpenConfig<ObjectID> {
     pub layer_refs: HashMap<Box<str>, ObjectID>,
     /// The EROFS image ObjectID linked to this config, if any.
     pub image_ref: Option<ObjectID>,
+    /// The boot EROFS image ObjectID linked to this config, if any.
+    pub boot_image_ref: Option<ObjectID>,
 }
 
 impl<ObjectID: std::fmt::Debug> std::fmt::Debug for OpenConfig<ObjectID> {
@@ -140,6 +149,7 @@ impl<ObjectID: std::fmt::Debug> std::fmt::Debug for OpenConfig<ObjectID> {
         f.debug_struct("OpenConfig")
             .field("layer_refs", &self.layer_refs)
             .field("image_ref", &self.image_ref)
+            .field("boot_image_ref", &self.boot_image_ref)
             .finish_non_exhaustive()
     }
 }
@@ -215,7 +225,7 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
 ) -> Result<PullResult<ObjectID>> {
     let (config_digest, config_verity, stats) =
         skopeo::pull(repo, imgref, reference, img_proxy_config).await?;
-    Ok(PullResult {
+    Ok(crate::PullResult {
         config_digest,
         config_verity,
         stats,
@@ -265,11 +275,13 @@ pub fn open_config<ObjectID: FsVerityHashValue>(
     }
 
     let image_ref = named_refs.remove(IMAGE_REF_KEY);
+    let boot_image_ref = named_refs.remove(BOOT_IMAGE_REF_KEY);
     let config = ImageConfiguration::from_reader(&data[..])?;
     Ok(OpenConfig {
         config,
         layer_refs: named_refs,
         image_ref,
+        boot_image_ref,
     })
 }
 
@@ -296,6 +308,26 @@ pub fn composefs_erofs_for_manifest<ObjectID: FsVerityHashValue>(
     Ok(img.image_ref().cloned())
 }
 
+/// Returns the boot EROFS ObjectID from the given OCI config, if any.
+pub fn composefs_boot_erofs_for_config<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    config_digest: &str,
+    verity: Option<&ObjectID>,
+) -> Result<Option<ObjectID>> {
+    let oc = open_config(repo, config_digest, verity)?;
+    Ok(oc.boot_image_ref)
+}
+
+/// Returns the boot EROFS ObjectID for an OCI image identified by manifest, if any.
+pub fn composefs_boot_erofs_for_manifest<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    manifest_digest: &str,
+    manifest_verity: Option<&ObjectID>,
+) -> Result<Option<ObjectID>> {
+    let img = oci_image::OciImage::open(repo, manifest_digest, manifest_verity)?;
+    Ok(img.boot_image_ref().cloned())
+}
+
 /// Writes a container configuration to the repository.
 ///
 /// Serializes the image configuration to JSON and stores it as a split stream with the
@@ -306,12 +338,16 @@ pub fn composefs_erofs_for_manifest<ObjectID: FsVerityHashValue>(
 /// splitstream pointing to the EROFS image's ObjectID. This ensures the GC walk keeps
 /// the EROFS image alive as long as the config is reachable.
 ///
+/// If `boot_image` is provided, a named ref with key [`BOOT_IMAGE_REF_KEY`] is added
+/// pointing to the boot EROFS image's ObjectID.
+///
 /// Returns a tuple of (sha256 content hash, fs-verity hash value).
 pub fn write_config<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     config: &ImageConfiguration,
     refs: HashMap<Box<str>, ObjectID>,
     image: Option<&ObjectID>,
+    boot_image: Option<&ObjectID>,
 ) -> Result<ContentAndVerity<ObjectID>> {
     let json = config.to_string()?;
     let json_bytes = json.as_bytes();
@@ -322,6 +358,9 @@ pub fn write_config<ObjectID: FsVerityHashValue>(
     }
     if let Some(image_id) = image {
         stream.add_named_stream_ref(IMAGE_REF_KEY, image_id);
+    }
+    if let Some(boot_id) = boot_image {
+        stream.add_named_stream_ref(BOOT_IMAGE_REF_KEY, boot_id);
     }
     stream.write_external(json_bytes)?;
     let id = repo.write_stream(stream, &config_identifier(&config_digest), None)?;
@@ -369,9 +408,15 @@ fn ensure_oci_composefs_erofs<ObjectID: FsVerityHashValue>(
     let erofs_id = fs.commit_image(repo, None)?;
 
     // Rewrite config with the EROFS image ref, using layer refs from the
-    // OciImage (which already stripped the old image ref if any)
-    let (_config_digest, new_config_verity) =
-        write_config(repo, &config, img.layer_refs().clone(), Some(&erofs_id))?;
+    // OciImage (which already stripped the old image ref if any).
+    // Preserve any existing boot image ref.
+    let (_config_digest, new_config_verity) = write_config(
+        repo,
+        &config,
+        img.layer_refs().clone(),
+        Some(&erofs_id),
+        img.boot_image_ref(),
+    )?;
 
     // Read original manifest JSON for rewriting
     let manifest_json = img.read_manifest_json(repo)?;
@@ -391,6 +436,60 @@ fn ensure_oci_composefs_erofs<ObjectID: FsVerityHashValue>(
     )?;
 
     Ok(Some(erofs_id))
+}
+
+/// Boot-variant counterpart to [`ensure_oci_composefs_erofs`]; applies
+/// `transform_for_boot` before committing.
+#[cfg(feature = "boot")]
+fn ensure_oci_composefs_erofs_boot<ObjectID: FsVerityHashValue>(
+    repo: &Arc<Repository<ObjectID>>,
+    manifest_digest: &str,
+    manifest_verity: Option<&ObjectID>,
+    tag: Option<&str>,
+) -> Result<Option<ObjectID>> {
+    use composefs_boot::BootOps;
+
+    let img = oci_image::OciImage::open(repo, manifest_digest, manifest_verity)?;
+    if !img.is_container_image() {
+        return Ok(None);
+    }
+
+    let config = img
+        .config()
+        .context("Container image missing config")?
+        .clone();
+
+    // Build the composefs filesystem from all layers, then transform for boot
+    let mut fs = image::create_filesystem(repo, img.config_digest(), Some(img.config_verity()))?;
+    fs.transform_for_boot(repo)?;
+
+    // Commit as EROFS image
+    let boot_erofs_id = fs.commit_image(repo, None)?;
+
+    // Rewrite config with the boot EROFS image ref, preserving the existing image ref
+    let (_config_digest, new_config_verity) = write_config(
+        repo,
+        &config,
+        img.layer_refs().clone(),
+        img.image_ref(),
+        Some(&boot_erofs_id),
+    )?;
+
+    // Read original manifest JSON for rewriting
+    let manifest_json = img.read_manifest_json(repo)?;
+
+    let layer_verities = img.layer_refs().clone();
+
+    let (_new_manifest_digest, _new_manifest_verity) = oci_image::rewrite_manifest(
+        repo,
+        &manifest_json,
+        manifest_digest,
+        &new_config_verity,
+        &layer_verities,
+        tag,
+    )?;
+
+    Ok(Some(boot_erofs_id))
 }
 
 #[cfg(test)]
@@ -475,7 +574,7 @@ mod test {
         refs.insert("sha256:abc123def456".into(), Sha256HashValue::EMPTY);
 
         let (config_digest, config_verity) =
-            write_config(&repo, &config, refs.clone(), None).unwrap();
+            write_config(&repo, &config, refs.clone(), None, None).unwrap();
 
         assert!(config_digest.starts_with("sha256:"));
 
@@ -485,6 +584,7 @@ mod test {
         assert_eq!(oc.layer_refs.len(), 1);
         assert!(oc.layer_refs.contains_key("sha256:abc123def456"));
         assert!(oc.image_ref.is_none());
+        assert!(oc.boot_image_ref.is_none());
 
         let oc2 = open_config(&repo, &config_digest, None).unwrap();
         assert_eq!(oc2.config.architecture().to_string(), "amd64");
@@ -511,7 +611,7 @@ mod test {
             .unwrap();
 
         let (config_digest, config_verity) =
-            write_config(&repo, &config, HashMap::new(), None).unwrap();
+            write_config(&repo, &config, HashMap::new(), None, None).unwrap();
 
         // Re-open the splitstream and check that the config JSON is stored
         // as an external object reference (not inline). This is important
@@ -571,7 +671,7 @@ mod test {
             .unwrap();
 
         let (config_digest, _config_verity) =
-            write_config(&repo, &config, HashMap::new(), None).unwrap();
+            write_config(&repo, &config, HashMap::new(), None, None).unwrap();
 
         let bad_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
         let result = open_config::<Sha256HashValue>(&repo, bad_digest, None);
@@ -610,7 +710,7 @@ mod test {
             composefs::fsverity::compute_verity(b"fake-erofs-image");
 
         let (config_digest, config_verity) =
-            write_config(&repo, &config, refs.clone(), Some(&fake_erofs_id)).unwrap();
+            write_config(&repo, &config, refs.clone(), Some(&fake_erofs_id), None).unwrap();
 
         // Reopen and verify
         let oc = open_config(&repo, &config_digest, Some(&config_verity)).unwrap();
@@ -656,7 +756,7 @@ mod test {
         refs.insert("sha256:abc123def456".into(), Sha256HashValue::EMPTY);
 
         let (config_digest, config_verity) =
-            write_config(&repo, &config, refs.clone(), None).unwrap();
+            write_config(&repo, &config, refs.clone(), None, None).unwrap();
 
         let oc = open_config(&repo, &config_digest, Some(&config_verity)).unwrap();
         assert_eq!(oc.layer_refs.len(), 1);

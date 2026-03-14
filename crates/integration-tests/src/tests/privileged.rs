@@ -125,6 +125,108 @@ fn privileged_repo_without_insecure() -> Result<()> {
 }
 integration_test!(privileged_repo_without_insecure);
 
+/// Build a bootable test OCI image, mount it via `cfsctl oci mount` (plain
+/// and `--bootable`), and verify the filesystem content differs correctly.
+/// The plain mount should contain /boot/EFI/Linux/test-6.1.0.efi (the UKI),
+/// while the bootable mount should have an empty /boot (transform_for_boot
+/// clears it) but still have /usr content intact.
+fn privileged_oci_bootable_mount() -> Result<()> {
+    if require_privileged("privileged_oci_bootable_mount")?.is_some() {
+        return Ok(());
+    }
+
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let verity_dir = VerityTempDir::new()?;
+    let repo_path = verity_dir.path().join("repo");
+    let repo_arg = repo_path.to_str().unwrap();
+    let hash = "sha256";
+
+    composefs_oci::test_util::create_test_bootable_oci_image(&repo_path, "boot-test:v1")?;
+
+    let inspect_output = cmd!(
+        sh,
+        "{cfsctl} --insecure --hash {hash} --repo {repo_arg} oci inspect boot-test:v1"
+    )
+    .read()?;
+    let inspect: serde_json::Value = serde_json::from_str(&inspect_output)?;
+    ensure!(
+        inspect.get("composefs_erofs").is_some(),
+        "inspect should show composefs_erofs field"
+    );
+    ensure!(
+        inspect.get("composefs_boot_erofs").is_some(),
+        "inspect should show composefs_boot_erofs field"
+    );
+
+    // Plain mount: full filesystem including /boot
+    let mountpoint1 = tempfile::tempdir()?;
+    let mp1 = mountpoint1.path().to_str().unwrap();
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --hash {hash} --repo {repo_arg} oci mount boot-test:v1 {mp1}"
+    )
+    .run()?;
+
+    ensure!(
+        mountpoint1
+            .path()
+            .join("boot/EFI/Linux/test-6.1.0.efi")
+            .exists(),
+        "plain mount should contain UKI at /boot/EFI/Linux/test-6.1.0.efi"
+    );
+
+    cmd!(sh, "umount {mp1}").run()?;
+
+    // Bootable mount: /boot empty, /usr intact
+    let mountpoint2 = tempfile::tempdir()?;
+    let mp2 = mountpoint2.path().to_str().unwrap();
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --hash {hash} --repo {repo_arg} oci mount --bootable boot-test:v1 {mp2}"
+    )
+    .run()?;
+
+    let boot_dir = mountpoint2.path().join("boot");
+    ensure!(
+        boot_dir.is_dir(),
+        "bootable mount should have /boot directory"
+    );
+    let boot_entries: Vec<_> = std::fs::read_dir(&boot_dir)?.collect();
+    ensure!(
+        boot_entries.is_empty(),
+        "bootable mount /boot should be empty, found {} entries",
+        boot_entries.len()
+    );
+
+    ensure!(
+        !mountpoint2
+            .path()
+            .join("boot/EFI/Linux/test-6.1.0.efi")
+            .exists(),
+        "bootable mount should NOT contain UKI"
+    );
+
+    ensure!(
+        mountpoint2
+            .path()
+            .join("usr/lib/modules/6.1.0/vmlinuz")
+            .exists(),
+        "bootable mount should still have kernel at /usr/lib/modules/6.1.0/vmlinuz"
+    );
+
+    let os_release = std::fs::read_to_string(mountpoint2.path().join("etc/os-release"))?;
+    ensure!(
+        os_release.contains("ID=test"),
+        "bootable mount os-release missing ID=test: {os_release:?}"
+    );
+
+    cmd!(sh, "umount {mp2}").run()?;
+
+    Ok(())
+}
+integration_test!(privileged_oci_bootable_mount);
+
 /// Build a test OCI image, mount it via `cfsctl oci mount`, and verify
 /// the filesystem content. Uses the library only for image creation (test
 /// setup); all verification goes through the CLI.

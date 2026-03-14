@@ -108,6 +108,8 @@ pub struct OciImage<ObjectID: FsVerityHashValue> {
     layer_refs: HashMap<Box<str>, ObjectID>,
     /// The EROFS image ObjectID linked to this config, if any
     image_ref: Option<ObjectID>,
+    /// The boot EROFS image ObjectID linked to this config, if any
+    boot_image_ref: Option<ObjectID>,
     /// The fs-verity ID of the manifest splitstream
     manifest_verity: ObjectID,
 }
@@ -178,6 +180,7 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
 
         // Strip the EROFS image ref from layer_refs (it's not a layer)
         let image_ref = layer_refs.remove(crate::IMAGE_REF_KEY);
+        let boot_image_ref = layer_refs.remove(crate::BOOT_IMAGE_REF_KEY);
 
         let manifest_verity = if let Some(v) = verity {
             v.clone()
@@ -194,6 +197,7 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
             config,
             layer_refs,
             image_ref,
+            boot_image_ref,
             manifest_verity,
         })
     }
@@ -247,6 +251,11 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
     /// Returns the EROFS image ObjectID linked to this config, if any.
     pub fn image_ref(&self) -> Option<&ObjectID> {
         self.image_ref.as_ref()
+    }
+
+    /// Returns the boot EROFS image ObjectID linked to this config, if any.
+    pub fn boot_image_ref(&self) -> Option<&ObjectID> {
+        self.boot_image_ref.as_ref()
     }
 
     /// Returns the image architecture (empty string for artifacts).
@@ -404,6 +413,10 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
 
         if let Some(ref erofs_id) = self.image_ref {
             result["composefs_erofs"] = serde_json::json!(erofs_id.to_hex());
+        }
+
+        if let Some(ref boot_id) = self.boot_image_ref {
+            result["composefs_boot_erofs"] = serde_json::json!(boot_id.to_hex());
         }
 
         Ok(result)
