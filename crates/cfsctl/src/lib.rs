@@ -135,6 +135,9 @@ enum OciCommand {
         image: String,
         /// optional reference name for the manifest, use as 'ref/<name>' elsewhere
         name: Option<String>,
+        /// Also generate a bootable EROFS image from the pulled OCI image
+        #[arg(long)]
+        bootable: bool,
     },
     /// List all tagged OCI images in the repository
     #[clap(name = "images")]
@@ -185,32 +188,20 @@ enum OciCommand {
         #[clap(long, conflicts_with = "dumpfile")]
         json: bool,
     },
+    /// Mount an OCI image's composefs EROFS at the given mountpoint
+    Mount {
+        /// Image reference (tag name or manifest digest)
+        image: String,
+        /// Target mountpoint
+        mountpoint: String,
+        /// Mount the bootable variant instead of the regular EROFS image
+        #[arg(long)]
+        bootable: bool,
+    },
     /// Compute the composefs image object id of the rootfs of a stored OCI image
     ComputeId {
         #[clap(flatten)]
         config_opts: OCIConfigFilesystemOptions,
-    },
-    /// Create the composefs image of the rootfs of a stored OCI image, commit it to the repo, and print its image object ID
-    CreateImage {
-        #[clap(flatten)]
-        config_opts: OCIConfigFilesystemOptions,
-        /// optional reference name for the image, use as 'ref/<name>' elsewhere
-        #[clap(long)]
-        image_name: Option<String>,
-    },
-    /// Seal a stored OCI image by creating a cloned manifest with embedded verity digest (a.k.a. composefs image object ID)
-    /// in the repo, then prints the stream and verity digest of the new sealed manifest
-    Seal {
-        #[clap(flatten)]
-        config_opts: OCIConfigOptions,
-    },
-    /// Mounts a stored and sealed OCI image by looking up its composefs image. Note that the composefs image must be built
-    /// and committed to the repo first
-    Mount {
-        /// the name of the target OCI manifest stream, either a stream ID in format oci-config-<hash_type>:<hash_digest> or a reference in 'ref/'
-        name: String,
-        /// the mountpoint
-        mountpoint: String,
     },
     /// Create the composefs image of the rootfs of a stored OCI image, perform bootable transformation, commit it to the repo,
     /// then configure boot for the image by writing new boot resources and bootloader entries to boot partition. Performs
@@ -502,24 +493,44 @@ where
                 let fs = load_filesystem_from_oci_image(&repo, config_opts)?;
                 fs.print_dumpfile()?;
             }
+            OciCommand::Mount {
+                ref image,
+                ref mountpoint,
+                bootable,
+            } => {
+                let img = if image.starts_with("sha256:") {
+                    composefs_oci::oci_image::OciImage::open(&repo, image, None)?
+                } else {
+                    composefs_oci::oci_image::OciImage::open_ref(&repo, image)?
+                };
+                let erofs_id = if bootable {
+                    match img.boot_image_ref() {
+                        Some(id) => id,
+                        None => anyhow::bail!("No boot EROFS image linked — try pulling with --bootable"),
+                    }
+                } else {
+                    match img.image_ref() {
+                        Some(id) => id,
+                        None => anyhow::bail!("No composefs EROFS image linked — try re-pulling the image"),
+                    }
+                };
+                repo.mount_at(&erofs_id.to_hex(), mountpoint.as_str())?;
+            }
             OciCommand::ComputeId { config_opts } => {
                 let fs = load_filesystem_from_oci_image(&repo, config_opts)?;
                 let id = fs.compute_image_id();
                 println!("{}", id.to_hex());
             }
-            OciCommand::CreateImage {
-                config_opts,
-                ref image_name,
+            OciCommand::Pull {
+                ref image,
+                name,
+                bootable,
             } => {
-                let fs = load_filesystem_from_oci_image(&repo, config_opts)?;
-                let image_id = fs.commit_image(&repo, image_name.as_deref())?;
-                println!("{}", image_id.to_id());
-            }
-            OciCommand::Pull { ref image, name } => {
                 // If no explicit name provided, use the image reference as the tag
                 let tag_name = name.as_deref().unwrap_or(image);
+                let repo_arc = Arc::new(repo);
                 let (result, stats) =
-                    composefs_oci::pull_image(&Arc::new(repo), image, Some(tag_name), None).await?;
+                    composefs_oci::pull_image(&repo_arc, image, Some(tag_name), None).await?;
 
                 println!("manifest {}", result.manifest_digest);
                 println!("config   {}", result.config_digest);
@@ -532,6 +543,12 @@ where
                     stats.bytes_copied,
                     stats.bytes_inlined,
                 );
+
+                if bootable {
+                    let image_verity =
+                        composefs_oci::generate_boot_image(&repo_arc, &result.manifest_digest)?;
+                    println!("Boot image: {}", image_verity.to_hex());
+                }
             }
             OciCommand::ListImages { json } => {
                 let images = composefs_oci::oci_image::list_images(&repo)?;
@@ -543,7 +560,7 @@ where
                 } else {
                     let mut table = Table::new();
                     table.load_preset(UTF8_FULL);
-                    table.set_header(["NAME", "DIGEST", "ARCH", "SEALED", "LAYERS", "REFS"]);
+                    table.set_header(["NAME", "DIGEST", "ARCH", "LAYERS", "REFS"]);
 
                     for img in images {
                         let digest_short = img
@@ -560,12 +577,10 @@ where
                         } else {
                             &img.architecture
                         };
-                        let sealed = if img.sealed { "yes" } else { "no" };
                         table.add_row([
                             img.name.as_str(),
                             digest_display,
                             arch,
-                            sealed,
                             &img.layer_count.to_string(),
                             &img.referrer_count.to_string(),
                         ]);
@@ -633,25 +648,6 @@ where
                     composefs_oci::layer_tar(&repo, layer, &mut out)?;
                 }
             }
-            OciCommand::Seal {
-                config_opts:
-                    OCIConfigOptions {
-                        ref config_name,
-                        ref config_verity,
-                    },
-            } => {
-                let verity = verity_opt(config_verity)?;
-                let (digest, verity) =
-                    composefs_oci::seal(&Arc::new(repo), config_name, verity.as_ref())?;
-                println!("config {digest}");
-                println!("verity {}", verity.to_id());
-            }
-            OciCommand::Mount {
-                ref name,
-                ref mountpoint,
-            } => {
-                composefs_oci::mount(&repo, name, mountpoint, None)?;
-            }
             OciCommand::PrepareBoot {
                 config_opts:
                     OCIConfigOptions {
@@ -697,11 +693,6 @@ where
                 create_dir_all(state.join("etc/work"))?;
             }
         },
-        Command::ComputeId { fs_opts } => {
-            let fs = load_filesystem_from_ondisk_fs(&fs_opts, &repo)?;
-            let id = fs.compute_image_id();
-            println!("{}", id.to_hex());
-        }
         Command::CreateImage {
             fs_opts,
             ref image_name,
@@ -709,6 +700,11 @@ where
             let fs = load_filesystem_from_ondisk_fs(&fs_opts, &repo)?;
             let id = fs.commit_image(&repo, image_name.as_deref())?;
             println!("{}", id.to_id());
+        }
+        Command::ComputeId { fs_opts } => {
+            let fs = load_filesystem_from_ondisk_fs(&fs_opts, &repo)?;
+            let id = fs.compute_image_id();
+            println!("{}", id.to_hex());
         }
         Command::CreateDumpfile { fs_opts } => {
             let fs = load_filesystem_from_ondisk_fs(&fs_opts, &repo)?;
