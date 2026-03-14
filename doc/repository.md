@@ -23,6 +23,7 @@ A composefs repository has a layout that looks something like
 
 ```
 composefs
+├── meta.json
 ├── objects
 │   ├── 00
 │   │   ├── 002183fb91[...]
@@ -44,6 +45,30 @@ composefs
     └── refs
         └── some/name.tar -> ../../streams/502b126bca0c[...]
 ```
+
+## `meta.json`
+
+This optional file records repository-level metadata.  When present, it is
+created by `cfsctl init` and contains:
+
+ - `version` — the base repository format version (currently `1`).  Tools
+   must refuse to operate on a repository whose version exceeds what they
+   understand.
+
+ - `algorithm` — the fs-verity digest algorithm identifier, in the format
+   `fsverity-<hash>-<lg_blocksize>`.  For example `fsverity-sha512-12`
+   means SHA-512 with 4 KiB (2^12) blocks.
+
+ - `features` (optional) — an object with three arrays of feature-flag
+   strings, following the ext4/XFS/EROFS compatibility model:
+   - `compatible` — old tools can safely ignore these.
+   - `read-only-compatible` — old tools may read but must not write.
+   - `incompatible` — old tools must refuse the repository entirely.
+
+When `meta.json` is present, `cfsctl` auto-detects the hash algorithm and
+errors if `--hash` is explicitly passed with a conflicting value.  When
+the file is absent (for repositories created before this feature), `--hash`
+is honoured as before and defaults to `sha512`.
 
 ## `objects/`
 

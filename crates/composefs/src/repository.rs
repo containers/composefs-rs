@@ -107,7 +107,7 @@ use rustix::{
 
 use crate::{
     fsverity::{
-        compute_verity, enable_verity_maybe_copy, ensure_verity_equal, measure_verity,
+        compute_verity, enable_verity_maybe_copy, ensure_verity_equal, measure_verity, Algorithm,
         CompareVerityError, EnableVerityError, FsVerityHashValue, FsVerityHasher,
         MeasureVerityError,
     },
@@ -115,6 +115,267 @@ use crate::{
     splitstream::{SplitStreamReader, SplitStreamWriter},
     util::{proc_self_fd, replace_symlinkat, ErrnoFilter},
 };
+
+/// The filename used for repository metadata.
+pub const REPO_METADATA_FILENAME: &str = "meta.json";
+
+/// The current repository format version.
+///
+/// This is a simple integer that is bumped only for fundamental,
+/// incompatible changes to the repository layout.  Finer-grained
+/// evolution uses the [`FeatureFlags`] system instead.
+pub const REPO_FORMAT_VERSION: u32 = 1;
+
+/// Set of feature flags understood by this version of the code.
+///
+/// When reading a repository whose metadata lists features not in
+/// these sets, the rules are:
+///
+/// - Unknown **compatible** features are silently ignored.
+/// - Unknown **read-only compatible** features allow read operations
+///   but prevent any writes (adding objects, creating images, GC, …).
+/// - Unknown **incompatible** features cause the repository to be
+///   rejected entirely.
+///
+/// There are currently no defined features.
+pub mod known_features {
+    /// Compatible features understood by this version.
+    pub const COMPAT: &[&str] = &[];
+    /// Read-only compatible features understood by this version.
+    pub const RO_COMPAT: &[&str] = &[];
+    /// Incompatible features understood by this version.
+    pub const INCOMPAT: &[&str] = &[];
+}
+
+/// Feature flags for a composefs repository.
+///
+/// Inspired by the ext4/XFS/EROFS on-disk feature model:
+///
+/// - **compatible**: old tools that don't understand these can still
+///   fully read and write the repository.
+/// - **read_only_compatible**: old tools can read but must not write.
+/// - **incompatible**: old tools must refuse to open the repository.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct FeatureFlags {
+    /// Features that can be safely ignored by older tools.
+    #[serde(default)]
+    pub compatible: Vec<String>,
+
+    /// Features that allow reading but prevent writing by older tools.
+    #[serde(default)]
+    pub read_only_compatible: Vec<String>,
+
+    /// Features that require newer tools; older tools must refuse entirely.
+    #[serde(default)]
+    pub incompatible: Vec<String>,
+}
+
+/// Result of checking repository feature compatibility.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeatureCheck {
+    /// All features are understood; full read-write access.
+    ReadWrite,
+    /// Unknown read-only-compatible features present; read access only.
+    /// The vec contains the unknown feature names.
+    ReadOnly(Vec<String>),
+}
+
+impl FeatureFlags {
+    /// Check these flags against the known feature sets.
+    ///
+    /// Returns an error if any unknown incompatible features are present.
+    /// Returns [`FeatureCheck::ReadOnly`] if unknown ro-compat features
+    /// are present. Returns [`FeatureCheck::ReadWrite`] otherwise.
+    pub fn check(&self) -> Result<FeatureCheck> {
+        // Check incompatible features first
+        let unknown_incompat: Vec<&str> = self
+            .incompatible
+            .iter()
+            .map(String::as_str)
+            .filter(|f| !known_features::INCOMPAT.contains(f))
+            .collect();
+        if !unknown_incompat.is_empty() {
+            bail!(
+                "repository requires unknown incompatible features: {}; \
+                 upgrade your tools",
+                unknown_incompat.join(", "),
+            );
+        }
+
+        // Check ro-compat features
+        let unknown_ro: Vec<String> = self
+            .read_only_compatible
+            .iter()
+            .filter(|f| !known_features::RO_COMPAT.contains(&f.as_str()))
+            .cloned()
+            .collect();
+        if !unknown_ro.is_empty() {
+            return Ok(FeatureCheck::ReadOnly(unknown_ro));
+        }
+
+        // Compatible features are ignored by definition
+        Ok(FeatureCheck::ReadWrite)
+    }
+}
+
+/// Repository metadata stored in `meta.json` at the repository root.
+///
+/// This file records the repository's format version, digest algorithm,
+/// and feature flags so that tools can detect misconfigured invocations
+/// (e.g. opening a sha256 repo with `--hash sha512`) and so the
+/// algorithm doesn't need to be specified on every command.
+///
+/// The versioning model is inspired by Linux filesystem superblocks
+/// (ext4, XFS, EROFS): a base version integer for fundamental layout
+/// changes, plus three tiers of feature flags for finer-grained
+/// evolution.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RepoMetadata {
+    /// Base repository format version.  Tools must refuse to operate
+    /// on a repository whose version exceeds what they understand.
+    pub version: u32,
+
+    /// The fs-verity algorithm configuration for this repository.
+    pub algorithm: Algorithm,
+
+    /// Feature flags.
+    #[serde(default)]
+    pub features: FeatureFlags,
+}
+
+impl RepoMetadata {
+    /// Build metadata for a repository using the given hash type.
+    pub fn for_hash<ObjectID: FsVerityHashValue>() -> Self {
+        Self {
+            version: REPO_FORMAT_VERSION,
+            algorithm: Algorithm::for_hash::<ObjectID>(),
+            features: FeatureFlags::default(),
+        }
+    }
+
+    /// Build metadata from an explicit [`Algorithm`].
+    pub fn new(algorithm: Algorithm) -> Self {
+        Self {
+            version: REPO_FORMAT_VERSION,
+            algorithm,
+            features: FeatureFlags::default(),
+        }
+    }
+
+    /// Check whether this metadata is compatible with the given hash type.
+    ///
+    /// Validates the base version, feature flags, and algorithm.
+    /// Returns a [`FeatureCheck`] indicating read-write or read-only access.
+    pub fn check_compatible<ObjectID: FsVerityHashValue>(&self) -> Result<FeatureCheck> {
+        if self.version > REPO_FORMAT_VERSION {
+            bail!(
+                "unsupported repository format version {} (this tool supports up to {})",
+                self.version,
+                REPO_FORMAT_VERSION,
+            );
+        }
+        let access = self.features.check()?;
+        if !self.algorithm.is_compatible::<ObjectID>() {
+            bail!(
+                "repository uses algorithm '{}' but was opened as {} \
+                 (hint: use --hash {} or omit --hash to auto-detect)",
+                self.algorithm,
+                ObjectID::ID,
+                self.algorithm.hash(),
+            );
+        }
+        Ok(access)
+    }
+
+    /// Serialize to pretty-printed JSON with a trailing newline.
+    pub fn to_json(&self) -> Result<Vec<u8>> {
+        let mut buf = serde_json::to_vec_pretty(self).context("serializing repository metadata")?;
+        buf.push(b'\n');
+        Ok(buf)
+    }
+
+    /// Deserialize from JSON bytes.
+    #[context("Parsing repository metadata JSON")]
+    pub fn from_json(data: &[u8]) -> Result<Self> {
+        serde_json::from_slice(data).context("deserializing repository metadata")
+    }
+}
+
+/// Read `meta.json` from a repository directory fd, if it exists.
+///
+/// Returns `Ok(None)` when the file is absent (backward-compatible repos).
+#[context("Reading repository metadata")]
+pub fn read_repo_metadata(repo_fd: &impl AsFd) -> Result<Option<RepoMetadata>> {
+    match openat(
+        repo_fd,
+        REPO_METADATA_FILENAME,
+        OFlags::RDONLY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => {
+            let mut data = Vec::new();
+            File::from(fd)
+                .read_to_end(&mut data)
+                .context("reading meta.json")?;
+            Ok(Some(RepoMetadata::from_json(&data)?))
+        }
+        Err(Errno::NOENT) => Ok(None),
+        Err(e) => Err(e).context("opening meta.json")?,
+    }
+}
+
+/// Write `meta.json` into a repository directory fd.
+///
+/// This atomically writes (via O_TMPFILE + linkat) the metadata file.
+/// It will fail if the file already exists.
+#[context("Writing repository metadata")]
+pub fn write_repo_metadata(repo_fd: &impl AsFd, meta: &RepoMetadata) -> Result<()> {
+    let data = meta.to_json()?;
+
+    // Try O_TMPFILE for atomic creation
+    match openat(
+        repo_fd,
+        ".",
+        OFlags::WRONLY | OFlags::TMPFILE | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o644),
+    ) {
+        Ok(fd) => {
+            let mut file = File::from(fd);
+            file.write_all(&data)
+                .context("writing metadata to tmpfile")?;
+            file.flush().context("flushing metadata tmpfile")?;
+            // Link into place
+            linkat(
+                CWD,
+                proc_self_fd(&file),
+                repo_fd,
+                REPO_METADATA_FILENAME,
+                AtFlags::SYMLINK_FOLLOW,
+            )
+            .context("linking meta.json into repository")?;
+        }
+        Err(Errno::OPNOTSUPP | Errno::NOSYS) => {
+            // Fallback: direct create (no tmpfs O_TMPFILE support).
+            // Use O_EXCL to avoid overwriting, and fsync to ensure the
+            // file is complete on disk before we consider init done.
+            let fd = openat(
+                repo_fd,
+                REPO_METADATA_FILENAME,
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+                Mode::from_raw_mode(0o644),
+            )
+            .context("creating meta.json")?;
+            let mut file = File::from(fd);
+            file.write_all(&data).context("writing meta.json")?;
+            file.sync_all().context("syncing meta.json to disk")?;
+        }
+        Err(e) => {
+            return Err(e).context("creating tmpfile for meta.json")?;
+        }
+    }
+    Ok(())
+}
 
 /// How an object was stored in the repository.
 ///
@@ -1442,6 +1703,16 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         self.repository.as_fd()
     }
 
+    /// Read the repository metadata from `meta.json`, if it exists.
+    ///
+    /// Returns `Ok(None)` for repositories created before metadata support
+    /// was added. When metadata is present, its version and algorithm are
+    /// not validated against this repository's generic type — call
+    /// [`RepoMetadata::check_compatible`] for that.
+    pub fn metadata(&self) -> Result<Option<RepoMetadata>> {
+        read_repo_metadata(&self.repository)
+    }
+
     /// Lists all named stream references under a given prefix.
     ///
     /// Returns (name, target) pairs where name is relative to the prefix.
@@ -2250,6 +2521,187 @@ mod tests {
         assert!(result.objects_bytes > 0);
         assert_eq!(result.images_pruned, 1);
         assert_eq!(result.streams_pruned, 0);
+        Ok(())
+    }
+
+    // ---- RepoMetadata tests ----
+
+    #[test]
+    fn test_metadata_for_hash() {
+        let meta = RepoMetadata::for_hash::<crate::fsverity::Sha256HashValue>();
+        assert_eq!(meta.version, REPO_FORMAT_VERSION);
+        assert_eq!(meta.algorithm.hash(), "sha256");
+        assert_eq!(meta.algorithm.to_string(), "fsverity-sha256-12");
+
+        let meta = RepoMetadata::for_hash::<Sha512HashValue>();
+        assert_eq!(meta.version, REPO_FORMAT_VERSION);
+        assert_eq!(meta.algorithm.hash(), "sha512");
+    }
+
+    #[test]
+    fn test_metadata_json_roundtrip() {
+        let meta = RepoMetadata::for_hash::<Sha512HashValue>();
+        let json = meta.to_json().unwrap();
+
+        // Check it's valid JSON with trailing newline
+        assert!(json.ends_with(b"\n"));
+        let parsed: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(parsed["version"], REPO_FORMAT_VERSION);
+        assert_eq!(parsed["algorithm"], "fsverity-sha512-12");
+        // Features always present, with empty arrays
+        let features = parsed.get("features").expect("features key must exist");
+        assert_eq!(features["compatible"], serde_json::json!([]));
+        assert_eq!(features["read-only-compatible"], serde_json::json!([]));
+        assert_eq!(features["incompatible"], serde_json::json!([]));
+
+        // Roundtrip
+        let meta2 = RepoMetadata::from_json(&json).unwrap();
+        assert_eq!(meta, meta2);
+    }
+
+    #[test]
+    fn test_metadata_json_with_features() {
+        let mut meta = RepoMetadata::for_hash::<Sha512HashValue>();
+        meta.features.compatible.push("some-compat".to_string());
+        meta.features
+            .read_only_compatible
+            .push("some-rocompat".to_string());
+
+        let json = meta.to_json().unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&json).unwrap();
+
+        assert_eq!(parsed["features"]["compatible"][0], "some-compat");
+        assert_eq!(
+            parsed["features"]["read-only-compatible"][0],
+            "some-rocompat"
+        );
+
+        // Roundtrip
+        let meta2 = RepoMetadata::from_json(&json).unwrap();
+        assert_eq!(meta, meta2);
+    }
+
+    #[test]
+    fn test_metadata_check_compatible() {
+        let meta = RepoMetadata::for_hash::<Sha512HashValue>();
+        assert_eq!(
+            meta.check_compatible::<Sha512HashValue>().unwrap(),
+            FeatureCheck::ReadWrite
+        );
+        assert!(meta
+            .check_compatible::<crate::fsverity::Sha256HashValue>()
+            .is_err());
+
+        let meta256 = RepoMetadata::for_hash::<crate::fsverity::Sha256HashValue>();
+        assert_eq!(
+            meta256
+                .check_compatible::<crate::fsverity::Sha256HashValue>()
+                .unwrap(),
+            FeatureCheck::ReadWrite
+        );
+        assert!(meta256.check_compatible::<Sha512HashValue>().is_err());
+    }
+
+    #[test]
+    fn test_metadata_version_mismatch() {
+        let meta = RepoMetadata {
+            version: 999,
+            algorithm: Algorithm::for_hash::<Sha512HashValue>(),
+            features: FeatureFlags::default(),
+        };
+        assert!(meta.check_compatible::<Sha512HashValue>().is_err());
+    }
+
+    #[test]
+    fn test_feature_flags_unknown_incompat() {
+        let mut meta = RepoMetadata::for_hash::<Sha512HashValue>();
+        meta.features
+            .incompatible
+            .push("fancy-new-thing".to_string());
+        let err = meta.check_compatible::<Sha512HashValue>().unwrap_err();
+        assert!(
+            format!("{err}").contains("fancy-new-thing"),
+            "error should name the unknown feature: {err}"
+        );
+    }
+
+    #[test]
+    fn test_feature_flags_unknown_ro_compat() {
+        let mut meta = RepoMetadata::for_hash::<Sha512HashValue>();
+        meta.features
+            .read_only_compatible
+            .push("new-index".to_string());
+        let check = meta.check_compatible::<Sha512HashValue>().unwrap();
+        assert_eq!(check, FeatureCheck::ReadOnly(vec!["new-index".to_string()]));
+    }
+
+    #[test]
+    fn test_feature_flags_unknown_compat_ignored() {
+        let mut meta = RepoMetadata::for_hash::<Sha512HashValue>();
+        meta.features.compatible.push("optional-hint".to_string());
+        assert_eq!(
+            meta.check_compatible::<Sha512HashValue>().unwrap(),
+            FeatureCheck::ReadWrite
+        );
+    }
+
+    #[test]
+    fn test_write_and_read_metadata() -> Result<()> {
+        let tmp = tempdir();
+        let repo_fd = rustix::fs::open(
+            tmp.path(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+
+        // No metadata initially
+        assert!(read_repo_metadata(&repo_fd)?.is_none());
+
+        // Write metadata
+        let meta = RepoMetadata::for_hash::<Sha512HashValue>();
+        write_repo_metadata(&repo_fd, &meta)?;
+
+        // Read it back
+        let read_meta = read_repo_metadata(&repo_fd)?.expect("metadata should exist");
+        assert_eq!(read_meta, meta);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_repo_metadata_method() -> Result<()> {
+        let tmp = tempdir();
+        let repo_path = tmp.path().join("repo");
+        let repo = create_test_repo(&repo_path)?;
+
+        // No metadata initially
+        assert!(repo.metadata()?.is_none());
+
+        // Write metadata via low-level function, then read via method
+        let meta = RepoMetadata::for_hash::<Sha512HashValue>();
+        write_repo_metadata(&repo.repo_fd(), &meta)?;
+
+        let read_meta = repo.metadata()?.expect("metadata should exist");
+        assert_eq!(read_meta, meta);
+        assert_eq!(read_meta.algorithm.hash(), "sha512");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_metadata_already_exists() -> Result<()> {
+        let tmp = tempdir();
+        let repo_fd = rustix::fs::open(
+            tmp.path(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+
+        let meta = RepoMetadata::for_hash::<Sha512HashValue>();
+        write_repo_metadata(&repo_fd, &meta)?;
+
+        // Second write should fail (file already exists)
+        assert!(write_repo_metadata(&repo_fd, &meta).is_err());
         Ok(())
     }
 }

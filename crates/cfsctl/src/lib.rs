@@ -23,20 +23,21 @@ pub use composefs_http;
 pub use composefs_oci;
 
 use std::io::Read;
+use std::path::Path;
 use std::{ffi::OsString, path::PathBuf};
 
 #[cfg(feature = "oci")]
-use std::{fs::create_dir_all, io::IsTerminal, path::Path};
+use std::{fs::create_dir_all, io::IsTerminal};
 
 #[cfg(any(feature = "oci", feature = "http"))]
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(feature = "oci")]
 use comfy_table::{presets::UTF8_FULL, Table};
 
-use rustix::fs::CWD;
+use rustix::fs::{Mode, OFlags, CWD};
 
 #[cfg(feature = "oci")]
 use composefs_boot::write_boot;
@@ -47,9 +48,9 @@ use composefs::shared_internals::IO_BUF_CAPACITY;
 use composefs::{
     dumpfile::{dump_single_dir, dump_single_file},
     erofs::reader::erofs_to_filesystem,
-    fsverity::{FsVerityHashValue, Sha256HashValue, Sha512HashValue},
+    fsverity::{Algorithm, FsVerityHashValue, Sha256HashValue, Sha512HashValue},
     generic_tree::{FileSystem, Inode},
-    repository::Repository,
+    repository::{write_repo_metadata, RepoMetadata, Repository, REPO_METADATA_FILENAME},
     tree::RegularFile,
 };
 
@@ -67,9 +68,11 @@ pub struct App {
     #[clap(long, group = "repopath")]
     system: bool,
 
-    /// What hash digest type to use for composefs repo
-    #[clap(long, value_enum, default_value_t = HashType::Sha512)]
-    pub hash: HashType,
+    /// What hash digest type to use for composefs repo.
+    /// If omitted, auto-detected from repository metadata (meta.json),
+    /// falling back to sha512.
+    #[clap(long, value_enum)]
+    pub hash: Option<HashType>,
 
     /// Sets the repository to insecure before running any operation and
     /// prepend '?' to the composefs kernel command line when writing
@@ -82,12 +85,11 @@ pub struct App {
 }
 
 /// The Hash algorithm used for FsVerity computation
-#[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum, Default)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
 pub enum HashType {
     /// Sha256
     Sha256,
     /// Sha512
-    #[default]
     Sha512,
 }
 
@@ -246,6 +248,20 @@ struct FsReadOptions {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Initialize a new composefs repository with a metadata file.
+    ///
+    /// Creates the repository directory (if it doesn't exist) and writes
+    /// a `meta.json` recording the digest algorithm. Subsequent commands
+    /// will auto-detect the algorithm from this file and error on mismatch.
+    Init {
+        /// The fs-verity algorithm identifier.
+        /// Format: fsverity-<hash>-<lg_blocksize>, e.g. fsverity-sha512-12
+        #[clap(long, value_parser = clap::value_parser!(Algorithm), default_value = "fsverity-sha512-12")]
+        algorithm: Algorithm,
+        /// Path to the repository directory (created if it doesn't exist).
+        /// If omitted, uses --repo/--user/--system location.
+        path: Option<PathBuf>,
+    },
     /// Take a transaction lock on the repository.
     /// This prevents garbage collection from occurring.
     Transaction,
@@ -335,10 +351,7 @@ where
         std::iter::once(OsString::from("cfsctl")).chain(args.into_iter().map(Into::into)),
     );
 
-    match args.hash {
-        HashType::Sha256 => run_cmd_with_repo(open_repo::<Sha256HashValue>(&args)?, args).await,
-        HashType::Sha512 => run_cmd_with_repo(open_repo::<Sha512HashValue>(&args)?, args).await,
-    }
+    run_app(args).await
 }
 
 #[cfg(feature = "oci")]
@@ -350,6 +363,149 @@ where
         Some(value) => Some(FsVerityHashValue::from_hex(value)?),
         None => None,
     })
+}
+
+/// Resolve the repository path from CLI args without opening it.
+fn resolve_repo_path(args: &App) -> PathBuf {
+    if let Some(path) = &args.repo {
+        path.clone()
+    } else if args.system {
+        PathBuf::from("/sysroot/composefs")
+    } else if args.user {
+        let home = std::env::var("HOME").expect("$HOME must be set when in user mode");
+        PathBuf::from(home).join(".var/lib/composefs")
+    } else if rustix::process::getuid().is_root() {
+        PathBuf::from("/sysroot/composefs")
+    } else {
+        let home = std::env::var("HOME").expect("$HOME must be set");
+        PathBuf::from(home).join(".var/lib/composefs")
+    }
+}
+
+/// Determine the effective hash type for a repository.
+///
+/// Resolution order:
+/// 1. If `meta.json` exists, use its algorithm. Error if `--hash` was
+///    explicitly passed and conflicts.
+/// 2. If no metadata, use `--hash` if given.
+/// 3. Otherwise default to sha512.
+///
+/// Note: we read the metadata file directly here (rather than via
+/// `Repository::metadata`) because this runs *before* we know which
+/// generic `ObjectID` type to use — that's exactly what we're deciding.
+fn resolve_hash_type(repo_path: &Path, cli_hash: Option<HashType>) -> Result<HashType> {
+    // Try reading meta.json from the repo path
+    let meta_path = repo_path.join(REPO_METADATA_FILENAME);
+    let data = match std::fs::read(&meta_path) {
+        Ok(data) => data,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // No metadata: use CLI flag or default
+            return Ok(cli_hash.unwrap_or(HashType::Sha512));
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context("reading repository meta.json"));
+        }
+    };
+
+    let meta = RepoMetadata::from_json(&data)?;
+    let detected = match meta.algorithm.hash() {
+        "sha256" => HashType::Sha256,
+        "sha512" => HashType::Sha512,
+        other => anyhow::bail!("unsupported hash algorithm '{other}' in repository metadata"),
+    };
+
+    // If the user explicitly passed --hash and it doesn't match, error
+    if let Some(explicit) = cli_hash {
+        if explicit != detected {
+            anyhow::bail!(
+                "repository is configured for {} (from {}) but --hash {} was specified",
+                meta.algorithm,
+                REPO_METADATA_FILENAME,
+                match explicit {
+                    HashType::Sha256 => "sha256",
+                    HashType::Sha512 => "sha512",
+                },
+            );
+        }
+    }
+
+    Ok(detected)
+}
+
+/// Top-level dispatch: handle init specially, otherwise open repo and run.
+pub async fn run_app(args: App) -> Result<()> {
+    // Init is handled before opening a repo since it creates one
+    if let Command::Init {
+        ref algorithm,
+        ref path,
+    } = args.cmd
+    {
+        return run_init(algorithm, path.as_deref(), &args);
+    }
+
+    let repo_path = resolve_repo_path(&args);
+    let effective_hash = resolve_hash_type(&repo_path, args.hash)?;
+
+    match effective_hash {
+        HashType::Sha256 => run_cmd_with_repo(open_repo::<Sha256HashValue>(&args)?, args).await,
+        HashType::Sha512 => run_cmd_with_repo(open_repo::<Sha512HashValue>(&args)?, args).await,
+    }
+}
+
+/// Handle `cfsctl init`
+fn run_init(algorithm: &Algorithm, path: Option<&Path>, args: &App) -> Result<()> {
+    let meta = RepoMetadata::new(algorithm.clone());
+
+    let repo_path = if let Some(p) = path {
+        p.to_path_buf()
+    } else {
+        resolve_repo_path(args)
+    };
+
+    // Create the directory if it doesn't exist
+    std::fs::create_dir_all(&repo_path)
+        .with_context(|| format!("creating repository directory {}", repo_path.display()))?;
+
+    // Check if meta.json already exists
+    let meta_path = repo_path.join(REPO_METADATA_FILENAME);
+    if meta_path.exists() {
+        // Read existing and compare
+        let existing_data = std::fs::read(&meta_path)
+            .with_context(|| format!("reading existing {}", meta_path.display()))?;
+        let existing = RepoMetadata::from_json(&existing_data)?;
+        if existing == meta {
+            // Idempotent: same config, nothing to do
+            println!("Repository already initialized at {}", repo_path.display());
+            return Ok(());
+        }
+        anyhow::bail!(
+            "repository at {} already initialized with algorithm '{}' (version {}); \
+             cannot re-initialize with '{}'",
+            repo_path.display(),
+            existing.algorithm,
+            existing.version,
+            algorithm,
+        );
+    }
+
+    // Open the repo dir fd and write metadata
+    let repo_fd = rustix::fs::open(
+        &repo_path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .with_context(|| format!("opening repository directory {}", repo_path.display()))?;
+
+    write_repo_metadata(&repo_fd, &meta)?;
+
+    println!(
+        "Initialized composefs repository at {}",
+        repo_path.display()
+    );
+    println!("  algorithm: {}", meta.algorithm);
+    println!("  version:   {}", meta.version);
+
+    Ok(())
 }
 
 /// Open a repo
@@ -469,6 +625,10 @@ where
     ObjectID: FsVerityHashValue,
 {
     match args.cmd {
+        Command::Init { .. } => {
+            // Handled in run_app before we get here
+            unreachable!("init is handled before opening a repository");
+        }
         Command::Transaction => {
             // just wait for ^C
             loop {
@@ -754,19 +914,11 @@ where
             let mut img_buf = Vec::new();
             std::fs::File::from(img_fd).read_to_end(&mut img_buf)?;
 
-            match args.hash {
-                HashType::Sha256 => dump_file_impl(
-                    erofs_to_filesystem::<Sha256HashValue>(&img_buf)?,
-                    &files,
-                    backing_path_only,
-                )?,
-
-                HashType::Sha512 => dump_file_impl(
-                    erofs_to_filesystem::<Sha512HashValue>(&img_buf)?,
-                    &files,
-                    backing_path_only,
-                )?,
-            };
+            dump_file_impl(
+                erofs_to_filesystem::<ObjectID>(&img_buf)?,
+                &files,
+                backing_path_only,
+            )?;
         }
         #[cfg(feature = "http")]
         Command::Fetch { url, name } => {
