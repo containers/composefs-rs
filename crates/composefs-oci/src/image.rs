@@ -104,7 +104,9 @@ pub fn create_filesystem<ObjectID: FsVerityHashValue>(
 ) -> Result<FileSystem<ObjectID>> {
     let mut filesystem = FileSystem::new(Stat::uninitialized());
 
-    let (config, map) = crate::open_config(repo, config_name, config_verity)?;
+    let oc = crate::open_config(repo, config_name, config_verity)?;
+    let config = oc.config;
+    let map = oc.layer_refs;
 
     for diff_id in config.rootfs().diff_ids() {
         let layer_verity = map

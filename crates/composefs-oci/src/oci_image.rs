@@ -106,6 +106,8 @@ pub struct OciImage<ObjectID: FsVerityHashValue> {
     config: Option<ImageConfiguration>,
     /// Map from layer diff_id to its fs-verity object ID
     layer_refs: HashMap<Box<str>, ObjectID>,
+    /// The EROFS image ObjectID linked to this config, if any
+    image_ref: Option<ObjectID>,
     /// The fs-verity ID of the manifest splitstream
     manifest_verity: ObjectID,
 }
@@ -151,7 +153,7 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
         )?;
 
         // Try to parse as ImageConfiguration, but don't fail for artifacts
-        let (config, layer_refs) = match manifest.config().media_type() {
+        let (config, mut layer_refs) = match manifest.config().media_type() {
             MediaType::ImageConfig => {
                 let config = ImageConfiguration::from_reader(&config_data[..])?;
                 (Some(config), config_named_refs)
@@ -174,6 +176,9 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
             }
         };
 
+        // Strip the EROFS image ref from layer_refs (it's not a layer)
+        let image_ref = layer_refs.remove(crate::IMAGE_REF_KEY);
+
         let manifest_verity = if let Some(v) = verity {
             v.clone()
         } else {
@@ -188,6 +193,7 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
             config_verity,
             config,
             layer_refs,
+            image_ref,
             manifest_verity,
         })
     }
@@ -223,9 +229,24 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
         &self.config_digest
     }
 
+    /// Returns the config fs-verity hash.
+    pub fn config_verity(&self) -> &ObjectID {
+        &self.config_verity
+    }
+
     /// Returns the OCI config, if this is a container image.
     pub fn config(&self) -> Option<&ImageConfiguration> {
         self.config.as_ref()
+    }
+
+    /// Returns the layer refs map (diff_id → fs-verity ObjectID).
+    pub fn layer_refs(&self) -> &HashMap<Box<str>, ObjectID> {
+        &self.layer_refs
+    }
+
+    /// Returns the EROFS image ObjectID linked to this config, if any.
+    pub fn image_ref(&self) -> Option<&ObjectID> {
+        self.image_ref.as_ref()
     }
 
     /// Returns the image architecture (empty string for artifacts).
@@ -375,11 +396,17 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
             .map(|(digest, _verity)| serde_json::json!({ "digest": digest }))
             .collect();
 
-        Ok(serde_json::json!({
+        let mut result = serde_json::json!({
             "manifest": manifest_value,
             "config": config_value,
             "referrers": referrers_value,
-        }))
+        });
+
+        if let Some(ref erofs_id) = self.image_ref {
+            result["composefs_erofs"] = serde_json::json!(erofs_id.to_hex());
+        }
+
+        Ok(result)
     }
 }
 
@@ -572,6 +599,46 @@ pub fn write_manifest<ObjectID: FsVerityHashValue>(
     }
 
     stream.write_external(json_bytes)?;
+
+    let oci_ref = reference.map(oci_ref_path);
+    let id = repo.write_stream(stream, &content_id, oci_ref.as_deref())?;
+
+    Ok((manifest_digest.to_string(), id))
+}
+
+/// Rewrites a manifest splitstream with updated named refs.
+///
+/// Unlike [`write_manifest`], this always writes the splitstream even if the
+/// content identifier already exists. This is needed when the manifest JSON
+/// hasn't changed but the config splitstream's verity has (e.g., because an
+/// EROFS image ref was added to the config).
+///
+/// If `reference` is provided, the manifest is also tagged with that name.
+pub(crate) fn rewrite_manifest<ObjectID: FsVerityHashValue>(
+    repo: &Arc<Repository<ObjectID>>,
+    manifest_json: &[u8],
+    manifest_digest: &str,
+    config_verity: &ObjectID,
+    layer_verities: &HashMap<Box<str>, ObjectID>,
+    reference: Option<&str>,
+) -> Result<(String, ObjectID)> {
+    let content_id = manifest_identifier(manifest_digest);
+
+    let config_digest = {
+        let manifest = ImageManifest::from_reader(manifest_json)?;
+        manifest.config().digest().to_string()
+    };
+
+    let mut stream = repo.create_stream(OCI_MANIFEST_CONTENT_TYPE);
+
+    let config_key = format!("config:{config_digest}");
+    stream.add_named_stream_ref(&config_key, config_verity);
+
+    for (diff_id, verity) in layer_verities {
+        stream.add_named_stream_ref(diff_id, verity);
+    }
+
+    stream.write_external(manifest_json)?;
 
     let oci_ref = reference.map(oci_ref_path);
     let id = repo.write_stream(stream, &content_id, oci_ref.as_deref())?;

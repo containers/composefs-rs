@@ -15,7 +15,9 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 cap-std-ext = "4.0"
-composefs = { workspace = true }
+# Only the test_util module is used — for creating test OCI images.
+# All verification must go through the cfsctl CLI.
+composefs-oci = { path = "../composefs-oci", features = ["test"] }
 libtest-mimic = "0.8"
 linkme = "0.3"
 ocidir = "0.6"
