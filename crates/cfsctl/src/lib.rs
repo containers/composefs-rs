@@ -298,32 +298,10 @@ enum OciCommand {
         #[clap(long)]
         image_name: Option<String>,
     },
-    /// Seal a stored OCI image by embedding its composefs verity digest
-    ///
-    /// The image can be specified by ref name or @digest:
-    ///   cfsctl oci seal myimage:latest
-    ///   cfsctl oci seal @sha256:a1b2c3...
-    Seal {
-        #[clap(flatten)]
-        config_opts: OCIConfigOptions,
-    },
-    /// Mount a stored (sealed) OCI image's composefs EROFS at a mountpoint
-    Mount {
-        /// Manifest digest, e.g. sha256:a1b2c3...
-        name: composefs_oci::OciDigest,
-        /// Target mountpoint
-        mountpoint: String,
-    },
-    /// Prepare boot resources from a stored OCI image
-    ///
-    /// Creates the composefs image with bootable transformation, writes boot
-    /// loader entries and kernel/initramfs to the boot partition.
-    ///
-    /// The image can be specified by ref name or @digest:
-    ///   cfsctl oci prepare-boot myimage:latest
-    ///   cfsctl oci prepare-boot @sha256:a1b2c3...
-    ///
-    /// Note: the state preparation here is not suitable for consumption by bootc.
+    /// Create the composefs image of the rootfs of a stored OCI image, perform bootable transformation, commit it to the repo,
+    /// then configure boot for the image by writing new boot resources and bootloader entries to boot partition. Performs
+    /// state preparation for composefs-setup-root consumption as well. Note that state preparation here is not suitable for
+    /// consumption by bootc.
     PrepareBoot {
         #[clap(flatten)]
         config_opts: OCIConfigOptions,
@@ -878,7 +856,7 @@ where
                 } else {
                     let mut table = Table::new();
                     table.load_preset(UTF8_FULL);
-                    table.set_header(["NAME", "DIGEST", "ARCH", "SEALED", "LAYERS", "REFS"]);
+                    table.set_header(["NAME", "DIGEST", "ARCH", "LAYERS", "REFS"]);
 
                     for img in images {
                         let digest_str: &str = img.manifest_digest.as_ref();
@@ -893,12 +871,10 @@ where
                         } else {
                             &img.architecture
                         };
-                        let sealed = if img.sealed { "yes" } else { "no" };
                         table.add_row([
                             img.name.as_str(),
                             digest_display,
                             arch,
-                            sealed,
                             &img.layer_count.to_string(),
                             &img.referrer_count.to_string(),
                         ]);
@@ -962,27 +938,7 @@ where
                     composefs_oci::layer_tar(&repo, layer, &mut out)?;
                 }
             }
-            OciCommand::Seal {
-                config_opts:
-                    OCIConfigOptions {
-                        ref config_name,
-                        ref config_verity,
-                    },
-            } => {
-                let verity = verity_opt(config_verity)?;
-                let (config_digest, config_verity) =
-                    resolve_oci_config(&repo, config_name, verity)?;
-                let (digest, verity) =
-                    composefs_oci::seal(&Arc::new(repo), &config_digest, config_verity.as_ref())?;
-                println!("config {digest}");
-                println!("verity {}", verity.to_id());
-            }
-            OciCommand::Mount {
-                ref name,
-                ref mountpoint,
-            } => {
-                composefs_oci::mount(&repo, name, mountpoint, None)?;
-            }
+
             OciCommand::PrepareBoot {
                 config_opts:
                     OCIConfigOptions {
