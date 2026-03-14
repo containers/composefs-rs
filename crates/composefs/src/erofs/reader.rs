@@ -1248,7 +1248,7 @@ fn check_metacopy_xattr<ObjectID: FsVerityHashValue>(
             value.flags(),
             value.digest_algo(),
             size_of::<OverlayMetacopy<ObjectID>>(),
-            ObjectID::ALGORITHM,
+            ObjectID::ALGORITHM.kernel_id(),
         );
     }
     Ok(None)

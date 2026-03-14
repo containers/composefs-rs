@@ -169,7 +169,7 @@ impl<H: FsVerityHashValue, const LG_BLKSZ: u8> FsVerityHasher<H, LG_BLKSZ> {
 
         let mut context = H::Digest::new();
         context.update(1u8.to_le_bytes()); /* version */
-        context.update(H::ALGORITHM.to_le_bytes()); /* hash_algorithm */
+        context.update(H::ALGORITHM.kernel_id().to_le_bytes()); /* hash_algorithm */
         context.update(LG_BLKSZ.to_le_bytes()); /* log_blocksize */
         context.update(0u8.to_le_bytes()); /* salt_size */
         context.update([0; 4]); /* reserved */

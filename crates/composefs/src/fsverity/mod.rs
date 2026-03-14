@@ -22,7 +22,10 @@ use std::{
 use rustix::fs::{open, openat, Mode, OFlags};
 use thiserror::Error;
 
-pub use hashvalue::{FsVerityHashValue, Sha256HashValue, Sha512HashValue};
+pub use hashvalue::{
+    Algorithm, AlgorithmParseError, FsVerityHashValue, Sha256HashValue, Sha512HashValue,
+    DEFAULT_LG_BLOCKSIZE,
+};
 
 // Re-export error types from composefs-ioctls
 pub use ioctl::{EnableVerityError, MeasureVerityError};

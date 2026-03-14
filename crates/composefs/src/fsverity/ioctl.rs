@@ -18,7 +18,7 @@ use super::FsVerityHashValue;
 pub(super) fn fs_ioc_enable_verity<H: FsVerityHashValue>(
     fd: impl AsFd,
 ) -> Result<(), EnableVerityError> {
-    composefs_ioctls::fsverity::fs_ioc_enable_verity(fd.as_fd(), H::ALGORITHM, 4096)
+    composefs_ioctls::fsverity::fs_ioc_enable_verity(fd.as_fd(), H::ALGORITHM.kernel_id(), 4096)
 }
 
 /// Measure the fsverity digest of the provided file descriptor.
@@ -28,20 +28,19 @@ pub(super) fn fs_ioc_measure_verity<H: FsVerityHashValue>(
     fd: impl AsFd,
 ) -> Result<H, MeasureVerityError> {
     // Dispatch based on algorithm to call the appropriate const-generic version
-    match H::ALGORITHM {
+    let kid = H::ALGORITHM.kernel_id();
+    match kid {
         1 => {
-            // SHA-256
             let digest: [u8; 32] =
-                composefs_ioctls::fsverity::fs_ioc_measure_verity(fd.as_fd(), H::ALGORITHM)?;
+                composefs_ioctls::fsverity::fs_ioc_measure_verity(fd.as_fd(), kid)?;
             Ok(H::read_from_bytes(&digest).expect("size mismatch"))
         }
         2 => {
-            // SHA-512
             let digest: [u8; 64] =
-                composefs_ioctls::fsverity::fs_ioc_measure_verity(fd.as_fd(), H::ALGORITHM)?;
+                composefs_ioctls::fsverity::fs_ioc_measure_verity(fd.as_fd(), kid)?;
             Ok(H::read_from_bytes(&digest).expect("size mismatch"))
         }
-        _ => panic!("Unsupported algorithm: {}", H::ALGORITHM),
+        _ => unreachable!(),
     }
 }
 
