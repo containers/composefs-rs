@@ -218,20 +218,6 @@ enum OciCommand {
         #[clap(long)]
         image_name: Option<String>,
     },
-    /// Seal a stored OCI image by creating a cloned manifest with embedded verity digest (a.k.a. composefs image object ID)
-    /// in the repo, then prints the stream and verity digest of the new sealed manifest
-    Seal {
-        #[clap(flatten)]
-        config_opts: OCIConfigOptions,
-    },
-    /// Mounts a stored and sealed OCI image by looking up its composefs image. Note that the composefs image must be built
-    /// and committed to the repo first
-    Mount {
-        /// the name of the target OCI manifest stream, either a stream ID in format oci-config-<hash_type>:<hash_digest> or a reference in 'ref/'
-        name: String,
-        /// the mountpoint
-        mountpoint: String,
-    },
     /// Create the composefs image of the rootfs of a stored OCI image, perform bootable transformation, commit it to the repo,
     /// then configure boot for the image by writing new boot resources and bootloader entries to boot partition. Performs
     /// state preparation for composefs-setup-root consumption as well. Note that state preparation here is not suitable for
@@ -743,7 +729,7 @@ where
                 } else {
                     let mut table = Table::new();
                     table.load_preset(UTF8_FULL);
-                    table.set_header(["NAME", "DIGEST", "ARCH", "SEALED", "LAYERS", "REFS"]);
+                    table.set_header(["NAME", "DIGEST", "ARCH", "LAYERS", "REFS"]);
 
                     for img in images {
                         let digest_short = img
@@ -760,12 +746,10 @@ where
                         } else {
                             &img.architecture
                         };
-                        let sealed = if img.sealed { "yes" } else { "no" };
                         table.add_row([
                             img.name.as_str(),
                             digest_display,
                             arch,
-                            sealed,
                             &img.layer_count.to_string(),
                             &img.referrer_count.to_string(),
                         ]);
@@ -832,25 +816,6 @@ where
                     }
                     composefs_oci::layer_tar(&repo, layer, &mut out)?;
                 }
-            }
-            OciCommand::Seal {
-                config_opts:
-                    OCIConfigOptions {
-                        ref config_name,
-                        ref config_verity,
-                    },
-            } => {
-                let verity = verity_opt(config_verity)?;
-                let (digest, verity) =
-                    composefs_oci::seal(&Arc::new(repo), config_name, verity.as_ref())?;
-                println!("config {digest}");
-                println!("verity {}", verity.to_id());
-            }
-            OciCommand::Mount {
-                ref name,
-                ref mountpoint,
-            } => {
-                composefs_oci::mount(&repo, name, mountpoint, None)?;
             }
             OciCommand::PrepareBoot {
                 config_opts:

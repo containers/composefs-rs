@@ -249,18 +249,6 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
         self.config.as_ref().and_then(|c| c.created().as_deref())
     }
 
-    /// Returns the composefs seal digest, if sealed.
-    pub fn seal_digest(&self) -> Option<&str> {
-        self.config
-            .as_ref()
-            .and_then(|c| c.get_config_annotation("containers.composefs.fsverity"))
-    }
-
-    /// Returns whether this image has been sealed.
-    pub fn is_sealed(&self) -> bool {
-        self.seal_digest().is_some()
-    }
-
     /// Opens an artifact layer's backing object by index, returning a
     /// read-only file descriptor to the raw blob data.
     ///
@@ -499,8 +487,6 @@ pub struct ImageInfo {
     pub os: String,
     /// Creation timestamp
     pub created: Option<String>,
-    /// Whether sealed with composefs
-    pub sealed: bool,
     /// Number of layers/blobs
     pub layer_count: usize,
     /// Number of OCI referrers (signatures, attestations, etc.)
@@ -524,7 +510,6 @@ pub fn list_images<ObjectID: FsVerityHashValue>(
                     architecture: img.architecture(),
                     os: img.os(),
                     created: img.created().map(String::from),
-                    sealed: img.is_sealed(),
                     layer_count: img.layer_descriptors().len(),
                     referrer_count,
                 });
