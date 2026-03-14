@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, ensure, Result};
 use xshell::{cmd, Shell};
 
-use crate::{cfsctl, create_test_rootfs, integration_test};
+use crate::{cfsctl, integration_test};
 
 /// Ensure we're running as root, or re-exec this test inside a VM.
 ///
@@ -125,45 +125,82 @@ fn privileged_repo_without_insecure() -> Result<()> {
 }
 integration_test!(privileged_repo_without_insecure);
 
-fn privileged_create_image() -> Result<()> {
-    if require_privileged("privileged_create_image")?.is_some() {
+/// Build a test OCI image, mount it via `cfsctl oci mount`, and verify
+/// the filesystem content. Uses the library only for image creation (test
+/// setup); all verification goes through the CLI.
+fn privileged_oci_pull_mount() -> Result<()> {
+    if require_privileged("privileged_oci_pull_mount")?.is_some() {
         return Ok(());
     }
 
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
     let verity_dir = VerityTempDir::new()?;
-    let repo = verity_dir.path().join("repo");
-    let fixture_dir = tempfile::tempdir()?;
-    let rootfs = create_test_rootfs(fixture_dir.path())?;
+    let repo_path = verity_dir.path().join("repo");
+    let repo_arg = repo_path.to_str().unwrap();
 
-    let output = cmd!(sh, "{cfsctl} --repo {repo} create-image {rootfs}").read()?;
+    // Create a test OCI image with EROFS linked (library used only for setup)
+    composefs_oci::test_util::create_test_oci_image(&repo_path, "mount-test:v1")?;
+
+    // test_util creates SHA-256 repos; tell cfsctl to match
+    let hash = "sha256";
+
+    // Verify inspect shows the EROFS ref
+    let inspect_output = cmd!(
+        sh,
+        "{cfsctl} --insecure --hash {hash} --repo {repo_arg} oci inspect mount-test:v1"
+    )
+    .read()?;
+    let inspect: serde_json::Value = serde_json::from_str(&inspect_output)?;
     ensure!(
-        !output.trim().is_empty(),
-        "expected image ID output, got nothing"
+        inspect.get("composefs_erofs").is_some(),
+        "inspect should show composefs_erofs field"
     );
+
+    // Mount via cfsctl oci mount
+    let mountpoint = tempfile::tempdir()?;
+    let mp = mountpoint.path().to_str().unwrap();
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --hash {hash} --repo {repo_arg} oci mount mount-test:v1 {mp}"
+    )
+    .run()?;
+
+    // Verify file content at the mountpoint
+    let hostname = std::fs::read_to_string(mountpoint.path().join("etc/hostname"))?;
+    ensure!(hostname == "testhost\n", "hostname mismatch: {hostname:?}");
+
+    let os_release = std::fs::read_to_string(mountpoint.path().join("etc/os-release"))?;
+    ensure!(
+        os_release.contains("ID=test"),
+        "os-release missing ID: {os_release:?}"
+    );
+
+    let busybox = std::fs::read(mountpoint.path().join("usr/bin/busybox"))?;
+    ensure!(
+        busybox == b"busybox-binary-content",
+        "busybox content mismatch"
+    );
+
+    let sh_target = std::fs::read_link(mountpoint.path().join("usr/bin/sh"))?;
+    ensure!(
+        sh_target.to_str() == Some("busybox"),
+        "sh symlink target mismatch: {sh_target:?}"
+    );
+
+    let app_data = std::fs::read_to_string(mountpoint.path().join("usr/share/myapp/data.txt"))?;
+    ensure!(
+        app_data == "application-data",
+        "app data mismatch: {app_data:?}"
+    );
+
+    ensure!(mountpoint.path().join("tmp").is_dir(), "/tmp missing");
+    ensure!(mountpoint.path().join("var").is_dir(), "/var missing");
+    ensure!(
+        mountpoint.path().join("usr/lib").is_dir(),
+        "/usr/lib missing"
+    );
+
     Ok(())
 }
-integration_test!(privileged_create_image);
-
-fn privileged_create_image_idempotent() -> Result<()> {
-    if require_privileged("privileged_create_image_idempotent")?.is_some() {
-        return Ok(());
-    }
-
-    let sh = Shell::new()?;
-    let cfsctl = cfsctl()?;
-    let verity_dir = VerityTempDir::new()?;
-    let repo = verity_dir.path().join("repo");
-    let fixture_dir = tempfile::tempdir()?;
-    let rootfs = create_test_rootfs(fixture_dir.path())?;
-
-    let id1 = cmd!(sh, "{cfsctl} --repo {repo} create-image {rootfs}").read()?;
-    let id2 = cmd!(sh, "{cfsctl} --repo {repo} create-image {rootfs}").read()?;
-    ensure!(
-        id1.trim() == id2.trim(),
-        "creating the same image twice should produce the same ID: {id1} vs {id2}"
-    );
-    Ok(())
-}
-integration_test!(privileged_create_image_idempotent);
+integration_test!(privileged_oci_pull_mount);

@@ -216,10 +216,42 @@ When a tag is removed, the manifest and everything reachable only from it
 becomes GC-eligible.  Layers shared between images survive as long as any
 referencing manifest remains tagged.
 
-### What is not currently covered
+### EROFS image tracking via config splitstream refs
 
-EROFS images produced from OCI content (via `create_filesystem` +
-`commit_image`) are stored in `images/` but are not referenced by any
-splitstream.  There is no GC chain from an OCI tag to the derived EROFS
-image — the caller must manage EROFS image lifecycle separately (e.g. via
-`additional_roots` or `images/refs/`).
+When an EROFS image is generated from an OCI image (via
+`create_filesystem` + `commit_image`), its object ID (fs-verity digest)
+is stored as a named ref on the config splitstream with the key
+`composefs.image`.
+
+GC walks from tag → manifest → config, and finds the `composefs.image`
+named ref.  The EROFS object ID is added to the live set, keeping the
+EROFS image alive.  The EROFS image still needs an entry under `images/`
+for the kernel mount security model (see above), but `images/` is not a
+GC root — the config ref is what keeps the object alive.
+
+This means a single OCI tag is sufficient to keep the entire image
+(manifest, config, layers, and the EROFS image) alive through GC.
+
+### Bootable image variant
+
+For bootable images, a second EROFS may be generated after
+`transform_for_boot` (stripping `/boot`, etc.).  This boot EROFS is
+stored as a second named ref on the config, `composefs.image.boot`.
+
+Since the config splitstream content changes (new named ref), it gets a
+new fs-verity digest.  This cascades: the manifest must also be
+rewritten (its `config:` named ref now points to the new config verity),
+producing a new manifest verity.  The tag is re-pointed to the new
+manifest.  The old config and manifest splitstreams become unreferenced
+and are collected by GC.
+
+The result: one tag still keeps everything alive — layers, raw EROFS,
+and boot EROFS.
+
+### Future: sealed images
+
+For sealed/signed images, the EROFS comes pre-built from the registry as
+part of a composefs OCI artifact (referrer pattern).  The artifact
+splitstream would hold references to the pre-fetched EROFS layers.  This
+is complementary to the unsealed case — both use the same GC mechanism
+(named refs pointing to EROFS objects).
