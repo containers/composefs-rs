@@ -575,6 +575,26 @@ pub fn create_test_oci_image(repo_path: &std::path::Path, tag: &str) -> anyhow::
     Ok(())
 }
 
+/// Create a bootable test OCI image in a repository at the given path.
+///
+/// Like [`create_test_oci_image`] but builds a 20-layer bootable image
+/// (version 1) and generates both the plain EROFS and the boot EROFS.
+/// Requires the `boot` feature.
+#[cfg(feature = "boot")]
+pub fn create_test_bootable_oci_image(
+    repo_path: &std::path::Path,
+    tag: &str,
+) -> anyhow::Result<()> {
+    let mut repo = Repository::<Sha256HashValue>::open_path(rustix::fs::CWD, repo_path)?;
+    repo.set_insecure(true);
+    let repo = Arc::new(repo);
+    let rt = tokio::runtime::Runtime::new()?;
+    let img = rt.block_on(create_bootable_image(&repo, Some(tag), 1));
+    ensure_erofs_for_image(&repo, tag)?;
+    crate::boot::generate_boot_image(&repo, &img.manifest_digest)?;
+    Ok(())
+}
+
 /// Generate the composefs EROFS for a tagged OCI image and link it to the
 /// config splitstream.
 ///

@@ -155,6 +155,9 @@ enum OciCommand {
         image: String,
         /// optional reference name for the manifest, use as 'ref/<name>' elsewhere
         name: Option<String>,
+        /// Also generate a bootable EROFS image from the pulled OCI image
+        #[arg(long)]
+        bootable: bool,
     },
     /// List all tagged OCI images in the repository
     #[clap(name = "images")]
@@ -211,6 +214,9 @@ enum OciCommand {
         image: String,
         /// Target mountpoint
         mountpoint: String,
+        /// Mount the bootable variant instead of the regular EROFS image
+        #[arg(long)]
+        bootable: bool,
     },
     /// Compute the composefs image object id of the rootfs of a stored OCI image
     ComputeId {
@@ -690,15 +696,23 @@ where
             OciCommand::Mount {
                 ref image,
                 ref mountpoint,
+                bootable,
             } => {
                 let img = if image.starts_with("sha256:") {
                     composefs_oci::oci_image::OciImage::open(&repo, image, None)?
                 } else {
                     composefs_oci::oci_image::OciImage::open_ref(&repo, image)?
                 };
-                let erofs_id = match img.image_ref() {
-                    Some(id) => id,
-                    None => bail!("No composefs EROFS image linked — try re-pulling the image"),
+                let erofs_id = if bootable {
+                    match img.boot_image_ref() {
+                        Some(id) => id,
+                        None => anyhow::bail!("No boot EROFS image linked — try pulling with --bootable"),
+                    }
+                } else {
+                    match img.image_ref() {
+                        Some(id) => id,
+                        None => anyhow::bail!("No composefs EROFS image linked — try re-pulling the image"),
+                    }
                 };
                 repo.mount_at(&erofs_id.to_hex(), mountpoint.as_str())?;
             }
@@ -707,11 +721,16 @@ where
                 let id = fs.compute_image_id();
                 println!("{}", id.to_hex());
             }
-            OciCommand::Pull { ref image, name } => {
+            OciCommand::Pull {
+                ref image,
+                name,
+                bootable,
+            } => {
                 // If no explicit name provided, use the image reference as the tag
                 let tag_name = name.as_deref().unwrap_or(image);
+                let repo_arc = Arc::new(repo);
                 let (result, stats) =
-                    composefs_oci::pull_image(&Arc::new(repo), image, Some(tag_name), None).await?;
+                    composefs_oci::pull_image(&repo_arc, image, Some(tag_name), None).await?;
 
                 println!("manifest {}", result.manifest_digest);
                 println!("config   {}", result.config_digest);
@@ -724,6 +743,12 @@ where
                     stats.bytes_copied,
                     stats.bytes_inlined,
                 );
+
+                if bootable {
+                    let image_verity =
+                        composefs_oci::generate_boot_image(&repo_arc, &result.manifest_digest)?;
+                    println!("Boot image: {}", image_verity.to_hex());
+                }
             }
             OciCommand::ListImages { json } => {
                 let images = composefs_oci::oci_image::list_images(&repo)?;
