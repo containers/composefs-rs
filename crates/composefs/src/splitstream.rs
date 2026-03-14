@@ -561,7 +561,7 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
                 magic: SPLITSTREAM_MAGIC,
                 version: 0,
                 _flags: U16::ZERO,
-                algorithm: ObjectID::ALGORITHM,
+                algorithm: ObjectID::ALGORITHM.kernel_id(),
                 lg_blocksize: LG_BLOCKSIZE,
                 info: (info_start..info_end).into(),
             }
@@ -678,7 +678,7 @@ impl<ObjectID: FsVerityHashValue> SplitStreamReader<ObjectID> {
             bail!("Invalid splitstream version {}", header.version);
         }
 
-        if header.algorithm != ObjectID::ALGORITHM {
+        if header.algorithm != ObjectID::ALGORITHM.kernel_id() {
             bail!("Invalid splitstream fs-verity algorithm type");
         }
 

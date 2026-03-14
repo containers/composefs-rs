@@ -24,7 +24,7 @@ impl<H: FsVerityHashValue> OverlayMetacopy<H> {
             version: 0,
             len: size_of::<Self>() as u8,
             flags: 0,
-            digest_algo: H::ALGORITHM,
+            digest_algo: H::ALGORITHM.kernel_id(),
             digest: digest.clone(),
         }
     }
@@ -33,7 +33,7 @@ impl<H: FsVerityHashValue> OverlayMetacopy<H> {
         self.version == 0
             && self.len == size_of::<Self>() as u8
             && self.flags == 0
-            && self.digest_algo == H::ALGORITHM
+            && self.digest_algo == H::ALGORITHM.kernel_id()
     }
 
     pub(super) fn version(&self) -> u8 {
