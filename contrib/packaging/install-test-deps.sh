@@ -15,7 +15,7 @@ case "${ID}" in
         ;;
     debian|ubuntu)
         pkg_install \
-            openssl e2fsprogs bubblewrap openssh-server
+            openssl e2fsprogs bubblewrap openssh-server fsverity-utils
 
         # OSTree symlink targets — /root, /home, /srv, etc. are symlinks
         # into /var on OSTree systems, so the target directories must exist.

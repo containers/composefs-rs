@@ -1,10 +1,10 @@
 //! Hash value types and trait definitions for fs-verity.
 //!
-//! This module defines the FsVerityHashValue trait and concrete implementations
-//! for SHA-256 and SHA-512 hash values, including parsing from hex strings
-//! and object pathnames.
+//! This module defines the [`FsVerityHashValue`] trait, concrete implementations
+//! for SHA-256 and SHA-512 hash values, and the [`Algorithm`] type that
+//! identifies an fs-verity algorithm configuration (hash + block size).
 
-use core::{fmt, hash::Hash};
+use core::{fmt, hash::Hash, str::FromStr};
 
 use hex::FromHexError;
 use sha2::{digest::FixedOutputReset, digest::Output, Digest, Sha256, Sha512};
@@ -197,6 +197,156 @@ impl FsVerityHashValue for Sha512HashValue {
     const ID: &str = "sha512";
 }
 
+/// Default log2 block size for fs-verity (4096 bytes).
+pub const DEFAULT_LG_BLOCKSIZE: u8 = 12;
+
+/// An fs-verity algorithm identifier: hash function + block size.
+///
+/// The string representation is `fsverity-<hash>-<lg_blocksize>`,
+/// e.g. `fsverity-sha256-12` (SHA-256 with 4 KiB blocks) or
+/// `fsverity-sha512-12` (SHA-512 with 4 KiB blocks).
+///
+/// This type implements [`FromStr`] and [`Display`](fmt::Display) so it
+/// can be used directly as a clap argument via `value_parser` and
+/// round-trips cleanly through serialisation.
+///
+/// # Examples
+///
+/// ```
+/// use composefs::fsverity::Algorithm;
+///
+/// let alg: Algorithm = "fsverity-sha512-12".parse().unwrap();
+/// assert_eq!(alg.hash(), "sha512");
+/// assert_eq!(alg.lg_blocksize(), 12);
+/// assert_eq!(alg.to_string(), "fsverity-sha512-12");
+///
+/// // Construct from a hash type at compile time
+/// use composefs::fsverity::Sha256HashValue;
+/// let alg = Algorithm::for_hash::<Sha256HashValue>();
+/// assert_eq!(alg.to_string(), "fsverity-sha256-12");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Algorithm {
+    hash: &'static str,
+    lg_blocksize: u8,
+}
+
+/// Errors from parsing an [`Algorithm`] string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlgorithmParseError {
+    /// The string does not start with `fsverity-`.
+    MissingPrefix,
+    /// The hash-blocksize separator is missing.
+    MissingSeparator,
+    /// The hash name is not recognised.
+    UnknownHash(String),
+    /// The log2 block size is not a valid number.
+    InvalidBlockSize(String),
+    /// The log2 block size value is not currently supported.
+    UnsupportedBlockSize(u8),
+}
+
+impl fmt::Display for AlgorithmParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingPrefix => write!(f, "algorithm must start with 'fsverity-'"),
+            Self::MissingSeparator => {
+                write!(f, "algorithm must be 'fsverity-<hash>-<lg_blocksize>'")
+            }
+            Self::UnknownHash(h) => {
+                write!(
+                    f,
+                    "unsupported hash algorithm '{h}' (expected sha256 or sha512)"
+                )
+            }
+            Self::InvalidBlockSize(s) => write!(f, "invalid lg_blocksize '{s}'"),
+            Self::UnsupportedBlockSize(n) => write!(
+                f,
+                "unsupported lg_blocksize {n} (only {DEFAULT_LG_BLOCKSIZE} is currently supported)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AlgorithmParseError {}
+
+impl Algorithm {
+    /// Build the algorithm identifier for a given [`FsVerityHashValue`] type.
+    ///
+    /// Uses [`DEFAULT_LG_BLOCKSIZE`] (12, i.e. 4096-byte blocks).
+    pub fn for_hash<H: FsVerityHashValue>() -> Self {
+        Self {
+            hash: H::ID,
+            lg_blocksize: DEFAULT_LG_BLOCKSIZE,
+        }
+    }
+
+    /// The hash algorithm name (e.g. `"sha256"` or `"sha512"`).
+    pub fn hash(&self) -> &str {
+        self.hash
+    }
+
+    /// The log2 block size (e.g. `12` for 4096-byte blocks).
+    pub fn lg_blocksize(&self) -> u8 {
+        self.lg_blocksize
+    }
+
+    /// Check whether this algorithm is compatible with the given hash type.
+    ///
+    /// Returns `true` if the hash name matches `H::ID`.
+    pub fn is_compatible<H: FsVerityHashValue>(&self) -> bool {
+        self.hash == H::ID
+    }
+}
+
+impl FromStr for Algorithm {
+    type Err = AlgorithmParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let rest = s
+            .strip_prefix("fsverity-")
+            .ok_or(AlgorithmParseError::MissingPrefix)?;
+        let (hash, lg_bs) = rest
+            .rsplit_once('-')
+            .ok_or(AlgorithmParseError::MissingSeparator)?;
+
+        // Validate and intern the hash name to a &'static str
+        let hash: &'static str = match hash {
+            "sha256" => "sha256",
+            "sha512" => "sha512",
+            other => return Err(AlgorithmParseError::UnknownHash(other.to_owned())),
+        };
+
+        let lg_blocksize: u8 = lg_bs
+            .parse()
+            .map_err(|_| AlgorithmParseError::InvalidBlockSize(lg_bs.to_owned()))?;
+        if lg_blocksize != DEFAULT_LG_BLOCKSIZE {
+            return Err(AlgorithmParseError::UnsupportedBlockSize(lg_blocksize));
+        }
+
+        Ok(Self { hash, lg_blocksize })
+    }
+}
+
+impl fmt::Display for Algorithm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "fsverity-{}-{}", self.hash, self.lg_blocksize)
+    }
+}
+
+impl serde::Serialize for Algorithm {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Algorithm {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -273,5 +423,61 @@ mod test {
     #[test]
     fn test_sha512hashvalue() {
         test_fsverity_hash::<Sha512HashValue>();
+    }
+
+    #[test]
+    fn test_algorithm_for_hash() {
+        let a256 = Algorithm::for_hash::<Sha256HashValue>();
+        assert_eq!(a256.hash(), "sha256");
+        assert_eq!(a256.lg_blocksize(), 12);
+        assert_eq!(a256.to_string(), "fsverity-sha256-12");
+        assert!(a256.is_compatible::<Sha256HashValue>());
+        assert!(!a256.is_compatible::<Sha512HashValue>());
+
+        let a512 = Algorithm::for_hash::<Sha512HashValue>();
+        assert_eq!(a512.hash(), "sha512");
+        assert_eq!(a512.to_string(), "fsverity-sha512-12");
+        assert!(a512.is_compatible::<Sha512HashValue>());
+        assert!(!a512.is_compatible::<Sha256HashValue>());
+    }
+
+    #[test]
+    fn test_algorithm_parse_roundtrip() {
+        for s in ["fsverity-sha256-12", "fsverity-sha512-12"] {
+            let alg: Algorithm = s.parse().unwrap();
+            assert_eq!(alg.to_string(), s);
+        }
+    }
+
+    #[test]
+    fn test_algorithm_parse_errors() {
+        let cases = [
+            ("sha256-12", AlgorithmParseError::MissingPrefix),
+            ("garbage", AlgorithmParseError::MissingPrefix),
+            ("fsverity-sha256", AlgorithmParseError::MissingSeparator),
+            (
+                "fsverity-sha1-12",
+                AlgorithmParseError::UnknownHash("sha1".to_owned()),
+            ),
+            (
+                "fsverity-sha256-abc",
+                AlgorithmParseError::InvalidBlockSize("abc".to_owned()),
+            ),
+            (
+                "fsverity-sha256-16",
+                AlgorithmParseError::UnsupportedBlockSize(16),
+            ),
+        ];
+        for (input, expected) in cases {
+            let err = input.parse::<Algorithm>().unwrap_err();
+            assert_eq!(err, expected, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn test_algorithm_equality() {
+        let a: Algorithm = "fsverity-sha512-12".parse().unwrap();
+        let b = Algorithm::for_hash::<Sha512HashValue>();
+        assert_eq!(a, b);
     }
 }

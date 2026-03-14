@@ -465,9 +465,28 @@ pub async fn pull_image<ObjectID: FsVerityHashValue>(
         .await
         .with_context(|| format!("Unable to pull container image {imgref}"))?;
 
-    if let Some(name) = reference {
-        tag_image(repo, &result.manifest_digest, name)?;
+    // Generate the composefs EROFS image and link it to the config splitstream.
+    // For container images this rewrites the config+manifest with the EROFS ref
+    // and tags the final manifest. Artifacts are skipped and tagged as-is.
+    let erofs = crate::ensure_oci_composefs_erofs(
+        repo,
+        &result.manifest_digest,
+        Some(&result.manifest_verity),
+        reference,
+    )?;
+    if erofs.is_none() {
+        // Not a container image (artifact) — tag the manifest directly
+        if let Some(name) = reference {
+            tag_image(repo, &result.manifest_digest, name)?;
+        }
     }
+
+    // TODO: When pulling from an OCI layout that contains referrer/signature
+    // artifacts (composefs signature artifacts), import them too. Currently
+    // only the image manifest, config, and layers are pulled, which breaks
+    // the signature round-trip: export with `--signatures` -> re-import ->
+    // verify fails because no artifacts exist in the new repo.
+
     Ok((result, stats))
 }
 

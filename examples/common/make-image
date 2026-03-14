@@ -4,8 +4,10 @@ set -eux
 
 output="$1"
 
-# check that the image doesn't have errors
-fsck.erofs tmp/sysroot/composefs/images/*
+# check that the images don't have errors
+for img in tmp/sysroot/composefs/images/*; do
+    fsck.erofs "$img"
+done
 
 fakeroot "${0%/*}/run-repart" tmp/image.raw
 qemu-img convert -f raw tmp/image.raw -O qcow2 "${output}"

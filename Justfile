@@ -25,6 +25,8 @@ check-feature-combos:
     cargo clippy -p cfsctl --no-default-features -- -D warnings
     cargo clippy -p cfsctl --no-default-features --features oci -- -D warnings
     cargo clippy -p cfsctl --no-default-features --features http -- -D warnings
+    cargo clippy -p composefs-oci -- -D warnings
+    cargo clippy -p composefs-oci --features boot -- -D warnings
 
 # Run rustfmt check
 fmt-check:
@@ -61,6 +63,36 @@ test-integration-vm: build _integration-container-build
 
 # Run everything: checks + full integration tests including VM
 ci: check test-integration-vm
+
+# Run a specific erofs fuzz target (e.g., `just fuzz read_image -- -max_total_time=60`)
+fuzz target *ARGS:
+    cd crates/composefs && cargo +nightly fuzz run {{target}} {{ARGS}}
+
+# Run all erofs fuzz targets for a given duration each (default: 120 seconds)
+fuzz-all seconds="120":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p target/fuzz-logs
+    for target in $(cd crates/composefs && cargo +nightly fuzz list); do
+        echo "--- Fuzzing $target for {{seconds}}s ---"
+        log="target/fuzz-logs/$target.log"
+        if (cd crates/composefs && cargo +nightly fuzz run "$target" -- -max_total_time={{seconds}}) > "$log" 2>&1; then
+            echo "  $target: OK"
+            tail -1 "$log"
+        else
+            echo "  $target: FAILED"
+            cat "$log"
+            exit 1
+        fi
+    done
+
+# Generate seed corpus for fuzz targets
+generate-corpus:
+    cargo run --manifest-path crates/composefs/fuzz/Cargo.toml --bin generate-corpus
+
+# List available fuzz targets
+fuzz-list:
+    cd crates/composefs && cargo +nightly fuzz list
 
 # Clean build artifacts
 clean:

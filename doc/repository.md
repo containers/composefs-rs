@@ -23,6 +23,7 @@ A composefs repository has a layout that looks something like
 
 ```
 composefs
+├── meta.json
 ├── objects
 │   ├── 00
 │   │   ├── 002183fb91[...]
@@ -44,6 +45,30 @@ composefs
     └── refs
         └── some/name.tar -> ../../streams/502b126bca0c[...]
 ```
+
+## `meta.json`
+
+This optional file records repository-level metadata.  When present, it is
+created by `cfsctl init` and contains:
+
+ - `version` — the base repository format version (currently `1`).  Tools
+   must refuse to operate on a repository whose version exceeds what they
+   understand.
+
+ - `algorithm` — the fs-verity digest algorithm identifier, in the format
+   `fsverity-<hash>-<lg_blocksize>`.  For example `fsverity-sha512-12`
+   means SHA-512 with 4 KiB (2^12) blocks.
+
+ - `features` (optional) — an object with three arrays of feature-flag
+   strings, following the ext4/XFS/EROFS compatibility model:
+   - `compatible` — old tools can safely ignore these.
+   - `read-only-compatible` — old tools may read but must not write.
+   - `incompatible` — old tools must refuse the repository entirely.
+
+When `meta.json` is present, `cfsctl` auto-detects the hash algorithm and
+errors if `--hash` is explicitly passed with a conflicting value.  When
+the file is absent (for repositories created before this feature), `--hash`
+is honoured as before and defaults to `sha512`.
 
 ## `objects/`
 
@@ -149,3 +174,109 @@ For example:
 cfsctl mount refs/system/rootfs/some_id /mnt   # does not check fs-verity
 cfsctl mount 974d04eaff[...] /mnt              # enforces fs-verity
 ```
+
+## OCI image storage
+
+OCI container images are stored using streams exclusively.  Each OCI artifact
+(manifest, config, layer) becomes a splitstream, and OCI "tags" are refs under
+`streams/refs/oci/`.
+
+### Naming conventions
+
+| OCI artifact  | Stream name pattern                | Example                            |
+|---------------|------------------------------------|------------------------------------|
+| Manifest      | `oci-manifest-{manifest_digest}`   | `oci-manifest-sha256:abc123...`    |
+| Config        | `oci-config-{config_digest}`       | `oci-config-sha256:def456...`      |
+| Layer         | `oci-layer-{diff_id}`              | `oci-layer-sha256:ghi789...`       |
+| Blob          | `oci-blob-{blob_digest}`           | `oci-blob-sha256:jkl012...`        |
+
+Tags are stored under `streams/refs/oci/` with percent-encoding for
+filesystem safety (`/` → `%2F`):
+
+```
+streams/refs/oci/myimage:latest → ../../oci-manifest-sha256:abc123...
+```
+
+### Splitstream reference chains
+
+Each splitstream contains `named_refs` (semantic labels mapping to entries
+in the `stream_refs` array) and `object_refs` (raw objects referenced by
+the compressed stream data).  For OCI images the chain is:
+
+**Manifest splitstream** (`oci-manifest-sha256:...`):
+  - `object_refs`: the manifest JSON blob
+  - `named_refs`:
+    - `config:{config_digest}` → config splitstream verity
+    - `{diff_id}` → layer splitstream verity (one per layer)
+
+**Config splitstream** (`oci-config-sha256:...`):
+  - `object_refs`: the config JSON blob
+  - `named_refs`:
+    - `{diff_id}` → layer splitstream verity (one per layer)
+
+**Layer splitstream** (`oci-layer-sha256:...`):
+  - `object_refs`: file content objects extracted from the tar
+  - `named_refs`: none (leaf node)
+
+Both the manifest and config redundantly reference the layers.  The GC
+can reach layers from either path.
+
+### Garbage collection
+
+The GC walks all refs under `streams/refs/` to find root splitstreams,
+then transitively follows `named_refs` (by resolving fs-verity IDs
+through a stream name map) and collects `object_refs`.  Any object not
+reachable from a root is deleted.
+
+Concretely, for a tagged container image:
+
+ 1. Tag `streams/refs/oci/myimage:v1` resolves to `oci-manifest-sha256:abc`
+ 2. Walk the manifest: mark its JSON blob and follow `named_refs` to
+    the config and layer streams
+ 3. Walk the config: mark its JSON blob and follow `named_refs` to layers
+    (already visited, skipped)
+ 4. Walk each layer: mark all file content objects
+
+When a tag is removed, the manifest and everything reachable only from it
+becomes GC-eligible.  Layers shared between images survive as long as any
+referencing manifest remains tagged.
+
+### EROFS image tracking via config splitstream refs
+
+When an EROFS image is generated from an OCI image (via
+`create_filesystem` + `commit_image`), its object ID (fs-verity digest)
+is stored as a named ref on the config splitstream with the key
+`composefs.image`.
+
+GC walks from tag → manifest → config, and finds the `composefs.image`
+named ref.  The EROFS object ID is added to the live set, keeping the
+EROFS image alive.  The EROFS image still needs an entry under `images/`
+for the kernel mount security model (see above), but `images/` is not a
+GC root — the config ref is what keeps the object alive.
+
+This means a single OCI tag is sufficient to keep the entire image
+(manifest, config, layers, and the EROFS image) alive through GC.
+
+### Bootable image variant
+
+For bootable images, a second EROFS may be generated after
+`transform_for_boot` (stripping `/boot`, etc.).  This boot EROFS is
+stored as a second named ref on the config, `composefs.image.boot`.
+
+Since the config splitstream content changes (new named ref), it gets a
+new fs-verity digest.  This cascades: the manifest must also be
+rewritten (its `config:` named ref now points to the new config verity),
+producing a new manifest verity.  The tag is re-pointed to the new
+manifest.  The old config and manifest splitstreams become unreferenced
+and are collected by GC.
+
+The result: one tag still keeps everything alive — layers, raw EROFS,
+and boot EROFS.
+
+### Future: sealed images
+
+For sealed/signed images, the EROFS comes pre-built from the registry as
+part of a composefs OCI artifact (referrer pattern).  The artifact
+splitstream would hold references to the pre-fetched EROFS layers.  This
+is complementary to the unsealed case — both use the same GC mechanism
+(named refs pointing to EROFS objects).
