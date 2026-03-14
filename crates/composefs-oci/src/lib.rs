@@ -15,6 +15,9 @@ pub mod oci_image;
 pub mod skopeo;
 pub mod tar;
 
+#[cfg(test)]
+pub(crate) mod test_util;
+
 // Re-export the composefs crate for consumers who only need composefs-oci
 pub use composefs;
 
@@ -281,7 +284,6 @@ pub fn write_config<ObjectID: FsVerityHashValue>(
     let id = repo.write_stream(stream, &config_identifier(&config_digest), None)?;
     Ok((config_digest, id))
 }
-
 
 #[cfg(test)]
 mod test {
