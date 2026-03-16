@@ -42,8 +42,14 @@ check: clippy check-feature-combos fmt-check test
 #   just base_image=quay.io/centos-bootc/centos-bootc:stream10 test-integration-vm
 base_image := env("COMPOSEFS_BASE_IMAGE", "ghcr.io/bootcrew/debian-bootc:latest")
 
+# cfsctl feature flags for the container build.  Defaults match the base_image:
+#   debian (>= 6.15 kernel): no compat features needed
+#   centos stream10 (6.12):  pre-6.15
+#   centos stream9 (5.14):   rhel9
+cfsctl_features := env("COMPOSEFS_CFSCTL_FEATURES", "pre-6.15")
+
 # Derive test image name from base_image
-_test_image := if base_image =~ "debian" { "localhost/composefs-rs-test-debian:latest" } else { "localhost/composefs-rs-test:latest" }
+_test_image := if base_image =~ "debian" { "localhost/composefs-rs-test-debian:latest" } else if base_image =~ "stream9" { "localhost/composefs-rs-test-c9s:latest" } else { "localhost/composefs-rs-test:latest" }
 
 # Run unprivileged integration tests against the cfsctl binary (no root, no VM)
 test-integration: build
@@ -51,7 +57,7 @@ test-integration: build
 
 # Build the test container image for VM-based integration tests
 _integration-container-build:
-    podman build --build-arg base_image={{base_image}} -t {{_test_image}} .
+    podman build --build-arg base_image={{base_image}} --build-arg cfsctl_features={{cfsctl_features}} -t {{_test_image}} .
 
 # Run all integration tests including privileged VM tests (requires podman + libvirt)
 test-integration-vm: build _integration-container-build

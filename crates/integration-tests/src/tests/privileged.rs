@@ -146,6 +146,44 @@ fn privileged_create_image() -> Result<()> {
 }
 integration_test!(privileged_create_image);
 
+/// Create an image and mount it via `cfsctl mount`, verifying the overlayfs
+/// composefs mount works.  This exercises the kernel-version-dependent
+/// lowerdir+/datadir+ setup in mountcompat.rs.
+fn privileged_mount_image() -> Result<()> {
+    if require_privileged("privileged_mount_image")?.is_some() {
+        return Ok(());
+    }
+
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let verity_dir = VerityTempDir::new()?;
+    let repo = verity_dir.path().join("repo");
+    let fixture_dir = tempfile::tempdir()?;
+    let rootfs = create_test_rootfs(fixture_dir.path())?;
+
+    let image_id_full = cmd!(sh, "{cfsctl} --repo {repo} create-image {rootfs}").read()?;
+    // create-image outputs "algo:hex", mount expects just the hex part
+    let image_id = image_id_full
+        .trim()
+        .split_once(':')
+        .map(|(_, hex)| hex)
+        .unwrap_or(image_id_full.trim());
+
+    let mountpoint = tempfile::tempdir()?;
+    let mp = mountpoint.path().to_str().unwrap();
+    cmd!(sh, "{cfsctl} --repo {repo} mount {image_id} {mp}").run()?;
+
+    let hostname = std::fs::read_to_string(mountpoint.path().join("etc/hostname"))?;
+    ensure!(
+        hostname == "integration-test\n",
+        "hostname mismatch through composefs mount: {hostname:?}"
+    );
+
+    cmd!(sh, "umount {mp}").run()?;
+    Ok(())
+}
+integration_test!(privileged_mount_image);
+
 fn privileged_create_image_idempotent() -> Result<()> {
     if require_privileged("privileged_create_image_idempotent")?.is_some() {
         return Ok(());
