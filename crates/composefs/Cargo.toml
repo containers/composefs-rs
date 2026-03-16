@@ -11,8 +11,8 @@ rust-version.workspace = true
 version.workspace = true
 
 [features]
-'pre-6.15' = ['tempfile', 'composefs-ioctls/loop-device']
-rhel9 = ['pre-6.15']
+'pre-6.15' = ['tempfile']
+rhel9 = ['pre-6.15', 'composefs-ioctls/loop-device']
 test = ["tempfile"]
 
 [dependencies]
