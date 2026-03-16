@@ -14,6 +14,7 @@
 # to clear stale build caches that may be incompatible across distros.
 
 ARG base_image=quay.io/centos-bootc/centos-bootc:stream10
+ARG cfsctl_features=pre-6.15
 
 # -- source snapshot (keeps layer graph clean) --
 FROM scratch AS src
@@ -21,6 +22,7 @@ COPY . /src
 
 # -- build stage --
 FROM ${base_image} AS build
+ARG cfsctl_features
 
 COPY --from=src /src/contrib /src/contrib
 RUN /src/contrib/packaging/install-build-deps.sh
@@ -39,7 +41,7 @@ RUN --network=none \
     --mount=type=cache,target=/src/target \
     --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
-    cargo build --release -p cfsctl -p integration-tests && \
+    cargo build --release -p cfsctl --features="${cfsctl_features}" -p integration-tests && \
     cp /src/target/release/cfsctl /usr/bin/cfsctl && \
     cp /src/target/release/cfsctl-integration-tests /usr/bin/cfsctl-integration-tests
 
