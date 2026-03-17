@@ -24,6 +24,7 @@ use crate::MAX_INLINE_CONTENT;
 
 /// https://github.com/torvalds/linux/blob/47ac09b91befbb6a235ab620c32af719f8208399/include/uapi/linux/limits.h#L13
 const PATH_MAX: u32 = 4096;
+use crate::SYMLINK_MAX;
 /// https://github.com/torvalds/linux/blob/47ac09b91befbb6a235ab620c32af719f8208399/include/uapi/linux/limits.h#L15
 /// This isn't exposed in libc/rustix, and in any case we should be conservative...if this ever
 /// gets bumped it'd be a hazard.
@@ -456,8 +457,10 @@ impl<'p> Entry<'p> {
                     let target =
                         unescape_to_path(payload.ok_or_else(|| anyhow!("Missing payload"))?)?;
                     let targetlen = target.as_os_str().as_bytes().len();
-                    if targetlen > PATH_MAX as usize {
-                        anyhow::bail!("Target length too large {targetlen}");
+                    if targetlen > SYMLINK_MAX {
+                        anyhow::bail!(
+                            "Symlink target length {targetlen} exceeds limit {SYMLINK_MAX}"
+                        );
                     }
                     Item::Symlink { nlink, target }
                 }

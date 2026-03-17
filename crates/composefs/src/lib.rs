@@ -45,6 +45,13 @@ pub const INLINE_CONTENT_MAX_V0: usize = 64;
 /// <https://github.com/composefs/composefs-rs/issues/107>).
 pub const MAX_INLINE_CONTENT: usize = 512;
 
+/// Maximum symlink target length in bytes.
+///
+/// XFS limits symlink targets to 1024 bytes (`XFS_SYMLINK_MAXLEN`). Since
+/// generic Linux containers are commonly backed by XFS, we enforce that
+/// limit rather than the Linux VFS `PATH_MAX` of 4096.
+pub const SYMLINK_MAX: usize = 1024;
+
 /// Internal constants shared across workspace crates.
 ///
 /// Not part of the public API — may change without notice.

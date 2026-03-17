@@ -293,6 +293,12 @@ impl<ObjectID: FsVerityHashValue> Leaf<'_, ObjectID> {
                 (format::DataLayout::FlatPlain, 0, 0)
             }
             tree::LeafContent::Symlink(target) => {
+                assert!(
+                    target.len() <= crate::SYMLINK_MAX,
+                    "symlink target is {} bytes (max {})",
+                    target.len(),
+                    crate::SYMLINK_MAX,
+                );
                 (format::DataLayout::FlatInline, 0, target.len() as u64)
             }
         };
