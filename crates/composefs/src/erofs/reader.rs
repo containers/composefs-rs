@@ -1350,6 +1350,14 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
                 }
                 S_IFLNK => {
                     let target_data = child_inode.inline().unwrap_or(&[]);
+                    if target_data.len() > crate::SYMLINK_MAX {
+                        anyhow::bail!(
+                            "symlink target for {:?} is {} bytes (max {})",
+                            name,
+                            target_data.len(),
+                            crate::SYMLINK_MAX,
+                        );
+                    }
                     let target = OsStr::from_bytes(target_data);
                     tree::LeafContent::Symlink(Box::from(target))
                 }
