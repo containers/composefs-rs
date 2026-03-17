@@ -50,32 +50,48 @@ fn write_escaped(writer: &mut impl fmt::Write, bytes: &[u8]) -> fmt::Result {
         return writer.write_str("\\x2d");
     }
 
-    write_escaped_raw(writer, bytes)
+    write_escaped_raw(writer, bytes, EscapeEquals::No)
+}
+
+/// Whether to escape `=` as `\x3d`.
+///
+/// The C composefs implementation only escapes `=` in xattr key/value
+/// fields where it separates the key from the value.  In other fields
+/// (paths, content, payload) `=` is a normal graphic character.
+#[derive(Clone, Copy)]
+enum EscapeEquals {
+    /// Escape `=` — used for xattr key/value fields.
+    Yes,
+    /// Do not escape `=` — used for paths, content, and payload fields.
+    No,
 }
 
 /// Escape a byte slice without the `-` sentinel logic.
 ///
-/// This corresponds to `print_escaped` with `ESCAPE_EQUAL` (but without
-/// `ESCAPE_LONE_DASH`) in the C composefs `composefs-info.c`.  Used for
-/// xattr values where `-` and empty are valid literal values, not
-/// sentinels.
+/// This corresponds to `print_escaped` in the C composefs
+/// `composefs-info.c`.  Used for xattr values where `-` and empty are
+/// valid literal values, not sentinels.
 ///
-/// Note: we unconditionally escape `=` in all fields, whereas the C code
-/// only uses `ESCAPE_EQUAL` for xattr keys and values.  This is harmless
-/// since `\x3d` round-trips correctly, but means our output for paths
-/// containing `=` is slightly more verbose than the C output.
-fn write_escaped_raw(writer: &mut impl fmt::Write, bytes: &[u8]) -> fmt::Result {
+/// The `escape_eq` parameter controls whether `=` is escaped (only
+/// needed in xattr key/value fields where `=` is a separator).
+fn write_escaped_raw(
+    writer: &mut impl fmt::Write,
+    bytes: &[u8],
+    escape_eq: EscapeEquals,
+) -> fmt::Result {
     for c in bytes {
         let c = *c;
 
-        // The set of hex-escaped characters matches C `!isgraph(c)` in the
-        // POSIX locale (i.e. outside 0x21..=0x7E), plus `=` and `\`.
-        // The C code uses named escapes for `\\`, `\n`, `\r`, `\t` while
-        // we hex-escape everything uniformly; both forms parse correctly.
-        if c < b'!' || c == b'=' || c == b'\\' || c > b'~' {
-            write!(writer, "\\x{c:02x}")?;
-        } else {
-            writer.write_char(c as char)?;
+        // Named escapes matching the C composefs implementation.
+        match c {
+            b'\\' => writer.write_str("\\\\")?,
+            b'\n' => writer.write_str("\\n")?,
+            b'\r' => writer.write_str("\\r")?,
+            b'\t' => writer.write_str("\\t")?,
+            b'=' if matches!(escape_eq, EscapeEquals::Yes) => write!(writer, "\\x{c:02x}")?,
+            // Hex-escape non-graphic characters (outside 0x21..=0x7E in POSIX locale).
+            c if !(b'!'..=b'~').contains(&c) => write!(writer, "\\x{c:02x}")?,
+            c => writer.write_char(c as char)?,
         }
     }
 
@@ -117,11 +133,11 @@ fn write_entry(
 
     for (key, value) in &*stat.xattrs.borrow() {
         write!(writer, " ")?;
-        write_escaped(writer, key.as_bytes())?;
+        write_escaped_raw(writer, key.as_bytes(), EscapeEquals::Yes)?;
         write!(writer, "=")?;
         // Xattr values don't use the `-` sentinel — they're always present
         // when the key=value pair exists, and empty or `-` are valid values.
-        write_escaped_raw(writer, value)?;
+        write_escaped_raw(writer, value, EscapeEquals::Yes)?;
     }
 
     Ok(())
@@ -763,6 +779,75 @@ mod tests {
         write_dumpfile(&mut out2, &fs2)?;
         assert_eq!(out, out2);
         Ok(())
+    }
+
+    /// Helper to escape bytes through write_escaped and return the result.
+    fn escaped(bytes: &[u8]) -> String {
+        let mut out = String::new();
+        write_escaped(&mut out, bytes).unwrap();
+        out
+    }
+
+    /// Helper to escape bytes through write_escaped_raw with the given mode.
+    fn escaped_raw(bytes: &[u8], eq: EscapeEquals) -> String {
+        let mut out = String::new();
+        write_escaped_raw(&mut out, bytes, eq).unwrap();
+        out
+    }
+
+    #[test]
+    fn test_named_escapes() {
+        // These must use named escapes matching C composefs, not \xHH.
+        assert_eq!(escaped_raw(b"\\", EscapeEquals::No), "\\\\");
+        assert_eq!(escaped_raw(b"\n", EscapeEquals::No), "\\n");
+        assert_eq!(escaped_raw(b"\r", EscapeEquals::No), "\\r");
+        assert_eq!(escaped_raw(b"\t", EscapeEquals::No), "\\t");
+
+        // Mixed: named escapes interspersed with literals
+        assert_eq!(escaped_raw(b"a\nb", EscapeEquals::No), "a\\nb");
+        assert_eq!(escaped_raw(b"\t\n\\", EscapeEquals::No), "\\t\\n\\\\");
+    }
+
+    #[test]
+    fn test_non_graphic_hex_escapes() {
+        // Characters outside 0x21..=0x7E get \xHH
+        assert_eq!(escaped_raw(b"\x00", EscapeEquals::No), "\\x00");
+        assert_eq!(escaped_raw(b"\x1f", EscapeEquals::No), "\\x1f");
+        assert_eq!(escaped_raw(b" ", EscapeEquals::No), "\\x20"); // space = 0x20 < '!'
+        assert_eq!(escaped_raw(b"\x7f", EscapeEquals::No), "\\x7f");
+        assert_eq!(escaped_raw(b"\xff", EscapeEquals::No), "\\xff");
+    }
+
+    #[test]
+    fn test_equals_escaping_context() {
+        // '=' is literal in normal fields (paths, content, payload)
+        assert_eq!(escaped_raw(b"a=b", EscapeEquals::No), "a=b");
+        assert_eq!(escaped(b"key=val"), "key=val");
+
+        // '=' is escaped in xattr key/value fields
+        assert_eq!(escaped_raw(b"a=b", EscapeEquals::Yes), "a\\x3db");
+        assert_eq!(
+            escaped_raw(b"overlay.redirect=/foo", EscapeEquals::Yes),
+            "overlay.redirect\\x3d/foo"
+        );
+    }
+
+    #[test]
+    fn test_escaped_sentinels() {
+        // Empty → "-"
+        assert_eq!(escaped(b""), "-");
+        // Lone dash → "\x2d"
+        assert_eq!(escaped(b"-"), "\\x2d");
+        // Dash in context is fine
+        assert_eq!(escaped(b"a-b"), "a-b");
+    }
+
+    #[test]
+    fn test_graphic_chars_literal() {
+        // All printable graphic ASCII (0x21..=0x7E) except '\' should be literal
+        assert_eq!(escaped_raw(b"!", EscapeEquals::No), "!");
+        assert_eq!(escaped_raw(b"~", EscapeEquals::No), "~");
+        assert_eq!(escaped_raw(b"abc/def.txt", EscapeEquals::No), "abc/def.txt");
     }
 
     mod proptest_tests {
