@@ -581,6 +581,252 @@ fn corrupt_one_object(repo: &std::path::Path) -> Result<()> {
     anyhow::bail!("no object found to corrupt");
 }
 
+fn test_init_creates_metadata() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+
+    // Init with default algorithm (--repo before subcommand)
+    let output = cmd!(sh, "{cfsctl} --insecure --repo {repo} init").read()?;
+    assert!(
+        output.contains("Initialized"),
+        "expected initialization message, got: {output}"
+    );
+    assert!(
+        output.contains("fsverity-sha512-12"),
+        "expected algorithm in output, got: {output}"
+    );
+
+    // Check meta.json exists and is valid
+    let meta_path = repo.join("meta.json");
+    assert!(meta_path.exists(), "meta.json should exist after init");
+
+    let meta_content = std::fs::read_to_string(&meta_path)?;
+    let meta: serde_json::Value = serde_json::from_str(&meta_content)?;
+    assert_eq!(meta["version"], 1);
+    assert_eq!(meta["algorithm"], "fsverity-sha512-12");
+    assert!(
+        meta.get("features").is_some(),
+        "features key should always be present"
+    );
+
+    Ok(())
+}
+integration_test!(test_init_creates_metadata);
+
+fn test_init_sha256() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+
+    let output = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} init --algorithm fsverity-sha256-12"
+    )
+    .read()?;
+    assert!(
+        output.contains("fsverity-sha256-12"),
+        "expected sha256 algorithm, got: {output}"
+    );
+
+    // Verify operations work with auto-detected hash
+    let fixture_dir = tempfile::tempdir()?;
+    let rootfs = create_test_rootfs(fixture_dir.path())?;
+    let image_id = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} create-image {rootfs}"
+    )
+    .read()?;
+    assert!(
+        !image_id.trim().is_empty(),
+        "should produce image ID with auto-detected sha256"
+    );
+
+    Ok(())
+}
+integration_test!(test_init_sha256);
+
+fn test_init_idempotent() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+
+    cmd!(sh, "{cfsctl} --insecure --repo {repo} init").read()?;
+
+    // Second init with same algorithm should succeed (idempotent)
+    let output = cmd!(sh, "{cfsctl} --insecure --repo {repo} init").read()?;
+    assert!(
+        output.contains("already initialized"),
+        "expected idempotent message, got: {output}"
+    );
+
+    Ok(())
+}
+integration_test!(test_init_idempotent);
+
+fn test_init_conflict() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+
+    cmd!(sh, "{cfsctl} --insecure --repo {repo} init").read()?;
+
+    // Re-init with different algorithm should fail
+    let result = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} init --algorithm fsverity-sha256-12"
+    )
+    .read();
+    assert!(
+        result.is_err(),
+        "re-init with different algorithm should fail"
+    );
+
+    Ok(())
+}
+integration_test!(test_init_conflict);
+
+fn test_hash_mismatch_errors() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+
+    // Init as sha512 repo
+    cmd!(sh, "{cfsctl} --insecure --repo {repo} init").read()?;
+
+    // Explicitly passing --hash sha256 on a sha512 repo should error
+    let result = cmd!(sh, "{cfsctl} --insecure --hash sha256 --repo {repo} gc").read();
+    assert!(
+        result.is_err(),
+        "should error when --hash sha256 used on sha512 repo"
+    );
+
+    Ok(())
+}
+integration_test!(test_hash_mismatch_errors);
+
+fn test_hash_match_ok() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+
+    // Init as sha512 repo
+    cmd!(sh, "{cfsctl} --insecure --repo {repo} init").read()?;
+
+    // Explicitly passing --hash sha512 on a sha512 repo should work
+    let output = cmd!(sh, "{cfsctl} --insecure --hash sha512 --repo {repo} gc").read()?;
+    assert!(
+        output.contains("Objects: 0 removed"),
+        "should succeed with matching --hash, got: {output}"
+    );
+
+    Ok(())
+}
+integration_test!(test_hash_match_ok);
+
+fn test_no_metadata_backcompat() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+
+    // Use repo without init (no meta.json) - should work with default sha512
+    let output = cmd!(sh, "{cfsctl} --insecure --repo {repo} gc").read()?;
+    assert!(
+        output.contains("Objects: 0 removed"),
+        "should work without meta.json (backcompat), got: {output}"
+    );
+
+    // Should also work with explicit --hash sha256 (no metadata to conflict)
+    let output = cmd!(sh, "{cfsctl} --insecure --hash sha256 --repo {repo} gc").read()?;
+    assert!(
+        output.contains("Objects: 0 removed"),
+        "should work with --hash sha256 and no metadata, got: {output}"
+    );
+
+    Ok(())
+}
+integration_test!(test_no_metadata_backcompat);
+
+fn test_init_creates_directory() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let parent = tempfile::tempdir()?;
+    let repo = parent.path().join("new-repo");
+
+    // Init with positional path argument
+    let output = cmd!(sh, "{cfsctl} --insecure init {repo}").read()?;
+    assert!(
+        output.contains("Initialized"),
+        "expected initialization message, got: {output}"
+    );
+    assert!(repo.exists(), "repo directory should be created");
+    assert!(
+        repo.join("meta.json").exists(),
+        "meta.json should exist in created dir"
+    );
+
+    Ok(())
+}
+integration_test!(test_init_creates_directory);
+
+fn test_auto_detect_hash_for_operations() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+
+    // Create a sha256 repo
+    let repo_dir = tempfile::tempdir()?;
+    let repo256 = repo_dir.path();
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo256} init --algorithm fsverity-sha256-12"
+    )
+    .read()?;
+
+    // Create a sha512 repo
+    let repo_dir2 = tempfile::tempdir()?;
+    let repo512 = repo_dir2.path();
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo512} init --algorithm fsverity-sha512-12"
+    )
+    .read()?;
+
+    let fixture_dir = tempfile::tempdir()?;
+    let rootfs = create_test_rootfs(fixture_dir.path())?;
+
+    // Create image in sha256 repo (no --hash flag needed)
+    let id256 = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo256} create-image {rootfs}"
+    )
+    .read()?;
+
+    // Create image in sha512 repo (no --hash flag needed)
+    let id512 = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo512} create-image {rootfs}"
+    )
+    .read()?;
+
+    // The image IDs should differ because different hash algorithms produce
+    // different fs-verity digests
+    assert_ne!(
+        id256.trim(),
+        id512.trim(),
+        "sha256 and sha512 should produce different image IDs"
+    );
+
+    Ok(())
+}
+integration_test!(test_auto_detect_hash_for_operations);
+
 fn test_fsck_empty_repo() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;

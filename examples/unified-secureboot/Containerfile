@@ -44,8 +44,8 @@ FROM base AS kernel
 RUN --mount=type=bind,from=base,target=/mnt/base <<EOF
     set -eux
 
-    mkdir -p /tmp/sysroot/composefs
-    COMPOSEFS_FSVERITY="$(cfsctl --repo /tmp/sysroot --hash sha256 compute-id --bootable /mnt/base)"
+    cfsctl init --algorithm=fsverity-sha256-12 /tmp/sysroot/composefs
+    COMPOSEFS_FSVERITY="$(cfsctl --repo /tmp/sysroot/composefs compute-id --bootable /mnt/base)"
 
     mkdir -p /etc/kernel /etc/dracut.conf.d
     echo "composefs=${COMPOSEFS_FSVERITY} rw" > /etc/kernel/cmdline
