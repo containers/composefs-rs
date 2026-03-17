@@ -16,11 +16,11 @@ cargo build --release
 
 cp ../../target/release/cfsctl .
 cp ../../target/release/composefs-setup-root extra/usr/lib/dracut/modules.d/37composefs/
-CFSCTL='./cfsctl --repo tmp/sysroot/composefs --hash sha256'
+CFSCTL='./cfsctl --repo tmp/sysroot/composefs'
 
 rm -rf tmp
 rm -rf tmp/efi tmp/sysroot/composefs/images
-mkdir -p tmp/sysroot/composefs
+${CFSCTL} init --algorithm=fsverity-sha256-12
 
 # See: https://wiki.archlinux.org/title/Unified_Extensible_Firmware_Interface/Secure_Boot
 # Alternative to generate keys for testing: `sbctl create-keys`

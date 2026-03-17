@@ -41,11 +41,11 @@ esac
 
 cp ../../target/release/cfsctl .
 cp ../../target/release/composefs-setup-root extra/usr/lib/dracut/modules.d/37composefs/
-CFSCTL='./cfsctl --repo tmp/sysroot/composefs --hash sha256'
+CFSCTL='./cfsctl --repo tmp/sysroot/composefs'
 
 rm -rf tmp
 rm -rf tmp/efi tmp/sysroot/composefs/images
-mkdir -p tmp/sysroot/composefs
+${CFSCTL} init --algorithm=fsverity-sha256-12
 
 podman build \
     --iidfile=tmp/base.iid \

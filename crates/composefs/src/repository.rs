@@ -108,7 +108,7 @@ use rustix::{
 
 use crate::{
     fsverity::{
-        compute_verity, enable_verity_maybe_copy, ensure_verity_equal, measure_verity,
+        compute_verity, enable_verity_maybe_copy, ensure_verity_equal, measure_verity, Algorithm,
         CompareVerityError, EnableVerityError, FsVerityHashValue, FsVerityHasher,
         MeasureVerityError,
     },
@@ -116,6 +116,278 @@ use crate::{
     splitstream::{SplitStreamReader, SplitStreamWriter},
     util::{proc_self_fd, replace_symlinkat, ErrnoFilter},
 };
+
+/// The filename used for repository metadata.
+pub const REPO_METADATA_FILENAME: &str = "meta.json";
+
+/// The current repository format version.
+///
+/// This is a simple integer that is bumped only for fundamental,
+/// incompatible changes to the repository layout.  Finer-grained
+/// evolution uses the [`FeatureFlags`] system instead.
+pub const REPO_FORMAT_VERSION: u32 = 1;
+
+/// Set of feature flags understood by this version of the code.
+///
+/// When reading a repository whose metadata lists features not in
+/// these sets, the rules are:
+///
+/// - Unknown **compatible** features are silently ignored.
+/// - Unknown **read-only compatible** features allow read operations
+///   but prevent any writes (adding objects, creating images, GC, …).
+/// - Unknown **incompatible** features cause the repository to be
+///   rejected entirely.
+///
+/// There are currently no defined features.
+pub mod known_features {
+    /// Compatible features understood by this version.
+    pub const COMPAT: &[&str] = &[];
+    /// Read-only compatible features understood by this version.
+    pub const RO_COMPAT: &[&str] = &[];
+    /// Incompatible features understood by this version.
+    pub const INCOMPAT: &[&str] = &[];
+}
+
+/// Feature flags for a composefs repository.
+///
+/// Inspired by the ext4/XFS/EROFS on-disk feature model:
+///
+/// - **compatible**: old tools that don't understand these can still
+///   fully read and write the repository.
+/// - **read_only_compatible**: old tools can read but must not write.
+/// - **incompatible**: old tools must refuse to open the repository.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct FeatureFlags {
+    /// Features that can be safely ignored by older tools.
+    #[serde(default)]
+    pub compatible: Vec<String>,
+
+    /// Features that allow reading but prevent writing by older tools.
+    #[serde(default)]
+    pub read_only_compatible: Vec<String>,
+
+    /// Features that require newer tools; older tools must refuse entirely.
+    #[serde(default)]
+    pub incompatible: Vec<String>,
+}
+
+/// Result of checking repository feature compatibility.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeatureCheck {
+    /// All features are understood; full read-write access.
+    ReadWrite,
+    /// Unknown read-only-compatible features present; read access only.
+    /// The vec contains the unknown feature names.
+    ReadOnly(Vec<String>),
+}
+
+impl FeatureFlags {
+    /// Check these flags against the known feature sets.
+    ///
+    /// Returns an error if any unknown incompatible features are present.
+    /// Returns [`FeatureCheck::ReadOnly`] if unknown ro-compat features
+    /// are present. Returns [`FeatureCheck::ReadWrite`] otherwise.
+    pub fn check(&self) -> Result<FeatureCheck> {
+        // Check incompatible features first
+        let unknown_incompat: Vec<&str> = self
+            .incompatible
+            .iter()
+            .map(String::as_str)
+            .filter(|f| !known_features::INCOMPAT.contains(f))
+            .collect();
+        if !unknown_incompat.is_empty() {
+            bail!(
+                "repository requires unknown incompatible features: {}; \
+                 upgrade your tools",
+                unknown_incompat.join(", "),
+            );
+        }
+
+        // Check ro-compat features
+        let unknown_ro: Vec<String> = self
+            .read_only_compatible
+            .iter()
+            .filter(|f| !known_features::RO_COMPAT.contains(&f.as_str()))
+            .cloned()
+            .collect();
+        if !unknown_ro.is_empty() {
+            return Ok(FeatureCheck::ReadOnly(unknown_ro));
+        }
+
+        // Compatible features are ignored by definition
+        Ok(FeatureCheck::ReadWrite)
+    }
+}
+
+/// Repository metadata stored in `meta.json` at the repository root.
+///
+/// This file records the repository's format version, digest algorithm,
+/// and feature flags so that tools can detect misconfigured invocations
+/// (e.g. opening a sha256 repo with `--hash sha512`) and so the
+/// algorithm doesn't need to be specified on every command.
+///
+/// The versioning model is inspired by Linux filesystem superblocks
+/// (ext4, XFS, EROFS): a base version integer for fundamental layout
+/// changes, plus three tiers of feature flags for finer-grained
+/// evolution.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RepoMetadata {
+    /// Base repository format version.  Tools must refuse to operate
+    /// on a repository whose version exceeds what they understand.
+    pub version: u32,
+
+    /// The fs-verity algorithm configuration for this repository.
+    pub algorithm: Algorithm,
+
+    /// Feature flags.
+    #[serde(default)]
+    pub features: FeatureFlags,
+}
+
+impl RepoMetadata {
+    /// Build metadata for a repository using the given hash type.
+    pub fn for_hash<ObjectID: FsVerityHashValue>() -> Self {
+        Self {
+            version: REPO_FORMAT_VERSION,
+            algorithm: Algorithm::for_hash::<ObjectID>(),
+            features: FeatureFlags::default(),
+        }
+    }
+
+    /// Build metadata from an explicit [`Algorithm`].
+    pub fn new(algorithm: Algorithm) -> Self {
+        Self {
+            version: REPO_FORMAT_VERSION,
+            algorithm,
+            features: FeatureFlags::default(),
+        }
+    }
+
+    /// Check whether this metadata is compatible with the given hash type.
+    ///
+    /// Validates the base version, feature flags, and algorithm.
+    /// Returns a [`FeatureCheck`] indicating read-write or read-only access.
+    pub fn check_compatible<ObjectID: FsVerityHashValue>(&self) -> Result<FeatureCheck> {
+        if self.version > REPO_FORMAT_VERSION {
+            bail!(
+                "unsupported repository format version {} (this tool supports up to {})",
+                self.version,
+                REPO_FORMAT_VERSION,
+            );
+        }
+        let access = self.features.check()?;
+        if !self.algorithm.is_compatible::<ObjectID>() {
+            bail!(
+                "repository uses algorithm '{}' but was opened as {} \
+                 (hint: use --hash {} or omit --hash to auto-detect)",
+                self.algorithm,
+                ObjectID::ALGORITHM.hash_name(),
+                self.algorithm.hash_name(),
+            );
+        }
+        Ok(access)
+    }
+
+    /// Serialize to pretty-printed JSON with a trailing newline.
+    pub fn to_json(&self) -> Result<Vec<u8>> {
+        let mut buf = serde_json::to_vec_pretty(self).context("serializing repository metadata")?;
+        buf.push(b'\n');
+        Ok(buf)
+    }
+
+    /// Deserialize from JSON bytes.
+    #[context("Parsing repository metadata JSON")]
+    pub fn from_json(data: &[u8]) -> Result<Self> {
+        serde_json::from_slice(data).context("deserializing repository metadata")
+    }
+}
+
+/// Read `meta.json` from a repository directory fd, if it exists.
+///
+/// Returns `Ok(None)` when the file is absent (backward-compatible repos).
+#[context("Reading repository metadata")]
+pub fn read_repo_metadata(repo_fd: &impl AsFd) -> Result<Option<RepoMetadata>> {
+    match openat(
+        repo_fd,
+        REPO_METADATA_FILENAME,
+        OFlags::RDONLY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => {
+            let mut data = Vec::new();
+            File::from(fd)
+                .read_to_end(&mut data)
+                .context("reading meta.json")?;
+            Ok(Some(RepoMetadata::from_json(&data)?))
+        }
+        Err(Errno::NOENT) => Ok(None),
+        Err(e) => Err(e).context("opening meta.json")?,
+    }
+}
+
+/// Return the default path for the user-owned composefs repository.
+pub fn user_path() -> Result<PathBuf> {
+    let home = std::env::var("HOME").with_context(|| "$HOME must be set when in user mode")?;
+    Ok(PathBuf::from(home).join(".var/lib/composefs"))
+}
+
+/// Return the default path for the system-global composefs repository.
+pub fn system_path() -> PathBuf {
+    PathBuf::from("/sysroot/composefs")
+}
+
+/// Write `meta.json` into a repository directory fd.
+///
+/// This atomically writes (via O_TMPFILE + linkat) the metadata file.
+/// It will fail if the file already exists.
+#[context("Writing repository metadata")]
+pub fn write_repo_metadata(repo_fd: &impl AsFd, meta: &RepoMetadata) -> Result<()> {
+    let data = meta.to_json()?;
+
+    // Try O_TMPFILE for atomic creation
+    match openat(
+        repo_fd,
+        ".",
+        OFlags::WRONLY | OFlags::TMPFILE | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o644),
+    ) {
+        Ok(fd) => {
+            let mut file = File::from(fd);
+            file.write_all(&data)
+                .context("writing metadata to tmpfile")?;
+            file.sync_all().context("syncing metadata tmpfile")?;
+            // Link into place
+            linkat(
+                CWD,
+                proc_self_fd(&file),
+                repo_fd,
+                REPO_METADATA_FILENAME,
+                AtFlags::SYMLINK_FOLLOW,
+            )
+            .context("linking meta.json into repository")?;
+        }
+        Err(Errno::OPNOTSUPP | Errno::NOSYS) => {
+            // Fallback: direct create (no tmpfs O_TMPFILE support).
+            // Use O_EXCL to avoid overwriting, and fsync to ensure the
+            // file is complete on disk before we consider init done.
+            let fd = openat(
+                repo_fd,
+                REPO_METADATA_FILENAME,
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+                Mode::from_raw_mode(0o644),
+            )
+            .context("creating meta.json")?;
+            let mut file = File::from(fd);
+            file.write_all(&data).context("writing meta.json")?;
+            file.sync_all().context("syncing meta.json to disk")?;
+        }
+        Err(e) => {
+            return Err(e).context("creating tmpfile for meta.json")?;
+        }
+    }
+    Ok(())
+}
 
 /// How an object was stored in the repository.
 ///
@@ -281,6 +553,12 @@ pub enum FsckError {
     #[error("fsck: image-missing-object: {path}: {object_id}")]
     #[serde(rename_all = "camelCase")]
     ImageMissingObject { path: String, object_id: String },
+
+    #[error("fsck: metadata-parse-failed: meta.json: {detail}")]
+    MetadataParseFailed { detail: String },
+
+    #[error("fsck: metadata-algorithm-mismatch: meta.json: expected {expected}, repository opened as {actual}")]
+    MetadataAlgorithmMismatch { expected: String, actual: String },
 }
 
 /// Results from a filesystem consistency check.
@@ -289,6 +567,7 @@ pub enum FsckError {
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FsckResult {
+    pub(crate) has_metadata: bool,
     pub(crate) objects_checked: u64,
     pub(crate) objects_corrupted: u64,
     pub(crate) streams_checked: u64,
@@ -301,6 +580,11 @@ pub struct FsckResult {
 }
 
 impl FsckResult {
+    /// Whether the repository has a `meta.json` file.
+    pub fn has_metadata(&self) -> bool {
+        self.has_metadata
+    }
+
     /// Returns true if no corruption or errors were found.
     pub fn is_ok(&self) -> bool {
         debug_assert!(
@@ -363,6 +647,19 @@ impl FsckResult {
 
 impl fmt::Display for FsckResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let metadata_errors = self.errors.iter().any(|e| {
+            matches!(
+                e,
+                FsckError::MetadataParseFailed { .. } | FsckError::MetadataAlgorithmMismatch { .. }
+            )
+        });
+        if metadata_errors {
+            writeln!(f, "meta.json: error")?;
+        } else if self.has_metadata {
+            writeln!(f, "meta.json: ok")?;
+        } else {
+            writeln!(f, "meta.json: absent")?;
+        }
         writeln!(
             f,
             "objects: {}/{} ok",
@@ -420,6 +717,37 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             .clone()
     }
 
+    /// Initialize a new repository at the target path and open it.
+    ///
+    /// Creates the directory (mode 0700) if it does not exist, writes
+    /// `meta.json` with the algorithm derived from `ObjectID`, and
+    /// returns the opened repository.
+    ///
+    /// Fails if `meta.json` already exists (use [`open_path`] for
+    /// existing repositories).
+    #[context("Initializing repository at {}", path.as_ref().display())]
+    pub fn init_path(dirfd: impl AsFd, path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+
+        mkdirat(&dirfd, path, Mode::from_raw_mode(0o700))
+            .or_else(|e| if e == Errno::EXIST { Ok(()) } else { Err(e) })
+            .with_context(|| format!("creating repository directory {}", path.display()))?;
+
+        let repo_fd = openat(
+            &dirfd,
+            path,
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .with_context(|| format!("opening repository directory {}", path.display()))?;
+
+        let meta = RepoMetadata::for_hash::<ObjectID>();
+        write_repo_metadata(&repo_fd, &meta)?;
+
+        drop(repo_fd);
+        Self::open_path(dirfd, path)
+    }
+
     /// Open a repository at the target directory and path.
     #[context("Opening repository at {}", path.as_ref().display())]
     pub fn open_path(dirfd: impl AsFd, path: impl AsRef<Path>) -> Result<Self> {
@@ -444,15 +772,13 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// Open the default user-owned composefs repository.
     #[context("Opening user repository")]
     pub fn open_user() -> Result<Self> {
-        let home = std::env::var("HOME").with_context(|| "$HOME must be set when in user mode")?;
-
-        Self::open_path(CWD, PathBuf::from(home).join(".var/lib/composefs"))
+        Self::open_path(CWD, user_path()?)
     }
 
     /// Open the default system-global composefs repository.
     #[context("Opening system repository")]
     pub fn open_system() -> Result<Self> {
-        Self::open_path(CWD, PathBuf::from("/sysroot/composefs".to_string()))
+        Self::open_path(CWD, system_path())
     }
 
     fn ensure_dir(&self, dir: impl AsRef<Path>) -> ErrnoResult<()> {
@@ -1643,6 +1969,9 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     pub async fn fsck(&self) -> Result<FsckResult> {
         let mut result = FsckResult::default();
 
+        // Phase 0: Validate meta.json if present
+        self.fsck_metadata(&mut result);
+
         // Phase 1: Verify all objects (parallel across object subdirectories)
         self.fsck_objects(&mut result)
             .await
@@ -1657,6 +1986,35 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             .context("Checking images")?;
 
         Ok(result)
+    }
+
+    /// Validate `meta.json` if present.
+    ///
+    /// Checks that the file parses correctly and that the declared algorithm
+    /// matches the repository's `ObjectID` type.  A missing `meta.json` is
+    /// not an error (older repositories won't have one).
+    fn fsck_metadata(&self, result: &mut FsckResult) {
+        match read_repo_metadata(&self.repository) {
+            Ok(Some(meta)) => {
+                result.has_metadata = true;
+                if let Err(e) = meta.check_compatible::<ObjectID>() {
+                    result.errors.push(FsckError::MetadataAlgorithmMismatch {
+                        expected: meta.algorithm.to_string(),
+                        actual: ObjectID::ALGORITHM.hash_name().to_string(),
+                    });
+                    log::warn!("meta.json algorithm mismatch: {e}");
+                }
+            }
+            Ok(None) => {
+                // No meta.json — that's fine for older repositories.
+                log::info!("no meta.json found (pre-0.7.0 repository)");
+            }
+            Err(e) => {
+                result.errors.push(FsckError::MetadataParseFailed {
+                    detail: format!("{e:#}"),
+                });
+            }
+        }
     }
 
     /// Verify all objects in the repository have correct fsverity digests.
@@ -2028,6 +2386,16 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// This allows low-level operations on the repository directory.
     pub fn repo_fd(&self) -> BorrowedFd<'_> {
         self.repository.as_fd()
+    }
+
+    /// Read the repository metadata from `meta.json`, if it exists.
+    ///
+    /// Returns `Ok(None)` for repositories created before metadata support
+    /// was added. When metadata is present, its version and algorithm are
+    /// not validated against this repository's generic type — call
+    /// [`RepoMetadata::check_compatible`] for that.
+    pub fn metadata(&self) -> Result<Option<RepoMetadata>> {
+        read_repo_metadata(&self.repository)
     }
 
     /// Lists all named stream references under a given prefix.
@@ -3543,5 +3911,153 @@ mod tests {
             result.errors
         );
         Ok(())
+    }
+
+    // ---- Fsck metadata validation tests ----
+
+    #[tokio::test]
+    async fn test_fsck_no_metadata() -> Result<()> {
+        // Repos without meta.json should fsck cleanly.
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let result = repo.fsck().await?;
+        assert!(result.is_ok());
+        assert!(!result.has_metadata());
+        assert!(result.errors().is_empty());
+        // Display should say "absent"
+        assert!(
+            result.to_string().contains("meta.json: absent"),
+            "display should show absent: {result}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fsck_valid_metadata() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let meta = RepoMetadata::for_hash::<Sha512HashValue>();
+        write_repo_metadata(&repo.repo_fd(), &meta)?;
+
+        let result = repo.fsck().await?;
+        assert!(result.is_ok());
+        assert!(result.has_metadata());
+        assert!(result.errors().is_empty());
+        assert!(
+            result.to_string().contains("meta.json: ok"),
+            "display should show ok: {result}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fsck_corrupt_metadata() -> Result<()> {
+        // Write garbage to meta.json — fsck should report a parse error.
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let dir = open_test_repo_dir(&tmp);
+        dir.write(REPO_METADATA_FILENAME, b"not valid json {{")?;
+
+        let result = repo.fsck().await?;
+        assert!(!result.is_ok());
+        assert!(result
+            .errors()
+            .iter()
+            .any(|e| matches!(e, FsckError::MetadataParseFailed { .. })));
+        assert!(
+            result.to_string().contains("meta.json: error"),
+            "display should show error: {result}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fsck_metadata_algorithm_mismatch() -> Result<()> {
+        // Write sha256 metadata, open repo as sha512 — fsck should report mismatch.
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let meta = RepoMetadata::for_hash::<crate::fsverity::Sha256HashValue>();
+        write_repo_metadata(&repo.repo_fd(), &meta)?;
+
+        let result = repo.fsck().await?;
+        assert!(!result.is_ok());
+        assert!(result.has_metadata());
+        assert!(result
+            .errors()
+            .iter()
+            .any(|e| matches!(e, FsckError::MetadataAlgorithmMismatch { .. })));
+        assert!(
+            result.to_string().contains("meta.json: error"),
+            "display should show error for mismatch: {result}"
+        );
+        Ok(())
+    }
+
+    // ---- RepoMetadata / FeatureFlags tests ----
+    //
+    // Basic metadata construction, JSON roundtrip, algorithm compatibility,
+    // and read/write are covered by the fsck tests above and the CLI
+    // integration tests (init, hash-mismatch, backcompat).  The tests
+    // below focus on the three-tier feature-flag compatibility model and
+    // JSON serialization of populated feature vectors, which aren't
+    // exercised elsewhere.
+
+    #[test]
+    fn test_metadata_json_with_features() {
+        let mut meta = RepoMetadata::for_hash::<Sha512HashValue>();
+        meta.features.compatible.push("some-compat".to_string());
+        meta.features
+            .read_only_compatible
+            .push("some-rocompat".to_string());
+
+        let json = meta.to_json().unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&json).unwrap();
+
+        assert_eq!(parsed["features"]["compatible"][0], "some-compat");
+        assert_eq!(
+            parsed["features"]["read-only-compatible"][0],
+            "some-rocompat"
+        );
+
+        // Roundtrip
+        let meta2 = RepoMetadata::from_json(&json).unwrap();
+        assert_eq!(meta, meta2);
+    }
+
+    #[test]
+    fn test_feature_flags_unknown_incompat() {
+        let mut meta = RepoMetadata::for_hash::<Sha512HashValue>();
+        meta.features
+            .incompatible
+            .push("fancy-new-thing".to_string());
+        let err = meta.check_compatible::<Sha512HashValue>().unwrap_err();
+        assert!(
+            format!("{err}").contains("fancy-new-thing"),
+            "error should name the unknown feature: {err}"
+        );
+    }
+
+    #[test]
+    fn test_feature_flags_unknown_ro_compat() {
+        let mut meta = RepoMetadata::for_hash::<Sha512HashValue>();
+        meta.features
+            .read_only_compatible
+            .push("new-index".to_string());
+        let check = meta.check_compatible::<Sha512HashValue>().unwrap();
+        assert_eq!(check, FeatureCheck::ReadOnly(vec!["new-index".to_string()]));
+    }
+
+    #[test]
+    fn test_feature_flags_unknown_compat_ignored() {
+        let mut meta = RepoMetadata::for_hash::<Sha512HashValue>();
+        meta.features.compatible.push("optional-hint".to_string());
+        assert_eq!(
+            meta.check_compatible::<Sha512HashValue>().unwrap(),
+            FeatureCheck::ReadWrite
+        );
     }
 }
