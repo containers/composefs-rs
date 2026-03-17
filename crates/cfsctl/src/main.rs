@@ -3,6 +3,25 @@
 //! `cfsctl` is a multi-call binary: when invoked as `mkcomposefs` or
 //! `composefs-info` (via symlink or hardlink), it dispatches to the
 //! corresponding tool. Otherwise it runs the normal `cfsctl` interface.
+//!
+//! ## C composefs compatibility roadmap
+//!
+//! This work aims to provide a Rust implementation that is a drop-in for the
+//! C composefs tools and library.  See:
+//! <https://github.com/composefs/composefs/discussions/423>
+//!
+//! Status:
+//! 1. **CLI interfaces** (`mkcomposefs`, `composefs-info`): Substantially
+//!    implemented. V1 EROFS output is byte-for-byte identical to C mkcomposefs.
+//!    See individual module docs for remaining gaps.
+//! 2. **EROFS output format**: V1 (C-compatible) writer with compact inodes,
+//!    BFS ordering, whiteout table, and overlay xattr escaping is complete and
+//!    tested.  V2 (Rust-native) is the default for the composefs-rs repository.
+//! 3. **C shared library (`libcomposefs`)**: TODO(compat): Not yet started.
+//!    This is the next major milestone — providing a C-ABI compatible shared
+//!    library so that existing C consumers (e.g. ostree, bootc) can link
+//!    against the Rust implementation.  Will require `#[no_mangle]` exports,
+//!    a `cdylib` crate, and C header generation (e.g. via cbindgen).
 
 use std::path::Path;
 

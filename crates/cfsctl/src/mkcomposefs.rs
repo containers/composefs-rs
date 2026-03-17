@@ -2,6 +2,31 @@
 //!
 //! This is a Rust reimplementation of the C mkcomposefs tool, providing
 //! compatible command-line interface and output format.
+//!
+//! ## Compatibility status
+//!
+//! See <https://github.com/composefs/composefs/discussions/423> for context.
+//!
+//! Implemented and tested (byte-for-byte match with C mkcomposefs):
+//! - `--from-file`, `--print-digest`, `--print-digest-only`
+//! - `--skip-devices`, `--skip-xattrs`, `--user-xattrs`
+//! - `--min-version` / `--max-version` (V1 compact inodes, BFS ordering, whiteout table)
+//! - `--digest-store` (uses composefs-rs repository layout: `objects/XX/digest`)
+//! - Source from directory or dumpfile, output to file or stdout
+//!
+//! Known gaps vs C mkcomposefs:
+//! - TODO(compat): `--use-epoch` only zeroes directory mtimes, not leaf nodes.
+//!   The `Stat` struct uses `Rc` for leaf sharing and `st_mtim_sec` lacks interior
+//!   mutability; needs upstream `Stat` changes or a pre-write tree walk.
+//! - TODO(compat): `--threads` is accepted but not implemented (returns error).
+//! - TODO(compat): `--digest-store` path layout differs from C: Rust uses
+//!   `objects/XX/digest` (Repository format) while C uses `XX/digest` directly.
+//!   These can't share the same digest store directory interchangeably.
+//! - TODO(compat): `--max-version` is parsed but doesn't drive auto-upgrade logic.
+//!   The C implementation starts at min_version and auto-upgrades to max_version
+//!   if the content requires it; Rust only uses min_version for format selection.
+//! - TODO(compat): `calculate_min_mtime` doesn't track nanoseconds (always 0).
+//!   The C implementation tracks mtime nanoseconds via `struct timespec`.
 
 use std::{
     ffi::OsString,
@@ -111,12 +136,15 @@ pub(crate) fn run() -> Result<()> {
         bail!("--threads is not yet implemented");
     }
 
-    // Determine format version based on min/max version flags
-    // min_version=0 means we can use Format 1.0 (composefs_version=0)
-    // min_version=1+ means we should use Format 1.1 (composefs_version=2)
-    // Note: Full Format 1.0 support (compact inodes, whiteout table) is not yet
-    // implemented. Currently this only affects the composefs_version header and
-    // build_time fields.
+    // Determine format version based on min/max version flags.
+    // min_version=0 means we use Format 1.0 / V1 (composefs_version=0):
+    //   compact inodes, BFS ordering, whiteout table, build_time
+    // min_version=1+ means we use Format 1.1 / V2 (composefs_version=2):
+    //   extended inodes, DFS ordering, no whiteouts
+    //
+    // TODO(compat): The C implementation uses both min_version and max_version
+    // to auto-upgrade the format if content requires it.  We only look at
+    // min_version today.
     let format_version = if args.min_version == 0 {
         FormatVersion::V1
     } else {
