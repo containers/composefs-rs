@@ -41,6 +41,7 @@ const SPLITSTREAM_MAGIC: [u8; 11] = *b"SplitStream";
 const LG_BLOCKSIZE: u8 = 12; // TODO: hard-coded 4k.  make this generic later...
 
 // Nearly everything in the file is located at an offset indicated by a FileRange.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout)]
 struct FileRange {
     start: U64,
@@ -48,6 +49,7 @@ struct FileRange {
 }
 
 // The only exception is the header: it is a fixed sized and comes at the start (offset 0).
+#[repr(C)]
 #[derive(Debug, FromBytes, Immutable, IntoBytes, KnownLayout)]
 struct SplitstreamHeader {
     pub magic: [u8; 11],  // Contains SPLITSTREAM_MAGIC
@@ -59,6 +61,7 @@ struct SplitstreamHeader {
 }
 
 // The info block can be located anywhere, indicated by the "info" FileRange in the header.
+#[repr(C)]
 #[derive(Debug, FromBytes, Immutable, IntoBytes, KnownLayout)]
 struct SplitstreamInfo {
     pub stream_refs: FileRange, // location of the stream references array
