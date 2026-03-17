@@ -33,7 +33,7 @@ const XATTR_LIST_MAX: usize = u16::MAX as usize;
 // See above
 const XATTR_SIZE_MAX: usize = u16::MAX as usize;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 /// An extended attribute entry
 pub struct Xattr<'k> {
     /// key
@@ -122,8 +122,6 @@ pub enum Item<'p> {
     },
     /// A directory
     Directory {
-        /// Size of a directory is not necessarily meaningful
-        size: u64,
         /// Number of links
         nlink: u32,
     },
@@ -375,16 +373,14 @@ impl<'p> Entry<'p> {
             (false, u32::from_str_radix(modeval, 8)?)
         };
 
-        // For hardlinks, the C parser skips the remaining numeric fields
-        // (nlink, uid, gid, rdev, mtime) and only reads the payload (target
-        // path).  We match that: consume the tokens without parsing them as
-        // integers, so values like `-` are accepted.
+        // Per composefs-dump(5): for hardlinks "we ignore all the fields
+        // except the payload."  The C parser does the same (mkcomposefs.c
+        // bails out early).  Skip everything and zero ignored fields.
         if is_hardlink {
             let ty = FileType::from_raw_mode(mode);
             if ty == FileType::Directory {
                 anyhow::bail!("Invalid hardlinked directory");
             }
-            // Skip nlink, uid, gid, rdev, mtime
             for field in ["nlink", "uid", "gid", "rdev", "mtime"] {
                 next(field)?;
             }
@@ -395,7 +391,7 @@ impl<'p> Entry<'p> {
                 path,
                 uid: 0,
                 gid: 0,
-                mode,
+                mode: 0,
                 mtime: Mtime { sec: 0, nsec: 0 },
                 item: Item::Hardlink { target },
                 xattrs: Vec::new(),
@@ -410,7 +406,7 @@ impl<'p> Entry<'p> {
         let payload = optional_str(next("payload")?);
         let content = optional_str(next("content")?);
         let fsverity_digest = optional_str(next("digest")?);
-        let xattrs = components
+        let mut xattrs = components
             .try_fold((Vec::new(), 0usize), |(mut acc, total_namelen), line| {
                 let xattr = Xattr::parse(line)?;
                 // Limit the total length of keys.
@@ -422,6 +418,10 @@ impl<'p> Entry<'p> {
                 Ok((acc, total_namelen))
             })?
             .0;
+        // Canonicalize xattr ordering — the composefs-dump(5) spec doesn't
+        // define an order, and different implementations emit them differently
+        // (C uses EROFS on-disk order, Rust uses BTreeMap order).
+        xattrs.sort();
 
         let ty = FileType::from_raw_mode(mode);
         let item = {
@@ -474,8 +474,9 @@ impl<'p> Entry<'p> {
                 FileType::Directory => {
                     Self::check_nonregfile(content, fsverity_digest)?;
                     Self::check_rdev(rdev)?;
-
-                    Item::Directory { size, nlink }
+                    // Per composefs-dump(5): "SIZE: The size of the file.
+                    // This is ignored for directories."  We discard it.
+                    Item::Directory { nlink }
                 }
                 FileType::Socket => {
                     anyhow::bail!("sockets are not supported");
@@ -512,8 +513,10 @@ impl<'p> Entry<'p> {
 impl Item<'_> {
     pub(crate) fn size(&self) -> u64 {
         match self {
-            Item::Regular { size, .. } | Item::Directory { size, .. } => *size,
+            Item::Regular { size, .. } => *size,
             Item::RegularInline { content, .. } => content.len() as u64,
+            // Directories always report 0; the spec says size is ignored.
+            Item::Directory { .. } => 0,
             _ => 0,
         }
     }
@@ -556,9 +559,14 @@ impl Display for Mtime {
 impl Display for Entry<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         escape(f, self.path.as_os_str().as_bytes(), EscapeMode::Standard)?;
+        let hardlink_prefix = if matches!(self.item, Item::Hardlink { .. }) {
+            "@"
+        } else {
+            ""
+        };
         write!(
             f,
-            " {} {:o} {} {} {} {} {} ",
+            " {} {hardlink_prefix}{:o} {} {} {} {} {} ",
             self.item.size(),
             self.mode,
             self.item.nlink(),
@@ -858,16 +866,76 @@ mod tests {
     fn test_parse() {
         const CONTENT: &str = include_str!("tests/assets/special.dump");
         for line in CONTENT.lines() {
-            // Test a full round trip by parsing, serialize, parsing again
+            // Test a full round trip by parsing, serializing, parsing again.
+            // The serialized form may differ from the input (e.g. xattr
+            // ordering is canonicalized), so we check structural equality
+            // and that serialization is idempotent.
             let e = Entry::parse(line).unwrap();
             let serialized = e.to_string();
-            if line != serialized {
-                dbg!(&line, &e, &serialized);
-            }
-            similar_asserts::assert_eq!(line, serialized);
             let e2 = Entry::parse(&serialized).unwrap();
             similar_asserts::assert_eq!(e, e2);
+            // Serialization must be idempotent
+            similar_asserts::assert_eq!(serialized, e2.to_string());
         }
+    }
+
+    #[test]
+    fn test_canonicalize_directory_size() {
+        // Directory size should be discarded — any input value becomes 0
+        let e = Entry::parse("/ 4096 40755 2 0 0 0 1000.0 - - -").unwrap();
+        assert_eq!(e.item.size(), 0);
+        assert!(e.to_string().starts_with("/ 0 40755"));
+
+        let e = Entry::parse("/ 99999 40755 2 0 0 0 1000.0 - - -").unwrap();
+        assert_eq!(e.item.size(), 0);
+    }
+
+    #[test]
+    fn test_canonicalize_hardlink_metadata() {
+        // Hardlink metadata fields should all be zeroed — only path and
+        // target (payload) are meaningful per composefs-dump(5).
+        let e = Entry::parse(
+            "/link 259 @100644 3 1000 1000 0 1695368732.385062094 /original - \
+             35d02f81325122d77ec1d11baba655bc9bf8a891ab26119a41c50fa03ddfb408 \
+             security.selinux=foo",
+        )
+        .unwrap();
+
+        // All metadata zeroed
+        assert_eq!(e.uid, 0);
+        assert_eq!(e.gid, 0);
+        assert_eq!(e.mode, 0);
+        assert_eq!(e.mtime, Mtime { sec: 0, nsec: 0 });
+        assert!(e.xattrs.is_empty());
+
+        // Target preserved
+        match &e.item {
+            Item::Hardlink { target } => assert_eq!(target.as_ref(), Path::new("/original")),
+            other => panic!("Expected Hardlink, got {other:?}"),
+        }
+
+        // Serialization uses @0 for mode, zeroed fields
+        let s = e.to_string();
+        assert!(s.contains("@0 0 0 0 0 0.0"), "got: {s}");
+    }
+
+    #[test]
+    fn test_canonicalize_xattr_ordering() {
+        // Xattrs should be sorted by key regardless of input order
+        let e = Entry::parse("/ 0 40755 2 0 0 0 0.0 - - - user.z=1 security.ima=2 trusted.a=3")
+            .unwrap();
+
+        let keys: Vec<&[u8]> = e.xattrs.iter().map(|x| x.key.as_bytes()).collect();
+        assert_eq!(
+            keys,
+            vec![b"security.ima".as_slice(), b"trusted.a", b"user.z"],
+            "xattrs should be sorted by key"
+        );
+
+        // Re-serialization preserves sorted order
+        let s = e.to_string();
+        let e2 = Entry::parse(&s).unwrap();
+        assert_eq!(e, e2);
     }
 
     fn parse_all(name: &str, s: &str) -> Result<()> {
@@ -886,10 +954,10 @@ mod tests {
         const CASES: &[(&str, &str)] = &[
             (
                 "content in fifo",
-                "/ 4096 40755 2 0 0 0 0.0 - - -\n/fifo 0 10777 1 0 0 0 0.0 - foobar -",
+                "/ 0 40755 2 0 0 0 0.0 - - -\n/fifo 0 10777 1 0 0 0 0.0 - foobar -",
             ),
-            ("root with rdev", "/ 4096 40755 2 0 0 42 0.0 - - -"),
-            ("root with fsverity", "/ 4096 40755 2 0 0 0 0.0 - - 35d02f81325122d77ec1d11baba655bc9bf8a891ab26119a41c50fa03ddfb408"),
+            ("root with rdev", "/ 0 40755 2 0 0 42 0.0 - - -"),
+            ("root with fsverity", "/ 0 40755 2 0 0 0 0.0 - - 35d02f81325122d77ec1d11baba655bc9bf8a891ab26119a41c50fa03ddfb408"),
         ];
         for (name, case) in CASES.iter().copied() {
             assert!(
@@ -919,7 +987,7 @@ mod tests {
     #[test]
     fn test_load_cfs_filtered() -> Result<()> {
         const FILTERED: &str =
-            "/ 4096 40555 2 0 0 0 1633950376.0 - - - trusted.foo1=bar-1 user.foo2=bar-2\n\
+            "/ 0 40555 2 0 0 0 1633950376.0 - - - trusted.foo1=bar-1 user.foo2=bar-2\n\
 /blockdev 0 60777 1 0 0 107690 1633950376.0 - - - trusted.bar=bar-2\n\
 /inline 15 100777 1 0 0 0 1633950376.0 - FOOBAR\\nINAFILE\\n - user.foo=bar-2\n";
         let mut tmpf = tempfile::tempfile()?;

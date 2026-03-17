@@ -1448,8 +1448,8 @@ mod tests {
     #[test]
     fn test_empty_directory() {
         // Create filesystem with empty directory
-        let dumpfile = r#"/ 4096 40755 2 0 0 0 1000.0 - - -
-/empty_dir 4096 40755 2 0 0 0 1000.0 - - -
+        let dumpfile = r#"/ 0 40755 2 0 0 0 1000.0 - - -
+/empty_dir 0 40755 2 0 0 0 1000.0 - - -
 "#;
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
@@ -1491,8 +1491,8 @@ mod tests {
     #[test]
     fn test_directory_with_inline_entries() {
         // Create filesystem with directory that has a few entries (should be inline)
-        let dumpfile = r#"/ 4096 40755 2 0 0 0 1000.0 - - -
-/dir1 4096 40755 2 0 0 0 1000.0 - - -
+        let dumpfile = r#"/ 0 40755 2 0 0 0 1000.0 - - -
+/dir1 0 40755 2 0 0 0 1000.0 - - -
 /dir1/file1 5 100644 1 0 0 0 1000.0 - hello -
 /dir1/file2 5 100644 1 0 0 0 1000.0 - world -
 "#;
@@ -1532,8 +1532,8 @@ mod tests {
     #[test]
     fn test_directory_with_many_entries() {
         // Create a directory with many entries to force block storage
-        let mut dumpfile = String::from("/ 4096 40755 2 0 0 0 1000.0 - - -\n");
-        dumpfile.push_str("/bigdir 4096 40755 2 0 0 0 1000.0 - - -\n");
+        let mut dumpfile = String::from("/ 0 40755 2 0 0 0 1000.0 - - -\n");
+        dumpfile.push_str("/bigdir 0 40755 2 0 0 0 1000.0 - - -\n");
 
         // Add many files to force directory blocks
         for i in 0..100 {
@@ -1585,10 +1585,10 @@ mod tests {
     #[test]
     fn test_nested_directories() {
         // Test deeply nested directory structure
-        let dumpfile = r#"/ 4096 40755 2 0 0 0 1000.0 - - -
-/a 4096 40755 2 0 0 0 1000.0 - - -
-/a/b 4096 40755 2 0 0 0 1000.0 - - -
-/a/b/c 4096 40755 2 0 0 0 1000.0 - - -
+        let dumpfile = r#"/ 0 40755 2 0 0 0 1000.0 - - -
+/a 0 40755 2 0 0 0 1000.0 - - -
+/a/b 0 40755 2 0 0 0 1000.0 - - -
+/a/b/c 0 40755 2 0 0 0 1000.0 - - -
 /a/b/c/file.txt 5 100644 1 0 0 0 1000.0 - hello -
 "#;
 
@@ -1622,12 +1622,12 @@ mod tests {
     #[test]
     fn test_mixed_entry_types() {
         // Test directory with various file types
-        let dumpfile = r#"/ 4096 40755 2 0 0 0 1000.0 - - -
-/mixed 4096 40755 2 0 0 0 1000.0 - - -
+        let dumpfile = r#"/ 0 40755 2 0 0 0 1000.0 - - -
+/mixed 0 40755 2 0 0 0 1000.0 - - -
 /mixed/regular 10 100644 1 0 0 0 1000.0 - content123 -
 /mixed/symlink 7 120777 1 0 0 0 1000.0 /target - -
 /mixed/fifo 0 10644 1 0 0 0 1000.0 - - -
-/mixed/subdir 4096 40755 2 0 0 0 1000.0 - - -
+/mixed/subdir 0 40755 2 0 0 0 1000.0 - - -
 "#;
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
@@ -1668,11 +1668,11 @@ mod tests {
     #[test]
     fn test_collect_objects_traversal() {
         // Test that object collection properly traverses all directories
-        let dumpfile = r#"/ 4096 40755 2 0 0 0 1000.0 - - -
-/dir1 4096 40755 2 0 0 0 1000.0 - - -
+        let dumpfile = r#"/ 0 40755 2 0 0 0 1000.0 - - -
+/dir1 0 40755 2 0 0 0 1000.0 - - -
 /dir1/file1 5 100644 1 0 0 0 1000.0 - hello -
-/dir2 4096 40755 2 0 0 0 1000.0 - - -
-/dir2/subdir 4096 40755 2 0 0 0 1000.0 - - -
+/dir2 0 40755 2 0 0 0 1000.0 - - -
+/dir2/subdir 0 40755 2 0 0 0 1000.0 - - -
 /dir2/subdir/file2 5 100644 1 0 0 0 1000.0 - world -
 "#;
 
@@ -1705,8 +1705,8 @@ mod tests {
         // . and .. entries).
 
         // Generate a C-generated erofs image using mkcomposefs
-        let dumpfile_content = r#"/ 4096 40755 2 0 0 0 1000.0 - - -
-/empty_dir 4096 40755 2 0 0 0 1000.0 - - -
+        let dumpfile_content = r#"/ 0 40755 2 0 0 0 1000.0 - - -
+/empty_dir 0 40755 2 0 0 0 1000.0 - - -
 "#;
 
         // Create temporary files for dumpfile and erofs output
@@ -1745,10 +1745,10 @@ mod tests {
     #[test]
     fn test_round_trip_basic() {
         // Full round-trip: dumpfile -> tree -> erofs -> read back -> validate
-        let dumpfile = r#"/ 4096 40755 2 0 0 0 1000.0 - - -
+        let dumpfile = r#"/ 0 40755 2 0 0 0 1000.0 - - -
 /file1 5 100644 1 0 0 0 1000.0 - hello -
 /file2 6 100644 1 0 0 0 1000.0 - world! -
-/dir1 4096 40755 2 0 0 0 1000.0 - - -
+/dir1 0 40755 2 0 0 0 1000.0 - - -
 /dir1/nested 8 100644 1 0 0 0 1000.0 - content1 -
 "#;
 
@@ -1812,14 +1812,14 @@ mod tests {
 
     #[test]
     fn test_erofs_to_filesystem_empty_root() {
-        let dumpfile = "/ 4096 40755 2 0 0 0 1000.0 - - -\n";
+        let dumpfile = "/ 0 40755 2 0 0 0 1000.0 - - -\n";
         let (orig, rt) = round_trip_dumpfile(dumpfile);
         assert_eq!(orig, rt);
     }
 
     #[test]
     fn test_erofs_to_filesystem_inline_files() {
-        let dumpfile = r#"/ 4096 40755 2 0 0 0 1000.0 - - -
+        let dumpfile = r#"/ 0 40755 2 0 0 0 1000.0 - - -
 /empty 0 100644 1 0 0 0 1000.0 - - -
 /hello 5 100644 1 0 0 0 1000.0 - hello -
 /world 6 100644 1 0 0 0 1000.0 - world! -
@@ -1830,7 +1830,7 @@ mod tests {
 
     #[test]
     fn test_erofs_to_filesystem_symlinks() {
-        let dumpfile = r#"/ 4096 40755 2 0 0 0 1000.0 - - -
+        let dumpfile = r#"/ 0 40755 2 0 0 0 1000.0 - - -
 /link1 7 120777 1 0 0 0 1000.0 /target - -
 /link2 11 120777 1 0 0 0 1000.0 /other/path - -
 "#;
@@ -1840,10 +1840,10 @@ mod tests {
 
     #[test]
     fn test_erofs_to_filesystem_nested_dirs() {
-        let dumpfile = r#"/ 4096 40755 3 0 0 0 1000.0 - - -
-/a 4096 40755 3 0 0 0 1000.0 - - -
-/a/b 4096 40755 3 0 0 0 1000.0 - - -
-/a/b/c 4096 40755 2 0 0 0 1000.0 - - -
+        let dumpfile = r#"/ 0 40755 3 0 0 0 1000.0 - - -
+/a 0 40755 3 0 0 0 1000.0 - - -
+/a/b 0 40755 3 0 0 0 1000.0 - - -
+/a/b/c 0 40755 2 0 0 0 1000.0 - - -
 /a/b/c/file.txt 5 100644 1 0 0 0 1000.0 - hello -
 /a/b/other 3 100644 1 0 0 0 1000.0 - abc -
 "#;
@@ -1853,7 +1853,7 @@ mod tests {
 
     #[test]
     fn test_erofs_to_filesystem_devices_and_fifos() {
-        let dumpfile = r#"/ 4096 40755 2 0 0 0 1000.0 - - -
+        let dumpfile = r#"/ 0 40755 2 0 0 0 1000.0 - - -
 /blk 0 60660 1 0 0 2049 1000.0 - - -
 /chr 0 20666 1 0 0 1025 1000.0 - - -
 /fifo 0 10644 1 0 0 0 1000.0 - - -
@@ -1865,7 +1865,7 @@ mod tests {
     #[test]
     fn test_erofs_to_filesystem_xattrs() {
         let dumpfile =
-            "/ 4096 40755 2 0 0 0 1000.0 - - - security.selinux=system_u:object_r:root_t:s0\n\
+            "/ 0 40755 2 0 0 0 1000.0 - - - security.selinux=system_u:object_r:root_t:s0\n\
              /file 5 100644 1 0 0 0 1000.0 - hello - user.myattr=myvalue\n";
         let (orig, rt) = round_trip_dumpfile(dumpfile);
         assert_eq!(orig, rt);
@@ -1875,7 +1875,7 @@ mod tests {
     fn test_erofs_to_filesystem_escaped_overlay_xattrs() {
         // The writer escapes trusted.overlay.X to trusted.overlay.overlay.X.
         // Round-tripping must preserve the original xattr name.
-        let dumpfile = "/ 4096 40755 2 0 0 0 1000.0 - - -\n\
+        let dumpfile = "/ 0 40755 2 0 0 0 1000.0 - - -\n\
              /file 5 100644 1 0 0 0 1000.0 - hello - trusted.overlay.custom=val\n";
         let (orig, rt) = round_trip_dumpfile(dumpfile);
         assert_eq!(orig, rt);
@@ -1891,7 +1891,7 @@ mod tests {
         let digest = "a".repeat(64);
         let pathname = format!("{}/{}", &digest[..2], &digest[2..]);
         let dumpfile = format!(
-            "/ 4096 40755 2 0 0 0 1000.0 - - -\n\
+            "/ 0 40755 2 0 0 0 1000.0 - - -\n\
              /ext 1000000000 100644 1 0 0 0 1000.0 {pathname} - {digest}\n"
         );
         let (orig, rt) = round_trip_dumpfile(&dumpfile);
@@ -1900,7 +1900,7 @@ mod tests {
 
     #[test]
     fn test_erofs_to_filesystem_hardlinks() {
-        let dumpfile = r#"/ 4096 40755 2 0 0 0 1000.0 - - -
+        let dumpfile = r#"/ 0 40755 2 0 0 0 1000.0 - - -
 /original 11 100644 2 0 0 0 1000.0 - hello_world -
 /hardlink 0 @120000 2 0 0 0 0.0 /original - -
 "#;
@@ -1933,10 +1933,10 @@ mod tests {
 
     #[test]
     fn test_erofs_to_filesystem_mixed_types() {
-        let dumpfile = r#"/ 4096 40755 3 0 0 0 1000.0 - - -
+        let dumpfile = r#"/ 0 40755 3 0 0 0 1000.0 - - -
 /blk 0 60660 1 0 6 259 1000.0 - - -
 /chr 0 20666 1 0 6 1025 1000.0 - - -
-/dir 4096 40755 2 42 42 0 2000.0 - - -
+/dir 0 40755 2 42 42 0 2000.0 - - -
 /dir/nested 3 100644 1 42 42 0 2000.0 - abc -
 /fifo 0 10644 1 0 0 0 1000.0 - - -
 /hello 5 100644 1 1000 1000 0 1500.0 - hello -
@@ -1949,7 +1949,7 @@ mod tests {
     #[test]
     fn test_restrict_to_composefs_rejects_unsupported_features() {
         // Build a minimal valid composefs image (just a root directory).
-        let dumpfile = "/ 4096 40755 2 0 0 0 1000.0 - - -\n";
+        let dumpfile = "/ 0 40755 2 0 0 0 1000.0 - - -\n";
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
         let base_image = mkfs_erofs(&fs);
 
@@ -2079,7 +2079,7 @@ mod tests {
         // The corrupted size must be a multiple of block_size so that
         // additional_bytes() (which uses `size % block_size` for FlatInline)
         // stays the same and the inode still parses successfully.
-        let dumpfile = "/ 4096 40755 1 0 0 0 0.0 - - -\n";
+        let dumpfile = "/ 0 40755 1 0 0 0 0.0 - - -\n";
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
         let mut image = mkfs_erofs(&fs);
 
@@ -2124,8 +2124,7 @@ mod tests {
         use crate::test::proptest_strategies::{build_filesystem, filesystem_spec};
         use proptest::prelude::*;
 
-        /// Round-trip a FileSystem through erofs with a given ObjectID type
-        /// and compare dumpfile output before and after.
+        /// Round-trip a FileSystem through erofs and compare dumpfile output.
         fn round_trip_filesystem<ObjectID: FsVerityHashValue>(
             fs_orig: &tree::FileSystem<ObjectID>,
         ) {
@@ -2138,7 +2137,10 @@ mod tests {
             let mut rt_output = Vec::new();
             write_dumpfile(&mut rt_output, &fs_rt).unwrap();
 
-            assert_eq!(orig_output, rt_output);
+            similar_asserts::assert_eq!(
+                String::from_utf8_lossy(&orig_output),
+                String::from_utf8_lossy(&rt_output)
+            );
         }
 
         proptest! {

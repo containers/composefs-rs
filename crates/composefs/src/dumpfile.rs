@@ -561,7 +561,7 @@ mod tests {
     use super::*;
     use crate::fsverity::Sha256HashValue;
 
-    const SIMPLE_DUMP: &str = r#"/ 4096 40755 2 0 0 0 1000.0 - - -
+    const SIMPLE_DUMP: &str = r#"/ 0 40755 2 0 0 0 1000.0 - - -
 /empty_file 0 100644 1 0 0 0 1000.0 - - -
 /small_file 5 100644 1 0 0 0 1000.0 - hello -
 /symlink 7 120777 1 0 0 0 1000.0 /target - -
@@ -592,10 +592,10 @@ mod tests {
         // The nlink/uid/gid/rdev fields on hardlink lines use `-` here,
         // matching the C composefs writer convention.  The parser must
         // accept these without trying to parse them as integers.
-        let dumpfile = r#"/ 4096 40755 2 0 0 0 1000.0 - - -
+        let dumpfile = r#"/ 0 40755 2 0 0 0 1000.0 - - -
 /original 11 100644 2 0 0 0 1000.0 - hello_world -
 /hardlink1 0 @120000 - - - - 0.0 /original - -
-/dir1 4096 40755 2 0 0 0 1000.0 - - -
+/dir1 0 40755 2 0 0 0 1000.0 - - -
 /dir1/hardlink2 0 @120000 - - - - 0.0 /original - -
 "#;
 
