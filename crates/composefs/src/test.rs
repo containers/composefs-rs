@@ -131,8 +131,7 @@ pub(crate) mod proptest_strategies {
     /// EROFS limit (`EROFS_NAME_LEN`).
     const NAME_MAX: usize = 255;
 
-    /// Maximum symlink target length on Linux (`PATH_MAX`).
-    const PATH_MAX: usize = 4096;
+    use crate::SYMLINK_MAX;
 
     /// Strategy for valid filenames as OsString.
     ///
@@ -230,8 +229,7 @@ pub(crate) mod proptest_strategies {
     /// Strategy for symlink targets as OsString.
     ///
     /// Symlink targets on Linux are arbitrary bytes except `\0`, up to
-    /// [`PATH_MAX`] (4096) bytes.  We generate a mix of path-like ASCII
-    /// targets and binary targets, occasionally long.
+    /// [`SYMLINK_MAX`] (1024) bytes, matching the XFS limit.
     fn symlink_target() -> impl Strategy<Value = OsString> {
         prop_oneof![
             // Short path-like ASCII target (common case)
@@ -241,8 +239,8 @@ pub(crate) mod proptest_strategies {
             // Binary target with arbitrary bytes (no NUL)
             3 => prop::collection::vec(1..=0xFFu8, 1..=100)
                 .prop_map(OsString::from_vec),
-            // Long ASCII target (up to PATH_MAX)
-            1 => proptest::string::string_regex(&format!("[a-zA-Z0-9/._-]{{100,{PATH_MAX}}}"))
+            // Long ASCII target (up to SYMLINK_MAX)
+            1 => proptest::string::string_regex(&format!("[a-zA-Z0-9/._-]{{100,{SYMLINK_MAX}}}"))
                 .expect("valid regex")
                 .prop_map(OsString::from),
         ]
