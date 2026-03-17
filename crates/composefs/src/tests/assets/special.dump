@@ -1,7 +1,7 @@
-/ 4096 40555 2 0 0 0 1633950376.0 - - - trusted.foo1=bar-1 user.foo2=bar-2
+/ 0 40555 2 0 0 0 1633950376.0 - - - trusted.foo1=bar-1 user.foo2=bar-2
 /blockdev 0 60777 1 0 0 107690 1633950376.0 - - - trusted.bar=bar-2
 /chardev 0 20777 1 0 0 10769 1633950376.0 - - - trusted.foo=bar-2
-/escaped-xattr 0 100777 1 0 0 0 1633950376.0 - - - trusted.overlay.redirect=/foo\n user.overlay.redirect=/foo\n user.foo=bar-2
+/escaped-xattr 0 100777 1 0 0 0 1633950376.0 - - - trusted.overlay.redirect=/foo\n user.foo=bar-2 user.overlay.redirect=/foo\n
 /external 42 100755 1 0 0 0 1731497312.0 70/a9125438f7255245f596c54cebb6621cb9a64f062752cf26763c1b690e7340 - 70a9125438f7255245f596c54cebb6621cb9a64f062752cf26763c1b690e7340
 /fifo 0 10777 1 0 0 0 1633950376.0 - - - trusted.bar=bar-2
 /inline 15 100777 1 0 0 0 1633950376.0 - FOOBAR\nINAFILE\n - user.foo=bar-2
