@@ -1254,22 +1254,45 @@ fn check_metacopy_xattr<ObjectID: FsVerityHashValue>(
     Ok(None)
 }
 
-/// Collect directory entries from an inode, yielding (name_bytes, nid) pairs.
-/// Skips "." and "..".
+/// Result of scanning a directory's entries, separating '.' and '..' from
+/// the normal children.
+struct DirEntries<'a> {
+    /// The nid that '.' points to, if present.
+    dot_nid: Option<u64>,
+    /// The nid that '..' points to, if present.
+    dotdot_nid: Option<u64>,
+    /// Child entries (everything except '.' and '..').
+    children: Vec<(&'a [u8], u64)>,
+}
+
+/// Collect directory entries from an inode, separating '.' and '..' from
+/// the normal children.
 fn dir_entries<'a>(
     img: &'a Image<'a>,
     dir_inode: &'a InodeType<'a>,
-) -> anyhow::Result<Vec<(&'a [u8], u64)>> {
-    let mut entries = Vec::new();
+) -> anyhow::Result<DirEntries<'a>> {
+    let mut result = DirEntries {
+        dot_nid: None,
+        dotdot_nid: None,
+        children: Vec::new(),
+    };
+
+    // Closure that processes a single entry
+    let mut process_entry = |entry: DirectoryEntry<'a>| {
+        if entry.name == b"." {
+            result.dot_nid = Some(entry.nid());
+        } else if entry.name == b".." {
+            result.dotdot_nid = Some(entry.nid());
+        } else {
+            result.children.push((entry.name, entry.nid()));
+        }
+    };
 
     // Block-based entries
     for blkid in img.inode_blocks(dir_inode)? {
         let block = img.directory_block(blkid)?;
         for entry in block.entries()? {
-            let entry = entry?;
-            if entry.name != b"." && entry.name != b".." {
-                entries.push((entry.name, entry.nid()));
-            }
+            process_entry(entry?);
         }
     }
 
@@ -1277,46 +1300,131 @@ fn dir_entries<'a>(
     if let Some(data) = dir_inode.inline() {
         if let Ok(block) = DirectoryBlock::ref_from_bytes(data) {
             for entry in block.entries()? {
-                let entry = entry?;
-                if entry.name != b"." && entry.name != b".." {
-                    entries.push((entry.name, entry.nid()));
-                }
+                process_entry(entry?);
             }
         }
     }
 
-    Ok(entries)
+    Ok(result)
 }
 
 /// Maximum directory nesting depth. PATH_MAX is 4096 on Linux, and directory names
 /// must be at least 2 bytes (1 char + separator), so the theoretical max is PATH_MAX / 2.
 const MAX_DIRECTORY_DEPTH: usize = 4096 / 2;
 
+/// Per-leaf nlink tracking for post-traversal validation.
+struct NlinkEntry<ObjectID: FsVerityHashValue> {
+    /// The on-disk nlink value from the inode header.
+    expected: u32,
+    /// Reference to the leaf so we can check Rc::strong_count() later.
+    leaf: Rc<tree::Leaf<ObjectID>>,
+}
+
+/// Mutable state threaded through the recursive directory traversal.
+struct TreeBuilder<ObjectID: FsVerityHashValue> {
+    /// Map from nid to first-seen leaf for hardlink detection.
+    hardlinks: HashMap<u64, Rc<tree::Leaf<ObjectID>>>,
+    /// Map from nid to nlink tracking entry for post-traversal validation.
+    nlink_tracker: HashMap<u64, NlinkEntry<ObjectID>>,
+}
+
+impl<ObjectID: FsVerityHashValue> TreeBuilder<ObjectID> {
+    fn new() -> Self {
+        Self {
+            hardlinks: HashMap::new(),
+            nlink_tracker: HashMap::new(),
+        }
+    }
+
+    /// Validate that every leaf's on-disk nlink matches the number of
+    /// references found during traversal.
+    fn validate_nlink(&self) -> anyhow::Result<()> {
+        for (nid, entry) in &self.nlink_tracker {
+            // strong_count includes: one per tree insertion + one held by
+            // nlink_tracker + possibly one in the hardlinks map.
+            let tracker_refs: usize = 1 + usize::from(self.hardlinks.contains_key(nid));
+            let tree_refs = Rc::strong_count(&entry.leaf)
+                .checked_sub(tracker_refs)
+                .expect("strong_count must be >= tracker_refs");
+            let tree_nlink: u32 = tree_refs
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("nlink overflow for inode nid {nid}"))?;
+            if entry.expected != tree_nlink {
+                anyhow::bail!(
+                    "nlink mismatch for inode nid {nid}: on-disk nlink is {}, \
+                     but found {tree_nlink} reference(s) in the directory tree",
+                    entry.expected,
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Recursively populate a `tree::Directory` from an erofs directory inode.
+///
+/// `dir_nid` and `parent_nid` are used to validate that the '.' and '..'
+/// entries point to the correct inodes.
 fn populate_directory<ObjectID: FsVerityHashValue>(
     img: &Image,
+    dir_nid: u64,
+    parent_nid: u64,
     dir_inode: &InodeType,
     dir: &mut tree::Directory<ObjectID>,
-    hardlinks: &mut HashMap<u64, Rc<tree::Leaf<ObjectID>>>,
+    builder: &mut TreeBuilder<ObjectID>,
     depth: usize,
 ) -> anyhow::Result<()> {
     if depth >= MAX_DIRECTORY_DEPTH {
         return Err(ErofsReaderError::DepthExceeded.into());
     }
 
-    for (name_bytes, nid) in dir_entries(img, dir_inode)? {
+    let dir_result = dir_entries(img, dir_inode)?;
+
+    // Validate '.' and '..' entries
+    match dir_result.dot_nid {
+        Some(nid) if nid != dir_nid => {
+            return Err(ErofsReaderError::InvalidSelfReference.into());
+        }
+        None => {
+            return Err(ErofsReaderError::InvalidSelfReference.into());
+        }
+        _ => {}
+    }
+    match dir_result.dotdot_nid {
+        Some(nid) if nid != parent_nid => {
+            return Err(ErofsReaderError::InvalidParentReference.into());
+        }
+        None => {
+            return Err(ErofsReaderError::InvalidParentReference.into());
+        }
+        _ => {}
+    }
+
+    let mut n_subdirs: u32 = 0;
+    for (name_bytes, nid) in dir_result.children {
         let name = OsStr::from_bytes(name_bytes);
         let child_inode = img.inode(nid)?;
 
         if child_inode.mode().is_dir() {
+            n_subdirs = n_subdirs
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("too many subdirectories"))?;
             let child_stat = stat_from_inode_for_tree(img, &child_inode)?;
             let mut child_dir = tree::Directory::new(child_stat);
-            populate_directory(img, &child_inode, &mut child_dir, hardlinks, depth + 1)
-                .with_context(|| format!("reading directory {:?}", name))?;
+            populate_directory(
+                img,
+                nid,
+                dir_nid,
+                &child_inode,
+                &mut child_dir,
+                builder,
+                depth + 1,
+            )
+            .with_context(|| format!("reading directory {:?}", name))?;
             dir.insert(name, tree::Inode::Directory(Box::new(child_dir)));
         } else {
             // Check if this is a hardlink (same nid seen before)
-            if let Some(existing_leaf) = hardlinks.get(&nid) {
+            if let Some(existing_leaf) = builder.hardlinks.get(&nid) {
                 dir.insert(name, tree::Inode::Leaf(Rc::clone(existing_leaf)));
                 continue;
             }
@@ -1371,12 +1479,35 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
             let leaf = Rc::new(tree::Leaf { stat, content });
 
             // Track for hardlink detection if nlink > 1
-            if child_inode.nlink() > 1 {
-                hardlinks.insert(nid, Rc::clone(&leaf));
+            let on_disk_nlink = child_inode.nlink();
+            if on_disk_nlink > 1 {
+                builder.hardlinks.insert(nid, Rc::clone(&leaf));
             }
+
+            // Track for post-traversal nlink validation
+            builder
+                .nlink_tracker
+                .entry(nid)
+                .or_insert_with(|| NlinkEntry {
+                    expected: on_disk_nlink,
+                    leaf: Rc::clone(&leaf),
+                });
 
             dir.insert(name, tree::Inode::Leaf(leaf));
         }
+    }
+
+    // Validate directory nlink: should be 2 (for '.' and parent's '..')
+    // plus one for each child subdirectory's '..' pointing back.
+    let expected_nlink = n_subdirs
+        .checked_add(2)
+        .ok_or_else(|| anyhow::anyhow!("directory nlink overflow"))?;
+    let actual_nlink = dir_inode.nlink();
+    if actual_nlink != expected_nlink {
+        anyhow::bail!(
+            "directory nlink mismatch: on-disk nlink is {actual_nlink}, \
+             expected {expected_nlink} (2 + {n_subdirs} subdirectories)",
+        );
     }
 
     Ok(())
@@ -1388,19 +1519,36 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
 /// reconstructs the tree structure, including proper handling of hardlinks
 /// (via `Rc` sharing), xattr namespace transformations, and metacopy-based
 /// external file references.
+///
+/// Validates structural invariants including:
+/// - '.' and '..' entries point to the correct directories
+/// - Directory nlink matches 2 + number of subdirectories
+/// - Leaf nlink matches the number of references in the tree
 pub fn erofs_to_filesystem<ObjectID: FsVerityHashValue>(
     image_data: &[u8],
 ) -> anyhow::Result<tree::FileSystem<ObjectID>> {
     let img = Image::open(image_data)?.restrict_to_composefs()?;
-    let root_inode = img.root()?;
+    let root_nid = img.sb.root_nid.get() as u64;
+    let root_inode = img.inode(root_nid)?;
 
     let root_stat = stat_from_inode_for_tree(&img, &root_inode)?;
     let mut fs = tree::FileSystem::new(root_stat);
 
-    let mut hardlinks: HashMap<u64, Rc<tree::Leaf<ObjectID>>> = HashMap::new();
+    let mut builder = TreeBuilder::new();
 
-    populate_directory(&img, &root_inode, &mut fs.root, &mut hardlinks, 0)
-        .context("reading root directory")?;
+    // Root's '..' points to itself
+    populate_directory(
+        &img,
+        root_nid,
+        root_nid,
+        &root_inode,
+        &mut fs.root,
+        &mut builder,
+        0,
+    )
+    .context("reading root directory")?;
+
+    builder.validate_nlink()?;
 
     Ok(fs)
 }
@@ -1414,6 +1562,36 @@ mod tests {
         fsverity::Sha256HashValue,
     };
     use std::collections::HashMap;
+
+    /// Returns whether `fsck.erofs` is available on the system.
+    /// The result is cached so the lookup only happens once.
+    fn have_fsck_erofs() -> bool {
+        static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *AVAILABLE.get_or_init(|| {
+            std::process::Command::new("fsck.erofs")
+                .arg("--help")
+                .output()
+                .is_ok()
+        })
+    }
+
+    /// Run `fsck.erofs` on an image and return whether it passed.
+    /// Returns `None` if `fsck.erofs` is not installed.
+    fn run_fsck_erofs(image: &[u8]) -> Option<bool> {
+        if !have_fsck_erofs() {
+            return None;
+        }
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let image_path = temp_dir.path().join("test.erofs");
+        std::fs::write(&image_path, image).unwrap();
+
+        let output = std::process::Command::new("fsck.erofs")
+            .arg(&image_path)
+            .output()
+            .expect("fsck.erofs was detected but failed to run");
+        Some(output.status.success())
+    }
 
     /// Helper to validate that directory entries can be read correctly
     fn validate_directory_entries(img: &Image, nid: u64, expected_names: &[&str]) {
@@ -2076,6 +2254,198 @@ mod tests {
                 case.expected_substr,
             );
         }
+    }
+
+    #[test]
+    fn test_rejects_corrupted_dot_and_dotdot() {
+        // Build a valid image and corrupt directory '.' and '..' entries
+        // to verify they are rejected by erofs_to_filesystem().
+        let dumpfile = r#"/ 4096 40755 3 0 0 0 1000.0 - - -
+/dir 4096 40755 2 0 0 0 1000.0 - - -
+/file 5 100644 1 0 0 0 1000.0 - hello -
+"#;
+
+        let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
+        let base_image = mkfs_erofs(&fs);
+
+        // Sanity: unmodified image round-trips fine
+        erofs_to_filesystem::<Sha256HashValue>(&base_image)
+            .expect("unmodified image should be accepted");
+        if let Some(ok) = run_fsck_erofs(&base_image) {
+            assert!(ok, "fsck.erofs should accept unmodified image");
+        }
+
+        // Find the byte positions of '.' entry nids in the image.
+        // Directory entries are stored inline after the inode header + xattrs.
+        // Each DirectoryEntryHeader is 12 bytes, with inode_offset at byte 0 (U64).
+        // Entries are sorted by name, so '.' comes first, then '..'.
+        let img = Image::open(&base_image).unwrap();
+        let root_nid = img.sb.root_nid.get() as u64;
+
+        // Find the child directory's nid
+        let dir_nid = img.find_child_nid(root_nid, b"dir").unwrap().unwrap();
+
+        // Locate the child directory's inline data in the raw image.
+        // The inode is at inodes_start + nid * 32, and the inline data
+        // follows the header + xattrs.
+        let dir_inode = img.inode(dir_nid).unwrap();
+        let dir_inline = dir_inode.inline().unwrap();
+
+        // Get byte offset of the inline data within the image
+        let inline_ptr = dir_inline.as_ptr() as usize;
+        let image_ptr = base_image.as_ptr() as usize;
+        let inline_offset = inline_ptr - image_ptr;
+        drop(img);
+
+        // The inline directory block contains entries sorted by name.
+        // For /dir, entries are: '.', '..'.
+        // Each DirectoryEntryHeader is 12 bytes with inode_offset (U64) at offset 0.
+
+        struct Case {
+            name: &'static str,
+            // Byte offset of the inode_offset field to corrupt, relative to inline_offset
+            entry_byte_offset: usize,
+            expected_error: &'static str,
+        }
+
+        let cases = [
+            Case {
+                name: "corrupted '.' entry",
+                entry_byte_offset: 0, // first entry's inode_offset
+                expected_error: "'.'",
+            },
+            Case {
+                name: "corrupted '..' entry",
+                entry_byte_offset: 12, // second entry's inode_offset
+                expected_error: "'..'",
+            },
+        ];
+
+        for case in &cases {
+            let mut image = base_image.clone();
+            let offset = inline_offset + case.entry_byte_offset;
+            // Write a bogus nid (0xDEAD) that doesn't match the directory's own nid
+            image[offset..offset + 8].copy_from_slice(&0xDEADu64.to_le_bytes());
+
+            let result = erofs_to_filesystem::<Sha256HashValue>(&image);
+            let err = result.expect_err(&format!("{}: should have been rejected", case.name));
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(case.expected_error),
+                "{}: expected error containing {:?}, got: {msg}",
+                case.name,
+                case.expected_error,
+            );
+
+            // Cross-check with fsck.erofs if available
+            if let Some(ok) = run_fsck_erofs(&image) {
+                assert!(
+                    !ok,
+                    "{}: fsck.erofs should also reject this corruption",
+                    case.name,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_rejects_corrupted_nlink() {
+        // Build a valid image and corrupt a leaf inode's nlink field to
+        // verify nlink validation catches the mismatch.
+        let dumpfile = r#"/ 4096 40755 2 0 0 0 1000.0 - - -
+/file 5 100644 1 0 0 0 1000.0 - hello -
+"#;
+
+        let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
+        let base_image = mkfs_erofs(&fs);
+
+        // Sanity check
+        erofs_to_filesystem::<Sha256HashValue>(&base_image)
+            .expect("unmodified image should be accepted");
+
+        // Find the file inode and corrupt its nlink field.
+        let img = Image::open(&base_image).unwrap();
+        let root_nid = img.sb.root_nid.get() as u64;
+        let file_nid = img.find_child_nid(root_nid, b"file").unwrap().unwrap();
+
+        // Compute byte offset of the file's inode in the image
+        let block_size = img.block_size;
+        let meta_start = img.sb.meta_blkaddr.get() as usize * block_size;
+        let inode_byte_offset = meta_start + file_nid as usize * 32;
+        let is_extended = base_image[inode_byte_offset] & 1 != 0;
+        drop(img);
+
+        let mut image = base_image.clone();
+        if is_extended {
+            // ExtendedInodeHeader.nlink is U32 at byte offset 44
+            let nlink_offset = inode_byte_offset + 44;
+            image[nlink_offset..nlink_offset + 4].copy_from_slice(&5u32.to_le_bytes());
+        } else {
+            // CompactInodeHeader.nlink is U16 at byte offset 6
+            let nlink_offset = inode_byte_offset + 6;
+            image[nlink_offset..nlink_offset + 2].copy_from_slice(&5u16.to_le_bytes());
+        }
+
+        let result = erofs_to_filesystem::<Sha256HashValue>(&image);
+        let err = result.expect_err("corrupted nlink should be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("nlink mismatch"),
+            "expected nlink mismatch error, got: {msg}",
+        );
+
+        // Note: fsck.erofs (as of 1.9) does not validate nlink counts --
+        // it reads nlink from disk and trusts it.  We intentionally go
+        // further here.
+    }
+
+    #[test]
+    fn test_rejects_corrupted_directory_nlink() {
+        // Build a valid image and corrupt a directory inode's nlink to
+        // verify directory nlink validation.
+        let dumpfile = r#"/ 4096 40755 3 0 0 0 1000.0 - - -
+/dir 4096 40755 2 0 0 0 1000.0 - - -
+/file 5 100644 1 0 0 0 1000.0 - hello -
+"#;
+
+        let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
+        let base_image = mkfs_erofs(&fs);
+
+        // Sanity check
+        erofs_to_filesystem::<Sha256HashValue>(&base_image)
+            .expect("unmodified image should be accepted");
+
+        // Find the child directory inode and corrupt its nlink
+        let img = Image::open(&base_image).unwrap();
+        let root_nid = img.sb.root_nid.get() as u64;
+        let dir_nid = img.find_child_nid(root_nid, b"dir").unwrap().unwrap();
+
+        let block_size = img.block_size;
+        let meta_start = img.sb.meta_blkaddr.get() as usize * block_size;
+        let inode_byte_offset = meta_start + dir_nid as usize * 32;
+        let is_extended = base_image[inode_byte_offset] & 1 != 0;
+        drop(img);
+
+        let mut image = base_image.clone();
+        if is_extended {
+            // ExtendedInodeHeader.nlink is U32 at byte offset 44
+            let nlink_offset = inode_byte_offset + 44;
+            image[nlink_offset..nlink_offset + 4].copy_from_slice(&99u32.to_le_bytes());
+        } else {
+            // CompactInodeHeader.nlink is U16 at byte offset 6
+            let nlink_offset = inode_byte_offset + 6;
+            image[nlink_offset..nlink_offset + 2].copy_from_slice(&99u16.to_le_bytes());
+        }
+
+        let result = erofs_to_filesystem::<Sha256HashValue>(&image);
+        let err = result.expect_err("corrupted directory nlink should be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("nlink mismatch"),
+            "expected directory nlink mismatch error, got: {msg}",
+        );
+
+        // Note: fsck.erofs (as of 1.9) does not validate nlink counts.
     }
 
     #[test]
