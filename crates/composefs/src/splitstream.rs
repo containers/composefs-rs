@@ -994,9 +994,8 @@ mod tests {
 
     /// Create a test repository in insecure mode (no fs-verity required).
     fn create_test_repo(path: &Path) -> Result<Arc<Repository<Sha256HashValue>>> {
-        mkdirat(CWD, path, Mode::from_raw_mode(0o755))?;
-        let mut repo = Repository::open_path(CWD, path)?;
-        repo.set_insecure(true);
+        let (repo, _) =
+            Repository::init_path(CWD, path, crate::fsverity::Algorithm::SHA256, false)?;
         Ok(Arc::new(repo))
     }
 

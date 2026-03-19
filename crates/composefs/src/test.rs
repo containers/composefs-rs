@@ -49,6 +49,8 @@ pub(crate) fn tempfile() -> std::fs::File {
 pub struct TestRepo<ObjectID: FsVerityHashValue> {
     /// The repository, wrapped in Arc for sharing.
     pub repo: Arc<Repository<ObjectID>>,
+    /// Path to the repository directory within the tempdir.
+    repo_path: PathBuf,
     /// The backing temporary directory (kept alive for the repo's lifetime).
     _tempdir: TempDir,
 }
@@ -60,10 +62,12 @@ impl<ObjectID: FsVerityHashValue> TestRepo<ObjectID> {
     /// to work without fs-verity support.
     pub fn new() -> Self {
         let dir = tempdir();
-        let mut repo = Repository::open_path(CWD, dir.path()).unwrap();
-        repo.set_insecure(true);
+        let repo_path = dir.path().join("repo");
+        let (repo, _) = Repository::init_path(CWD, &repo_path, ObjectID::ALGORITHM, false)
+            .expect("initializing test repo");
         Self {
             repo: Arc::new(repo),
+            repo_path,
             _tempdir: dir,
         }
     }
@@ -73,7 +77,7 @@ impl<ObjectID: FsVerityHashValue> TestRepo<ObjectID> {
     /// Useful in tests that need to manipulate the on-disk layout directly
     /// (e.g. corruption tests for fsck).
     pub fn path(&self) -> &std::path::Path {
-        self._tempdir.path()
+        &self.repo_path
     }
 
     /// Returns a capability-based directory handle for the repository root.
@@ -86,8 +90,7 @@ impl<ObjectID: FsVerityHashValue> TestRepo<ObjectID> {
     /// `cap_std::fs::Dir` from [`path()`](Self::path) directly.
     #[cfg(test)]
     pub fn dir(&self) -> cap_std::fs::Dir {
-        cap_std::fs::Dir::open_ambient_dir(self._tempdir.path(), cap_std::ambient_authority())
-            .unwrap()
+        cap_std::fs::Dir::open_ambient_dir(&self.repo_path, cap_std::ambient_authority()).unwrap()
     }
 }
 

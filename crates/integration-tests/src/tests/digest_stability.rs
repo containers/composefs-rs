@@ -119,6 +119,7 @@ fn test_oci_container_digest_stability() -> Result<()> {
         eprintln!("--- {} ---", image.label);
         let repo_dir = tempfile::tempdir()?;
         let repo = repo_dir.path();
+        cmd!(sh, "{cfsctl} --repo {repo} init --insecure").read()?;
 
         eprintln!("Pulling {} (this may take a while)...", image.label);
         let config = pull_image(&sh, &cfsctl, repo, image.image_ref, image.label)?;
