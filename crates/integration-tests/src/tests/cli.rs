@@ -17,10 +17,20 @@ const OCI_LAYOUT_COMPOSEFS_ID: &str =
     "f26c6eb439749b82f0d1520e83455bb21766572fb2b5cfe009dd7749a61caf74e0c42c56f1a2cbd9d\
      359e7d172c8e2c65641666c9a18cc484a8b0f6e4e6d47ab";
 
+/// Create a fresh initialized insecure repository in a tempdir.
+///
+/// Returns the tempdir (for lifetime) and the path to the repo.
+fn init_insecure_repo(sh: &Shell, cfsctl: &std::path::Path) -> Result<tempfile::TempDir> {
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    cmd!(sh, "{cfsctl} --repo {repo} init --insecure").read()?;
+    Ok(repo_dir)
+}
+
 fn test_gc_empty_repo() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
 
     let output = cmd!(sh, "{cfsctl} --insecure --repo {repo} gc").read()?;
@@ -35,7 +45,7 @@ integration_test!(test_gc_empty_repo);
 fn test_create_image_from_path() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let rootfs = create_test_rootfs(fixture_dir.path())?;
@@ -56,7 +66,7 @@ integration_test!(test_create_image_from_path);
 fn test_create_image_idempotent() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let rootfs = create_test_rootfs(fixture_dir.path())?;
@@ -83,7 +93,7 @@ integration_test!(test_create_image_idempotent);
 fn test_create_and_list_objects() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let rootfs = create_test_rootfs(fixture_dir.path())?;
@@ -111,7 +121,7 @@ integration_test!(test_create_and_list_objects);
 fn test_gc_after_create() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let rootfs = create_test_rootfs(fixture_dir.path())?;
@@ -135,7 +145,7 @@ integration_test!(test_gc_after_create);
 fn test_gc_dry_run() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let rootfs = create_test_rootfs(fixture_dir.path())?;
@@ -171,7 +181,7 @@ integration_test!(test_gc_dry_run);
 fn test_oci_images_empty_repo() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
 
     let output = cmd!(sh, "{cfsctl} --insecure --repo {repo} oci images").read()?;
@@ -186,7 +196,7 @@ integration_test!(test_oci_images_empty_repo);
 fn test_oci_images_json_empty_repo() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
 
     let output = cmd!(sh, "{cfsctl} --insecure --repo {repo} oci images --json").read()?;
@@ -273,7 +283,7 @@ fn create_oci_layout(parent: &std::path::Path) -> Result<std::path::PathBuf> {
 fn test_oci_pull_and_inspect() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let oci_layout = create_oci_layout(fixture_dir.path())?;
@@ -377,7 +387,7 @@ fn test_oci_layer_inspect() -> Result<()> {
 
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let oci_layout = create_oci_layout(fixture_dir.path())?;
@@ -493,7 +503,7 @@ integration_test!(test_oci_layer_inspect);
 fn test_dump_files() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let rootfs = create_test_rootfs(fixture_dir.path())?;
@@ -730,29 +740,29 @@ fn test_hash_match_ok() -> Result<()> {
 }
 integration_test!(test_hash_match_ok);
 
-fn test_no_metadata_backcompat() -> Result<()> {
+fn test_no_metadata_errors() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
     let repo_dir = tempfile::tempdir()?;
     let repo = repo_dir.path();
 
-    // Use repo without init (no meta.json) - should work with default sha512
-    let output = cmd!(sh, "{cfsctl} --insecure --repo {repo} gc").read()?;
+    // Use repo without init (no meta.json) - should error
+    let result = cmd!(sh, "{cfsctl} --insecure --repo {repo} gc").read();
     assert!(
-        output.contains("Objects: 0 removed"),
-        "should work without meta.json (backcompat), got: {output}"
+        result.is_err(),
+        "should fail without meta.json, got: {result:?}"
     );
 
-    // Should also work with explicit --hash sha256 (no metadata to conflict)
-    let output = cmd!(sh, "{cfsctl} --insecure --hash sha256 --repo {repo} gc").read()?;
+    // Should also fail with explicit --hash sha256 (no metadata)
+    let result = cmd!(sh, "{cfsctl} --insecure --hash sha256 --repo {repo} gc").read();
     assert!(
-        output.contains("Objects: 0 removed"),
-        "should work with --hash sha256 and no metadata, got: {output}"
+        result.is_err(),
+        "should fail with --hash sha256 and no metadata, got: {result:?}"
     );
 
     Ok(())
 }
-integration_test!(test_no_metadata_backcompat);
+integration_test!(test_no_metadata_errors);
 
 fn test_init_creates_directory() -> Result<()> {
     let sh = Shell::new()?;
@@ -830,7 +840,7 @@ integration_test!(test_auto_detect_hash_for_operations);
 fn test_fsck_empty_repo() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
 
     let output = cmd!(sh, "{cfsctl} --insecure --repo {repo} fsck --json").read()?;
@@ -846,7 +856,7 @@ integration_test!(test_fsck_empty_repo);
 fn test_fsck_healthy_repo() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let rootfs = create_test_rootfs(fixture_dir.path())?;
@@ -870,7 +880,7 @@ integration_test!(test_fsck_healthy_repo);
 fn test_fsck_detects_corrupted_object() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let rootfs = create_test_rootfs(fixture_dir.path())?;
@@ -895,7 +905,7 @@ integration_test!(test_fsck_detects_corrupted_object);
 fn test_fsck_nonzero_exit_on_corruption() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let rootfs = create_test_rootfs(fixture_dir.path())?;
@@ -917,7 +927,7 @@ integration_test!(test_fsck_nonzero_exit_on_corruption);
 fn test_oci_fsck_healthy() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let oci_layout = create_oci_layout(fixture_dir.path())?;
@@ -942,7 +952,7 @@ fn test_oci_fsck_detects_corrupted_manifest() -> Result<()> {
 
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let oci_layout = create_oci_layout(fixture_dir.path())?;
@@ -985,7 +995,7 @@ integration_test!(test_oci_fsck_detects_corrupted_manifest);
 fn test_oci_fsck_single_image() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let oci_layout = create_oci_layout(fixture_dir.path())?;
@@ -1022,7 +1032,7 @@ fn test_fsck_detects_broken_image_ref() -> Result<()> {
 
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let rootfs = create_test_rootfs(fixture_dir.path())?;
@@ -1062,3 +1072,75 @@ fn test_fsck_detects_broken_image_ref() -> Result<()> {
     Ok(())
 }
 integration_test!(test_fsck_detects_broken_image_ref);
+
+fn test_init_insecure() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+
+    let output = cmd!(sh, "{cfsctl} --repo {repo} init --insecure").read()?;
+    assert!(
+        output.contains("Initialized"),
+        "expected initialization message, got: {output}"
+    );
+    assert!(
+        output.contains("insecure"),
+        "expected insecure in output, got: {output}"
+    );
+
+    // Operations should work without --insecure flag (auto-detected)
+    let fixture_dir = tempfile::tempdir()?;
+    let rootfs = create_test_rootfs(fixture_dir.path())?;
+    let image_id = cmd!(sh, "{cfsctl} --repo {repo} create-image {rootfs}").read()?;
+    assert!(
+        !image_id.trim().is_empty(),
+        "should produce image ID on insecure repo"
+    );
+
+    let output = cmd!(sh, "{cfsctl} --repo {repo} gc").read()?;
+    assert!(
+        output.contains("Objects:"),
+        "gc should work on insecure repo, got: {output}"
+    );
+
+    Ok(())
+}
+integration_test!(test_init_insecure);
+
+fn test_require_verity_fails_on_insecure_repo() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+
+    // Create an insecure repo
+    cmd!(sh, "{cfsctl} --repo {repo} init --insecure").read()?;
+
+    // --require-verity should fail
+    let result = cmd!(sh, "{cfsctl} --require-verity --repo {repo} gc").read();
+    assert!(
+        result.is_err(),
+        "--require-verity should fail on insecure repo"
+    );
+
+    Ok(())
+}
+integration_test!(test_require_verity_fails_on_insecure_repo);
+
+fn test_missing_metadata_fails() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+
+    // Legacy repo: no init, no meta.json — should fail at open time
+    let result = cmd!(sh, "{cfsctl} --repo {repo} gc").read();
+    assert!(
+        result.is_err(),
+        "repo without meta.json should fail to open"
+    );
+
+    Ok(())
+}
+integration_test!(test_missing_metadata_fails);

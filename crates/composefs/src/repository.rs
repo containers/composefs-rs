@@ -108,9 +108,9 @@ use rustix::{
 
 use crate::{
     fsverity::{
-        compute_verity, enable_verity_maybe_copy, ensure_verity_equal, measure_verity, Algorithm,
-        CompareVerityError, EnableVerityError, FsVerityHashValue, FsVerityHasher,
-        MeasureVerityError,
+        compute_verity, enable_verity_maybe_copy, ensure_verity_equal, measure_verity,
+        measure_verity_opt, Algorithm, CompareVerityError, EnableVerityError, FsVerityHashValue,
+        FsVerityHasher, MeasureVerityError,
     },
     mount::{composefs_fsmount, mount_at},
     splitstream::{SplitStreamReader, SplitStreamWriter},
@@ -303,11 +303,23 @@ impl RepoMetadata {
     }
 }
 
+/// Read the fs-verity algorithm from a repository's `meta.json`.
+///
+/// This is the public API for determining which algorithm a repository
+/// uses before opening it (needed to choose the correct `ObjectID`
+/// generic parameter for [`Repository::open_path`]).
+///
+/// Returns `Ok(None)` when `meta.json` is absent.
+#[context("Reading repository algorithm")]
+pub fn read_repo_algorithm(repo_fd: &impl AsFd) -> Result<Option<Algorithm>> {
+    Ok(read_repo_metadata(repo_fd)?.map(|m| m.algorithm))
+}
+
 /// Read `meta.json` from a repository directory fd, if it exists.
 ///
-/// Returns `Ok(None)` when the file is absent (backward-compatible repos).
+/// Returns `Ok(None)` when the file is absent.
 #[context("Reading repository metadata")]
-pub fn read_repo_metadata(repo_fd: &impl AsFd) -> Result<Option<RepoMetadata>> {
+pub(crate) fn read_repo_metadata(repo_fd: &impl AsFd) -> Result<Option<RepoMetadata>> {
     match openat(
         repo_fd,
         REPO_METADATA_FILENAME,
@@ -315,15 +327,33 @@ pub fn read_repo_metadata(repo_fd: &impl AsFd) -> Result<Option<RepoMetadata>> {
         Mode::empty(),
     ) {
         Ok(fd) => {
-            let mut data = Vec::new();
-            File::from(fd)
-                .read_to_end(&mut data)
-                .context("reading meta.json")?;
-            Ok(Some(RepoMetadata::from_json(&data)?))
+            let meta = serde_json::from_reader(std::io::BufReader::new(File::from(fd)))
+                .context("parsing meta.json")?;
+            Ok(Some(meta))
         }
         Err(Errno::NOENT) => Ok(None),
         Err(e) => Err(e).context("opening meta.json")?,
     }
+}
+
+/// Enable fs-verity on an fd, dispatching to the correct hash type
+/// based on the [`Algorithm`].
+fn enable_verity_for_algorithm(
+    dirfd: &impl AsFd,
+    fd: BorrowedFd,
+    algorithm: &Algorithm,
+) -> Result<()> {
+    match algorithm {
+        Algorithm::Sha256 { .. } => {
+            enable_verity_maybe_copy::<crate::fsverity::Sha256HashValue>(dirfd, fd)
+                .context("enabling verity (sha256)")?;
+        }
+        Algorithm::Sha512 { .. } => {
+            enable_verity_maybe_copy::<crate::fsverity::Sha512HashValue>(dirfd, fd)
+                .context("enabling verity (sha512)")?;
+        }
+    }
+    Ok(())
 }
 
 /// Return the default path for the user-owned composefs repository.
@@ -341,8 +371,17 @@ pub fn system_path() -> PathBuf {
 ///
 /// This atomically writes (via O_TMPFILE + linkat) the metadata file.
 /// It will fail if the file already exists.
+///
+/// If `enable_verity` is true, fs-verity is enabled on `meta.json`
+/// before linking it into place.  This signals to future
+/// [`Repository::open_path`] callers that verity is required on all
+/// objects.
 #[context("Writing repository metadata")]
-pub fn write_repo_metadata(repo_fd: &impl AsFd, meta: &RepoMetadata) -> Result<()> {
+pub(crate) fn write_repo_metadata(
+    repo_fd: &impl AsFd,
+    meta: &RepoMetadata,
+    enable_verity: bool,
+) -> Result<()> {
     let data = meta.to_json()?;
 
     // Try O_TMPFILE for atomic creation
@@ -359,6 +398,11 @@ pub fn write_repo_metadata(repo_fd: &impl AsFd, meta: &RepoMetadata) -> Result<(
             file.sync_all().context("syncing metadata tmpfile")?;
 
             let ro_fd = reopen_tmpfile_ro(file).context("re-opening tmpfile read-only")?;
+
+            if enable_verity {
+                enable_verity_for_algorithm(repo_fd, ro_fd.as_fd(), &meta.algorithm)
+                    .context("enabling verity on meta.json")?;
+            }
 
             linkat(
                 CWD,
@@ -383,6 +427,19 @@ pub fn write_repo_metadata(repo_fd: &impl AsFd, meta: &RepoMetadata) -> Result<(
             let mut file = File::from(fd);
             file.write_all(&data).context("writing meta.json")?;
             file.sync_all().context("syncing meta.json to disk")?;
+
+            if enable_verity {
+                let ro_fd = openat(
+                    repo_fd,
+                    REPO_METADATA_FILENAME,
+                    OFlags::RDONLY | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .context("re-opening meta.json for verity")?;
+                drop(file);
+                enable_verity_for_algorithm(repo_fd, ro_fd.as_fd(), &meta.algorithm)
+                    .context("enabling verity on meta.json")?;
+            }
         }
         Err(e) => {
             return Err(e).context("creating tmpfile for meta.json")?;
@@ -439,6 +496,7 @@ pub struct Repository<ObjectID: FsVerityHashValue> {
     objects: OnceCell<OwnedFd>,
     write_semaphore: OnceCell<Arc<Semaphore>>,
     insecure: bool,
+    metadata: RepoMetadata,
     _data: std::marker::PhantomData<ObjectID>,
 }
 
@@ -722,14 +780,36 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// Initialize a new repository at the target path and open it.
     ///
     /// Creates the directory (mode 0700) if it does not exist, writes
-    /// `meta.json` with the algorithm derived from `ObjectID`, and
-    /// returns the opened repository.
+    /// `meta.json` for the given `algorithm`, and returns the opened
+    /// repository together with a flag indicating whether this was a
+    /// fresh initialization (`true`) or an idempotent open of an
+    /// existing repository with the same algorithm (`false`).
     ///
-    /// Fails if `meta.json` already exists (use [`open_path`] for
-    /// existing repositories).
+    /// The `algorithm` must be compatible with this repository's
+    /// `ObjectID` type (e.g. `Algorithm::Sha512` for
+    /// `Repository<Sha512HashValue>`).
+    ///
+    /// If `enable_verity` is true, fs-verity is enabled on `meta.json`,
+    /// signaling that all objects must also have verity.
+    ///
+    /// If `meta.json` already exists with a different algorithm, an
+    /// error is returned.
     #[context("Initializing repository at {}", path.as_ref().display())]
-    pub fn init_path(dirfd: impl AsFd, path: impl AsRef<Path>) -> Result<Self> {
+    pub fn init_path(
+        dirfd: impl AsFd,
+        path: impl AsRef<Path>,
+        algorithm: Algorithm,
+        enable_verity: bool,
+    ) -> Result<(Self, bool)> {
         let path = path.as_ref();
+
+        if !algorithm.is_compatible::<ObjectID>() {
+            bail!(
+                "algorithm {} is not compatible with this repository type (expected {})",
+                algorithm,
+                Algorithm::for_hash::<ObjectID>(),
+            );
+        }
 
         mkdirat(&dirfd, path, Mode::from_raw_mode(0o700))
             .or_else(|e| if e == Errno::EXIST { Ok(()) } else { Err(e) })
@@ -743,14 +823,49 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         )
         .with_context(|| format!("opening repository directory {}", path.display()))?;
 
-        let meta = RepoMetadata::for_hash::<ObjectID>();
-        write_repo_metadata(&repo_fd, &meta)?;
+        let meta = RepoMetadata::new(algorithm);
+
+        // Try to write meta.json.  If it already exists, check for
+        // idempotency: same algorithm is fine, different is an error.
+        if let Err(write_err) = write_repo_metadata(&repo_fd, &meta, enable_verity) {
+            match read_repo_metadata(&repo_fd)? {
+                Some(existing) if existing == meta => {
+                    // Idempotent: same config, already initialized.
+                    let repo = Self::open_path(dirfd, path)?;
+                    return Ok((repo, false));
+                }
+                Some(existing) => {
+                    bail!(
+                        "repository already initialized with algorithm '{}'; \
+                         cannot re-initialize with '{}'",
+                        existing.algorithm,
+                        meta.algorithm,
+                    );
+                }
+                None => {
+                    // meta.json doesn't exist, so the write failure
+                    // was something else — propagate original error.
+                    return Err(write_err);
+                }
+            }
+        }
 
         drop(repo_fd);
-        Self::open_path(dirfd, path)
+        let repo = Self::open_path(dirfd, path)?;
+        Ok((repo, true))
     }
 
     /// Open a repository at the target directory and path.
+    ///
+    /// `meta.json` is read, parsed, and validated against this
+    /// repository's `ObjectID` type.  Parsing or compatibility errors
+    /// are propagated immediately so that broken metadata is never
+    /// silently ignored.
+    ///
+    /// The repository's security mode is auto-detected: if `meta.json`
+    /// has fs-verity enabled the repo requires verity on all objects
+    /// (secure mode).  Otherwise the repository operates in insecure
+    /// mode.  Use [`set_insecure`] to override after opening.
     #[context("Opening repository at {}", path.as_ref().display())]
     pub fn open_path(dirfd: impl AsFd, path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -762,13 +877,55 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         flock(&repository, FlockOperation::LockShared)
             .context("Cannot lock composefs repository")?;
 
+        // Read, parse, and validate meta.json up front so that broken
+        // or incompatible metadata is caught immediately rather than
+        // being discovered lazily on first use.
+        let (metadata, has_verity) = Self::read_and_probe_metadata(&repository)?;
+        metadata.check_compatible::<ObjectID>()?;
+
         Ok(Self {
             repository,
             objects: OnceCell::new(),
             write_semaphore: OnceCell::new(),
-            insecure: false,
+            insecure: !has_verity,
+            metadata,
             _data: std::marker::PhantomData,
         })
+    }
+
+    /// Read, parse, and probe verity on `meta.json`.
+    ///
+    /// Returns `Ok((metadata, has_verity))` when the file exists,
+    /// and `Err` when absent or on I/O / parse failures.
+    fn read_and_probe_metadata(repo_fd: &OwnedFd) -> Result<(RepoMetadata, bool)> {
+        let meta_fd = match openat(
+            repo_fd,
+            REPO_METADATA_FILENAME,
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => bail!(
+                "{REPO_METADATA_FILENAME} not found; \
+                 this repository must be initialized with `cfsctl init`"
+            ),
+            Err(e) => return Err(e).with_context(|| format!("opening {REPO_METADATA_FILENAME}")),
+        };
+
+        // Clone the fd: one for reading, one for the verity probe.
+        let read_fd = meta_fd
+            .try_clone()
+            .context("cloning meta.json fd for reading")?;
+        let meta: RepoMetadata =
+            serde_json::from_reader(std::io::BufReader::new(File::from(read_fd)))
+                .context("parsing meta.json")?;
+
+        // Probe verity on the original fd.
+        let has_verity = measure_verity_opt::<ObjectID>(&meta_fd)
+            .context("probing verity on meta.json")?
+            .is_some();
+
+        Ok((meta, has_verity))
     }
 
     /// Open the default user-owned composefs repository.
@@ -1068,13 +1225,36 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(fd)
     }
 
-    /// By default fsverity is required to be enabled on the target
-    /// filesystem. Setting this disables verification of digests
-    /// and an instance of [`Self`] can be used on a filesystem
-    /// without fsverity support.
-    pub fn set_insecure(&mut self, insecure: bool) -> &mut Self {
-        self.insecure = insecure;
+    /// Returns whether the repository is in insecure mode.
+    ///
+    /// This is auto-detected from whether `meta.json` has fs-verity
+    /// enabled, but can be overridden with [`set_insecure`].
+    pub fn is_insecure(&self) -> bool {
+        self.insecure
+    }
+
+    /// Mark this repository as insecure, disabling verification of
+    /// fs-verity digests.  This allows operation on filesystems
+    /// without verity support.
+    pub fn set_insecure(&mut self) -> &mut Self {
+        self.insecure = true;
         self
+    }
+
+    /// Require that this repository has fs-verity enabled.
+    ///
+    /// Returns an error if the repository was not initialized with
+    /// verity on `meta.json`, since there is no mechanism to
+    /// retroactively enable verity on existing objects.
+    pub fn require_verity(&self) -> Result<()> {
+        if self.insecure {
+            bail!(
+                "repository was not initialized with fs-verity \
+                 (hint: re-create with `cfsctl init` on a \
+                 verity-capable filesystem)"
+            );
+        }
+        Ok(())
     }
 
     /// Creates a SplitStreamWriter for writing a split stream.
@@ -1978,11 +2158,11 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(result)
     }
 
-    /// Validate `meta.json` if present.
+    /// Validate `meta.json`.
     ///
-    /// Checks that the file parses correctly and that the declared algorithm
-    /// matches the repository's `ObjectID` type.  A missing `meta.json` is
-    /// not an error (older repositories won't have one).
+    /// Since `open_path` already requires `meta.json` to exist and be
+    /// parseable, this re-reads from disk to verify on-disk integrity
+    /// and checks algorithm compatibility.
     fn fsck_metadata(&self, result: &mut FsckResult) {
         match read_repo_metadata(&self.repository) {
             Ok(Some(meta)) => {
@@ -1996,8 +2176,14 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                 }
             }
             Ok(None) => {
-                // No meta.json — that's fine for older repositories.
-                log::info!("no meta.json found (pre-0.7.0 repository)");
+                // Should not happen since open_path requires meta.json,
+                // but report it if the file was removed after open.
+                result.errors.push(FsckError::MetadataParseFailed {
+                    detail: format!(
+                        "{REPO_METADATA_FILENAME} not found; \
+                         expected because repository was opened successfully"
+                    ),
+                });
             }
             Err(e) => {
                 result.errors.push(FsckError::MetadataParseFailed {
@@ -2378,14 +2564,13 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         self.repository.as_fd()
     }
 
-    /// Read the repository metadata from `meta.json`, if it exists.
+    /// Return the repository metadata parsed from `meta.json` at open time.
     ///
-    /// Returns `Ok(None)` for repositories created before metadata support
-    /// was added. When metadata is present, its version and algorithm are
-    /// not validated against this repository's generic type — call
-    /// [`RepoMetadata::check_compatible`] for that.
-    pub fn metadata(&self) -> Result<Option<RepoMetadata>> {
-        read_repo_metadata(&self.repository)
+    /// The metadata was already validated against this repository's
+    /// `ObjectID` type when the repository was opened, so no further
+    /// compatibility check is needed.
+    pub fn metadata(&self) -> &RepoMetadata {
+        &self.metadata
     }
 
     /// Lists all named stream references under a given prefix.
@@ -2549,9 +2734,7 @@ mod tests {
 
     /// Create a test repository in insecure mode (no fs-verity required).
     fn create_test_repo(path: &Path) -> Result<Arc<Repository<Sha512HashValue>>> {
-        mkdirat(CWD, path, Mode::from_raw_mode(0o755))?;
-        let mut repo = Repository::open_path(CWD, path)?;
-        repo.set_insecure(true);
+        let (repo, _) = Repository::init_path(CWD, path, Algorithm::SHA512, false)?;
         Ok(Arc::new(repo))
     }
 
@@ -3906,30 +4089,9 @@ mod tests {
     // ---- Fsck metadata validation tests ----
 
     #[tokio::test]
-    async fn test_fsck_no_metadata() -> Result<()> {
-        // Repos without meta.json should fsck cleanly.
-        let tmp = tempdir();
-        let repo = create_test_repo(&tmp.path().join("repo"))?;
-
-        let result = repo.fsck().await?;
-        assert!(result.is_ok());
-        assert!(!result.has_metadata());
-        assert!(result.errors().is_empty());
-        // Display should say "absent"
-        assert!(
-            result.to_string().contains("meta.json: absent"),
-            "display should show absent: {result}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn test_fsck_valid_metadata() -> Result<()> {
         let tmp = tempdir();
         let repo = create_test_repo(&tmp.path().join("repo"))?;
-
-        let meta = RepoMetadata::for_hash::<Sha512HashValue>();
-        write_repo_metadata(&repo.repo_fd(), &meta)?;
 
         let result = repo.fsck().await?;
         assert!(result.is_ok());
@@ -3944,11 +4106,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_fsck_corrupt_metadata() -> Result<()> {
-        // Write garbage to meta.json — fsck should report a parse error.
+        // Write garbage to meta.json after opening — fsck re-reads from disk.
         let tmp = tempdir();
         let repo = create_test_repo(&tmp.path().join("repo"))?;
 
         let dir = open_test_repo_dir(&tmp);
+        // Remove the valid meta.json and replace with garbage
+        dir.remove_file(REPO_METADATA_FILENAME)?;
         dir.write(REPO_METADATA_FILENAME, b"not valid json {{")?;
 
         let result = repo.fsck().await?;
@@ -3964,27 +4128,19 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_fsck_metadata_algorithm_mismatch() -> Result<()> {
-        // Write sha256 metadata, open repo as sha512 — fsck should report mismatch.
+    #[test]
+    fn test_open_path_requires_metadata() {
+        // Opening a directory without meta.json should fail.
         let tmp = tempdir();
-        let repo = create_test_repo(&tmp.path().join("repo"))?;
-
-        let meta = RepoMetadata::for_hash::<crate::fsverity::Sha256HashValue>();
-        write_repo_metadata(&repo.repo_fd(), &meta)?;
-
-        let result = repo.fsck().await?;
-        assert!(!result.is_ok());
-        assert!(result.has_metadata());
-        assert!(result
-            .errors()
-            .iter()
-            .any(|e| matches!(e, FsckError::MetadataAlgorithmMismatch { .. })));
+        let path = tmp.path().join("bare-repo");
+        mkdirat(CWD, &path, Mode::from_raw_mode(0o755)).unwrap();
+        let result = Repository::<Sha512HashValue>::open_path(CWD, &path);
+        assert!(result.is_err(), "open_path should fail without meta.json");
+        let err_msg = format!("{:#}", result.unwrap_err());
         assert!(
-            result.to_string().contains("meta.json: error"),
-            "display should show error for mismatch: {result}"
+            err_msg.contains("cfsctl init"),
+            "error should mention cfsctl init: {err_msg}"
         );
-        Ok(())
     }
 
     // ---- RepoMetadata / FeatureFlags tests ----

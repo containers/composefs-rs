@@ -182,12 +182,20 @@ fn mount_composefs_image(sysroot: &OwnedFd, name: &str, insecure: bool) -> Resul
     match name.len() {
         128 => {
             let mut repo = Repository::<Sha512HashValue>::open_path(sysroot, "composefs")?;
-            repo.set_insecure(insecure);
+            if insecure {
+                repo.set_insecure();
+            } else {
+                repo.require_verity()?;
+            }
             repo.mount(name).context("Failed to mount composefs image")
         }
         64 => {
             let mut repo = Repository::<Sha256HashValue>::open_path(sysroot, "composefs")?;
-            repo.set_insecure(insecure);
+            if insecure {
+                repo.set_insecure();
+            } else {
+                repo.require_verity()?;
+            }
             repo.mount(name).context("Failed to mount composefs image")
         }
         _ => anyhow::bail!("Invalid composefs digest length: {}", name.len()),

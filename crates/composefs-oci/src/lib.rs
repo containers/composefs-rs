@@ -318,6 +318,20 @@ mod test {
 
     use super::*;
 
+    /// Create a test repository with meta.json in insecure mode.
+    fn create_test_repo() -> (tempfile::TempDir, Arc<Repository<Sha256HashValue>>) {
+        let dir = tempdir();
+        let repo_path = dir.path().join("repo");
+        let (repo, _) = Repository::init_path(
+            CWD,
+            &repo_path,
+            composefs::fsverity::Algorithm::SHA256,
+            false,
+        )
+        .expect("initializing test repo");
+        (dir, Arc::new(repo))
+    }
+
     fn append_data(builder: &mut ::tar::Builder<Vec<u8>>, name: &str, size: usize) {
         let mut header = ::tar::Header::new_ustar();
         header.set_uid(0);
@@ -346,8 +360,7 @@ mod test {
         context.update(&layer);
         let layer_id = format!("sha256:{}", hex::encode(context.finalize()));
 
-        let repo_dir = tempdir();
-        let repo = Arc::new(Repository::<Sha256HashValue>::open_path(CWD, &repo_dir).unwrap());
+        let (_repo_dir, repo) = create_test_repo();
         let (id, _stats) = import_layer(&repo, &layer_id, Some("name"), &layer[..])
             .await
             .unwrap();
@@ -369,8 +382,7 @@ mod test {
     fn test_write_and_open_config() {
         use oci_spec::image::{ImageConfigurationBuilder, RootFsBuilder};
 
-        let repo_dir = tempdir();
-        let repo = Arc::new(Repository::<Sha256HashValue>::open_path(CWD, &repo_dir).unwrap());
+        let (_repo_dir, repo) = create_test_repo();
 
         let rootfs = RootFsBuilder::default()
             .typ("layers")
@@ -407,8 +419,7 @@ mod test {
     fn test_config_stored_as_external_object() {
         use oci_spec::image::{ImageConfigurationBuilder, RootFsBuilder};
 
-        let repo_dir = tempdir();
-        let repo = Arc::new(Repository::<Sha256HashValue>::open_path(CWD, &repo_dir).unwrap());
+        let (_repo_dir, repo) = create_test_repo();
 
         let rootfs = RootFsBuilder::default()
             .typ("layers")
@@ -466,8 +477,7 @@ mod test {
     fn test_open_config_bad_hash() {
         use oci_spec::image::{ImageConfigurationBuilder, RootFsBuilder};
 
-        let repo_dir = tempdir();
-        let repo = Arc::new(Repository::<Sha256HashValue>::open_path(CWD, &repo_dir).unwrap());
+        let (_repo_dir, repo) = create_test_repo();
 
         let rootfs = RootFsBuilder::default()
             .typ("layers")

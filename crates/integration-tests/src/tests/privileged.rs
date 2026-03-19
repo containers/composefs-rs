@@ -116,6 +116,9 @@ fn privileged_repo_without_insecure() -> Result<()> {
     let verity_dir = VerityTempDir::new()?;
     let repo = verity_dir.path().join("repo");
 
+    // Init on ext4+verity: meta.json gets verity enabled → secure repo
+    cmd!(sh, "{cfsctl} --repo {repo} init").run()?;
+
     let output = cmd!(sh, "{cfsctl} --repo {repo} gc").read()?;
     ensure!(
         output.contains("Objects: 0 removed"),
@@ -136,6 +139,8 @@ fn privileged_create_image() -> Result<()> {
     let repo = verity_dir.path().join("repo");
     let fixture_dir = tempfile::tempdir()?;
     let rootfs = create_test_rootfs(fixture_dir.path())?;
+
+    cmd!(sh, "{cfsctl} --repo {repo} init").run()?;
 
     let output = cmd!(sh, "{cfsctl} --repo {repo} create-image {rootfs}").read()?;
     ensure!(
@@ -160,6 +165,8 @@ fn privileged_mount_image() -> Result<()> {
     let repo = verity_dir.path().join("repo");
     let fixture_dir = tempfile::tempdir()?;
     let rootfs = create_test_rootfs(fixture_dir.path())?;
+
+    cmd!(sh, "{cfsctl} --repo {repo} init").run()?;
 
     let image_id_full = cmd!(sh, "{cfsctl} --repo {repo} create-image {rootfs}").read()?;
     // create-image outputs "algo:hex", mount expects just the hex part
@@ -196,6 +203,8 @@ fn privileged_create_image_idempotent() -> Result<()> {
     let fixture_dir = tempfile::tempdir()?;
     let rootfs = create_test_rootfs(fixture_dir.path())?;
 
+    cmd!(sh, "{cfsctl} --repo {repo} init").run()?;
+
     let id1 = cmd!(sh, "{cfsctl} --repo {repo} create-image {rootfs}").read()?;
     let id2 = cmd!(sh, "{cfsctl} --repo {repo} create-image {rootfs}").read()?;
     ensure!(
@@ -205,3 +214,69 @@ fn privileged_create_image_idempotent() -> Result<()> {
     Ok(())
 }
 integration_test!(privileged_create_image_idempotent);
+
+/// Verify that `init` on a verity-capable filesystem enables verity on
+/// meta.json, and that `--require-verity` succeeds on such a repo.
+fn privileged_init_enables_verity() -> Result<()> {
+    if require_privileged("privileged_init_enables_verity")?.is_some() {
+        return Ok(());
+    }
+
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let verity_dir = VerityTempDir::new()?;
+    let repo = verity_dir.path().join("repo");
+
+    let output = cmd!(sh, "{cfsctl} --repo {repo} init").read()?;
+    ensure!(
+        output.contains("verity") && output.contains("required"),
+        "init should report verity as required, got: {output}"
+    );
+
+    // --require-verity should succeed on this repo
+    let output = cmd!(sh, "{cfsctl} --require-verity --repo {repo} gc").read()?;
+    ensure!(
+        output.contains("Objects: 0 removed"),
+        "--require-verity gc should work on secure repo, got: {output}"
+    );
+
+    Ok(())
+}
+integration_test!(privileged_init_enables_verity);
+
+/// Verify that `init --insecure` on a verity-capable filesystem does NOT
+/// enable verity on meta.json, and `--require-verity` fails.
+fn privileged_init_insecure_skips_verity() -> Result<()> {
+    if require_privileged("privileged_init_insecure_skips_verity")?.is_some() {
+        return Ok(());
+    }
+
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let verity_dir = VerityTempDir::new()?;
+    let repo = verity_dir.path().join("repo");
+
+    let output = cmd!(sh, "{cfsctl} --repo {repo} init --insecure").read()?;
+    ensure!(
+        output.contains("insecure"),
+        "init --insecure should say insecure, got: {output}"
+    );
+
+    // --require-verity should fail even though the filesystem supports verity,
+    // because init --insecure skipped enabling it on meta.json
+    let result = cmd!(sh, "{cfsctl} --require-verity --repo {repo} gc").read();
+    ensure!(
+        result.is_err(),
+        "--require-verity should fail on insecure-initialized repo"
+    );
+
+    // But operations without --require-verity should work fine
+    let output = cmd!(sh, "{cfsctl} --repo {repo} gc").read()?;
+    ensure!(
+        output.contains("Objects: 0 removed"),
+        "gc should work on insecure repo, got: {output}"
+    );
+
+    Ok(())
+}
+integration_test!(privileged_init_insecure_skips_verity);

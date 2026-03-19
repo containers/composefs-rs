@@ -327,7 +327,14 @@ mod test {
         let (tar_data, diff_id) = build_baseimage();
 
         let repo_dir = tempdir();
-        let repo = Arc::new(Repository::<Sha256HashValue>::open_path(CWD, &repo_dir)?);
+        let repo_path = repo_dir.path().join("repo");
+        let (repo, _) = Repository::<Sha256HashValue>::init_path(
+            CWD,
+            &repo_path,
+            composefs::fsverity::Algorithm::SHA256,
+            false,
+        )?;
+        let repo = Arc::new(repo);
         let (verity, _stats) =
             crate::import_layer(&repo, &diff_id, Some("layer"), &tar_data[..]).await?;
 

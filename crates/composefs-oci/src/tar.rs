@@ -457,12 +457,13 @@ mod tests {
         Lazy::new(|| Mutex::new(Vec::new()));
 
     pub(crate) fn create_test_repository() -> Result<Arc<Repository<Sha256HashValue>>> {
-        // Create a temporary repository for testing and store it in static
         let tempdir = tempfile::TempDir::new().unwrap();
-        let fd = rustix::fs::open(
-            tempdir.path(),
-            rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::PATH,
-            0.into(),
+        let repo_path = tempdir.path().join("repo");
+        let (repo, _) = Repository::init_path(
+            rustix::fs::CWD,
+            &repo_path,
+            composefs::fsverity::Algorithm::SHA256,
+            false,
         )?;
 
         // Store tempdir in static to keep it alive
@@ -470,9 +471,6 @@ mod tests {
             let mut guard = TEST_TEMPDIRS.lock().unwrap();
             guard.push(tempdir);
         }
-
-        let mut repo = Repository::open_path(&fd, ".").unwrap();
-        repo.set_insecure(true);
 
         Ok(Arc::new(repo))
     }

@@ -36,8 +36,9 @@ use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(feature = "oci")]
 use comfy_table::{presets::UTF8_FULL, Table};
+use rustix::fs::{Mode, OFlags};
 
-use rustix::fs::{Mode, OFlags, CWD};
+use rustix::fs::CWD;
 use serde::Serialize;
 
 #[cfg(feature = "oci")]
@@ -51,10 +52,7 @@ use composefs::{
     erofs::reader::erofs_to_filesystem,
     fsverity::{Algorithm, FsVerityHashValue, Sha256HashValue, Sha512HashValue},
     generic_tree::{FileSystem, Inode},
-    repository::{
-        system_path, user_path, write_repo_metadata, RepoMetadata, Repository,
-        REPO_METADATA_FILENAME,
-    },
+    repository::{read_repo_algorithm, system_path, user_path, Repository, REPO_METADATA_FILENAME},
     tree::RegularFile,
 };
 
@@ -90,16 +88,19 @@ pub struct App {
     system: bool,
 
     /// What hash digest type to use for composefs repo.
-    /// If omitted, auto-detected from repository metadata (meta.json),
-    /// falling back to sha512.
+    /// If omitted, auto-detected from repository metadata (meta.json).
     #[clap(long, value_enum)]
     pub hash: Option<HashType>,
 
-    /// Sets the repository to insecure before running any operation and
-    /// prepend '?' to the composefs kernel command line when writing
-    /// boot entry.
-    #[clap(long)]
+    /// Deprecated: security mode is now auto-detected from meta.json.
+    /// Use `cfsctl init --insecure` to create a repo without verity.
+    /// Kept for backward compatibility.
+    #[clap(long, hide = true)]
     insecure: bool,
+
+    /// Error if the repository does not have fs-verity enabled.
+    #[clap(long)]
+    require_verity: bool,
 
     #[clap(subcommand)]
     cmd: Command,
@@ -284,8 +285,9 @@ enum Command {
     /// Initialize a new composefs repository with a metadata file.
     ///
     /// Creates the repository directory (if it doesn't exist) and writes
-    /// a `meta.json` recording the digest algorithm. Subsequent commands
-    /// will auto-detect the algorithm from this file and error on mismatch.
+    /// a `meta.json` recording the digest algorithm.  By default fs-verity
+    /// is enabled on `meta.json`, signaling that all objects require
+    /// verity.  Use `--insecure` to skip (e.g. on tmpfs).
     Init {
         /// The fs-verity algorithm identifier.
         /// Format: fsverity-<hash>-<lg_blocksize>, e.g. fsverity-sha512-12
@@ -294,6 +296,9 @@ enum Command {
         /// Path to the repository directory (created if it doesn't exist).
         /// If omitted, uses --repo/--user/--system location.
         path: Option<PathBuf>,
+        /// Do not enable fs-verity on meta.json (insecure repository).
+        #[clap(long)]
+        insecure: bool,
     },
     /// Take a transaction lock on the repository.
     /// This prevents garbage collection from occurring.
@@ -438,21 +443,22 @@ fn resolve_repo_path(args: &App) -> Result<PathBuf> {
 /// `Repository::metadata`) because this runs *before* we know which
 /// generic `ObjectID` type to use — that's exactly what we're deciding.
 fn resolve_hash_type(repo_path: &Path, cli_hash: Option<HashType>) -> Result<HashType> {
-    // Try reading meta.json from the repo path
-    let meta_path = repo_path.join(REPO_METADATA_FILENAME);
-    let data = match std::fs::read(&meta_path) {
-        Ok(data) => data,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // No metadata: use CLI flag or default
-            return Ok(cli_hash.unwrap_or(HashType::Sha512));
-        }
-        Err(e) => {
-            return Err(anyhow::Error::new(e).context("reading repository meta.json"));
-        }
-    };
+    let repo_fd = rustix::fs::open(
+        repo_path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .with_context(|| format!("opening repository {}", repo_path.display()))?;
 
-    let meta = RepoMetadata::from_json(&data)?;
-    let detected = match meta.algorithm {
+    let algorithm = read_repo_algorithm(&repo_fd)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "{REPO_METADATA_FILENAME} not found in {}; \
+             this repository must be initialized with `cfsctl init`",
+            repo_path.display(),
+        )
+    })?;
+
+    let detected = match algorithm {
         Algorithm::Sha256 { .. } => HashType::Sha256,
         Algorithm::Sha512 { .. } => HashType::Sha512,
     };
@@ -461,9 +467,8 @@ fn resolve_hash_type(repo_path: &Path, cli_hash: Option<HashType>) -> Result<Has
     if let Some(explicit) = cli_hash {
         if explicit != detected {
             anyhow::bail!(
-                "repository is configured for {} (from {}) but --hash {} was specified",
-                meta.algorithm,
-                REPO_METADATA_FILENAME,
+                "repository is configured for {algorithm} (from {REPO_METADATA_FILENAME}) \
+                 but --hash {} was specified",
                 match explicit {
                     HashType::Sha256 => "sha256",
                     HashType::Sha512 => "sha512",
@@ -481,9 +486,10 @@ pub async fn run_app(args: App) -> Result<()> {
     if let Command::Init {
         ref algorithm,
         ref path,
+        insecure,
     } = args.cmd
     {
-        return run_init(algorithm, path.as_deref(), &args);
+        return run_init(algorithm, path.as_deref(), insecure || args.insecure, &args);
     }
 
     let repo_path = resolve_repo_path(&args)?;
@@ -496,57 +502,44 @@ pub async fn run_app(args: App) -> Result<()> {
 }
 
 /// Handle `cfsctl init`
-fn run_init(algorithm: &Algorithm, path: Option<&Path>, args: &App) -> Result<()> {
-    let meta = RepoMetadata::new(*algorithm);
-
+fn run_init(algorithm: &Algorithm, path: Option<&Path>, insecure: bool, args: &App) -> Result<()> {
     let repo_path = if let Some(p) = path {
         p.to_path_buf()
     } else {
         resolve_repo_path(args)?
     };
 
-    // Create the directory if it doesn't exist
-    std::fs::create_dir_all(&repo_path)
-        .with_context(|| format!("creating repository directory {}", repo_path.display()))?;
-
-    // Check if meta.json already exists
-    let meta_path = repo_path.join(REPO_METADATA_FILENAME);
-    if meta_path.exists() {
-        // Read existing and compare
-        let existing_data = std::fs::read(&meta_path)
-            .with_context(|| format!("reading existing {}", meta_path.display()))?;
-        let existing = RepoMetadata::from_json(&existing_data)?;
-        if existing == meta {
-            // Idempotent: same config, nothing to do
-            println!("Repository already initialized at {}", repo_path.display());
-            return Ok(());
-        }
-        anyhow::bail!(
-            "repository at {} already initialized with algorithm '{}' (version {}); \
-             cannot re-initialize with '{}'",
-            repo_path.display(),
-            existing.algorithm,
-            existing.version,
-            algorithm,
-        );
+    // Ensure parent directories exist (init_path only creates the final dir).
+    if let Some(parent) = repo_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating parent directories for {}", repo_path.display()))?;
     }
 
-    // Open the repo dir fd and write metadata.
-    let repo_fd = rustix::fs::open(
-        &repo_path,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .with_context(|| format!("opening repository directory {}", repo_path.display()))?;
+    // init_path handles idempotency: same algorithm is a no-op,
+    // different algorithm is an error.
+    let created = match algorithm {
+        Algorithm::Sha256 { .. } => {
+            Repository::<Sha256HashValue>::init_path(CWD, &repo_path, *algorithm, !insecure)?.1
+        }
+        Algorithm::Sha512 { .. } => {
+            Repository::<Sha512HashValue>::init_path(CWD, &repo_path, *algorithm, !insecure)?.1
+        }
+    };
 
-    write_repo_metadata(&repo_fd, &meta)?;
-
-    println!(
-        "Initialized composefs repository at {}",
-        repo_path.display()
-    );
-    println!("  algorithm: {}", meta.algorithm);
-    println!("  version:   {}", meta.version);
+    if created {
+        println!(
+            "Initialized composefs repository at {}",
+            repo_path.display()
+        );
+        println!("  algorithm: {algorithm}");
+        if insecure {
+            println!("  verity:    not required (insecure)");
+        } else {
+            println!("  verity:    required");
+        }
+    } else {
+        println!("Repository already initialized at {}", repo_path.display());
+    }
 
     Ok(())
 }
@@ -558,7 +551,15 @@ where
 {
     let path = resolve_repo_path(args)?;
     let mut repo = Repository::open_path(CWD, path)?;
-    repo.set_insecure(args.insecure);
+    // Hidden --insecure flag for backward compatibility; the default
+    // now is to inherit the repo config, but if it's specified we
+    // disable requiring verity even if the repo says to use it.
+    if args.insecure {
+        repo.set_insecure();
+    }
+    if args.require_verity {
+        repo.require_verity()?;
+    }
     Ok(repo)
 }
 
@@ -869,7 +870,7 @@ where
                     &repo,
                     entry,
                     &id,
-                    args.insecure,
+                    repo.is_insecure(),
                     bootdir,
                     None,
                     entry_id.as_deref(),
