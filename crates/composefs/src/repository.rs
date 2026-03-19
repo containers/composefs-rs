@@ -100,7 +100,7 @@ use fn_error_context::context;
 use once_cell::sync::OnceCell;
 use rustix::{
     fs::{
-        flock, linkat, mkdirat, open, openat, readlinkat, statat, syncfs, unlinkat, AtFlags, Dir,
+        flock, linkat, mkdirat, openat, readlinkat, statat, syncfs, unlinkat, AtFlags, Dir,
         FileType, FlockOperation, Mode, OFlags, CWD,
     },
     io::{Errno, Result as ErrnoResult},
@@ -114,7 +114,7 @@ use crate::{
     },
     mount::{composefs_fsmount, mount_at},
     splitstream::{SplitStreamReader, SplitStreamWriter},
-    util::{proc_self_fd, replace_symlinkat, ErrnoFilter},
+    util::{proc_self_fd, reopen_tmpfile_ro, replace_symlinkat, ErrnoFilter},
 };
 
 /// The filename used for repository metadata.
@@ -357,10 +357,12 @@ pub fn write_repo_metadata(repo_fd: &impl AsFd, meta: &RepoMetadata) -> Result<(
             file.write_all(&data)
                 .context("writing metadata to tmpfile")?;
             file.sync_all().context("syncing metadata tmpfile")?;
-            // Link into place
+
+            let ro_fd = reopen_tmpfile_ro(file).context("re-opening tmpfile read-only")?;
+
             linkat(
                 CWD,
-                proc_self_fd(&file),
+                proc_self_fd(&ro_fd),
                 repo_fd,
                 REPO_METADATA_FILENAME,
                 AtFlags::SYMLINK_FOLLOW,
@@ -860,13 +862,8 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         file: File,
         size: u64,
     ) -> Result<(ObjectID, ObjectStoreMethod)> {
-        // Re-open as read-only via /proc/self/fd (required for verity enable)
-        let fd_path = proc_self_fd(&file);
-        let ro_fd = open(&*fd_path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
-            .context("Re-opening tmpfile as read-only for verity")?;
-
-        // Must close writable fd before enabling verity
-        drop(file);
+        let ro_fd =
+            reopen_tmpfile_ro(file).context("Re-opening tmpfile as read-only for verity")?;
 
         // Get objects_dir early since we may need it for verity copy
         let objects_dir = self
@@ -1005,17 +1002,10 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             .with_context(|| "Creating tempfile in object subdirectory")?;
         let mut file = File::from(fd);
         file.write_all(data).context("Writing data to tmpfile")?;
-        // We can't enable verity with an open writable fd, so re-open and close the old one.
-        let ro_fd = open(
-            proc_self_fd(&file),
-            OFlags::RDONLY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .context("Re-opening file as read-only for verity")?;
         // NB: We should do fdatasync() or fsync() here, but doing this for each file forces the
         // creation of a massive number of journal commits and is a performance disaster.  We need
         // to coordinate this at a higher level.  See .write_stream().
-        drop(file);
+        let ro_fd = reopen_tmpfile_ro(file).context("Re-opening file as read-only for verity")?;
 
         let ro_fd = match enable_verity_maybe_copy::<ObjectID>(dirfd, ro_fd.as_fd()) {
             Ok(maybe_fd) => {
