@@ -299,6 +299,12 @@ enum Command {
         /// Do not enable fs-verity on meta.json (insecure repository).
         #[clap(long)]
         insecure: bool,
+        /// Migrate an old-format repository: remove streams/ and images/
+        /// (which encode the algorithm) but keep objects/, then write
+        /// fresh meta.json.  Streams and images will need to be
+        /// re-imported after migration.
+        #[clap(long)]
+        reset_metadata: bool,
     },
     /// Take a transaction lock on the repository.
     /// This prevents garbage collection from occurring.
@@ -487,9 +493,16 @@ pub async fn run_app(args: App) -> Result<()> {
         ref algorithm,
         ref path,
         insecure,
+        reset_metadata,
     } = args.cmd
     {
-        return run_init(algorithm, path.as_deref(), insecure || args.insecure, &args);
+        return run_init(
+            algorithm,
+            path.as_deref(),
+            insecure || args.insecure,
+            reset_metadata,
+            &args,
+        );
     }
 
     let repo_path = resolve_repo_path(&args)?;
@@ -502,12 +515,22 @@ pub async fn run_app(args: App) -> Result<()> {
 }
 
 /// Handle `cfsctl init`
-fn run_init(algorithm: &Algorithm, path: Option<&Path>, insecure: bool, args: &App) -> Result<()> {
+fn run_init(
+    algorithm: &Algorithm,
+    path: Option<&Path>,
+    insecure: bool,
+    reset_metadata: bool,
+    args: &App,
+) -> Result<()> {
     let repo_path = if let Some(p) = path {
         p.to_path_buf()
     } else {
         resolve_repo_path(args)?
     };
+
+    if reset_metadata {
+        composefs::repository::reset_metadata(&repo_path)?;
+    }
 
     // Ensure parent directories exist (init_path only creates the final dir).
     if let Some(parent) = repo_path.parent() {

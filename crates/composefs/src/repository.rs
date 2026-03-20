@@ -120,6 +120,56 @@ use crate::{
 /// The filename used for repository metadata.
 pub const REPO_METADATA_FILENAME: &str = "meta.json";
 
+/// Errors that can occur when opening a repository.
+#[derive(Debug, thiserror::Error)]
+pub enum RepositoryOpenError {
+    /// `meta.json` is missing and the directory does not appear to be
+    /// an existing repository.
+    #[error("{REPO_METADATA_FILENAME} not found; this repository must be initialized with `cfsctl init`")]
+    MetadataMissing,
+    /// `meta.json` is missing but `objects/` exists, indicating an
+    /// old-format repository that predates `meta.json`.
+    #[error("{REPO_METADATA_FILENAME} not found; this appears to be an old-format repository — run `cfsctl init --reset-metadata` to migrate")]
+    OldFormatRepository,
+    /// `meta.json` exists but could not be parsed.
+    #[error("failed to parse {REPO_METADATA_FILENAME}")]
+    MetadataInvalid(#[source] serde_json::Error),
+    /// The algorithm in `meta.json` does not match the expected type.
+    #[error("repository algorithm {found} does not match expected {expected}")]
+    AlgorithmMismatch {
+        /// The algorithm found in `meta.json`.
+        found: Algorithm,
+        /// The algorithm expected for this repository type.
+        expected: Algorithm,
+    },
+    /// The repository format version is newer than this tool supports.
+    #[error(
+        "unsupported repository format version {found} (this tool supports up to {REPO_FORMAT_VERSION})"
+    )]
+    UnsupportedVersion {
+        /// The version found in `meta.json`.
+        found: u32,
+    },
+    /// The repository requires features this tool does not understand.
+    #[error("repository requires unknown incompatible features: {0:?}")]
+    IncompatibleFeatures(Vec<String>),
+    /// An I/O error occurred while opening or probing the repository.
+    #[error(transparent)]
+    Io(std::io::Error),
+}
+
+impl From<Errno> for RepositoryOpenError {
+    fn from(e: Errno) -> Self {
+        Self::Io(e.into())
+    }
+}
+
+impl From<std::io::Error> for RepositoryOpenError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
 /// The current repository format version.
 ///
 /// This is a simple integer that is bumped only for fundamental,
@@ -188,20 +238,16 @@ impl FeatureFlags {
     /// Returns an error if any unknown incompatible features are present.
     /// Returns [`FeatureCheck::ReadOnly`] if unknown ro-compat features
     /// are present. Returns [`FeatureCheck::ReadWrite`] otherwise.
-    pub fn check(&self) -> Result<FeatureCheck> {
+    pub fn check(&self) -> Result<FeatureCheck, RepositoryOpenError> {
         // Check incompatible features first
-        let unknown_incompat: Vec<&str> = self
+        let unknown_incompat: Vec<String> = self
             .incompatible
             .iter()
-            .map(String::as_str)
-            .filter(|f| !known_features::INCOMPAT.contains(f))
+            .filter(|f| !known_features::INCOMPAT.contains(&f.as_str()))
+            .cloned()
             .collect();
         if !unknown_incompat.is_empty() {
-            bail!(
-                "repository requires unknown incompatible features: {}; \
-                 upgrade your tools",
-                unknown_incompat.join(", "),
-            );
+            return Err(RepositoryOpenError::IncompatibleFeatures(unknown_incompat));
         }
 
         // Check ro-compat features
@@ -268,24 +314,21 @@ impl RepoMetadata {
     ///
     /// Validates the base version, feature flags, and algorithm.
     /// Returns a [`FeatureCheck`] indicating read-write or read-only access.
-    pub fn check_compatible<ObjectID: FsVerityHashValue>(&self) -> Result<FeatureCheck> {
+    pub fn check_compatible<ObjectID: FsVerityHashValue>(
+        &self,
+    ) -> Result<FeatureCheck, RepositoryOpenError> {
         if self.version > REPO_FORMAT_VERSION {
-            bail!(
-                "unsupported repository format version {} (this tool supports up to {})",
-                self.version,
-                REPO_FORMAT_VERSION,
-            );
+            return Err(RepositoryOpenError::UnsupportedVersion {
+                found: self.version,
+            });
+        }
+        if !self.algorithm.is_compatible::<ObjectID>() {
+            return Err(RepositoryOpenError::AlgorithmMismatch {
+                found: self.algorithm,
+                expected: Algorithm::for_hash::<ObjectID>(),
+            });
         }
         let access = self.features.check()?;
-        if !self.algorithm.is_compatible::<ObjectID>() {
-            bail!(
-                "repository uses algorithm '{}' but was opened as {} \
-                 (hint: use --hash {} or omit --hash to auto-detect)",
-                self.algorithm,
-                ObjectID::ALGORITHM.hash_name(),
-                self.algorithm.hash_name(),
-            );
-        }
         Ok(access)
     }
 
@@ -352,6 +395,31 @@ fn enable_verity_for_algorithm(
             enable_verity_maybe_copy::<crate::fsverity::Sha512HashValue>(dirfd, fd)
                 .context("enabling verity (sha512)")?;
         }
+    }
+    Ok(())
+}
+
+/// Remove algorithm-specific data from a repository directory.
+///
+/// Deletes `streams/`, `images/`, and `meta.json` but preserves
+/// `objects/` (content-addressed blobs that are algorithm-agnostic).
+/// This prepares the repository for re-initialization with a
+/// (potentially different) algorithm via [`Repository::init_path`].
+///
+/// After calling this, streams and images will need to be re-imported.
+#[context("Resetting repository metadata at {}", path.as_ref().display())]
+pub fn reset_metadata(path: impl AsRef<Path>) -> Result<()> {
+    let path = path.as_ref();
+    for dir in ["streams", "images"] {
+        let p = path.join(dir);
+        if p.exists() {
+            std::fs::remove_dir_all(&p).with_context(|| format!("removing {}", p.display()))?;
+        }
+    }
+    let meta_path = path.join(REPO_METADATA_FILENAME);
+    if meta_path.exists() {
+        std::fs::remove_file(&meta_path)
+            .with_context(|| format!("removing {}", meta_path.display()))?;
     }
     Ok(())
 }
@@ -866,16 +934,16 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// has fs-verity enabled the repo requires verity on all objects
     /// (secure mode).  Otherwise the repository operates in insecure
     /// mode.  Use [`set_insecure`] to override after opening.
-    #[context("Opening repository at {}", path.as_ref().display())]
-    pub fn open_path(dirfd: impl AsFd, path: impl AsRef<Path>) -> Result<Self> {
+    pub fn open_path(
+        dirfd: impl AsFd,
+        path: impl AsRef<Path>,
+    ) -> Result<Self, RepositoryOpenError> {
         let path = path.as_ref();
 
         // O_PATH isn't enough because flock()
-        let repository = openat(dirfd, path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
-            .with_context(|| format!("Cannot open composefs repository at {}", path.display()))?;
+        let repository = openat(dirfd, path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())?;
 
-        flock(&repository, FlockOperation::LockShared)
-            .context("Cannot lock composefs repository")?;
+        flock(&repository, FlockOperation::LockShared)?;
 
         // Read, parse, and validate meta.json up front so that broken
         // or incompatible metadata is caught immediately rather than
@@ -897,7 +965,9 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     ///
     /// Returns `Ok((metadata, has_verity))` when the file exists,
     /// and `Err` when absent or on I/O / parse failures.
-    fn read_and_probe_metadata(repo_fd: &OwnedFd) -> Result<(RepoMetadata, bool)> {
+    fn read_and_probe_metadata(
+        repo_fd: &OwnedFd,
+    ) -> Result<(RepoMetadata, bool), RepositoryOpenError> {
         let meta_fd = match openat(
             repo_fd,
             REPO_METADATA_FILENAME,
@@ -905,24 +975,30 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             Mode::empty(),
         ) {
             Ok(fd) => fd,
-            Err(Errno::NOENT) => bail!(
-                "{REPO_METADATA_FILENAME} not found; \
-                 this repository must be initialized with `cfsctl init`"
-            ),
-            Err(e) => return Err(e).with_context(|| format!("opening {REPO_METADATA_FILENAME}")),
+            Err(Errno::NOENT) => {
+                // Detect old-format repositories that have objects/ but
+                // no meta.json.  Use filter_errno so non-ENOENT errors
+                // from statat are propagated.
+                return Err(
+                    match statat(repo_fd, "objects", AtFlags::empty()).filter_errno(Errno::NOENT) {
+                        Ok(Some(_)) => RepositoryOpenError::OldFormatRepository,
+                        Ok(None) => RepositoryOpenError::MetadataMissing,
+                        Err(e) => e.into(),
+                    },
+                );
+            }
+            Err(e) => return Err(e.into()),
         };
 
         // Clone the fd: one for reading, one for the verity probe.
-        let read_fd = meta_fd
-            .try_clone()
-            .context("cloning meta.json fd for reading")?;
+        let read_fd = meta_fd.try_clone()?;
         let meta: RepoMetadata =
             serde_json::from_reader(std::io::BufReader::new(File::from(read_fd)))
-                .context("parsing meta.json")?;
+                .map_err(RepositoryOpenError::MetadataInvalid)?;
 
         // Probe verity on the original fd.
         let has_verity = measure_verity_opt::<ObjectID>(&meta_fd)
-            .context("probing verity on meta.json")?
+            .map_err(|e| std::io::Error::other(e.to_string()))?
             .is_some();
 
         Ok((meta, has_verity))
@@ -931,13 +1007,13 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// Open the default user-owned composefs repository.
     #[context("Opening user repository")]
     pub fn open_user() -> Result<Self> {
-        Self::open_path(CWD, user_path()?)
+        Ok(Self::open_path(CWD, user_path()?)?)
     }
 
     /// Open the default system-global composefs repository.
     #[context("Opening system repository")]
     pub fn open_system() -> Result<Self> {
-        Self::open_path(CWD, system_path())
+        Ok(Self::open_path(CWD, system_path())?)
     }
 
     fn ensure_dir(&self, dir: impl AsRef<Path>) -> ErrnoResult<()> {
@@ -2727,7 +2803,7 @@ fn fsck_measure_object<ObjectID: FsVerityHashValue>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fsverity::Sha512HashValue;
+    use crate::fsverity::{Sha256HashValue, Sha512HashValue};
     use crate::test::tempdir;
     use rustix::fs::{statat, CWD};
     use tempfile::TempDir;
@@ -4130,17 +4206,39 @@ mod tests {
 
     #[test]
     fn test_open_path_requires_metadata() {
-        // Opening a directory without meta.json should fail.
+        // Opening a directory without meta.json should fail with MetadataMissing.
         let tmp = tempdir();
         let path = tmp.path().join("bare-repo");
         mkdirat(CWD, &path, Mode::from_raw_mode(0o755)).unwrap();
-        let result = Repository::<Sha512HashValue>::open_path(CWD, &path);
-        assert!(result.is_err(), "open_path should fail without meta.json");
-        let err_msg = format!("{:#}", result.unwrap_err());
-        assert!(
-            err_msg.contains("cfsctl init"),
-            "error should mention cfsctl init: {err_msg}"
-        );
+        assert!(matches!(
+            Repository::<Sha512HashValue>::open_path(CWD, &path),
+            Err(RepositoryOpenError::MetadataMissing)
+        ));
+    }
+
+    #[test]
+    fn test_open_path_detects_old_format() {
+        // A directory with objects/ but no meta.json → OldFormatRepository.
+        let tmp = tempdir();
+        let path = tmp.path().join("old-repo");
+        mkdirat(CWD, &path, Mode::from_raw_mode(0o755)).unwrap();
+        mkdirat(CWD, &path.join("objects"), Mode::from_raw_mode(0o755)).unwrap();
+        assert!(matches!(
+            Repository::<Sha512HashValue>::open_path(CWD, &path),
+            Err(RepositoryOpenError::OldFormatRepository)
+        ));
+    }
+
+    #[test]
+    fn test_open_path_algorithm_mismatch() {
+        // Open a sha512 repo as sha256 → AlgorithmMismatch.
+        let tmp = tempdir();
+        let path = tmp.path().join("sha512-repo");
+        Repository::<Sha512HashValue>::init_path(CWD, &path, Algorithm::SHA512, false).unwrap();
+        assert!(matches!(
+            Repository::<Sha256HashValue>::open_path(CWD, &path),
+            Err(RepositoryOpenError::AlgorithmMismatch { .. })
+        ));
     }
 
     // ---- RepoMetadata / FeatureFlags tests ----

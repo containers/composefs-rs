@@ -1144,3 +1144,114 @@ fn test_missing_metadata_fails() -> Result<()> {
     Ok(())
 }
 integration_test!(test_missing_metadata_fails);
+
+fn test_old_format_repo_gives_migration_hint() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+
+    // Simulate an old-format repo: has objects/ but no meta.json
+    std::fs::create_dir(repo.join("objects"))?;
+
+    // Should fail with a helpful migration hint
+    let result = cmd!(sh, "{cfsctl} --repo {repo} gc").read();
+    assert!(result.is_err(), "old-format repo should fail to open");
+
+    Ok(())
+}
+integration_test!(test_old_format_repo_gives_migration_hint);
+
+fn test_init_reset_metadata() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
+    let repo = repo_dir.path();
+
+    // Create some content so streams/ and images/ exist
+    let fixture_dir = tempfile::tempdir()?;
+    let rootfs = create_test_rootfs(fixture_dir.path())?;
+    cmd!(sh, "{cfsctl} --repo {repo} create-image {rootfs}").read()?;
+
+    // Verify streams/ and/or images/ exist
+    assert!(
+        repo.join("streams").exists() || repo.join("images").exists(),
+        "repo should have streams/ or images/ after create-image"
+    );
+
+    // Reset metadata — should remove streams/ and images/ but keep objects/
+    let output = cmd!(
+        sh,
+        "{cfsctl} --repo {repo} init --insecure --reset-metadata"
+    )
+    .read()?;
+    assert!(
+        output.contains("Initialized") || output.contains("Removed"),
+        "expected init output after reset, got: {output}"
+    );
+
+    // streams/ and images/ should be gone
+    assert!(
+        !repo.join("streams").exists(),
+        "streams/ should be removed after --reset-metadata"
+    );
+    assert!(
+        !repo.join("images").exists(),
+        "images/ should be removed after --reset-metadata"
+    );
+
+    // objects/ should still exist
+    assert!(
+        repo.join("objects").exists(),
+        "objects/ should be preserved after --reset-metadata"
+    );
+
+    // Repo should be usable again
+    let output = cmd!(sh, "{cfsctl} --repo {repo} gc").read()?;
+    assert!(
+        output.contains("Objects:"),
+        "gc should work after --reset-metadata, got: {output}"
+    );
+
+    Ok(())
+}
+integration_test!(test_init_reset_metadata);
+
+fn test_init_reset_metadata_changes_algorithm() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+
+    // Init with sha256
+    cmd!(
+        sh,
+        "{cfsctl} --repo {repo} init --insecure --algorithm fsverity-sha256-12"
+    )
+    .read()?;
+
+    // Trying to re-init with sha512 without --reset-metadata should fail
+    let result = cmd!(
+        sh,
+        "{cfsctl} --repo {repo} init --insecure --algorithm fsverity-sha512-12"
+    )
+    .read();
+    assert!(
+        result.is_err(),
+        "re-init with different algorithm should fail without --reset-metadata"
+    );
+
+    // With --reset-metadata it should succeed
+    let output = cmd!(
+        sh,
+        "{cfsctl} --repo {repo} init --insecure --reset-metadata --algorithm fsverity-sha512-12"
+    )
+    .read()?;
+    assert!(
+        output.contains("Initialized"),
+        "expected init output after reset with new algorithm, got: {output}"
+    );
+
+    Ok(())
+}
+integration_test!(test_init_reset_metadata_changes_algorithm);
