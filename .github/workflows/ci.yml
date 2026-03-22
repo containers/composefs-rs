@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
     - uses: dtolnay/rust-toolchain@nightly
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
     - run: cargo +nightly -Z package-workspace package
 
   fedora:
@@ -35,7 +35,7 @@ jobs:
     - run: dnf -y install cargo clippy composefs-devel e2fsprogs just rustfmt
     - name: Enable fs-verity on /
       run: tune2fs -O verity $(findmnt -vno SOURCE /run/host)
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
     - run: just build
     - run: just check
     - run: env CFS_TEST_TMPDIR=/run/host/var/tmp just test
@@ -47,7 +47,7 @@ jobs:
     name: Unprivileged smoke test
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: bootc-dev/actions/bootc-ubuntu-setup@main
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -59,9 +59,9 @@ jobs:
     name: Fuzz smoke test
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
-      - uses: extractions/setup-just@v2
+      - uses: extractions/setup-just@v3
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates/composefs/fuzz
@@ -73,7 +73,7 @@ jobs:
         run: just fuzz-all
       - name: Upload fuzz artifacts on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-artifacts
           path: |
@@ -105,7 +105,7 @@ jobs:
       COMPOSEFS_CFSCTL_FEATURES: ${{ matrix.cfsctl_features }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Setup
         uses: bootc-dev/actions/bootc-ubuntu-setup@main
@@ -177,10 +177,10 @@ jobs:
         sudo apt update
         sudo apt install -y crun/plucky podman/plucky
 
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Check cache for patched tools
-      uses: actions/cache@v3
+      uses: actions/cache@v5
       with:
         path: ~/bin
         key: patched-tools-bin-${{ hashFiles('examples/common/install-patched-tools') }}
