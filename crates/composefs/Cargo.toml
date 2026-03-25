@@ -24,23 +24,23 @@ hex = { version = "0.4.0", default-features = false, features = ["std"] }
 log = { version = "0.4.8", default-features = false }
 once_cell = { version = "1.21.3", default-features = false, features = ["std"] }
 rustix = { version = "1.0.0", default-features = false, features = ["fs", "mount", "process", "std"] }
-sha2 = { version = "0.10.1", default-features = false, features = ["std"] }
+sha2 = { version = "0.11.0", default-features = false, features = ["std"] }
 thiserror = { version = "2.0.0", default-features = false }
 tokio = { version = "1.24.2", default-features = false, features = ["macros", "process", "io-util", "rt-multi-thread", "sync"] }
 tempfile = { version = "3.8.0", optional = true, default-features = false }
 xxhash-rust = { version = "0.8.2", default-features = false, features = ["xxh32"] }
 zerocopy = { version = "0.8.0", default-features = false, features = ["derive", "std"] }
 zstd = { version = "0.13.0", default-features = false }
-rand = { version = "0.9.1", default-features = true }
+rand = { version = "0.10.0", default-features = true }
 
 [dev-dependencies]
-cap-std = { version = "3.4.5", default-features = false }
-cap-tempfile = { version = "3.4.5", default-features = false }
+cap-std = { version = "4.0.0", default-features = false }
+cap-tempfile = { version = "4.0.0", default-features = false }
 insta = "1.42.2"
 proptest = "1"
 similar-asserts = "1.7.0"
 tempfile = { version = "3.8.0", default-features = false }
-test-with = { version = "0.14", default-features = false, features = ["executable", "runtime"] }
+test-with = { version = "0.16", default-features = false, features = ["executable", "runtime"] }
 tokio-test = "0.4.4"
 
 [lints]
