@@ -11,6 +11,7 @@
 use std::{ffi::OsStr, os::unix::ffi::OsStrExt, rc::Rc};
 
 use anyhow::{ensure, Context, Result};
+use composefs::util::DigestWrite;
 use fn_error_context::context;
 use sha2::{Digest, Sha256};
 
@@ -117,7 +118,7 @@ pub fn create_filesystem<ObjectID: FsVerityHashValue>(
             // stream.
             let mut layer_stream =
                 repo.open_stream("", Some(layer_verity), Some(TAR_LAYER_CONTENT_TYPE))?;
-            let mut context = Sha256::new();
+            let mut context = DigestWrite(Sha256::new());
             layer_stream.cat(repo, &mut context)?;
             let content_hash = format!("sha256:{}", hex::encode(context.finalize()));
             ensure!(content_hash == *diff_id, "Layer has incorrect checksum");

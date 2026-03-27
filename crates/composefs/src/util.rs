@@ -4,7 +4,8 @@
 //! I/O utilities for reading data streams, SHA256 digest parsing, and
 //! filesystem operations like atomic symlink replacement.
 
-use rand::{distr::Alphanumeric, Rng};
+use rand::{distr::Alphanumeric, RngExt};
+use sha2::Digest;
 use std::{
     io::{Error, ErrorKind, Read, Result},
     os::{
@@ -19,6 +20,32 @@ use rustix::{
     io::{Errno, Result as ErrnoResult},
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
+
+/// Adapts a [`sha2::Digest`] hasher to implement [`std::io::Write`].
+///
+/// sha2 0.11 removed its `std::io::Write` impl. This wrapper bridges
+/// the gap so that digest hashers can still be used with APIs that
+/// accept `impl Write` (e.g. [`SplitStreamReader::cat`]).
+#[derive(Debug)]
+pub struct DigestWrite<D: Digest>(pub D);
+
+impl<D: Digest> std::io::Write for DigestWrite<D> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl<D: Digest> DigestWrite<D> {
+    /// Consumes the wrapper and returns the computed digest.
+    pub fn finalize(self) -> sha2::digest::Output<D> {
+        self.0.finalize()
+    }
+}
 
 /// Formats a string like "/proc/self/fd/3" for the given fd.  This can be used to work with kernel
 /// APIs that don't directly accept file descriptors.
