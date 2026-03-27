@@ -14,6 +14,7 @@ use std::{
 
 use anyhow::{bail, Result};
 use bytes::Bytes;
+use composefs::util::DigestWrite;
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::{Client, Response, Url};
 use sha2::{Digest, Sha256};
@@ -199,7 +200,7 @@ impl<ObjectID: FsVerityHashValue> Downloader<ObjectID> {
         // TODO: This can definitely happen in parallel...
         for (id, expected_checksum) in splitstreams {
             let mut reader = self.open_splitstream(&id)?;
-            let mut context = Sha256::new();
+            let mut context = DigestWrite(Sha256::new());
             reader.cat(&self.repo, &mut context)?;
             let measured_checksum = format!("sha256:{}", hex::encode(context.finalize()));
 

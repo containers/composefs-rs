@@ -261,7 +261,7 @@ mod tests {
     use composefs_ioctls::test_utils_pub::CommandExt;
 
     use once_cell::sync::Lazy;
-    use rand::Rng;
+    use rand::RngExt;
     use rustix::{
         fd::OwnedFd,
         fs::{open, Mode, OFlags},
