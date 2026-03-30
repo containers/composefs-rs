@@ -19,7 +19,7 @@ use fn_error_context::context;
 use regex_automata::{Anchored, Input, hybrid::dfa, util::syntax};
 use rustix::{
     fd::AsFd,
-    fs::{openat, Mode, OFlags},
+    fs::{Mode, OFlags, openat},
     io::Errno,
 };
 
