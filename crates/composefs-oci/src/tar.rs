@@ -10,7 +10,6 @@
 //! The `TarEntry` and `TarItem` types represent processed tar entries in composefs format.
 
 use std::{
-    cell::RefCell,
     collections::BTreeMap,
     ffi::{OsStr, OsString},
     fmt,
@@ -18,6 +17,7 @@ use std::{
     os::unix::prelude::{OsStrExt, OsStringExt},
     path::PathBuf,
     sync::Arc,
+    sync::RwLock,
 };
 
 use anyhow::{bail, ensure, Result};
@@ -425,7 +425,7 @@ pub fn get_entry<ObjectID: FsVerityHashValue>(
                             st_gid: entry.gid as u32,
                             st_mode: entry.mode,
                             st_mtim_sec: entry.mtime as i64,
-                            xattrs: RefCell::new(xattrs),
+                            xattrs: RwLock::new(xattrs),
                         },
                         item,
                     }));

@@ -5,7 +5,6 @@
 //! handling of hardlinks, extended attributes, and repository integration.
 
 use std::{
-    cell::RefCell,
     collections::{BTreeMap, HashMap},
     ffi::{CStr, OsStr},
     fs::File,
@@ -13,7 +12,8 @@ use std::{
     mem::MaybeUninit,
     os::unix::ffi::OsStrExt,
     path::Path,
-    rc::Rc,
+    sync::Arc,
+    sync::RwLock,
 };
 
 use anyhow::{ensure, Context as _, Result};
@@ -167,7 +167,7 @@ pub fn write_to_path<ObjectID: FsVerityHashValue>(
 #[derive(Debug)]
 pub struct FilesystemReader<'repo, ObjectID: FsVerityHashValue> {
     repo: Option<&'repo Repository<ObjectID>>,
-    inodes: HashMap<(u64, u64), Rc<Leaf<ObjectID>>>,
+    inodes: HashMap<(u64, u64), Arc<Leaf<ObjectID>>>,
 }
 
 impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
@@ -213,7 +213,7 @@ impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
                 st_uid: buf.st_uid,
                 st_gid: buf.st_gid,
                 st_mtim_sec: buf.st_mtime as i64,
-                xattrs: RefCell::new(Self::read_xattrs(fd)?),
+                xattrs: RwLock::new(Self::read_xattrs(fd)?),
             },
         ))
     }
@@ -263,7 +263,7 @@ impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
         dirfd: &OwnedFd,
         name: &OsStr,
         ifmt: FileType,
-    ) -> Result<Rc<Leaf<ObjectID>>> {
+    ) -> Result<Arc<Leaf<ObjectID>>> {
         let oflags = match ifmt {
             FileType::RegularFile => OFlags::RDONLY,
             _ => OFlags::PATH,
@@ -283,11 +283,11 @@ impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
         // Track all files.  https://github.com/containers/fuse-overlayfs/issues/435
         let key = (buf.st_dev, buf.st_ino);
         if let Some(leafref) = self.inodes.get(&key) {
-            Ok(Rc::clone(leafref))
+            Ok(Arc::clone(leafref))
         } else {
             let content = self.read_leaf_content(fd, buf)?;
-            let leaf = Rc::new(Leaf { stat, content });
-            self.inodes.insert(key, Rc::clone(&leaf));
+            let leaf = Arc::new(Leaf { stat, content });
+            self.inodes.insert(key, Arc::clone(&leaf));
             Ok(leaf)
         }
     }
@@ -333,7 +333,7 @@ impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
     ) -> Result<Inode<ObjectID>> {
         if ifmt == FileType::Directory {
             let dir = self.read_directory(dirfd, name)?;
-            Ok(Inode::Directory(Box::new(dir)))
+            Ok(Inode::Directory(Arc::new(dir)))
         } else {
             let leaf = self.read_leaf(dirfd, name, ifmt)?;
             Ok(Inode::Leaf(leaf))

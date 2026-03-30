@@ -7,12 +7,12 @@
 //! Run via: `cargo run --manifest-path crates/composefs/fuzz/Cargo.toml --bin generate-corpus`
 //! or:      `just generate-corpus`
 
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::Path;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::RwLock;
 
 use composefs::erofs::writer::mkfs_erofs;
 use composefs::fsverity::{FsVerityHashValue, Sha256HashValue};
@@ -31,7 +31,7 @@ fn stat(mode: u32, uid: u32, gid: u32, mtime: i64) -> Stat {
         st_uid: uid,
         st_gid: gid,
         st_mtim_sec: mtime,
-        xattrs: RefCell::new(BTreeMap::new()),
+        xattrs: RwLock::new(BTreeMap::new()),
     }
 }
 
@@ -52,14 +52,14 @@ fn empty_root() -> FileSystem<Sha256HashValue> {
 
 /// Insert a leaf into a directory.
 fn insert_leaf(dir: &mut Dir, name: &str, leaf: Leaf) {
-    dir.insert(OsStr::new(name), Inode::Leaf(Rc::new(leaf)));
+    dir.insert(OsStr::new(name), Inode::Leaf(Arc::new(leaf)));
 }
 
 /// Insert a subdirectory into a directory, returning a mutable reference to it.
 fn insert_dir<'a>(parent: &'a mut Dir, name: &str, s: Stat) -> &'a mut Dir {
     parent.insert(
         OsStr::new(name),
-        Inode::Directory(Box::new(generic_tree::Directory::new(s))),
+        Inode::Directory(Arc::new(generic_tree::Directory::new(s))),
     );
     parent.get_directory_mut(OsStr::new(name)).unwrap()
 }
@@ -231,7 +231,7 @@ fn main() {
         let mut fs = empty_root();
         let xattr_stat = file_stat();
         {
-            let mut xattrs = xattr_stat.xattrs.borrow_mut();
+            let mut xattrs = xattr_stat.xattrs.write().unwrap();
             xattrs.insert(
                 Box::from(OsStr::new("security.selinux")),
                 Box::from(b"system_u:object_r:usr_t:s0".as_slice()),
@@ -322,10 +322,10 @@ fn main() {
         seeds.push(("mixed_types", image.into()));
     }
 
-    // 13. Hardlink — two entries sharing the same Rc<Leaf> (nlink > 1)
+    // 13. Hardlink — two entries sharing the same Arc<Leaf> (nlink > 1)
     {
         let mut fs = empty_root();
-        let shared = Rc::new(Leaf {
+        let shared = Arc::new(Leaf {
             stat: file_stat(),
             content: LeafContent::Regular(RegularFile::Inline(
                 b"shared content".to_vec().into_boxed_slice(),
@@ -333,7 +333,7 @@ fn main() {
         });
         fs.root.insert(
             OsStr::new("original").into(),
-            Inode::Leaf(Rc::clone(&shared)),
+            Inode::Leaf(Arc::clone(&shared)),
         );
         fs.root
             .insert(OsStr::new("hardlink").into(), Inode::Leaf(shared));

@@ -1,12 +1,12 @@
 //! Tests for mkfs
 
 use std::{
-    cell::RefCell,
     collections::BTreeMap,
     ffi::OsStr,
     io::Write,
     process::{Command, Stdio},
-    rc::Rc,
+    sync::Arc,
+    sync::RwLock,
 };
 
 use similar_asserts::assert_eq;
@@ -25,7 +25,7 @@ fn default_stat() -> Stat {
         st_uid: 0,
         st_gid: 0,
         st_mtim_sec: 0,
-        xattrs: RefCell::new(BTreeMap::new()),
+        xattrs: RwLock::new(BTreeMap::new()),
     }
 }
 
@@ -52,14 +52,14 @@ fn add_leaf<ObjectID: FsVerityHashValue>(
 ) {
     dir.insert(
         name.as_ref(),
-        Inode::Leaf(Rc::new(Leaf {
+        Inode::Leaf(Arc::new(Leaf {
             content,
             stat: Stat {
                 st_gid: 0,
                 st_uid: 0,
                 st_mode: 0,
                 st_mtim_sec: 0,
-                xattrs: RefCell::new(BTreeMap::new()),
+                xattrs: RwLock::new(BTreeMap::new()),
             },
         })),
     );
