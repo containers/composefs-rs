@@ -14,12 +14,12 @@ use std::{iter::zip, sync::Arc};
 
 use anyhow::{Context, Result};
 use async_compression::tokio::bufread::{GzipDecoder, ZstdDecoder};
+use containers_image_proxy::oci_spec::image::{Descriptor, ImageConfiguration, MediaType};
 use containers_image_proxy::{
     ConvertedLayerInfo, ImageProxy, ImageProxyConfig, OpenedImage, Transport,
 };
 use fn_error_context::context;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use oci_spec::image::{Descriptor, ImageConfiguration, MediaType};
 use rustix::process::geteuid;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
@@ -402,7 +402,9 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             .await
             .context("Fetching manifest")?;
 
-        let manifest = oci_spec::image::ImageManifest::from_reader(raw_manifest.as_slice())?;
+        let manifest = containers_image_proxy::oci_spec::image::ImageManifest::from_reader(
+            raw_manifest.as_slice(),
+        )?;
         let config_descriptor = manifest.config();
         let layers = manifest.layers();
         let (config_digest, config_verity, layer_verities, stats) = self

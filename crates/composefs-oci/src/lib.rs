@@ -23,8 +23,8 @@ pub use composefs;
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{bail, ensure, Context, Result};
+use containers_image_proxy::oci_spec::image::ImageConfiguration;
 use containers_image_proxy::ImageProxyConfig;
-use oci_spec::image::ImageConfiguration;
 use sha2::{Digest, Sha256};
 
 use composefs::{
@@ -367,7 +367,7 @@ mod test {
 
     #[test]
     fn test_write_and_open_config() {
-        use oci_spec::image::{ImageConfigurationBuilder, RootFsBuilder};
+        use containers_image_proxy::oci_spec::image::{ImageConfigurationBuilder, RootFsBuilder};
 
         let repo_dir = tempdir();
         let repo = Arc::new(Repository::<Sha256HashValue>::open_path(CWD, &repo_dir).unwrap());
@@ -405,7 +405,7 @@ mod test {
 
     #[test]
     fn test_config_stored_as_external_object() {
-        use oci_spec::image::{ImageConfigurationBuilder, RootFsBuilder};
+        use containers_image_proxy::oci_spec::image::{ImageConfigurationBuilder, RootFsBuilder};
 
         let repo_dir = tempdir();
         let repo = Arc::new(Repository::<Sha256HashValue>::open_path(CWD, &repo_dir).unwrap());
@@ -464,7 +464,7 @@ mod test {
 
     #[test]
     fn test_open_config_bad_hash() {
-        use oci_spec::image::{ImageConfigurationBuilder, RootFsBuilder};
+        use containers_image_proxy::oci_spec::image::{ImageConfigurationBuilder, RootFsBuilder};
 
         let repo_dir = tempdir();
         let repo = Arc::new(Repository::<Sha256HashValue>::open_path(CWD, &repo_dir).unwrap());
