@@ -14,13 +14,13 @@ use std::{
     fs::File,
     hash::Hash,
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Take, Write},
-    mem::size_of,
     mem::MaybeUninit,
+    mem::size_of,
     ops::Range,
     sync::Arc,
 };
 
-use anyhow::{bail, ensure, Context, Error, Result};
+use anyhow::{Context, Error, Result, bail, ensure};
 use fn_error_context::context;
 use rustix::{
     buffer::spare_capacity,
@@ -30,8 +30,8 @@ use tokio::task::JoinHandle;
 
 use crate::repository::ObjectStoreMethod;
 use zerocopy::{
-    little_endian::{I64, U16, U64},
     FromBytes, Immutable, IntoBytes, KnownLayout,
+    little_endian::{I64, U16, U64},
 };
 use zstd::stream::{read::Decoder, write::Encoder};
 
@@ -256,7 +256,7 @@ impl<ObjectID: FsVerityHashValue> SplitStreamBuilder<ObjectID> {
         }
         self.total_inline_bytes += data.len() as u64;
         // Coalesce with the previous inline entry if possible
-        if let Some(SplitStreamEntry::Inline(ref mut existing)) = self.entries.last_mut() {
+        if let Some(SplitStreamEntry::Inline(existing)) = self.entries.last_mut() {
             existing.extend_from_slice(data);
         } else {
             self.entries.push(SplitStreamEntry::Inline(data.to_vec()));
@@ -935,9 +935,9 @@ impl<ObjectID: FsVerityHashValue> Read for SplitStreamReader<ObjectID> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fsverity::{compute_verity, Sha256HashValue};
+    use crate::fsverity::{Sha256HashValue, compute_verity};
     use crate::test::tempdir;
-    use rustix::fs::{mkdirat, Mode, CWD};
+    use rustix::fs::{CWD, Mode, mkdirat};
     use std::io::Cursor;
     use std::path::Path;
 

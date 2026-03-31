@@ -25,27 +25,27 @@ use super::reader::{
 /// Converts any reference to a thin pointer (as usize)
 /// Used for address calculations in various outputs
 macro_rules! addr {
-    ($ref: expr) => {
+    ($ref: expr_2021) => {
         &raw const (*$ref) as *const u8 as usize
     };
 }
 
 macro_rules! write_with_offset {
-    ($fmt: expr, $base: expr, $label: expr, $ref: expr) => {{
+    ($fmt: expr_2021, $base: expr_2021, $label: expr_2021, $ref: expr_2021) => {{
         let offset = addr!($ref) - addr!($base);
         writeln!($fmt, "{offset:+8x}     {}: {:?}", $label, $ref)
     }};
 }
 
 macro_rules! write_fields {
-    ($fmt: expr, $base: expr, $struct: expr, $field: ident) => {{
+    ($fmt: expr_2021, $base: expr_2021, $struct: expr_2021, $field: ident) => {{
         let value = &$struct.$field;
         let default = if false { value } else { &Default::default() };
         if value != default {
             write_with_offset!($fmt, $base, stringify!($field), value)?;
         }
     }};
-    ($fmt: expr, $base: expr, $struct: expr, $head: ident; $($tail: ident);+) => {{
+    ($fmt: expr_2021, $base: expr_2021, $struct: expr_2021, $head: ident; $($tail: ident);+) => {{
         write_fields!($fmt, $base, $struct, $head);
         write_fields!($fmt, $base, $struct, $($tail);+);
     }};
@@ -214,10 +214,11 @@ impl<T: fmt::Debug + InodeHeader> fmt::Debug for Inode<T> {
         }
 
         // Small string (<= 128 bytes, utf8, no control characters).
-        if inline.len() <= 128 && !inline.iter().any(|c| c.is_ascii_control()) {
-            if let Ok(string) = std::str::from_utf8(inline) {
-                return write_with_offset!(f, self, "inline", string);
-            }
+        if inline.len() <= 128
+            && !inline.iter().any(|c| c.is_ascii_control())
+            && let Ok(string) = std::str::from_utf8(inline)
+        {
+            return write_with_offset!(f, self, "inline", string);
         }
 
         // Else, hexdump data block

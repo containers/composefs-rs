@@ -35,15 +35,15 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(feature = "oci")]
-use comfy_table::{presets::UTF8_FULL, Table};
+use comfy_table::{Table, presets::UTF8_FULL};
 use rustix::fs::{Mode, OFlags};
 
 use rustix::fs::CWD;
 use serde::Serialize;
 
+use composefs_boot::BootOps;
 #[cfg(feature = "oci")]
 use composefs_boot::write_boot;
-use composefs_boot::BootOps;
 
 #[cfg(feature = "oci")]
 use composefs::shared_internals::IO_BUF_CAPACITY;
@@ -52,7 +52,7 @@ use composefs::{
     erofs::reader::erofs_to_filesystem,
     fsverity::{Algorithm, FsVerityHashValue, Sha256HashValue, Sha512HashValue},
     generic_tree::{FileSystem, Inode},
-    repository::{read_repo_algorithm, system_path, user_path, Repository, REPO_METADATA_FILENAME},
+    repository::{REPO_METADATA_FILENAME, Repository, read_repo_algorithm, system_path, user_path},
     tree::RegularFile,
 };
 

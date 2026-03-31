@@ -7,7 +7,7 @@
 use core::{fmt, hash::Hash, str::FromStr};
 
 use hex::FromHexError;
-use sha2::{digest::FixedOutputReset, digest::Output, Digest, Sha256, Sha512};
+use sha2::{Digest, Sha256, Sha512, digest::FixedOutputReset, digest::Output};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 /// Trait for fs-verity hash value types supporting SHA-256 and SHA-512.

@@ -11,7 +11,7 @@ use std::{
     os::fd::{AsFd, AsRawFd, OwnedFd},
 };
 
-use rustix::ioctl::{ioctl, Opcode, Setter};
+use rustix::ioctl::{Opcode, Setter, ioctl};
 
 /// Flags for loop device configuration.
 pub mod flags {

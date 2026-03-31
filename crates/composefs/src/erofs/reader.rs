@@ -14,20 +14,20 @@ use std::rc::Rc;
 
 use anyhow::Context;
 use thiserror::Error;
-use zerocopy::{little_endian::U32, FromBytes, Immutable, KnownLayout};
+use zerocopy::{FromBytes, Immutable, KnownLayout, little_endian::U32};
 
 use super::{
     composefs::OverlayMetacopy,
     format::{
-        self, CompactInodeHeader, ComposefsHeader, DataLayout, DirectoryEntryHeader,
-        ExtendedInodeHeader, InodeXAttrHeader, ModeField, Superblock, XAttrHeader, BLOCK_BITS,
-        COMPOSEFS_MAGIC, MAGIC_V1, S_IFBLK, S_IFCHR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK,
-        VERSION, XATTR_PREFIXES,
+        self, BLOCK_BITS, COMPOSEFS_MAGIC, CompactInodeHeader, ComposefsHeader, DataLayout,
+        DirectoryEntryHeader, ExtendedInodeHeader, InodeXAttrHeader, MAGIC_V1, ModeField, S_IFBLK,
+        S_IFCHR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, Superblock, VERSION, XATTR_PREFIXES,
+        XAttrHeader,
     },
 };
+use crate::MAX_INLINE_CONTENT;
 use crate::fsverity::FsVerityHashValue;
 use crate::tree;
-use crate::MAX_INLINE_CONTENT;
 
 /// Rounds up a value to the nearest multiple of `to`
 pub fn round_up(n: usize, to: usize) -> usize {
@@ -721,13 +721,13 @@ impl<'img> Image<'img> {
         name: &[u8],
     ) -> Result<Option<u64>, ErofsReaderError> {
         let inode = self.inode(parent_nid)?;
-        if let Some(inline) = inode.inline() {
-            if let Ok(block) = DirectoryBlock::ref_from_bytes(inline) {
-                for entry in block.entries()? {
-                    let entry = entry?;
-                    if entry.name == name {
-                        return Ok(Some(entry.nid()));
-                    }
+        if let Some(inline) = inode.inline()
+            && let Ok(block) = DirectoryBlock::ref_from_bytes(inline)
+        {
+            for entry in block.entries()? {
+                let entry = entry?;
+                if entry.name == name {
+                    return Ok(Some(entry.nid()));
                 }
             }
         }
@@ -756,7 +756,7 @@ impl InodeXAttrs {
             &Array::ref_from_prefix_with_elems(&self.data, self.header.shared_count as usize)
                 .map_err(|_| ErofsReaderError::OutOfBounds)?
                 .0
-                 .0,
+                .0,
         )
     }
 
@@ -832,7 +832,7 @@ impl DirectoryBlock {
         Ok(&Array::ref_from_prefix_with_elems(&self.0, n)
             .map_err(|_| ErofsReaderError::OutOfBounds)?
             .0
-             .0)
+            .0)
     }
 
     /// Returns the number of entries in this directory block
@@ -974,10 +974,10 @@ impl<ObjectID: FsVerityHashValue> ObjectCollector<ObjectID> {
         if attr.suffix()? != b"overlay.metacopy" {
             return Ok(());
         }
-        if let Ok(value) = OverlayMetacopy::read_from_bytes(attr.value()?) {
-            if value.valid() {
-                self.objects.insert(value.digest);
-            }
+        if let Ok(value) = OverlayMetacopy::read_from_bytes(attr.value()?)
+            && value.valid()
+        {
+            self.objects.insert(value.digest);
         }
         Ok(())
     }
@@ -1297,11 +1297,11 @@ fn dir_entries<'a>(
     }
 
     // Inline entries
-    if let Some(data) = dir_inode.inline() {
-        if let Ok(block) = DirectoryBlock::ref_from_bytes(data) {
-            for entry in block.entries()? {
-                process_entry(entry?);
-            }
+    if let Some(data) = dir_inode.inline()
+        && let Ok(block) = DirectoryBlock::ref_from_bytes(data)
+    {
+        for entry in block.entries()? {
+            process_entry(entry?);
         }
     }
 
@@ -2050,8 +2050,7 @@ mod tests {
 
     #[test]
     fn test_erofs_to_filesystem_xattrs() {
-        let dumpfile =
-            "/ 0 40755 2 0 0 0 1000.0 - - - security.selinux=system_u:object_r:root_t:s0\n\
+        let dumpfile = "/ 0 40755 2 0 0 0 1000.0 - - - security.selinux=system_u:object_r:root_t:s0\n\
              /file 5 100644 1 0 0 0 1000.0 - hello - user.myattr=myvalue\n";
         let (orig, rt) = round_trip_dumpfile(dumpfile);
         assert_eq!(orig, rt);

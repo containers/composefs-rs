@@ -17,7 +17,7 @@ use std::process::Command;
 use std::str::FromStr;
 
 use anyhow::Context;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use rustix::fs::FileType;
 
 use crate::MAX_INLINE_CONTENT;
@@ -843,7 +843,9 @@ mod tests {
 
     #[test]
     fn long_xattrs() {
-        let mut s = String::from("/file 0 100755 1 0 0 0 0.0 00/26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae - -");
+        let mut s = String::from(
+            "/file 0 100755 1 0 0 0 0.0 00/26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae - -",
+        );
         Entry::parse(&s).unwrap();
         let xattrs_to_fill = XATTR_LIST_MAX / XATTR_NAME_MAX;
         let xattr_name_remainder = XATTR_LIST_MAX % XATTR_NAME_MAX;
@@ -960,7 +962,10 @@ mod tests {
                 "/ 0 40755 2 0 0 0 0.0 - - -\n/fifo 0 10777 1 0 0 0 0.0 - foobar -",
             ),
             ("root with rdev", "/ 0 40755 2 0 0 42 0.0 - - -"),
-            ("root with fsverity", "/ 0 40755 2 0 0 0 0.0 - - 35d02f81325122d77ec1d11baba655bc9bf8a891ab26119a41c50fa03ddfb408"),
+            (
+                "root with fsverity",
+                "/ 0 40755 2 0 0 0 0.0 - - 35d02f81325122d77ec1d11baba655bc9bf8a891ab26119a41c50fa03ddfb408",
+            ),
         ];
         for (name, case) in CASES.iter().copied() {
             assert!(
@@ -989,8 +994,7 @@ mod tests {
     #[test_with::executable(mkcomposefs)]
     #[test]
     fn test_load_cfs_filtered() -> Result<()> {
-        const FILTERED: &str =
-            "/ 0 40555 2 0 0 0 1633950376.0 - - - trusted.foo1=bar-1 user.foo2=bar-2\n\
+        const FILTERED: &str = "/ 0 40555 2 0 0 0 1633950376.0 - - - trusted.foo1=bar-1 user.foo2=bar-2\n\
 /blockdev 0 60777 1 0 0 107690 1633950376.0 - - - trusted.bar=bar-2\n\
 /inline 15 100777 1 0 0 0 1633950376.0 - FOOBAR\\nINAFILE\\n - user.foo=bar-2\n";
         let mut tmpf = tempfile::tempfile()?;

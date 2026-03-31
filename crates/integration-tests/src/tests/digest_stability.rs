@@ -1,7 +1,7 @@
 //! EROFS digest stability tests for the OCI → composefs pipeline.
 
-use anyhow::{bail, Result};
-use xshell::{cmd, Shell};
+use anyhow::{Result, bail};
+use xshell::{Shell, cmd};
 
 use crate::{cfsctl, integration_test};
 

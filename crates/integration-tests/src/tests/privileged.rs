@@ -10,8 +10,8 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, ensure, Result};
-use xshell::{cmd, Shell};
+use anyhow::{Result, bail, ensure};
+use xshell::{Shell, cmd};
 
 use crate::{cfsctl, create_test_rootfs, integration_test};
 

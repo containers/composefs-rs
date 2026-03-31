@@ -21,7 +21,7 @@ use anyhow::Result;
 
 use composefs::{fsverity::FsVerityHashValue, repository::Repository, tree::FileSystem};
 
-use crate::bootloader::{get_boot_resources, BootEntry};
+use crate::bootloader::{BootEntry, get_boot_resources};
 
 /// These directories are required to exist in images.
 /// They may have content in the container, but we don't

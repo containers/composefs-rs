@@ -7,14 +7,13 @@
 
 use anyhow::Result;
 use rustix::path::Arg;
-use xshell::{cmd, Shell};
+use xshell::{Shell, cmd};
 
 use crate::{cfsctl, create_test_rootfs, integration_test};
 
 // Pinned composefs image ID for the deterministic OCI layout built by
 // create_oci_layout() (single layer with usr/ dir + hello.txt, mtime=1234567890).
-const OCI_LAYOUT_COMPOSEFS_ID: &str =
-    "f26c6eb439749b82f0d1520e83455bb21766572fb2b5cfe009dd7749a61caf74e0c42c56f1a2cbd9d\
+const OCI_LAYOUT_COMPOSEFS_ID: &str = "f26c6eb439749b82f0d1520e83455bb21766572fb2b5cfe009dd7749a61caf74e0c42c56f1a2cbd9d\
      359e7d172c8e2c65641666c9a18cc484a8b0f6e4e6d47ab";
 
 /// Create a fresh initialized insecure repository in a tempdir.

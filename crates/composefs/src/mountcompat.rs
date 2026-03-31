@@ -130,8 +130,8 @@ mod tmpmount {
         os::fd::{AsFd, BorrowedFd, OwnedFd},
     };
 
-    use rustix::fs::{open, Mode, OFlags};
-    use rustix::mount::{move_mount, unmount, MoveMountFlags, UnmountFlags};
+    use rustix::fs::{Mode, OFlags, open};
+    use rustix::mount::{MoveMountFlags, UnmountFlags, move_mount, unmount};
 
     pub(super) struct TmpMount {
         dir: tempfile::TempDir,

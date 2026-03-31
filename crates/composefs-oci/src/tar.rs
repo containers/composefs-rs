@@ -20,12 +20,12 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{Result, bail, ensure};
 use bytes::{Bytes, BytesMut};
 use rustix::fs::makedev;
 use tar_core::{
-    parse::{ParseEvent, Parser},
     EntryType, HEADER_SIZE,
+    parse::{ParseEvent, Parser},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
@@ -33,13 +33,12 @@ use tokio::{
 };
 
 use composefs::{
-    dumpfile,
+    INLINE_CONTENT_MAX_V0, dumpfile,
     fsverity::FsVerityHashValue,
     repository::{ObjectStoreMethod, Repository},
     shared_internals::IO_BUF_CAPACITY,
     splitstream::{SplitStreamBuilder, SplitStreamData, SplitStreamReader},
     tree::{LeafContent, RegularFile, Stat},
-    INLINE_CONTENT_MAX_V0,
 };
 
 use crate::ImportStats;
@@ -884,7 +883,7 @@ mod tests {
         let entries = read_all_via_splitstream(tar_data).await.unwrap();
         assert_eq!(entries.len(), 1);
         match &entries[0].item {
-            TarItem::Leaf(LeafContent::Symlink(ref target)) => {
+            TarItem::Leaf(LeafContent::Symlink(target)) => {
                 assert_eq!(&**target, OsStr::new(&very_long_path));
             }
             _ => unreachable!(),
