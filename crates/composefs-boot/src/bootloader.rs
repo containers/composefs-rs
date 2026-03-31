@@ -11,7 +11,7 @@ use std::{
     collections::HashMap, ffi::OsStr, os::unix::ffi::OsStrExt, path::PathBuf, str::from_utf8,
 };
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use composefs::{
     fsverity::FsVerityHashValue,

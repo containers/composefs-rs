@@ -24,11 +24,11 @@ use fuser::{
 };
 use rustix::{
     buffer::spare_capacity,
-    fs::{open, Mode, OFlags},
-    io::{pread, Errno},
+    fs::{Mode, OFlags, open},
+    io::{Errno, pread},
     mount::{
-        fsconfig_create, fsconfig_set_flag, fsconfig_set_string, fsmount, FsMountFlags,
-        MountAttrFlags,
+        FsMountFlags, MountAttrFlags, fsconfig_create, fsconfig_set_flag, fsconfig_set_string,
+        fsmount,
     },
 };
 

@@ -40,11 +40,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 use containers_image_proxy::oci_spec::image::{
     Descriptor, ImageConfiguration, ImageManifest, MediaType,
 };
-use rustix::fs::{openat, readlinkat, unlinkat, AtFlags, Dir, Mode, OFlags};
+use rustix::fs::{AtFlags, Dir, Mode, OFlags, openat, readlinkat, unlinkat};
 use rustix::io::Errno;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -898,7 +898,8 @@ pub fn cleanup_dangling_referrers<ObjectID: FsVerityHashValue>(
             Ok(fd) => fd,
             Err(Errno::NOENT) => continue,
             Err(e) => {
-                return Err(e).context(format!("Opening referrer subject dir {encoded_subject}"))?
+                return Err(e)
+                    .context(format!("Opening referrer subject dir {encoded_subject}"))?;
             }
         };
 
@@ -2533,10 +2534,11 @@ mod test {
         assert!(has_manifest(repo, &digest2).unwrap().is_none());
 
         // Shared layer still exists because the tagged image references it
-        assert!(repo
-            .has_stream(&crate::layer_identifier(&shared_layer_digest))
-            .unwrap()
-            .is_some());
+        assert!(
+            repo.has_stream(&crate::layer_identifier(&shared_layer_digest))
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// Test that multiple tags on the same manifest are handled correctly.

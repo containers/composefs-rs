@@ -9,7 +9,7 @@ use std::{io::Error, os::fd::AsFd};
 
 use rustix::{
     io::Errno,
-    ioctl::{ioctl, opcode, Opcode, Setter, Updater},
+    ioctl::{Opcode, Setter, Updater, ioctl, opcode},
 };
 use thiserror::Error;
 

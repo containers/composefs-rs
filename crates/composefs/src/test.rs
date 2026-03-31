@@ -124,9 +124,9 @@ pub(crate) mod proptest_strategies {
     use proptest::prelude::*;
 
     use crate::{
+        INLINE_CONTENT_MAX_V0,
         fsverity::FsVerityHashValue,
         tree::{self, RegularFile},
-        INLINE_CONTENT_MAX_V0,
     };
 
     /// Maximum filename length (single directory entry name) on Linux.

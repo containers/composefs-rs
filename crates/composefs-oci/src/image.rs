@@ -10,7 +10,7 @@
 
 use std::{ffi::OsStr, os::unix::ffi::OsStrExt, rc::Rc};
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 use composefs::util::DigestWrite;
 use fn_error_context::context;
 use sha2::{Digest, Sha256};
@@ -319,7 +319,7 @@ mod test {
     /// with `get_entry()`, and verify every entry type round-trips correctly.
     #[tokio::test]
     async fn test_build_baseimage_roundtrip() -> Result<()> {
-        use composefs::{repository::Repository, test::tempdir, INLINE_CONTENT_MAX_V0};
+        use composefs::{INLINE_CONTENT_MAX_V0, repository::Repository, test::tempdir};
         use rustix::fs::CWD;
         use std::ffi::OsStr;
         use std::sync::Arc;

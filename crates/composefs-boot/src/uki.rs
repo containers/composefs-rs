@@ -7,8 +7,8 @@
 
 use thiserror::Error;
 use zerocopy::{
-    little_endian::{U16, U32},
     FromBytes, Immutable, KnownLayout,
+    little_endian::{U16, U32},
 };
 
 use crate::os_release::OsReleaseInfo;

@@ -10,7 +10,7 @@ use std::{
     path::Path,
 };
 
-use anyhow::{ensure, Result};
+use anyhow::{Result, ensure};
 
 use composefs::{fsverity::FsVerityHashValue, repository::Repository};
 

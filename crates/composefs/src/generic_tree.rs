@@ -437,8 +437,8 @@ impl<T> Directory<T> {
         let mut newest = self.stat.st_mtim_sec;
         for inode in self.entries.values() {
             let mtime = match inode {
-                Inode::Leaf(ref leaf) => leaf.stat.st_mtim_sec,
-                Inode::Directory(ref dir) => dir.newest_file(),
+                Inode::Leaf(leaf) => leaf.stat.st_mtim_sec,
+                Inode::Directory(dir) => dir.newest_file(),
             };
             if mtime > newest {
                 newest = mtime;
@@ -518,8 +518,8 @@ impl<T> FileSystem<T> {
     {
         fn visit_inode<T, F: Fn(&Stat)>(inode: &Inode<T>, f: &F) {
             match inode {
-                Inode::Directory(ref dir) => visit_dir(dir, f),
-                Inode::Leaf(ref leaf) => f(&leaf.stat),
+                Inode::Directory(dir) => visit_dir(dir, f),
+                Inode::Leaf(leaf) => f(&leaf.stat),
             }
         }
 
@@ -710,10 +710,11 @@ mod tests {
             Err(ImageError::NotFound(name)) => assert_eq!(name.to_str().unwrap(), "nonexistent"),
             _ => panic!("Expected NotFound"),
         }
-        assert!(root
-            .get_directory_opt(OsStr::new("nonexistent"))
-            .unwrap()
-            .is_none());
+        assert!(
+            root.get_directory_opt(OsStr::new("nonexistent"))
+                .unwrap()
+                .is_none()
+        );
 
         match root.get_directory(OsStr::new("file1")) {
             Err(ImageError::NotADirectory(name)) => assert_eq!(name.to_str().unwrap(), "file1"),
@@ -736,10 +737,11 @@ mod tests {
             }
             _ => panic!("Expected NotFound"),
         }
-        assert!(dir
-            .get_file_opt(OsStr::new("nonexistent.txt"))
-            .unwrap()
-            .is_none());
+        assert!(
+            dir.get_file_opt(OsStr::new("nonexistent.txt"))
+                .unwrap()
+                .is_none()
+        );
 
         match dir.get_file(OsStr::new("subdir")) {
             Err(ImageError::IsADirectory(name)) => assert_eq!(name.to_str().unwrap(), "subdir"),
@@ -918,12 +920,13 @@ mod tests {
         assert_eq!(fs.root.stat.st_uid, 42);
         assert_eq!(fs.root.stat.st_gid, 43);
         assert_eq!(fs.root.stat.st_mtim_sec, 1234567890);
-        assert!(fs
-            .root
-            .stat
-            .xattrs
-            .borrow()
-            .contains_key(OsStr::new("security.selinux")));
+        assert!(
+            fs.root
+                .stat
+                .xattrs
+                .borrow()
+                .contains_key(OsStr::new("security.selinux"))
+        );
     }
 
     #[test]

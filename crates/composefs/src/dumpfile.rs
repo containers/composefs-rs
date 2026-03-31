@@ -17,7 +17,7 @@ use std::{
     rc::Rc,
 };
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 use fn_error_context::context;
 use rustix::fs::FileType;
 
@@ -179,7 +179,7 @@ pub fn write_leaf(
     nlink: usize,
 ) -> fmt::Result {
     match content {
-        LeafContent::Regular(RegularFile::Inline(ref data)) => write_entry(
+        LeafContent::Regular(RegularFile::Inline(data)) => write_entry(
             writer,
             path,
             stat,
@@ -251,7 +251,7 @@ pub fn write_leaf(
             &[],
             None,
         ),
-        LeafContent::Symlink(ref target) => write_entry(
+        LeafContent::Symlink(target) => write_entry(
             writer,
             path,
             stat,
@@ -322,10 +322,10 @@ impl<'a, W: Write, ObjectID: FsVerityHashValue> DumpfileWriter<'a, W, ObjectID> 
             path.push(name);
 
             match inode {
-                Inode::Directory(ref dir) => {
+                Inode::Directory(dir) => {
                     self.write_dir(path, dir)?;
                 }
-                Inode::Leaf(ref leaf) => {
+                Inode::Leaf(leaf) => {
                     self.write_leaf(path, leaf)?;
                 }
             }
@@ -627,15 +627,15 @@ mod tests {
 
         // All three should be Leaf inodes
         let original_leaf = match original {
-            Inode::Leaf(ref l) => l,
+            Inode::Leaf(l) => l,
             _ => panic!("Expected Leaf inode"),
         };
         let hardlink1_leaf = match hardlink1 {
-            Inode::Leaf(ref l) => l,
+            Inode::Leaf(l) => l,
             _ => panic!("Expected Leaf inode"),
         };
         let hardlink2_leaf = match hardlink2 {
-            Inode::Leaf(ref l) => l,
+            Inode::Leaf(l) => l,
             _ => panic!("Expected Leaf inode"),
         };
 
@@ -666,7 +666,7 @@ mod tests {
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile)?;
         let link = fs.root.lookup(OsStr::new("link")).unwrap();
         match link {
-            Inode::Leaf(ref l) => match &l.content {
+            Inode::Leaf(l) => match &l.content {
                 LeafContent::Symlink(target) => assert_eq!(target.as_ref(), OsStr::new("-")),
                 other => panic!("expected symlink, got {other:?}"),
             },

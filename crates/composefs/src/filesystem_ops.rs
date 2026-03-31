@@ -10,7 +10,7 @@ use fn_error_context::context;
 use crate::{
     dumpfile::write_dumpfile,
     erofs::writer::mkfs_erofs,
-    fsverity::{compute_verity, FsVerityHashValue},
+    fsverity::{FsVerityHashValue, compute_verity},
     repository::Repository,
     tree::FileSystem,
 };

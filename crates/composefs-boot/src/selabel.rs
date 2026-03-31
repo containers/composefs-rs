@@ -14,9 +14,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use fn_error_context::context;
-use regex_automata::{hybrid::dfa, util::syntax, Anchored, Input};
+use regex_automata::{Anchored, Input, hybrid::dfa, util::syntax};
 
 use composefs::{
     fsverity::FsVerityHashValue,
@@ -235,8 +235,8 @@ fn relabel_leaf<H: FsVerityHashValue>(leaf: &Leaf<H>, path: &Path, policy: &mut 
 
 fn relabel_inode<H: FsVerityHashValue>(inode: &Inode<H>, path: &mut PathBuf, policy: &mut Policy) {
     match inode {
-        Inode::Directory(ref dir) => relabel_dir(dir, path, policy),
-        Inode::Leaf(ref leaf) => relabel_leaf(leaf, path, policy),
+        Inode::Directory(dir) => relabel_dir(dir, path, policy),
+        Inode::Leaf(leaf) => relabel_leaf(leaf, path, policy),
     }
 }
 

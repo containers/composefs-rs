@@ -11,8 +11,8 @@
 use std::fmt;
 
 use zerocopy::{
-    little_endian::{U16, U32, U64},
     FromBytes, Immutable, IntoBytes, KnownLayout,
+    little_endian::{U16, U32, U64},
 };
 
 /// Number of bits used for block size (12 = 4096 bytes)
