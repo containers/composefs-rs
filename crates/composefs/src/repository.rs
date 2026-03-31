@@ -81,7 +81,7 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::{CStr, CString, OsStr, OsString},
     fmt,
-    fs::{canonicalize, File},
+    fs::{File, canonicalize},
     io::{Read, Write},
     os::{
         fd::{AsFd, BorrowedFd, OwnedFd},
@@ -95,26 +95,26 @@ use std::{
 use log::{debug, trace};
 use tokio::sync::Semaphore;
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use fn_error_context::context;
 use once_cell::sync::OnceCell;
 use rustix::{
     fs::{
-        flock, linkat, mkdirat, openat, readlinkat, statat, syncfs, unlinkat, AtFlags, Dir,
-        FileType, FlockOperation, Mode, OFlags, CWD,
+        AtFlags, CWD, Dir, FileType, FlockOperation, Mode, OFlags, flock, linkat, mkdirat, open,
+        openat, readlinkat, statat, syncfs, unlinkat,
     },
     io::{Errno, Result as ErrnoResult},
 };
 
 use crate::{
     fsverity::{
-        compute_verity, enable_verity_maybe_copy, ensure_verity_equal, measure_verity,
-        measure_verity_opt, Algorithm, CompareVerityError, EnableVerityError, FsVerityHashValue,
-        FsVerityHasher, MeasureVerityError,
+        Algorithm, CompareVerityError, EnableVerityError, FsVerityHashValue, FsVerityHasher,
+        MeasureVerityError, compute_verity, enable_verity_maybe_copy, ensure_verity_equal,
+        measure_verity, measure_verity_opt,
     },
     mount::{composefs_fsmount, mount_at},
     splitstream::{SplitStreamReader, SplitStreamWriter},
-    util::{proc_self_fd, reopen_tmpfile_ro, replace_symlinkat, ErrnoFilter},
+    util::{ErrnoFilter, proc_self_fd, reopen_tmpfile_ro, replace_symlinkat},
 };
 
 /// The filename used for repository metadata.
@@ -125,11 +125,15 @@ pub const REPO_METADATA_FILENAME: &str = "meta.json";
 pub enum RepositoryOpenError {
     /// `meta.json` is missing and the directory does not appear to be
     /// an existing repository.
-    #[error("{REPO_METADATA_FILENAME} not found; this repository must be initialized with `cfsctl init`")]
+    #[error(
+        "{REPO_METADATA_FILENAME} not found; this repository must be initialized with `cfsctl init`"
+    )]
     MetadataMissing,
     /// `meta.json` is missing but `objects/` exists, indicating an
     /// old-format repository that predates `meta.json`.
-    #[error("{REPO_METADATA_FILENAME} not found; this appears to be an old-format repository — run `cfsctl init --reset-metadata` to migrate")]
+    #[error(
+        "{REPO_METADATA_FILENAME} not found; this appears to be an old-format repository — run `cfsctl init --reset-metadata` to migrate"
+    )]
     OldFormatRepository,
     /// `meta.json` exists but could not be parsed.
     #[error("failed to parse {REPO_METADATA_FILENAME}")]
@@ -685,7 +689,9 @@ pub enum FsckError {
     #[error("fsck: metadata-parse-failed: meta.json: {detail}")]
     MetadataParseFailed { detail: String },
 
-    #[error("fsck: metadata-algorithm-mismatch: meta.json: expected {expected}, repository opened as {actual}")]
+    #[error(
+        "fsck: metadata-algorithm-mismatch: meta.json: expected {expected}, repository opened as {actual}"
+    )]
     MetadataAlgorithmMismatch { expected: String, actual: String },
 }
 
@@ -2675,10 +2681,10 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                 Err(_) => continue,
             };
 
-            if let Ok(target) = readlinkat(&dir_fd, name_bytes, vec![]) {
-                if let Ok(target_str) = target.into_string() {
-                    refs.push((name, target_str));
-                }
+            if let Ok(target) = readlinkat(&dir_fd, name_bytes, vec![])
+                && let Ok(target_str) = target.into_string()
+            {
+                refs.push((name, target_str));
             }
         }
 
@@ -2805,7 +2811,7 @@ mod tests {
     use super::*;
     use crate::fsverity::{Sha256HashValue, Sha512HashValue};
     use crate::test::tempdir;
-    use rustix::fs::{statat, CWD};
+    use rustix::fs::{CWD, statat};
     use tempfile::TempDir;
 
     /// Create a test repository in insecure mode (no fs-verity required).
@@ -4193,10 +4199,12 @@ mod tests {
 
         let result = repo.fsck().await?;
         assert!(!result.is_ok());
-        assert!(result
-            .errors()
-            .iter()
-            .any(|e| matches!(e, FsckError::MetadataParseFailed { .. })));
+        assert!(
+            result
+                .errors()
+                .iter()
+                .any(|e| matches!(e, FsckError::MetadataParseFailed { .. }))
+        );
         assert!(
             result.to_string().contains("meta.json: error"),
             "display should show error: {result}"

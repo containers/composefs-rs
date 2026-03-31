@@ -34,10 +34,9 @@ use composefs::{
 };
 
 use crate::{
-    config_identifier, layer_identifier,
+    ContentAndVerity, ImportStats, config_identifier, layer_identifier,
     oci_image::{is_tar_media_type, manifest_identifier, tag_image},
     tar::split_async,
-    ContentAndVerity, ImportStats,
 };
 
 /// Result of pulling an OCI image.

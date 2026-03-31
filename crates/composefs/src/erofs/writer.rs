@@ -467,10 +467,10 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
     fn collect_leaf(&mut self, leaf: &'a Rc<tree::Leaf<ObjectID>>) -> usize {
         let nlink = Rc::strong_count(leaf);
 
-        if nlink > 1 {
-            if let Some(inode) = self.hardlinks.get(&Rc::as_ptr(leaf)) {
-                return *inode;
-            }
+        if nlink > 1
+            && let Some(inode) = self.hardlinks.get(&Rc::as_ptr(leaf))
+        {
+            return *inode;
         }
 
         let inode = self.push_inode(

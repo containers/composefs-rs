@@ -16,18 +16,18 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use hex::FromHexError;
 use rustix::{
-    fs::{major, minor, mkdirat, openat, stat, symlink, Mode, OFlags, CWD},
+    fs::{CWD, Mode, OFlags, major, minor, mkdirat, openat, stat, symlink},
     io::Errno,
     mount::{
-        fsconfig_create, fsconfig_set_string, fsmount, open_tree, unmount, FsMountFlags,
-        MountAttrFlags, OpenTreeFlags, UnmountFlags,
+        FsMountFlags, MountAttrFlags, OpenTreeFlags, UnmountFlags, fsconfig_create,
+        fsconfig_set_string, fsmount, open_tree, unmount,
     },
 };
 use serde::Deserialize;
 
 use composefs::{
     fsverity::{FsVerityHashValue, Sha256HashValue, Sha512HashValue},
-    mount::{mount_at, FsHandle},
+    mount::{FsHandle, mount_at},
     mountcompat::{overlayfs_set_fd, overlayfs_set_lower_and_data_fds, prepare_mount},
     repository::Repository,
 };

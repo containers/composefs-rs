@@ -22,9 +22,9 @@ pub use composefs;
 
 use std::{collections::HashMap, sync::Arc};
 
-use anyhow::{bail, ensure, Context, Result};
-use containers_image_proxy::oci_spec::image::ImageConfiguration;
+use anyhow::{Context, Result, bail, ensure};
 use containers_image_proxy::ImageProxyConfig;
+use containers_image_proxy::oci_spec::image::ImageConfiguration;
 use sha2::{Digest, Sha256};
 
 use composefs::{
@@ -38,10 +38,10 @@ use crate::tar::get_entry;
 
 // Re-export key types for convenience
 pub use oci_image::{
+    ImageInfo, LayerInfo, OCI_REF_PREFIX, OciFsckError, OciFsckResult, OciImage, SplitstreamInfo,
     add_referrer, layer_dumpfile, layer_info, layer_tar, list_images, list_referrers, list_refs,
     oci_fsck, oci_fsck_image, remove_referrer, remove_referrers_for_subject, resolve_ref,
-    tag_image, untag_image, ImageInfo, LayerInfo, OciFsckError, OciFsckResult, OciImage,
-    SplitstreamInfo, OCI_REF_PREFIX,
+    tag_image, untag_image,
 };
 pub use skopeo::pull_image;
 

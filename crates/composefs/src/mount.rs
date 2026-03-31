@@ -11,8 +11,8 @@ use std::{
 
 use rustix::{
     mount::{
-        fsconfig_create, fsconfig_set_flag, fsconfig_set_string, fsmount, fsopen, move_mount,
-        FsMountFlags, FsOpenFlags, MountAttrFlags, MoveMountFlags,
+        FsMountFlags, FsOpenFlags, MountAttrFlags, MoveMountFlags, fsconfig_create,
+        fsconfig_set_flag, fsconfig_set_string, fsmount, fsopen, move_mount,
     },
     path,
 };

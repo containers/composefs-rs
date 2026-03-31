@@ -16,25 +16,25 @@ use std::{
     rc::Rc,
 };
 
-use anyhow::{ensure, Context as _, Result};
+use anyhow::{Context as _, Result, ensure};
 use fn_error_context::context;
 use rustix::{
     buffer::spare_capacity,
     fd::{AsFd, OwnedFd},
     fs::{
-        fstat, getxattr, linkat, listxattr, mkdirat, mknodat, openat, readlinkat, symlinkat,
-        AtFlags, Dir, FileType, Mode, OFlags, CWD,
+        AtFlags, CWD, Dir, FileType, Mode, OFlags, fstat, getxattr, linkat, listxattr, mkdirat,
+        mknodat, openat, readlinkat, symlinkat,
     },
-    io::{read, Errno},
+    io::{Errno, read},
 };
 use zerocopy::IntoBytes;
 
 use crate::{
-    fsverity::{compute_verity, FsVerityHashValue},
+    INLINE_CONTENT_MAX_V0,
+    fsverity::{FsVerityHashValue, compute_verity},
     repository::Repository,
     tree::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
     util::proc_self_fd,
-    INLINE_CONTENT_MAX_V0,
 };
 
 /// Attempt to use O_TMPFILE + rename to atomically set file contents.
@@ -105,10 +105,10 @@ fn write_leaf<ObjectID: FsVerityHashValue>(
     let mode = leaf.stat.st_mode.into();
 
     match &leaf.content {
-        LeafContent::Regular(RegularFile::Inline(ref data)) => {
+        LeafContent::Regular(RegularFile::Inline(data)) => {
             set_file_contents(dirfd, name, &leaf.stat, data)?
         }
-        LeafContent::Regular(RegularFile::External(ref id, size)) => {
+        LeafContent::Regular(RegularFile::External(id, size)) => {
             let object = repo.open_object(id)?;
             // TODO: make this better.  At least needs to be EINTR-safe.  Could even do reflink in some cases.
             // Regardless we shouldn't read the whole file into memory.
@@ -137,8 +137,8 @@ fn write_directory_contents<ObjectID: FsVerityHashValue>(
 ) -> Result<()> {
     for (name, inode) in dir.entries() {
         match inode {
-            Inode::Directory(ref dir) => write_directory(dir, fd, name, repo),
-            Inode::Leaf(ref leaf) => write_leaf(leaf, fd, name, repo),
+            Inode::Directory(dir) => write_directory(dir, fd, name, repo),
+            Inode::Leaf(leaf) => write_leaf(leaf, fd, name, repo),
         }?;
     }
 
@@ -466,7 +466,7 @@ pub fn read_file<ObjectID: FsVerityHashValue>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustix::fs::{openat, CWD};
+    use rustix::fs::{CWD, openat};
 
     #[test]
     fn test_write_contents() -> Result<()> {

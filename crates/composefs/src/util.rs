@@ -4,7 +4,7 @@
 //! I/O utilities for reading data streams, SHA256 digest parsing, and
 //! filesystem operations like atomic symlink replacement.
 
-use rand::{distr::Alphanumeric, RngExt};
+use rand::{RngExt, distr::Alphanumeric};
 use sha2::Digest;
 use std::{
     io::{Error, ErrorKind, Read, Result},
@@ -16,7 +16,7 @@ use std::{
 };
 
 use rustix::{
-    fs::{readlinkat, renameat, symlinkat, unlinkat, AtFlags},
+    fs::{AtFlags, readlinkat, renameat, symlinkat, unlinkat},
     io::{Errno, Result as ErrnoResult},
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -196,10 +196,10 @@ pub(crate) fn replace_symlinkat(
     };
 
     // Step 2: the symlink already exists.  Maybe it already has the correct target?
-    if let Some(current_target) = readlinkat(dirfd, name, []).filter_errno(Errno::NOENT)? {
-        if current_target.into_bytes() == target.as_os_str().as_bytes() {
-            return Ok(());
-        }
+    if let Some(current_target) = readlinkat(dirfd, name, []).filter_errno(Errno::NOENT)?
+        && current_target.into_bytes() == target.as_os_str().as_bytes()
+    {
+        return Ok(());
     }
 
     // Step 3: full atomic replace path

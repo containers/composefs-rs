@@ -19,12 +19,12 @@ use std::{
     },
 };
 
-use rustix::fs::{open, openat, Mode, OFlags};
+use rustix::fs::{Mode, OFlags, open, openat};
 use thiserror::Error;
 
 pub use hashvalue::{
-    Algorithm, AlgorithmParseError, FsVerityHashValue, Sha256HashValue, Sha512HashValue,
-    DEFAULT_LG_BLOCKSIZE,
+    Algorithm, AlgorithmParseError, DEFAULT_LG_BLOCKSIZE, FsVerityHashValue, Sha256HashValue,
+    Sha512HashValue,
 };
 
 // Re-export error types from composefs-ioctls
@@ -267,9 +267,9 @@ mod tests {
     use rand::RngExt;
     use rustix::{
         fd::OwnedFd,
-        fs::{open, Mode, OFlags},
+        fs::{Mode, OFlags, open},
     };
-    use tempfile::{tempfile_in, TempDir};
+    use tempfile::{TempDir, tempfile_in};
     use tokio::{task::JoinSet, time::Instant};
 
     use crate::{test::tempdir, util::proc_self_fd};
@@ -313,9 +313,11 @@ mod tests {
             MeasureVerityError::VerityMissing
         ));
 
-        assert!(measure_verity_opt::<Sha256HashValue>(&tf)
-            .unwrap()
-            .is_none());
+        assert!(
+            measure_verity_opt::<Sha256HashValue>(&tf)
+                .unwrap()
+                .is_none()
+        );
 
         assert!(matches!(
             ensure_verity_equal(&tf, &Sha256HashValue::EMPTY).unwrap_err(),
@@ -552,9 +554,11 @@ mod tests {
             MeasureVerityError::FilesystemNotSupported
         ));
 
-        assert!(measure_verity_opt::<Sha256HashValue>(&tf)
-            .unwrap()
-            .is_none());
+        assert!(
+            measure_verity_opt::<Sha256HashValue>(&tf)
+                .unwrap()
+                .is_none()
+        );
 
         assert!(matches!(
             ensure_verity_equal(&tf, &Sha256HashValue::EMPTY).unwrap_err(),
@@ -683,13 +687,15 @@ mod tests {
             .unwrap();
 
         // The new fd has the correct data
-        assert!(ensure_verity_equal(
-            fd,
-            &Sha256HashValue::from_hex(
-                "1e2eaa4202d750a41174ee454970b92c1bc2f925b1e35076d8c7d5f56362ba64",
+        assert!(
+            ensure_verity_equal(
+                fd,
+                &Sha256HashValue::from_hex(
+                    "1e2eaa4202d750a41174ee454970b92c1bc2f925b1e35076d8c7d5f56362ba64",
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        )
-        .is_ok());
+            .is_ok()
+        );
     }
 }

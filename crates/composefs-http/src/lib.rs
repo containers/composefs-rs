@@ -12,7 +12,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use bytes::Bytes;
 use composefs::util::DigestWrite;
 use indicatif::{ProgressBar, ProgressStyle};

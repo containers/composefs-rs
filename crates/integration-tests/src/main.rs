@@ -10,10 +10,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use libtest_mimic::{Arguments, Trial};
 
-pub(crate) use integration_tests::{integration_test, INTEGRATION_TESTS};
+pub(crate) use integration_tests::{INTEGRATION_TESTS, integration_test};
 
 mod tests;
 
