@@ -2710,7 +2710,7 @@ mod tests {
     /// Make a test in-memory filesystem that only contains one externally referenced object
     fn make_test_fs(obj: &Sha512HashValue, size: u64) -> FileSystem<Sha512HashValue> {
         let mut fs: FileSystem<Sha512HashValue> = FileSystem::new(test_root_stat());
-        let inode = Inode::Leaf(std::rc::Rc::new(Leaf {
+        let inode = Inode::Leaf(std::sync::Arc::new(Leaf {
             stat: Stat {
                 st_mode: 0o644,
                 st_uid: 0,
@@ -2871,7 +2871,7 @@ mod tests {
         size2: u64,
     ) -> FileSystem<Sha512HashValue> {
         let mut fs = make_test_fs(obj1, size1);
-        let inode = Inode::Leaf(std::rc::Rc::new(Leaf {
+        let inode = Inode::Leaf(std::sync::Arc::new(Leaf {
             stat: Stat {
                 st_mode: 0o644,
                 st_uid: 0,

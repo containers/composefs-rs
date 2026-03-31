@@ -41,7 +41,11 @@ pub type FileSystem<T> = generic_tree::FileSystem<RegularFile<T>>;
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, collections::BTreeMap, ffi::OsStr, rc::Rc};
+    use std::{
+        collections::BTreeMap,
+        ffi::OsStr,
+        sync::{Arc, RwLock},
+    };
 
     use super::*;
     use crate::fsverity::Sha256HashValue;
@@ -53,21 +57,21 @@ mod tests {
             st_uid: 1000,
             st_gid: 1000,
             st_mtim_sec: mtime,
-            xattrs: RefCell::new(BTreeMap::new()),
+            xattrs: RwLock::new(BTreeMap::new()),
         }
     }
 
     // Helper to create an empty Directory Inode with a specific mtime
     fn new_dir_inode(mtime: i64) -> Inode<Sha256HashValue> {
-        Inode::Directory(Box::new(Directory {
+        Inode::Directory(Arc::new(Directory {
             stat: stat_with_mtime(mtime),
             entries: BTreeMap::new(),
         }))
     }
 
     // Helper to create a simple Leaf (e.g., an empty inline file)
-    fn new_leaf_file(mtime: i64) -> Rc<Leaf<Sha256HashValue>> {
-        Rc::new(Leaf {
+    fn new_leaf_file(mtime: i64) -> Arc<Leaf<Sha256HashValue>> {
+        Arc::new(Leaf {
             stat: stat_with_mtime(mtime),
             content: LeafContent::Regular(super::RegularFile::Inline(Default::default())),
         })
@@ -80,7 +84,7 @@ mod tests {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
-            xattrs: RefCell::new(BTreeMap::new()),
+            xattrs: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -88,11 +92,11 @@ mod tests {
     fn test_insert_and_get_leaf() {
         let mut dir = Directory::<Sha256HashValue>::new(default_stat());
         let leaf = new_leaf_file(10);
-        dir.insert(OsStr::new("file.txt"), Inode::Leaf(Rc::clone(&leaf)));
+        dir.insert(OsStr::new("file.txt"), Inode::Leaf(Arc::clone(&leaf)));
         assert_eq!(dir.entries.len(), 1);
 
         let retrieved_leaf_rc = dir.ref_leaf(OsStr::new("file.txt")).unwrap();
-        assert!(Rc::ptr_eq(&retrieved_leaf_rc, &leaf));
+        assert!(Arc::ptr_eq(&retrieved_leaf_rc, &leaf));
 
         let regular_file_content = dir.get_file(OsStr::new("file.txt")).unwrap();
         assert!(matches!(

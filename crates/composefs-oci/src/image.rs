@@ -8,7 +8,7 @@
 //! and builds a complete filesystem by processing all layers in order. The `process_entry()` function
 //! handles individual tar entries and implements overlayfs whiteout semantics for proper layer merging.
 
-use std::{ffi::OsStr, os::unix::ffi::OsStrExt, rc::Rc};
+use std::{ffi::OsStr, os::unix::ffi::OsStrExt, sync::Arc};
 
 use anyhow::{ensure, Context, Result};
 use composefs::util::DigestWrite;
@@ -50,8 +50,8 @@ pub fn process_entry<ObjectID: FsVerityHashValue>(
     }
 
     let inode = match entry.item {
-        TarItem::Directory => Inode::Directory(Box::from(Directory::new(entry.stat))),
-        TarItem::Leaf(content) => Inode::Leaf(Rc::new(Leaf {
+        TarItem::Directory => Inode::Directory(Arc::from(Directory::new(entry.stat))),
+        TarItem::Leaf(content) => Inode::Leaf(Arc::new(Leaf {
             stat: entry.stat,
             content,
         })),
@@ -145,7 +145,7 @@ mod test {
         fsverity::Sha256HashValue,
         tree::{LeafContent, RegularFile, Stat},
     };
-    use std::{cell::RefCell, collections::BTreeMap, io::BufRead, path::PathBuf};
+    use std::{collections::BTreeMap, io::BufRead, path::PathBuf, sync::RwLock};
 
     use super::*;
 
@@ -157,7 +157,7 @@ mod test {
                 st_uid: 0,
                 st_gid: 0,
                 st_mtim_sec: 0,
-                xattrs: RefCell::new(BTreeMap::new()),
+                xattrs: RwLock::new(BTreeMap::new()),
             },
             item: TarItem::Leaf(LeafContent::Regular(RegularFile::Inline([].into()))),
         }
@@ -171,7 +171,7 @@ mod test {
                 st_uid: 0,
                 st_gid: 0,
                 st_mtim_sec: 0,
-                xattrs: RefCell::new(BTreeMap::new()),
+                xattrs: RwLock::new(BTreeMap::new()),
             },
             item: TarItem::Directory,
         }

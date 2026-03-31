@@ -13,19 +13,19 @@ use std::{
         fd::{AsFd, AsRawFd, OwnedFd},
         unix::ffi::OsStrExt,
     },
-    rc::Rc,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
 
 use anyhow::Context;
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen,
-    Request, Session, SessionACL,
+    Config, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, OpenFlags,
+    ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen, Request, Session,
 };
 use rustix::{
     buffer::spare_capacity,
     fs::{open, Mode, OFlags},
-    io::{pread, Errno},
+    io::pread,
     mount::{
         fsconfig_create, fsconfig_set_flag, fsconfig_set_string, fsmount, FsMountFlags,
         MountAttrFlags,
@@ -42,9 +42,9 @@ use composefs::{
 const TTL: Duration = Duration::from_secs(1_000_000);
 
 #[derive(Debug, Clone)]
-enum InodeRef<'a, ObjectID: FsVerityHashValue> {
-    Directory(&'a Directory<ObjectID>, u64),
-    Leaf(&'a Rc<Leaf<ObjectID>>),
+enum InodeRef<ObjectID: FsVerityHashValue> {
+    Directory(Arc<Directory<ObjectID>>, u64),
+    Leaf(Arc<Leaf<ObjectID>>),
 }
 
 #[derive(Debug)]
@@ -53,18 +53,18 @@ enum OpenHandle {
     Data(Box<[u8]>),
 }
 
-impl<'a, ObjectID: FsVerityHashValue> InodeRef<'a, ObjectID> {
-    fn new(inode: &'a Inode<ObjectID>, parent: u64) -> Self {
+impl<ObjectID: FsVerityHashValue> InodeRef<ObjectID> {
+    fn new(inode: &Inode<ObjectID>, parent: u64) -> Self {
         match inode {
-            Inode::Directory(dir) => InodeRef::Directory(dir, parent),
-            Inode::Leaf(leaf) => InodeRef::Leaf(leaf),
+            Inode::Directory(dir) => InodeRef::Directory(Arc::clone(dir), parent),
+            Inode::Leaf(leaf) => InodeRef::Leaf(Arc::clone(leaf)),
         }
     }
 
     fn ino(&self) -> u64 {
         match self {
-            InodeRef::Directory(dir, ..) => *dir as *const Directory<ObjectID> as u64,
-            InodeRef::Leaf(leaf) => Rc::as_ptr(leaf) as u64,
+            InodeRef::Directory(dir, ..) => Arc::as_ptr(dir) as u64,
+            InodeRef::Leaf(leaf) => Arc::as_ptr(leaf) as u64,
         }
     }
 
@@ -76,7 +76,7 @@ impl<'a, ObjectID: FsVerityHashValue> InodeRef<'a, ObjectID> {
                     .filter(|i| matches!(i, Inode::Directory(..)))
                     .count()
             }
-            InodeRef::Leaf(leaf) => Rc::strong_count(leaf),
+            InodeRef::Leaf(leaf) => Arc::strong_count(leaf),
         }) as u32
     }
 
@@ -108,7 +108,7 @@ impl<'a, ObjectID: FsVerityHashValue> InodeRef<'a, ObjectID> {
         }
     }
 
-    fn stat(&self) -> &'a Stat {
+    fn stat(&self) -> &Stat {
         match self {
             InodeRef::Directory(dir, ..) => &dir.stat,
             InodeRef::Leaf(leaf) => &leaf.stat,
@@ -131,7 +131,7 @@ impl<'a, ObjectID: FsVerityHashValue> InodeRef<'a, ObjectID> {
         let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_mtim_sec as u64);
 
         FileAttr {
-            ino: self.ino(),
+            ino: INodeNo(self.ino()),
             size: self.size(),
             blocks: 1,
             atime: mtime,
@@ -150,120 +150,156 @@ impl<'a, ObjectID: FsVerityHashValue> InodeRef<'a, ObjectID> {
     }
 }
 
+/// Mutable state for the FUSE filesystem, protected by a Mutex since fuser 0.17
+/// requires `Filesystem` methods to take `&self` (not `&mut self`).
 #[derive(Debug)]
-struct TreeFuse<'a, ObjectID: FsVerityHashValue> {
-    repo: &'a Repository<ObjectID>,
-    inodes: HashMap<u64, InodeRef<'a, ObjectID>>,
+struct TreeFuseState<ObjectID: FsVerityHashValue> {
+    inodes: HashMap<u64, InodeRef<ObjectID>>,
     attrs: HashMap<u64, FileAttr>,
     handles: HashMap<u64, OpenHandle>,
     next_fh: u64,
 }
 
-impl<'a, ObjectID: FsVerityHashValue> TreeFuse<'a, ObjectID> {
-    fn inode_ref(&mut self, inode: &'a Inode<ObjectID>, parent: u64) -> InodeRef<'a, ObjectID> {
+#[derive(Debug)]
+struct TreeFuse<ObjectID: FsVerityHashValue> {
+    repo: Arc<Repository<ObjectID>>,
+    state: Mutex<TreeFuseState<ObjectID>>,
+}
+
+impl<ObjectID: FsVerityHashValue> TreeFuse<ObjectID> {
+    fn inode_ref(
+        state: &mut TreeFuseState<ObjectID>,
+        inode: &Inode<ObjectID>,
+        parent: u64,
+    ) -> InodeRef<ObjectID> {
         let iref = InodeRef::new(inode, parent);
-        self.inodes.insert(iref.ino(), iref.clone());
+        state.inodes.insert(iref.ino(), iref.clone());
         iref
     }
 
-    fn iref_fileattr(&mut self, iref: &InodeRef<ObjectID>) -> &FileAttr {
-        self.attrs.insert(iref.ino(), iref.fileattr());
-        self.attrs.get(&iref.ino()).unwrap()
+    fn iref_fileattr(state: &mut TreeFuseState<ObjectID>, iref: &InodeRef<ObjectID>) -> FileAttr {
+        let attr = iref.fileattr();
+        state.attrs.insert(iref.ino(), attr);
+        attr
     }
 
-    fn inode_fileattr(&mut self, inode: &'a Inode<ObjectID>, parent: u64) -> &FileAttr {
-        let iref = self.inode_ref(inode, parent);
-        self.attrs.insert(iref.ino(), iref.fileattr());
-        self.attrs.get(&iref.ino()).unwrap()
+    fn inode_fileattr(
+        state: &mut TreeFuseState<ObjectID>,
+        inode: &Inode<ObjectID>,
+        parent: u64,
+    ) -> FileAttr {
+        let iref = Self::inode_ref(state, inode, parent);
+        let attr = iref.fileattr();
+        state.attrs.insert(iref.ino(), attr);
+        attr
     }
 }
 
-impl<ObjectID: FsVerityHashValue> Filesystem for TreeFuse<'_, ObjectID> {
-    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: fuser::ReplyStatfs) {
+impl<ObjectID: FsVerityHashValue> Filesystem for TreeFuse<ObjectID> {
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: fuser::ReplyStatfs) {
         reply.statfs(0, 0, 0, 0, 0, 4096, 255, 4096);
     }
 
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        let parent = parent.0;
         log::trace!("lookup {parent} {name:?}");
-        let Some(InodeRef::Directory(dir, ..)) = self.inodes.get(&parent) else {
-            log::error!("lookup({parent}, {name:?}) parent does not exist");
-            return reply.error(Errno::BADF.raw_os_error());
+        let mut state = self.state.lock().unwrap();
+
+        // Clone the directory Arc to release the borrow on state
+        let dir = match state.inodes.get(&parent) {
+            Some(InodeRef::Directory(dir, ..)) => Arc::clone(dir),
+            _ => {
+                log::error!(
+                    "lookup({parent}, {name:?}) parent does not exist or is not a directory"
+                );
+                return reply.error(fuser::Errno::EBADF);
+            }
         };
 
-        // dir is &&Directory which means it holds a reference to the image and also a reference to
-        // self.  Dereference to drop the spurious self-reference to allow further mutability.
-        let dir = *dir;
-
         match dir.lookup(name) {
-            Some(inode) => reply.entry(&TTL, self.inode_fileattr(inode, parent), 0),
-            None => reply.error(Errno::NOENT.raw_os_error()),
+            Some(inode) => {
+                let attr = Self::inode_fileattr(&mut state, inode, parent);
+                reply.entry(&TTL, &attr, Generation(0));
+            }
+            None => reply.error(fuser::Errno::ENOENT),
         }
     }
 
-    fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        if let Some(attrs) = self.attrs.get(&ino) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        let ino = ino.0;
+        let mut state = self.state.lock().unwrap();
+        if let Some(attrs) = state.attrs.get(&ino) {
             return reply.attr(&TTL, attrs);
         }
 
-        let Some(iref) = self.inodes.get(&ino) else {
+        let Some(iref) = state.inodes.get(&ino) else {
             log::error!("getattr({ino}) inode does not exist");
-            return reply.error(Errno::BADF.raw_os_error());
+            return reply.error(fuser::Errno::EBADF);
         };
 
-        // iref is &InodeRef which means it holds a reference to self.  Drop that.
+        // Clone to release the borrow on state
         let iref = iref.clone();
-
-        reply.attr(&TTL, self.iref_fileattr(&iref));
+        let attr = Self::iref_fileattr(&mut state, &iref);
+        reply.attr(&TTL, &attr);
     }
 
-    fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
-        let Some(InodeRef::Leaf(leaf, ..)) = self.inodes.get(&ino) else {
-            return reply.error(Errno::INVAL.raw_os_error());
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        let ino = ino.0;
+        let state = self.state.lock().unwrap();
+        let Some(InodeRef::Leaf(leaf)) = state.inodes.get(&ino) else {
+            return reply.error(fuser::Errno::EINVAL);
         };
 
         let LeafContent::Symlink(target) = &leaf.content else {
-            return reply.error(Errno::INVAL.raw_os_error());
+            return reply.error(fuser::Errno::EINVAL);
         };
 
         reply.data(target.as_bytes());
     }
 
-    fn opendir(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {
-        reply.opened(0, 0);
+    fn opendir(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        reply.opened(FileHandle(0), FopenFlags::empty());
     }
 
     fn readdir(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        _fh: u64,
-        mut offset: i64,
+        ino: INodeNo,
+        _fh: FileHandle,
+        mut offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let Some(InodeRef::Directory(dir, parent)) = self.inodes.get(&ino) else {
-            log::error!("readdir({ino}) inode is not a directory");
-            return reply.error(Errno::BADF.raw_os_error());
+        let ino = ino.0;
+        let mut state = self.state.lock().unwrap();
+
+        // Clone the directory Arc and parent to release the borrow on state
+        let (dir, parent) = match state.inodes.get(&ino) {
+            Some(InodeRef::Directory(dir, parent)) => (Arc::clone(dir), *parent),
+            _ => {
+                log::error!("readdir({ino}) inode is not a directory");
+                return reply.error(fuser::Errno::EBADF);
+            }
         };
 
         if offset == 0 {
             offset += 1;
-            if reply.add(ino, offset, FileType::Directory, ".") {
+            if reply.add(INodeNo(ino), offset, FileType::Directory, ".") {
                 return reply.ok();
             }
         }
 
         if offset == 1 {
             offset += 1;
-            if reply.add(*parent, offset, FileType::Directory, "..") {
+            if reply.add(INodeNo(parent), offset, FileType::Directory, "..") {
                 return reply.ok();
             }
         }
 
         for (name, inode) in dir.sorted_entries().skip(offset as usize - 2) {
-            let iref = self.inode_ref(inode, ino);
+            let iref = Self::inode_ref(&mut state, inode, ino);
 
             offset += 1;
-            if reply.add(iref.ino(), offset, iref.kind(), name) {
+            if reply.add(INodeNo(iref.ino()), offset, iref.kind(), name) {
                 break;
             }
         }
@@ -272,51 +308,55 @@ impl<ObjectID: FsVerityHashValue> Filesystem for TreeFuse<'_, ObjectID> {
     }
 
     fn releasedir(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _fh: u64,
-        _flags: i32,
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _flags: OpenFlags,
         reply: fuser::ReplyEmpty,
     ) {
         reply.ok();
     }
 
     fn getxattr(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
         name: &OsStr,
         size: u32,
         reply: fuser::ReplyXattr,
     ) {
-        let Some(iref) = self.inodes.get(&ino) else {
+        let ino = ino.0;
+        let state = self.state.lock().unwrap();
+        let Some(iref) = state.inodes.get(&ino) else {
             log::error!("getxattr({ino}, {name:?}, {size}) inode does not exist");
-            return reply.error(Errno::BADF.raw_os_error());
+            return reply.error(fuser::Errno::EBADF);
         };
 
-        let xattrs = iref.stat().xattrs.borrow();
+        let xattrs = iref.stat().xattrs.read().unwrap();
         let Some(value) = xattrs.get(name) else {
-            return reply.error(Errno::NODATA.raw_os_error());
+            return reply.error(fuser::Errno::ENODATA);
         };
 
         if size == 0 {
             return reply.size(value.len() as u32);
         } else if value.len() > size as usize {
-            return reply.error(Errno::RANGE.raw_os_error());
+            return reply.error(fuser::Errno::ERANGE);
         }
 
         reply.data(value);
     }
 
-    fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: fuser::ReplyXattr) {
-        let Some(iref) = self.inodes.get(&ino) else {
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: fuser::ReplyXattr) {
+        let ino = ino.0;
+        let state = self.state.lock().unwrap();
+        let Some(iref) = state.inodes.get(&ino) else {
             log::error!("listxattr({ino}, {size}) inode does not exist");
-            return reply.error(Errno::BADF.raw_os_error());
+            return reply.error(fuser::Errno::EBADF);
         };
 
         let mut list = vec![];
-        for name in iref.stat().xattrs.borrow().keys() {
+        for name in iref.stat().xattrs.read().unwrap().keys() {
             list.extend_from_slice(name.as_bytes());
             list.push(b'\0');
         }
@@ -324,70 +364,79 @@ impl<ObjectID: FsVerityHashValue> Filesystem for TreeFuse<'_, ObjectID> {
         if size == 0 {
             return reply.size(list.len() as u32);
         } else if list.len() > size as usize {
-            return reply.error(Errno::RANGE.raw_os_error());
+            return reply.error(fuser::Errno::ERANGE);
         }
 
         reply.data(&list);
     }
 
-    fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        let ino = ino.0;
         log::trace!("open({ino})");
-        let Some(iref) = self.inodes.get(&ino) else {
-            log::error!("open({ino}) inode does not exist");
-            return reply.error(Errno::BADF.raw_os_error());
-        };
+        let mut state = self.state.lock().unwrap();
 
-        let InodeRef::Leaf(leaf) = iref else {
-            log::error!("open({ino}) inode is a directory");
-            return reply.error(Errno::BADF.raw_os_error());
+        // Clone the leaf Arc to release the borrow on state
+        let leaf = match state.inodes.get(&ino) {
+            Some(InodeRef::Leaf(leaf)) => Arc::clone(leaf),
+            Some(_) => {
+                log::error!("open({ino}) inode is a directory");
+                return reply.error(fuser::Errno::EBADF);
+            }
+            None => {
+                log::error!("open({ino}) inode does not exist");
+                return reply.error(fuser::Errno::EBADF);
+            }
         };
 
         let handle = match &leaf.content {
             LeafContent::Regular(RegularFile::External(id, ..)) => {
                 let Ok(fd) = self.repo.open_object(id) else {
                     log::error!("open({ino}) open object failed");
-                    return reply.error(Errno::INVAL.raw_os_error());
+                    return reply.error(fuser::Errno::EINVAL);
                 };
                 OpenHandle::Fd(fd)
             }
             LeafContent::Regular(RegularFile::Inline(data)) => OpenHandle::Data(data.clone()),
             _ => {
                 log::error!("open({ino}) non-regular file");
-                return reply.error(Errno::BADF.raw_os_error());
+                return reply.error(fuser::Errno::EBADF);
             }
         };
 
-        let fh = self.next_fh;
-        self.next_fh += 1;
-        log::debug!("self.handles.insert({fh}, {handle:?})");
-        self.handles.insert(fh, handle);
-        reply.opened(fh, 0);
+        let fh = state.next_fh;
+        state.next_fh += 1;
+        log::debug!("state.handles.insert({fh}, {handle:?})");
+        state.handles.insert(fh, handle);
+        reply.opened(FileHandle(fh), FopenFlags::empty());
     }
 
     fn read(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _flags: OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
         reply: fuser::ReplyData,
     ) {
-        match self.handles.get(&fh) {
+        let fh = fh.0;
+        let state = self.state.lock().unwrap();
+        match state.handles.get(&fh) {
             Some(OpenHandle::Fd(fd)) => {
                 let mut data = Vec::with_capacity(size as usize);
-                match pread(fd, spare_capacity(&mut data), offset as u64) {
+                match pread(fd, spare_capacity(&mut data), offset) {
                     Ok(_) => reply.data(&data),
-                    Err(errno) => reply.error(errno.raw_os_error()),
+                    Err(errno) => reply.error(fuser::Errno::from_i32(errno.raw_os_error())),
                 }
             }
             Some(OpenHandle::Data(data)) => {
-                if offset as usize > data.len() {
+                let offset = offset as usize;
+                if offset > data.len() {
                     reply.data(b"");
                 } else {
-                    let mut data = &data[offset as usize..];
+                    let mut data = &data[offset..];
                     if data.len() > size as usize {
                         data = &data[..size as usize];
                     }
@@ -396,26 +445,28 @@ impl<ObjectID: FsVerityHashValue> Filesystem for TreeFuse<'_, ObjectID> {
             }
             None => {
                 log::error!("Handle doesn't exist: pread({fh}, {size}, {offset})");
-                reply.error(Errno::BADF.raw_os_error());
+                reply.error(fuser::Errno::EBADF);
             }
         }
     }
 
     fn release(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        fh: u64,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        match self.handles.remove(&fh) {
+        let fh = fh.0;
+        let mut state = self.state.lock().unwrap();
+        match state.handles.remove(&fh) {
             Some(_) => reply.ok(),
             None => {
                 log::error!("Handle doesn't exist: close({fh})");
-                reply.error(Errno::BADF.raw_os_error())
+                reply.error(fuser::Errno::EBADF)
             }
         }
     }
@@ -461,17 +512,22 @@ pub fn mount_fuse(dev_fuse: impl AsFd) -> anyhow::Result<OwnedFd> {
 /// Serves a FUSE filesystem exposing the content of `root`, backed by `repo`.
 ///
 /// You should have called mount_fuse() on the dev_fuse fd to establish a mount point.
-pub fn serve_tree_fuse<'a, ObjectID: FsVerityHashValue>(
+pub fn serve_tree_fuse<ObjectID: FsVerityHashValue>(
     dev_fuse: OwnedFd,
-    root: &'a Directory<ObjectID>,
-    repo: &'a Repository<ObjectID>,
+    root: Arc<Directory<ObjectID>>,
+    repo: Arc<Repository<ObjectID>>,
 ) -> std::io::Result<()> {
+    let root_ref = InodeRef::Directory(root, 1);
+    let root_ino = root_ref.ino();
     let fs = TreeFuse::<ObjectID> {
         repo,
-        inodes: HashMap::from([(1, InodeRef::Directory(root, 1))]),
-        attrs: Default::default(),
-        handles: Default::default(),
-        next_fh: 1,
+        state: Mutex::new(TreeFuseState {
+            inodes: HashMap::from([(root_ino, root_ref)]),
+            attrs: Default::default(),
+            handles: Default::default(),
+            next_fh: 1,
+        }),
     };
-    Session::from_fd(fs, dev_fuse, SessionACL::All).run()
+    let session = Session::from_fd(fs, dev_fuse, fuser::SessionACL::All, Config::default())?;
+    session.spawn()?.join()
 }

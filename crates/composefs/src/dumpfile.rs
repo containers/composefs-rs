@@ -7,14 +7,14 @@
 //! The module handles file metadata, extended attributes, and hardlink tracking.
 
 use std::{
-    cell::RefCell,
     collections::{BTreeMap, HashMap},
     ffi::{OsStr, OsString},
     fmt,
     io::{BufWriter, Write},
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
-    rc::Rc,
+    sync::Arc,
+    sync::RwLock,
 };
 
 use anyhow::{ensure, Context, Result};
@@ -131,7 +131,7 @@ fn write_entry(
         write_empty(writer)?;
     }
 
-    for (key, value) in &*stat.xattrs.borrow() {
+    for (key, value) in &*stat.xattrs.read().unwrap() {
         write!(writer, " ")?;
         write_escaped_raw(writer, key.as_bytes(), EscapeEquals::Yes)?;
         write!(writer, "=")?;
@@ -336,12 +336,12 @@ impl<'a, W: Write, ObjectID: FsVerityHashValue> DumpfileWriter<'a, W, ObjectID> 
     }
 
     #[context("Writing leaf to dumpfile: {}", path.display())]
-    fn write_leaf(&mut self, path: &Path, leaf: &Rc<Leaf<ObjectID>>) -> Result<()> {
-        let nlink = Rc::strong_count(leaf);
+    fn write_leaf(&mut self, path: &Path, leaf: &Arc<Leaf<ObjectID>>) -> Result<()> {
+        let nlink = Arc::strong_count(leaf);
 
         if nlink > 1 {
             // This is a hardlink.  We need to handle that specially.
-            let ptr = Rc::as_ptr(leaf);
+            let ptr = Arc::as_ptr(leaf);
             if let Some(target) = self.hardlinks.get(&ptr) {
                 return writeln_fmt(self.writer, |fmt| write_hardlink(fmt, path, target));
             }
@@ -388,7 +388,7 @@ pub fn dump_single_dir(
 /// Write a single file
 pub fn dump_single_file(
     writer: &mut impl Write,
-    file: &Rc<Leaf<impl FsVerityHashValue>>,
+    file: &Arc<Leaf<impl FsVerityHashValue>>,
     path: PathBuf,
 ) -> Result<()> {
     // default pipe capacity on Linux is 16 pages (65536 bytes), but
@@ -408,7 +408,7 @@ pub fn dump_single_file(
 pub fn add_entry_to_filesystem<ObjectID: FsVerityHashValue>(
     fs: &mut FileSystem<ObjectID>,
     entry: Entry<'_>,
-    hardlinks: &mut HashMap<PathBuf, Rc<Leaf<ObjectID>>>,
+    hardlinks: &mut HashMap<PathBuf, Arc<Leaf<ObjectID>>>,
 ) -> Result<()> {
     let path = entry.path.as_ref();
 
@@ -438,7 +438,7 @@ pub fn add_entry_to_filesystem<ObjectID: FsVerityHashValue>(
     let inode = match entry.item {
         Item::Directory { .. } => {
             let stat = entry_to_stat(&entry);
-            Inode::Directory(Box::new(Directory::new(stat)))
+            Inode::Directory(Arc::new(Directory::new(stat)))
         }
         Item::Hardlink { ref target } => {
             // Look up the target in our hardlinks map and clone the Rc
@@ -455,7 +455,7 @@ pub fn add_entry_to_filesystem<ObjectID: FsVerityHashValue>(
                 std::borrow::Cow::Owned(d) => d.clone().into_boxed_slice(),
             };
             let content = LeafContent::Regular(RegularFile::Inline(data));
-            Inode::Leaf(Rc::new(Leaf { stat, content }))
+            Inode::Leaf(Arc::new(Leaf { stat, content }))
         }
         Item::Regular {
             size,
@@ -468,7 +468,7 @@ pub fn add_entry_to_filesystem<ObjectID: FsVerityHashValue>(
                 .ok_or_else(|| anyhow::anyhow!("External file missing fsverity digest"))?;
             let object_id = ObjectID::from_hex(digest)?;
             let content = LeafContent::Regular(RegularFile::External(object_id, size));
-            Inode::Leaf(Rc::new(Leaf { stat, content }))
+            Inode::Leaf(Arc::new(Leaf { stat, content }))
         }
         Item::Device { rdev, .. } => {
             let stat = entry_to_stat(&entry);
@@ -478,7 +478,7 @@ pub fn add_entry_to_filesystem<ObjectID: FsVerityHashValue>(
             } else {
                 LeafContent::CharacterDevice(rdev)
             };
-            Inode::Leaf(Rc::new(Leaf { stat, content }))
+            Inode::Leaf(Arc::new(Leaf { stat, content }))
         }
         Item::Symlink { ref target, .. } => {
             let stat = entry_to_stat(&entry);
@@ -487,12 +487,12 @@ pub fn add_entry_to_filesystem<ObjectID: FsVerityHashValue>(
                 std::borrow::Cow::Owned(t) => Box::from(t.as_os_str()),
             };
             let content = LeafContent::Symlink(target_os);
-            Inode::Leaf(Rc::new(Leaf { stat, content }))
+            Inode::Leaf(Arc::new(Leaf { stat, content }))
         }
         Item::Fifo { .. } => {
             let stat = entry_to_stat(&entry);
             let content = LeafContent::Fifo;
-            Inode::Leaf(Rc::new(Leaf { stat, content }))
+            Inode::Leaf(Arc::new(Leaf { stat, content }))
         }
     };
 
@@ -525,7 +525,7 @@ fn entry_to_stat(entry: &Entry<'_>) -> Stat {
         st_uid: entry.uid,
         st_gid: entry.gid,
         st_mtim_sec: entry.mtime.sec as i64,
-        xattrs: RefCell::new(xattrs),
+        xattrs: RwLock::new(xattrs),
     }
 }
 
@@ -640,11 +640,11 @@ mod tests {
         };
 
         // They should all point to the same Rc (same pointer)
-        assert!(Rc::ptr_eq(original_leaf, hardlink1_leaf));
-        assert!(Rc::ptr_eq(original_leaf, hardlink2_leaf));
+        assert!(Arc::ptr_eq(original_leaf, hardlink1_leaf));
+        assert!(Arc::ptr_eq(original_leaf, hardlink2_leaf));
 
         // Verify the strong count is 3 (original + 2 hardlinks)
-        assert_eq!(Rc::strong_count(original_leaf), 3);
+        assert_eq!(Arc::strong_count(original_leaf), 3);
 
         // Verify content
         if let LeafContent::Regular(RegularFile::Inline(data)) = &original_leaf.content {
@@ -690,8 +690,8 @@ mod tests {
     /// not treat specially.
     #[test]
     fn test_xattr_empty_and_dash_values_round_trip() -> Result<()> {
-        use std::cell::RefCell;
         use std::collections::BTreeMap;
+        use std::sync::RwLock;
 
         let mut xattrs = BTreeMap::new();
         xattrs.insert(
@@ -708,15 +708,15 @@ mod tests {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
-            xattrs: RefCell::new(BTreeMap::new()),
+            xattrs: RwLock::new(BTreeMap::new()),
         });
-        let leaf = std::rc::Rc::new(Leaf {
+        let leaf = std::sync::Arc::new(Leaf {
             stat: Stat {
                 st_mode: 0o644,
                 st_uid: 0,
                 st_gid: 0,
                 st_mtim_sec: 0,
-                xattrs: RefCell::new(xattrs),
+                xattrs: RwLock::new(xattrs),
             },
             content: LeafContent::Regular(RegularFile::Inline(b"test".to_vec().into())),
         });
@@ -736,22 +736,22 @@ mod tests {
     /// hardlinks correctly.
     #[test]
     fn test_hardlink_write_round_trip() -> Result<()> {
-        use std::cell::RefCell;
         use std::collections::BTreeMap;
+        use std::sync::RwLock;
 
         let stat = || Stat {
             st_mode: 0o644,
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
-            xattrs: RefCell::new(BTreeMap::new()),
+            xattrs: RwLock::new(BTreeMap::new()),
         };
 
         let mut fs = FileSystem::<Sha256HashValue>::new(Stat {
             st_mode: 0o755,
             ..stat()
         });
-        let leaf = std::rc::Rc::new(Leaf {
+        let leaf = std::sync::Arc::new(Leaf {
             stat: stat(),
             content: LeafContent::Regular(RegularFile::Inline(b"data".to_vec().into())),
         });
@@ -770,7 +770,7 @@ mod tests {
         let orig = fs2.root.lookup(OsStr::new("original")).unwrap();
         let link = fs2.root.lookup(OsStr::new("link")).unwrap();
         match (orig, link) {
-            (Inode::Leaf(a), Inode::Leaf(b)) => assert!(Rc::ptr_eq(a, b)),
+            (Inode::Leaf(a), Inode::Leaf(b)) => assert!(Arc::ptr_eq(a, b)),
             _ => panic!("expected both to be leaves"),
         }
 

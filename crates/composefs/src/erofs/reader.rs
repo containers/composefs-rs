@@ -5,12 +5,12 @@
 //! reference collection for garbage collection.
 
 use core::mem::size_of;
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::ops::Range;
 use std::os::unix::ffi::OsStrExt;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::RwLock;
 
 use anyhow::Context;
 use thiserror::Error;
@@ -1118,7 +1118,7 @@ fn stat_from_inode_for_tree(img: &Image, inode: &InodeType) -> anyhow::Result<tr
         st_uid,
         st_gid,
         st_mtim_sec,
-        xattrs: RefCell::new(xattrs),
+        xattrs: RwLock::new(xattrs),
     })
 }
 
@@ -1316,14 +1316,14 @@ const MAX_DIRECTORY_DEPTH: usize = 4096 / 2;
 struct NlinkEntry<ObjectID: FsVerityHashValue> {
     /// The on-disk nlink value from the inode header.
     expected: u32,
-    /// Reference to the leaf so we can check Rc::strong_count() later.
-    leaf: Rc<tree::Leaf<ObjectID>>,
+    /// Reference to the leaf so we can check Arc::strong_count() later.
+    leaf: Arc<tree::Leaf<ObjectID>>,
 }
 
 /// Mutable state threaded through the recursive directory traversal.
 struct TreeBuilder<ObjectID: FsVerityHashValue> {
     /// Map from nid to first-seen leaf for hardlink detection.
-    hardlinks: HashMap<u64, Rc<tree::Leaf<ObjectID>>>,
+    hardlinks: HashMap<u64, Arc<tree::Leaf<ObjectID>>>,
     /// Map from nid to nlink tracking entry for post-traversal validation.
     nlink_tracker: HashMap<u64, NlinkEntry<ObjectID>>,
 }
@@ -1343,7 +1343,7 @@ impl<ObjectID: FsVerityHashValue> TreeBuilder<ObjectID> {
             // strong_count includes: one per tree insertion + one held by
             // nlink_tracker + possibly one in the hardlinks map.
             let tracker_refs: usize = 1 + usize::from(self.hardlinks.contains_key(nid));
-            let tree_refs = Rc::strong_count(&entry.leaf)
+            let tree_refs = Arc::strong_count(&entry.leaf)
                 .checked_sub(tracker_refs)
                 .expect("strong_count must be >= tracker_refs");
             let tree_nlink: u32 = tree_refs
@@ -1421,11 +1421,11 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
                 depth + 1,
             )
             .with_context(|| format!("reading directory {:?}", name))?;
-            dir.insert(name, tree::Inode::Directory(Box::new(child_dir)));
+            dir.insert(name, tree::Inode::Directory(Arc::new(child_dir)));
         } else {
             // Check if this is a hardlink (same nid seen before)
             if let Some(existing_leaf) = builder.hardlinks.get(&nid) {
-                dir.insert(name, tree::Inode::Leaf(Rc::clone(existing_leaf)));
+                dir.insert(name, tree::Inode::Leaf(Arc::clone(existing_leaf)));
                 continue;
             }
 
@@ -1476,12 +1476,12 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
                 _ => anyhow::bail!("unknown file type {:#o} for {:?}", file_type, name),
             };
 
-            let leaf = Rc::new(tree::Leaf { stat, content });
+            let leaf = Arc::new(tree::Leaf { stat, content });
 
             // Track for hardlink detection if nlink > 1
             let on_disk_nlink = child_inode.nlink();
             if on_disk_nlink > 1 {
-                builder.hardlinks.insert(nid, Rc::clone(&leaf));
+                builder.hardlinks.insert(nid, Arc::clone(&leaf));
             }
 
             // Track for post-traversal nlink validation
@@ -1490,7 +1490,7 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
                 .entry(nid)
                 .or_insert_with(|| NlinkEntry {
                     expected: on_disk_nlink,
-                    leaf: Rc::clone(&leaf),
+                    leaf: Arc::clone(&leaf),
                 });
 
             dir.insert(name, tree::Inode::Leaf(leaf));
@@ -2101,7 +2101,7 @@ mod tests {
             let orig_leaf = fs_rt.root.ref_leaf(OsStr::new("original")).unwrap();
             let hardlink_leaf = fs_rt.root.ref_leaf(OsStr::new("hardlink")).unwrap();
             assert!(
-                Rc::ptr_eq(&orig_leaf, &hardlink_leaf),
+                Arc::ptr_eq(&orig_leaf, &hardlink_leaf),
                 "hardlink entries should share the same Rc"
             );
         }

@@ -5,11 +5,10 @@
 //! and metadata serialization.
 
 use std::{
-    cell::RefCell,
     collections::{BTreeMap, HashMap},
     mem::size_of,
     os::unix::ffi::OsStrExt,
-    rc::Rc,
+    sync::Arc,
 };
 
 use log::trace;
@@ -442,7 +441,7 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
         }
 
         // Add the normal xattrs.  They're already listed in sorted order.
-        for (name, value) in RefCell::borrow(&stat.xattrs).iter() {
+        for (name, value) in stat.xattrs.read().unwrap().iter() {
             let name = name.as_bytes();
 
             if let Some(escapee) = name.strip_prefix(b"trusted.overlay.") {
@@ -464,11 +463,11 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
         inode
     }
 
-    fn collect_leaf(&mut self, leaf: &'a Rc<tree::Leaf<ObjectID>>) -> usize {
-        let nlink = Rc::strong_count(leaf);
+    fn collect_leaf(&mut self, leaf: &'a Arc<tree::Leaf<ObjectID>>) -> usize {
+        let nlink = Arc::strong_count(leaf);
 
         if nlink > 1 {
-            if let Some(inode) = self.hardlinks.get(&Rc::as_ptr(leaf)) {
+            if let Some(inode) = self.hardlinks.get(&Arc::as_ptr(leaf)) {
                 return *inode;
             }
         }
@@ -482,7 +481,7 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
         );
 
         if nlink > 1 {
-            self.hardlinks.insert(Rc::as_ptr(leaf), inode);
+            self.hardlinks.insert(Arc::as_ptr(leaf), inode);
         }
 
         inode

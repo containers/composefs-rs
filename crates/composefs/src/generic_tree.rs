@@ -2,11 +2,10 @@
 //! however the caller wants.
 
 use std::{
-    cell::RefCell,
     collections::BTreeMap,
     ffi::OsStr,
     path::{Component, Path},
-    rc::Rc,
+    sync::{Arc, RwLock},
 };
 
 use thiserror::Error;
@@ -23,7 +22,7 @@ pub struct Stat {
     /// Modification time in seconds since Unix epoch.
     pub st_mtim_sec: i64,
     /// Extended attributes as key-value pairs.
-    pub xattrs: RefCell<BTreeMap<Box<OsStr>, Box<[u8]>>>,
+    pub xattrs: RwLock<BTreeMap<Box<OsStr>, Box<[u8]>>>,
 }
 
 impl Stat {
@@ -41,7 +40,7 @@ impl Stat {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
-            xattrs: RefCell::new(BTreeMap::new()),
+            xattrs: RwLock::new(BTreeMap::new()),
         }
     }
 }
@@ -85,9 +84,9 @@ pub struct Directory<T> {
 #[derive(Debug)]
 pub enum Inode<T> {
     /// A directory inode.
-    Directory(Box<Directory<T>>),
+    Directory(Arc<Directory<T>>),
     /// A leaf inode (reference-counted to support hardlinks).
-    Leaf(Rc<Leaf<T>>),
+    Leaf(Arc<Leaf<T>>),
 }
 
 /// Errors that can occur when working with filesystem images.
@@ -221,7 +220,8 @@ impl<T> Directory<T> {
                     return Err(ImageError::InvalidFilename(pathname.into()));
                 }
                 Component::Normal(filename) => match dir.entries.get_mut(filename) {
-                    Some(Inode::Directory(subdir)) => subdir,
+                    Some(Inode::Directory(subdir)) => Arc::get_mut(subdir)
+                        .expect("directory Arc should be uniquely owned during tree construction"),
                     Some(_) => return Err(ImageError::NotADirectory(filename.into())),
                     None => return Err(ImageError::NotFound(filename.into())),
                 },
@@ -302,13 +302,13 @@ impl<T> Directory<T> {
     ///
     /// # Return value
     ///
-    /// On success (the entry exists and is not a directory) the Rc is cloned and a new reference
+    /// On success (the entry exists and is not a directory) the Arc is cloned and a new reference
     /// is returned.
     ///
     /// On failure, can return any number of errors from ImageError.
-    pub fn ref_leaf(&self, filename: &OsStr) -> Result<Rc<Leaf<T>>, ImageError> {
+    pub fn ref_leaf(&self, filename: &OsStr) -> Result<Arc<Leaf<T>>, ImageError> {
         match self.entries.get(filename) {
-            Some(Inode::Leaf(leaf)) => Ok(Rc::clone(leaf)),
+            Some(Inode::Leaf(leaf)) => Ok(Arc::clone(leaf)),
             Some(Inode::Directory(..)) => Err(ImageError::IsADirectory(Box::from(filename))),
             None => Err(ImageError::NotFound(Box::from(filename))),
         }
@@ -366,7 +366,12 @@ impl<T> Directory<T> {
         // keep the old entries in place.
         if let Inode::Directory(new_dir) = inode {
             if let Some(Inode::Directory(old_dir)) = self.entries.get_mut(filename) {
-                old_dir.stat = new_dir.stat;
+                let new_dir = Arc::try_unwrap(new_dir)
+                    .ok()
+                    .expect("directory Arc should be uniquely owned during tree construction");
+                Arc::get_mut(old_dir)
+                    .expect("directory Arc should be uniquely owned during tree construction")
+                    .stat = new_dir.stat;
             } else {
                 // Unfortunately we already deconstructed the original inode and we can't get it
                 // back again.  This is necessary because we wanted to move the stat field (above)
@@ -496,14 +501,14 @@ impl<T> FileSystem<T> {
         let st_uid = usr.stat.st_uid;
         let st_gid = usr.stat.st_gid;
         let st_mtim_sec = usr.stat.st_mtim_sec;
-        let xattrs = usr.stat.xattrs.clone();
+        let xattrs = usr.stat.xattrs.read().unwrap().clone();
 
         // Apply copied metadata to root
         self.root.stat.st_mode = st_mode;
         self.root.stat.st_uid = st_uid;
         self.root.stat.st_gid = st_gid;
         self.root.stat.st_mtim_sec = st_mtim_sec;
-        self.root.stat.xattrs = xattrs;
+        self.root.stat.xattrs = RwLock::new(xattrs);
 
         Ok(())
     }
@@ -544,7 +549,7 @@ impl<T> FileSystem<T> {
         F: Fn(&OsStr) -> bool,
     {
         self.for_each_stat(|stat| {
-            stat.xattrs.borrow_mut().retain(|k, _| predicate(k));
+            stat.xattrs.write().unwrap().retain(|k, _| predicate(k));
         });
     }
 
@@ -598,10 +603,10 @@ impl<T> FileSystem<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::ffi::{OsStr, OsString};
-    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::RwLock;
 
     // We never store any actual data here
     #[derive(Debug, Default)]
@@ -614,7 +619,7 @@ mod tests {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
-            xattrs: RefCell::new(BTreeMap::new()),
+            xattrs: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -625,21 +630,21 @@ mod tests {
             st_uid: 1000,
             st_gid: 1000,
             st_mtim_sec: mtime,
-            xattrs: RefCell::new(BTreeMap::new()),
+            xattrs: RwLock::new(BTreeMap::new()),
         }
     }
 
     // Helper to create a simple Leaf (e.g., an empty inline file)
-    fn new_leaf_file(mtime: i64) -> Rc<Leaf<FileContents>> {
-        Rc::new(Leaf {
+    fn new_leaf_file(mtime: i64) -> Arc<Leaf<FileContents>> {
+        Arc::new(Leaf {
             stat: stat_with_mtime(mtime),
             content: LeafContent::Regular(FileContents::default()),
         })
     }
 
     // Helper to create a simple Leaf (symlink)
-    fn new_leaf_symlink(target: &str, mtime: i64) -> Rc<Leaf<FileContents>> {
-        Rc::new(Leaf {
+    fn new_leaf_symlink(target: &str, mtime: i64) -> Arc<Leaf<FileContents>> {
+        Arc::new(Leaf {
             stat: stat_with_mtime(mtime),
             content: LeafContent::Symlink(OsString::from(target).into_boxed_os_str()),
         })
@@ -647,7 +652,7 @@ mod tests {
 
     // Helper to create an empty Directory Inode with a specific mtime
     fn new_dir_inode<T>(mtime: i64) -> Inode<T> {
-        Inode::Directory(Box::new(Directory {
+        Inode::Directory(Arc::new(Directory {
             stat: stat_with_mtime(mtime),
             entries: BTreeMap::new(),
         }))
@@ -655,7 +660,7 @@ mod tests {
 
     // Helper to create a Directory Inode with specific stat
     fn new_dir_inode_with_stat<T>(stat: Stat) -> Inode<T> {
-        Inode::Directory(Box::new(Directory {
+        Inode::Directory(Arc::new(Directory {
             stat,
             entries: BTreeMap::new(),
         }))
@@ -673,11 +678,11 @@ mod tests {
     fn test_insert_and_get_leaf() {
         let mut dir = Directory::<FileContents>::new(default_stat());
         let leaf = new_leaf_file(10);
-        dir.insert(OsStr::new("file.txt"), Inode::Leaf(Rc::clone(&leaf)));
+        dir.insert(OsStr::new("file.txt"), Inode::Leaf(Arc::clone(&leaf)));
         assert_eq!(dir.entries.len(), 1);
 
         let retrieved_leaf_rc = dir.ref_leaf(OsStr::new("file.txt")).unwrap();
-        assert!(Rc::ptr_eq(&retrieved_leaf_rc, &leaf));
+        assert!(Arc::ptr_eq(&retrieved_leaf_rc, &leaf));
 
         let regular_file_content = dir.get_file(OsStr::new("file.txt")).unwrap();
         assert!(matches!(regular_file_content, FileContents {}));
@@ -783,8 +788,10 @@ mod tests {
 
         // Merge Directory onto existing Directory
         let mut existing_dir_inode = new_dir_inode_with_stat(stat_with_mtime(80));
-        if let Inode::Directory(ref mut ed_box) = existing_dir_inode {
-            ed_box.insert(OsStr::new("inner_file"), Inode::Leaf(new_leaf_file(85)));
+        if let Inode::Directory(ref mut ed_arc) = existing_dir_inode {
+            Arc::get_mut(ed_arc)
+                .unwrap()
+                .insert(OsStr::new("inner_file"), Inode::Leaf(new_leaf_file(85)));
         }
         dir.insert(OsStr::new("merged_dir"), existing_dir_inode);
 
@@ -836,13 +843,15 @@ mod tests {
         assert_eq!(root.newest_file(), 10);
 
         let subdir_stat = stat_with_mtime(15);
-        let mut subdir = Box::new(Directory::new(subdir_stat));
+        let mut subdir = Directory::new(subdir_stat);
         subdir.insert(OsStr::new("subfile1"), Inode::Leaf(new_leaf_file(12)));
-        root.insert(OsStr::new("subdir"), Inode::Directory(subdir));
+        root.insert(OsStr::new("subdir"), Inode::Directory(Arc::new(subdir)));
         assert_eq!(root.newest_file(), 15);
 
         if let Some(Inode::Directory(sd)) = root.entries.get_mut(OsStr::new("subdir")) {
-            sd.insert(OsStr::new("subfile2"), Inode::Leaf(new_leaf_file(20)));
+            Arc::get_mut(sd)
+                .unwrap()
+                .insert(OsStr::new("subfile2"), Inode::Leaf(new_leaf_file(20)));
         }
         assert_eq!(root.newest_file(), 20);
 
@@ -898,7 +907,7 @@ mod tests {
             st_uid: 42,
             st_gid: 43,
             st_mtim_sec: 1234567890,
-            xattrs: RefCell::new(BTreeMap::from([(
+            xattrs: RwLock::new(BTreeMap::from([(
                 Box::from(OsStr::new("security.selinux")),
                 Box::from(b"system_u:object_r:usr_t:s0".as_slice()),
             )])),
@@ -909,7 +918,7 @@ mod tests {
         };
         fs.root.entries.insert(
             Box::from(OsStr::new("usr")),
-            Inode::Directory(Box::new(usr_dir)),
+            Inode::Directory(Arc::new(usr_dir)),
         );
 
         fs.copy_root_metadata_from_usr().unwrap();
@@ -922,7 +931,8 @@ mod tests {
             .root
             .stat
             .xattrs
-            .borrow()
+            .read()
+            .unwrap()
             .contains_key(OsStr::new("security.selinux")));
     }
 
@@ -943,7 +953,7 @@ mod tests {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
-            xattrs: RefCell::new(BTreeMap::from([
+            xattrs: RwLock::new(BTreeMap::from([
                 (
                     Box::from(OsStr::new("security.selinux")),
                     Box::from(b"label".as_slice()),
@@ -963,7 +973,7 @@ mod tests {
         // Filter to keep only xattrs starting with "user."
         fs.filter_xattrs(|name| name.as_encoded_bytes().starts_with(b"user."));
 
-        let root_xattrs = fs.root.stat.xattrs.borrow();
+        let root_xattrs = fs.root.stat.xattrs.read().unwrap();
         assert_eq!(root_xattrs.len(), 1);
         assert!(root_xattrs.contains_key(OsStr::new("user.custom")));
     }
@@ -975,16 +985,16 @@ mod tests {
         // Create /usr with specific mtime
         let usr_dir = Directory::new(stat_with_mtime(12345));
         fs.root
-            .insert(OsStr::new("usr"), Inode::Directory(Box::new(usr_dir)));
+            .insert(OsStr::new("usr"), Inode::Directory(Arc::new(usr_dir)));
 
         // Create /run with content and different mtime
         let mut run_dir = Directory::new(stat_with_mtime(99999));
         run_dir.insert(OsStr::new("somefile"), Inode::Leaf(new_leaf_file(11111)));
         let mut subdir = Directory::new(stat_with_mtime(22222));
         subdir.insert(OsStr::new("nested"), Inode::Leaf(new_leaf_file(33333)));
-        run_dir.insert(OsStr::new("subdir"), Inode::Directory(Box::new(subdir)));
+        run_dir.insert(OsStr::new("subdir"), Inode::Directory(Arc::new(subdir)));
         fs.root
-            .insert(OsStr::new("run"), Inode::Directory(Box::new(run_dir)));
+            .insert(OsStr::new("run"), Inode::Directory(Arc::new(run_dir)));
 
         // Verify /run has content before
         assert_eq!(
@@ -1012,7 +1022,7 @@ mod tests {
         // Create /usr but no /run
         let usr_dir = Directory::new(stat_with_mtime(12345));
         fs.root
-            .insert(OsStr::new("usr"), Inode::Directory(Box::new(usr_dir)));
+            .insert(OsStr::new("usr"), Inode::Directory(Arc::new(usr_dir)));
 
         // Should succeed without error
         fs.canonicalize_run().unwrap();
@@ -1028,7 +1038,7 @@ mod tests {
             st_uid: 100,
             st_gid: 200,
             st_mtim_sec: 54321,
-            xattrs: RefCell::new(BTreeMap::from([(
+            xattrs: RwLock::new(BTreeMap::from([(
                 Box::from(OsStr::new("user.test")),
                 Box::from(b"val".as_slice()),
             )])),
@@ -1040,7 +1050,7 @@ mod tests {
         let mut run_dir = Directory::new(stat_with_mtime(99999));
         run_dir.insert(OsStr::new("file"), Inode::Leaf(new_leaf_file(11111)));
         fs.root
-            .insert(OsStr::new("run"), Inode::Directory(Box::new(run_dir)));
+            .insert(OsStr::new("run"), Inode::Directory(Arc::new(run_dir)));
 
         // Transform for OCI
         fs.transform_for_oci().unwrap();

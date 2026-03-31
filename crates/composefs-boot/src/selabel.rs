@@ -211,7 +211,7 @@ impl Policy {
 }
 
 fn relabel(stat: &Stat, path: &Path, ifmt: u8, policy: &mut Policy) {
-    let mut xattrs = stat.xattrs.borrow_mut();
+    let mut xattrs = stat.xattrs.write().unwrap();
     let key = OsStr::new(XATTR_SECURITY_SELINUX);
 
     if let Some(label) = policy.lookup(path.as_os_str(), ifmt) {
@@ -268,7 +268,8 @@ fn parse_config(file: impl Read) -> Result<Option<String>> {
 fn strip_selinux_labels<H: FsVerityHashValue>(fs: &FileSystem<H>) {
     fs.for_each_stat(|stat| {
         stat.xattrs
-            .borrow_mut()
+            .write()
+            .unwrap()
             .remove(OsStr::new(XATTR_SECURITY_SELINUX));
     });
 }
