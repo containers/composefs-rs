@@ -2,4 +2,5 @@
 
 pub mod cli;
 pub mod digest_stability;
+pub mod oci_compat;
 pub mod privileged;
