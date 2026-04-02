@@ -115,7 +115,61 @@ pub enum HashType {
     Sha512,
 }
 
+/// A reference to an OCI image: either a content digest or a named ref.
+///
+/// Digests are prefixed with `@` (e.g. `@sha256:abc123…`), while bare
+/// names are refs resolved through the repository's ref tree. The `@`
+/// prefix is necessary to disambiguate because ref names may contain `:`
+/// — OCI digest algorithms are intentionally extensible, so we cannot
+/// rely on parse heuristics to distinguish the two.
+///
+/// Note this differs from the podman/docker convention where `@` appears
+/// between the image name and the digest (e.g. `fedora@sha256:abc…`).
+/// Here, `@` is always a leading prefix on the entire argument.
+///
+/// At the repository level, ref names are freeform strings (the only
+/// restriction is that they must not start with `@`). In practice,
+/// `oci pull` defaults to tagging with the source transport reference
+/// (e.g. `docker://quay.io/fedora/fedora:latest`), so most refs in a
+/// repository will be container transport names — which naturally never
+/// start with `@`.
+#[cfg(feature = "oci")]
+#[derive(Debug, Clone)]
+enum OciReference {
+    /// A content-addressable digest such as `sha256:abcdef…`.
+    Digest(composefs_oci::OciDigest),
+    /// A named ref resolved through the repository's ref tree, typically
+    /// a container transport name (e.g. `docker://quay.io/foo:latest`).
+    Named(String),
+}
+
+#[cfg(feature = "oci")]
+impl std::str::FromStr for OciReference {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        if let Some(digest_str) = s.strip_prefix('@') {
+            let digest: composefs_oci::OciDigest =
+                digest_str.parse().context("Invalid OCI digest after '@'")?;
+            Ok(Self::Digest(digest))
+        } else {
+            Ok(Self::Named(s.to_owned()))
+        }
+    }
+}
+
+#[cfg(feature = "oci")]
+impl std::fmt::Display for OciReference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Digest(d) => write!(f, "@{d}"),
+            Self::Named(n) => write!(f, "{n}"),
+        }
+    }
+}
+
 /// Common options for operations using OCI config manifest streams that may transform the image rootfs
+#[cfg(feature = "oci")]
 #[derive(Debug, Parser)]
 struct OCIConfigFilesystemOptions {
     #[clap(flatten)]
@@ -126,11 +180,11 @@ struct OCIConfigFilesystemOptions {
 }
 
 /// Common options for operations using OCI config manifest streams
+#[cfg(feature = "oci")]
 #[derive(Debug, Parser)]
 struct OCIConfigOptions {
-    /// the name of the target OCI manifest stream,
-    /// either a stream ID in format oci-config-<hash_type>:<hash_digest> or a reference in 'ref/'
-    config_name: String,
+    /// Ref name (e.g. myimage:latest) or @digest (e.g. @sha256:a1b2c3...)
+    config_name: OciReference,
     /// verity digest for the manifest stream to be verified against
     config_verity: Option<String>,
 }
@@ -138,26 +192,34 @@ struct OCIConfigOptions {
 #[cfg(feature = "oci")]
 #[derive(Debug, Subcommand)]
 enum OciCommand {
-    /// Stores a tar layer file as a splitstream in the repository.
+    /// Import a tar layer as a splitstream in the repository
     ImportLayer {
-        digest: String,
+        /// Layer content digest, e.g. sha256:a1b2c3...
+        digest: composefs_oci::OciDigest,
+        /// Optional human-readable name for the layer
         name: Option<String>,
     },
-    /// Lists the contents of a tar stream
+    /// List the contents of a stored tar layer
     LsLayer {
-        /// the name of the stream to list, either a stream ID in format oci-config-<hash_type>:<hash_digest> or a reference in 'ref/'
-        name: String,
+        /// Layer content digest, e.g. sha256:a1b2c3...
+        name: composefs_oci::OciDigest,
     },
-    /// Dump full content of the rootfs of a stored OCI image to a composefs dumpfile and write to stdout
+    /// Dump the rootfs of a stored OCI image as a composefs dumpfile to stdout
+    ///
+    /// The image can be specified by ref name or @digest:
+    ///   cfsctl oci dump myimage:latest
+    ///   cfsctl oci dump @sha256:a1b2c3...
     Dump {
         #[clap(flatten)]
         config_opts: OCIConfigFilesystemOptions,
     },
-    /// Pull an OCI image to be stored in repo then prints the stream and verity digest of its manifest
+    /// Pull an OCI image into the repository
+    ///
+    /// Prints the config stream digest and verity of the stored manifest.
     Pull {
-        /// source image reference, as accepted by skopeo
+        /// Source image reference, as accepted by skopeo
         image: String,
-        /// optional reference name for the manifest, use as 'ref/<name>' elsewhere
+        /// Tag name to assign to the pulled image (defaults to the image reference)
         name: Option<String>,
     },
     /// List all tagged OCI images in the repository
@@ -169,12 +231,16 @@ enum OciCommand {
     },
     /// Show information about an OCI image
     ///
+    /// The image can be specified by ref name or @digest:
+    ///   cfsctl oci inspect myimage:latest
+    ///   cfsctl oci inspect @sha256:a1b2c3...
+    ///
     /// By default, outputs JSON with manifest, config, and referrers.
     /// Use --manifest or --config to output just that raw JSON.
     #[clap(name = "inspect")]
     Inspect {
-        /// Image reference (tag name or manifest digest)
-        image: String,
+        /// Ref name (e.g. myimage:latest) or @digest (e.g. @sha256:a1b2c3...)
+        image: OciReference,
         /// Output only the raw manifest JSON (as originally stored)
         #[clap(long, conflicts_with = "config")]
         manifest: bool,
@@ -183,10 +249,12 @@ enum OciCommand {
         config: bool,
     },
     /// Tag an image with a new name
+    ///
+    /// Example: cfsctl oci tag sha256:a1b2c3... myimage:latest
     Tag {
-        /// Manifest digest (sha256:...)
-        manifest_digest: String,
-        /// Tag name to assign
+        /// Manifest digest, e.g. sha256:a1b2c3...
+        manifest_digest: composefs_oci::OciDigest,
+        /// Tag name to assign (must not contain '@')
         name: String,
     },
     /// Remove a tag from an image
@@ -200,8 +268,8 @@ enum OciCommand {
     /// Use --dumpfile for composefs dumpfile format, or --json for metadata.
     #[clap(name = "layer")]
     LayerInspect {
-        /// Layer diff_id (sha256:...)
-        layer: String,
+        /// Layer diff_id, e.g. sha256:a1b2c3...
+        layer: composefs_oci::OciDigest,
         /// Output as composefs dumpfile format (one entry per line)
         #[clap(long, conflicts_with = "json")]
         dumpfile: bool,
@@ -209,37 +277,53 @@ enum OciCommand {
         #[clap(long, conflicts_with = "dumpfile")]
         json: bool,
     },
-    /// Compute the composefs image object id of the rootfs of a stored OCI image
+    /// Compute the composefs image ID of a stored OCI image's rootfs
+    ///
+    /// The image can be specified by ref name or @digest:
+    ///   cfsctl oci compute-id myimage:latest
+    ///   cfsctl oci compute-id @sha256:a1b2c3...
     ComputeId {
         #[clap(flatten)]
         config_opts: OCIConfigFilesystemOptions,
     },
-    /// Create the composefs image of the rootfs of a stored OCI image, commit it to the repo, and print its image object ID
+    /// Create and commit a composefs EROFS image from a stored OCI image, printing its object ID
+    ///
+    /// The image can be specified by ref name or @digest:
+    ///   cfsctl oci create-image myimage:latest
+    ///   cfsctl oci create-image @sha256:a1b2c3...
     CreateImage {
         #[clap(flatten)]
         config_opts: OCIConfigFilesystemOptions,
-        /// optional reference name for the image, use as 'ref/<name>' elsewhere
+        /// Optional ref name for the created image
         #[clap(long)]
         image_name: Option<String>,
     },
-    /// Seal a stored OCI image by creating a cloned manifest with embedded verity digest (a.k.a. composefs image object ID)
-    /// in the repo, then prints the stream and verity digest of the new sealed manifest
+    /// Seal a stored OCI image by embedding its composefs verity digest
+    ///
+    /// The image can be specified by ref name or @digest:
+    ///   cfsctl oci seal myimage:latest
+    ///   cfsctl oci seal @sha256:a1b2c3...
     Seal {
         #[clap(flatten)]
         config_opts: OCIConfigOptions,
     },
-    /// Mounts a stored and sealed OCI image by looking up its composefs image. Note that the composefs image must be built
-    /// and committed to the repo first
+    /// Mount a stored (sealed) OCI image's composefs EROFS at a mountpoint
     Mount {
-        /// the name of the target OCI manifest stream, either a stream ID in format oci-config-<hash_type>:<hash_digest> or a reference in 'ref/'
-        name: String,
-        /// the mountpoint
+        /// Manifest digest, e.g. sha256:a1b2c3...
+        name: composefs_oci::OciDigest,
+        /// Target mountpoint
         mountpoint: String,
     },
-    /// Create the composefs image of the rootfs of a stored OCI image, perform bootable transformation, commit it to the repo,
-    /// then configure boot for the image by writing new boot resources and bootloader entries to boot partition. Performs
-    /// state preparation for composefs-setup-root consumption as well. Note that state preparation here is not suitable for
-    /// consumption by bootc.
+    /// Prepare boot resources from a stored OCI image
+    ///
+    /// Creates the composefs image with bootable transformation, writes boot
+    /// loader entries and kernel/initramfs to the boot partition.
+    ///
+    /// The image can be specified by ref name or @digest:
+    ///   cfsctl oci prepare-boot myimage:latest
+    ///   cfsctl oci prepare-boot @sha256:a1b2c3...
+    ///
+    /// Note: the state preparation here is not suitable for consumption by bootc.
     PrepareBoot {
         #[clap(flatten)]
         config_opts: OCIConfigOptions,
@@ -470,17 +554,17 @@ fn resolve_hash_type(repo_path: &Path, cli_hash: Option<HashType>) -> Result<Has
     };
 
     // If the user explicitly passed --hash and it doesn't match, error
-    if let Some(explicit) = cli_hash {
-        if explicit != detected {
-            anyhow::bail!(
-                "repository is configured for {algorithm} (from {REPO_METADATA_FILENAME}) \
-                 but --hash {} was specified",
-                match explicit {
-                    HashType::Sha256 => "sha256",
-                    HashType::Sha512 => "sha512",
-                },
-            );
-        }
+    if let Some(explicit) = cli_hash
+        && explicit != detected
+    {
+        anyhow::bail!(
+            "repository is configured for {algorithm} (from {REPO_METADATA_FILENAME}) \
+             but --hash {} was specified",
+            match explicit {
+                HashType::Sha256 => "sha256",
+                HashType::Sha512 => "sha512",
+            },
+        );
     }
 
     Ok(detected)
@@ -586,17 +670,52 @@ where
     Ok(repo)
 }
 
+/// Resolve an [`OciReference`] to an [`OciImage`].
+#[cfg(feature = "oci")]
+fn resolve_oci_image<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    reference: &OciReference,
+) -> Result<composefs_oci::oci_image::OciImage<ObjectID>> {
+    match reference {
+        OciReference::Digest(digest) => {
+            composefs_oci::oci_image::OciImage::open(repo, digest, None)
+        }
+        OciReference::Named(name) => composefs_oci::oci_image::OciImage::open_ref(repo, name),
+    }
+}
+
+/// Resolve an [`OciReference`] to a config digest and optional verity.
+///
+/// When resolving via a named ref, the verity override is ignored since
+/// the image metadata provides the correct verity.
+#[cfg(feature = "oci")]
+fn resolve_oci_config<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    reference: &OciReference,
+    verity_override: Option<ObjectID>,
+) -> Result<(composefs_oci::OciDigest, Option<ObjectID>)> {
+    match reference {
+        OciReference::Digest(digest) => Ok((digest.clone(), verity_override)),
+        OciReference::Named(_) => {
+            let img = resolve_oci_image(repo, reference)?;
+            Ok((
+                img.config_digest().clone(),
+                Some(img.config_verity().clone()),
+            ))
+        }
+    }
+}
+
 #[cfg(feature = "oci")]
 fn load_filesystem_from_oci_image<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     opts: OCIConfigFilesystemOptions,
 ) -> Result<FileSystem<RegularFile<ObjectID>>> {
     let verity = verity_opt(&opts.base_config.config_verity)?;
-    let mut fs = composefs_oci::image::create_filesystem(
-        repo,
-        &opts.base_config.config_name,
-        verity.as_ref(),
-    )?;
+    let (config_digest, config_verity) =
+        resolve_oci_config(repo, &opts.base_config.config_name, verity)?;
+    let mut fs =
+        composefs_oci::image::create_filesystem(repo, &config_digest, config_verity.as_ref())?;
     if opts.bootable {
         fs.transform_for_boot(repo)?;
     }
@@ -700,19 +819,19 @@ where
         }
         #[cfg(feature = "oci")]
         Command::Oci { cmd: oci_cmd } => match oci_cmd {
-            OciCommand::ImportLayer { name, digest } => {
+            OciCommand::ImportLayer { name, ref digest } => {
                 let repo = Arc::new(repo);
                 let (object_id, _stats) = composefs_oci::import_layer(
                     &repo,
-                    &digest,
+                    digest,
                     name.as_deref(),
                     tokio::io::BufReader::with_capacity(IO_BUF_CAPACITY, tokio::io::stdin()),
                 )
                 .await?;
                 println!("{}", object_id.to_id());
             }
-            OciCommand::LsLayer { name } => {
-                composefs_oci::ls_layer(&repo, &name)?;
+            OciCommand::LsLayer { ref name } => {
+                composefs_oci::ls_layer(&repo, name)?;
             }
             OciCommand::Dump { config_opts } => {
                 let fs = load_filesystem_from_oci_image(&repo, config_opts)?;
@@ -762,10 +881,8 @@ where
                     table.set_header(["NAME", "DIGEST", "ARCH", "SEALED", "LAYERS", "REFS"]);
 
                     for img in images {
-                        let digest_short = img
-                            .manifest_digest
-                            .strip_prefix("sha256:")
-                            .unwrap_or(&img.manifest_digest);
+                        let digest_str: &str = img.manifest_digest.as_ref();
+                        let digest_short = digest_str.strip_prefix("sha256:").unwrap_or(digest_str);
                         let digest_display = if digest_short.len() > 12 {
                             &digest_short[..12]
                         } else {
@@ -794,11 +911,7 @@ where
                 manifest,
                 config,
             } => {
-                let img = if image.starts_with("sha256:") {
-                    composefs_oci::oci_image::OciImage::open(&repo, image, None)?
-                } else {
-                    composefs_oci::oci_image::OciImage::open_ref(&repo, image)?
-                };
+                let img = resolve_oci_image(&repo, image)?;
 
                 if manifest {
                     // Output raw manifest JSON exactly as stored
@@ -857,8 +970,10 @@ where
                     },
             } => {
                 let verity = verity_opt(config_verity)?;
+                let (config_digest, config_verity) =
+                    resolve_oci_config(&repo, config_name, verity)?;
                 let (digest, verity) =
-                    composefs_oci::seal(&Arc::new(repo), config_name, verity.as_ref())?;
+                    composefs_oci::seal(&Arc::new(repo), &config_digest, config_verity.as_ref())?;
                 println!("config {digest}");
                 println!("verity {}", verity.to_id());
             }
@@ -879,8 +994,13 @@ where
                 ref cmdline,
             } => {
                 let verity = verity_opt(config_verity)?;
-                let mut fs =
-                    composefs_oci::image::create_filesystem(&repo, config_name, verity.as_ref())?;
+                let (config_digest, config_verity) =
+                    resolve_oci_config(&repo, config_name, verity)?;
+                let mut fs = composefs_oci::image::create_filesystem(
+                    &repo,
+                    &config_digest,
+                    config_verity.as_ref(),
+                )?;
                 let entries = fs.transform_for_boot(&repo)?;
                 let id = fs.commit_image(&repo, None)?;
 

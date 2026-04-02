@@ -49,7 +49,7 @@ podman build \
 
 IMAGE_ID="$(cat tmp/iid)"
 ${CFSCTL} oci pull containers-storage:"${IMAGE_ID}"
-${CFSCTL} oci prepare-boot "${IMAGE_ID}" --bootdir tmp/efi
+${CFSCTL} oci prepare-boot "@${IMAGE_ID}" --bootdir tmp/efi
 
 # install a signed copy of systemd-boot
 mkdir -p tmp/efi/loader

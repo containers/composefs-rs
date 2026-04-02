@@ -42,15 +42,15 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
 use containers_image_proxy::oci_spec::image::{
-    Descriptor, ImageConfiguration, ImageManifest, MediaType,
+    Descriptor, Digest as OciDigest, ImageConfiguration, ImageManifest, MediaType,
 };
 use rustix::fs::{AtFlags, Dir, Mode, OFlags, openat, readlinkat, unlinkat};
 use rustix::io::Errno;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 
 use composefs::{fsverity::FsVerityHashValue, repository::Repository};
 
+use crate::ContentAndVerity;
 use crate::skopeo::{OCI_BLOB_CONTENT_TYPE, OCI_CONFIG_CONTENT_TYPE, OCI_MANIFEST_CONTENT_TYPE};
 
 /// Data and named refs from a splitstream with external object storage.
@@ -95,11 +95,11 @@ pub const OCI_REF_PREFIX: &str = "oci/";
 #[derive(Debug)]
 pub struct OciImage<ObjectID: FsVerityHashValue> {
     /// The manifest digest (sha256 content hash)
-    manifest_digest: String,
+    manifest_digest: OciDigest,
     /// The parsed OCI manifest
     manifest: ImageManifest,
     /// The config digest (sha256 content hash)
-    config_digest: String,
+    config_digest: OciDigest,
     /// The fs-verity ID of the config splitstream
     config_verity: ObjectID,
     /// The parsed OCI config (may be empty for artifacts)
@@ -117,7 +117,7 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
     /// Otherwise, the content is verified against the digest.
     pub fn open(
         repo: &Repository<ObjectID>,
-        manifest_digest: &str,
+        manifest_digest: &OciDigest,
         verity: Option<&ObjectID>,
     ) -> Result<Self> {
         let manifest_id = manifest_identifier(manifest_digest);
@@ -126,16 +126,16 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
 
         // Verify content hash when no verity was provided
         if verity.is_none() {
-            let computed = hash(&data);
+            let computed = hash_sha256(&data);
             ensure!(
-                manifest_digest == computed,
+                *manifest_digest == computed,
                 "Manifest integrity failed: expected {manifest_digest}, got {computed}"
             );
         }
 
         let manifest = ImageManifest::from_reader(&data[..])?;
 
-        let config_digest = manifest.config().digest().to_string();
+        let config_digest = manifest.config().digest().clone();
         let config_key = format!("config:{config_digest}");
         let config_verity = named_refs
             .get(config_key.as_str())
@@ -182,7 +182,7 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
         };
 
         Ok(Self {
-            manifest_digest: manifest_digest.to_string(),
+            manifest_digest: manifest_digest.clone(),
             manifest,
             config_digest,
             config_verity,
@@ -204,7 +204,7 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
     }
 
     /// Returns the manifest digest.
-    pub fn manifest_digest(&self) -> &str {
+    pub fn manifest_digest(&self) -> &OciDigest {
         &self.manifest_digest
     }
 
@@ -219,8 +219,13 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
     }
 
     /// Returns the config digest.
-    pub fn config_digest(&self) -> &str {
+    pub fn config_digest(&self) -> &OciDigest {
         &self.config_digest
+    }
+
+    /// Returns the config fs-verity hash.
+    pub fn config_verity(&self) -> &ObjectID {
+        &self.config_verity
     }
 
     /// Returns the OCI config, if this is a container image.
@@ -284,9 +289,9 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
             descriptor.media_type()
         );
 
-        let diff_id: &str = descriptor.digest().as_ref();
+        let diff_id = descriptor.digest();
         let layer_verity = self
-            .layer_verity(diff_id)
+            .layer_verity(diff_id.as_ref())
             .with_context(|| format!("No verity for layer {diff_id}"))?;
 
         let content_id = crate::layer_identifier(diff_id);
@@ -361,6 +366,7 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
     /// slightly from re-serializing the parsed config (e.g., whitespace).
     pub fn read_config_json(&self, repo: &Repository<ObjectID>) -> Result<Vec<u8>> {
         let config_id = crate::config_identifier(&self.config_digest);
+
         let (data, _) = read_external_splitstream(
             repo,
             &config_id,
@@ -399,14 +405,26 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
 // Reference Management (GC Roots)
 // =============================================================================
 
+/// Validate that a ref name doesn't start with `@`, which is reserved as
+/// the digest prefix (e.g. `@sha256:abc...`).
+fn validate_ref_name(name: &str) -> Result<()> {
+    ensure!(
+        !name.starts_with('@'),
+        "Invalid ref name {name:?}: leading '@' is reserved for digest references"
+    );
+    Ok(())
+}
+
 /// Tags an image with a name, making it a GC root.
 ///
 /// The name should be in the format `image:tag` or just `image` (implies `:latest`).
+/// Names must not contain `@`, which is reserved for digest references.
 pub fn tag_image<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
-    manifest_digest: &str,
+    manifest_digest: &OciDigest,
     name: &str,
 ) -> Result<()> {
+    validate_ref_name(name)?;
     let manifest_id = manifest_identifier(manifest_digest);
     let ref_name = oci_ref_path(name);
     repo.name_stream(&manifest_id, &ref_name)
@@ -430,7 +448,7 @@ pub fn untag_image<ObjectID: FsVerityHashValue>(
 pub fn resolve_ref<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     name: &str,
-) -> Result<(String, ObjectID)> {
+) -> Result<(OciDigest, ObjectID)> {
     let ref_path = format!("streams/refs/{}", oci_ref_path(name));
 
     // Read the symlink to get the manifest path
@@ -447,16 +465,20 @@ pub fn resolve_ref<ObjectID: FsVerityHashValue>(
         .next()
         .context("Invalid reference target")?;
 
-    let digest = manifest_part
+    let digest_str = manifest_part
         .strip_prefix("oci-manifest-")
         .with_context(|| format!("Invalid manifest reference: {manifest_part}"))?;
 
+    let digest: OciDigest = digest_str
+        .parse()
+        .with_context(|| format!("Invalid OCI digest in reference: {digest_str}"))?;
+
     // Get the verity by looking up the manifest
     let verity = repo
-        .has_stream(&manifest_identifier(digest))?
+        .has_stream(&manifest_identifier(&digest))?
         .with_context(|| format!("Manifest {digest} not found"))?;
 
-    Ok((digest.to_string(), verity))
+    Ok((digest, verity))
 }
 
 /// Lists all tagged OCI images.
@@ -464,16 +486,18 @@ pub fn resolve_ref<ObjectID: FsVerityHashValue>(
 /// Returns (name, manifest_digest) pairs for each tag.
 pub fn list_refs<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
-) -> Result<Vec<(String, String)>> {
+) -> Result<Vec<(String, OciDigest)>> {
     let mut refs = Vec::new();
 
     // Use the repository's ref listing method
     for (name, target) in repo.list_stream_refs("oci")? {
         // Extract manifest digest from target path
         let manifest_part = target.rsplit('/').next().unwrap_or(&target);
-        if let Some(digest) = manifest_part.strip_prefix("oci-manifest-") {
+        if let Some(digest_str) = manifest_part.strip_prefix("oci-manifest-")
+            && let Ok(digest) = digest_str.parse()
+        {
             // Decode the tag name from filesystem-safe encoding
-            refs.push((decode_tag(&name), digest.to_string()));
+            refs.push((decode_tag(&name), digest));
         }
     }
 
@@ -490,7 +514,7 @@ pub struct ImageInfo {
     /// The tag/name of the image
     pub name: String,
     /// The manifest digest
-    pub manifest_digest: String,
+    pub manifest_digest: OciDigest,
     /// Whether this is a container image (vs artifact)
     pub is_container: bool,
     /// Architecture (empty for artifacts)
@@ -550,14 +574,20 @@ pub fn list_images<ObjectID: FsVerityHashValue>(
 /// a signature can reference the fsverity digest of the manifest content directly.
 ///
 /// The manifest becomes a GC root only if a `reference` name is provided.
+/// The reference name must not contain `@`, which is reserved for digest
+/// references.
 pub fn write_manifest<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     manifest: &ImageManifest,
-    manifest_digest: &str,
+    manifest_digest: &OciDigest,
     config_verity: &ObjectID,
     layer_verities: &HashMap<Box<str>, ObjectID>,
     reference: Option<&str>,
-) -> Result<(String, ObjectID)> {
+) -> Result<ContentAndVerity<ObjectID>> {
+    if let Some(name) = reference {
+        validate_ref_name(name)?;
+    }
+
     let content_id = manifest_identifier(manifest_digest);
 
     if let Some(verity) = repo.has_stream(&content_id)? {
@@ -565,15 +595,15 @@ pub fn write_manifest<ObjectID: FsVerityHashValue>(
         if let Some(name) = reference {
             tag_image(repo, manifest_digest, name)?;
         }
-        return Ok((manifest_digest.to_string(), verity));
+        return Ok((manifest_digest.clone(), verity));
     }
 
     let json = manifest.to_string()?;
     let json_bytes = json.as_bytes();
 
-    let computed = hash(json_bytes);
+    let computed = hash_sha256(json_bytes);
     ensure!(
-        manifest_digest == computed,
+        *manifest_digest == computed,
         "Manifest digest mismatch: expected {manifest_digest}, got {computed}"
     );
 
@@ -591,19 +621,19 @@ pub fn write_manifest<ObjectID: FsVerityHashValue>(
     let oci_ref = reference.map(oci_ref_path);
     let id = repo.write_stream(stream, &content_id, oci_ref.as_deref())?;
 
-    Ok((manifest_digest.to_string(), id))
+    Ok((computed, id))
 }
 
 /// Checks if a manifest exists.
 pub fn has_manifest<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
-    manifest_digest: &str,
+    manifest_digest: &OciDigest,
 ) -> Result<Option<ObjectID>> {
     repo.has_stream(&manifest_identifier(manifest_digest))
 }
 
 /// Returns the content identifier for a manifest.
-pub fn manifest_identifier(digest: &str) -> String {
+pub fn manifest_identifier(digest: &OciDigest) -> String {
     format!("oci-manifest-{digest}")
 }
 
@@ -659,11 +689,9 @@ fn decode_tag(encoded: &str) -> String {
     result
 }
 
-/// Computes sha256 hash.
-fn hash(bytes: &[u8]) -> String {
-    let mut context = Sha256::new();
-    context.update(bytes);
-    format!("sha256:{}", hex::encode(context.finalize()))
+/// Computes sha256 content hash, returning an OCI `Digest`.
+fn hash_sha256(bytes: &[u8]) -> OciDigest {
+    crate::sha256_content_digest(bytes)
 }
 
 // =============================================================================
@@ -671,7 +699,7 @@ fn hash(bytes: &[u8]) -> String {
 // =============================================================================
 
 /// Returns the content identifier for an arbitrary blob.
-pub fn blob_identifier(digest: &str) -> String {
+pub fn blob_identifier(digest: &OciDigest) -> String {
     format!("oci-blob-{digest}")
 }
 
@@ -685,8 +713,8 @@ pub fn blob_identifier(digest: &str) -> String {
 pub fn write_blob<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     data: &[u8],
-) -> Result<(String, ObjectID)> {
-    let digest = hash(data);
+) -> Result<(OciDigest, ObjectID)> {
+    let digest = hash_sha256(data);
     let content_id = blob_identifier(&digest);
 
     if let Some(verity) = repo.has_stream(&content_id)? {
@@ -706,7 +734,7 @@ pub fn write_blob<ObjectID: FsVerityHashValue>(
 /// otherwise, the content hash is verified against the digest.
 pub fn open_blob<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
-    digest: &str,
+    digest: &OciDigest,
     verity: Option<&ObjectID>,
 ) -> Result<Vec<u8>> {
     let content_id = blob_identifier(digest);
@@ -714,9 +742,9 @@ pub fn open_blob<ObjectID: FsVerityHashValue>(
         read_external_splitstream(repo, &content_id, verity, Some(OCI_BLOB_CONTENT_TYPE))?;
 
     if verity.is_none() {
-        let computed = hash(&data);
+        let computed = hash_sha256(&data);
         ensure!(
-            digest == computed,
+            *digest == computed,
             "Blob integrity failed: expected {digest}, got {computed}"
         );
     }
@@ -740,13 +768,15 @@ const REFERRER_REF_PREFIX: &str = "oci-referrers/";
 /// Both digests should be in the `sha256:...` format used by OCI.
 pub fn add_referrer<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
-    subject_digest: &str,
-    artifact_manifest_digest: &str,
+    subject_digest: &OciDigest,
+    artifact_manifest_digest: &OciDigest,
 ) -> Result<()> {
+    let subject_str: &str = subject_digest.as_ref();
+    let artifact_str: &str = artifact_manifest_digest.as_ref();
     let ref_name = format!(
         "{REFERRER_REF_PREFIX}{}/{}",
-        encode_tag(subject_digest),
-        encode_tag(artifact_manifest_digest)
+        encode_tag(subject_str),
+        encode_tag(artifact_str)
     );
     let manifest_id = manifest_identifier(artifact_manifest_digest);
     repo.name_stream(&manifest_id, &ref_name)
@@ -759,27 +789,31 @@ pub fn add_referrer<ObjectID: FsVerityHashValue>(
 /// in `sha256:...` format.
 pub fn list_referrers<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
-    subject_digest: &str,
-) -> Result<Vec<(String, ObjectID)>> {
-    let prefix = format!("{REFERRER_REF_PREFIX}{}", encode_tag(subject_digest));
+    subject_digest: &OciDigest,
+) -> Result<Vec<(OciDigest, ObjectID)>> {
+    let subject_str: &str = subject_digest.as_ref();
+    let prefix = format!("{REFERRER_REF_PREFIX}{}", encode_tag(subject_str));
 
     let mut referrers = Vec::new();
 
     for (name, target) in repo.list_stream_refs(&prefix)? {
         // The name is the encoded artifact manifest digest
-        let artifact_digest = decode_tag(&name);
+        let artifact_digest_str = decode_tag(&name);
 
         // Extract verity from the symlink target — it points to
         // a manifest stream path like "../../oci-manifest-sha256:abc..."
         let manifest_part = target.rsplit('/').next().unwrap_or(&target);
         if let Some(digest) = manifest_part.strip_prefix("oci-manifest-") {
             // Verify consistency: the ref name should match the target
-            if digest != artifact_digest {
+            if digest != artifact_digest_str {
                 continue;
             }
         }
 
         // Look up the verity for this manifest
+        let artifact_digest: OciDigest = artifact_digest_str
+            .parse()
+            .with_context(|| format!("Parsing referrer digest '{artifact_digest_str}'"))?;
         match repo.has_stream(&manifest_identifier(&artifact_digest))? {
             Some(verity) => referrers.push((artifact_digest, verity)),
             None => {
@@ -796,13 +830,15 @@ pub fn list_referrers<ObjectID: FsVerityHashValue>(
 /// Idempotent — returns Ok if the entry doesn't exist.
 pub fn remove_referrer<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
-    subject_digest: &str,
-    artifact_digest: &str,
+    subject_digest: &OciDigest,
+    artifact_digest: &OciDigest,
 ) -> Result<()> {
+    let subject_str: &str = subject_digest.as_ref();
+    let artifact_str: &str = artifact_digest.as_ref();
     let ref_path = format!(
         "streams/refs/{REFERRER_REF_PREFIX}{}/{}",
-        encode_tag(subject_digest),
-        encode_tag(artifact_digest)
+        encode_tag(subject_str),
+        encode_tag(artifact_str)
     );
     match unlinkat(repo.repo_fd(), &ref_path, AtFlags::empty()) {
         Ok(()) => Ok(()),
@@ -817,16 +853,17 @@ pub fn remove_referrer<ObjectID: FsVerityHashValue>(
 /// directory afterwards. Idempotent — returns Ok if no entries exist.
 pub fn remove_referrers_for_subject<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
-    subject_digest: &str,
+    subject_digest: &OciDigest,
 ) -> Result<()> {
     let referrers = list_referrers(repo, subject_digest)?;
     for (artifact_digest, _verity) in &referrers {
         remove_referrer(repo, subject_digest, artifact_digest)?;
     }
     // Try to remove the now-empty subject directory (ignore errors)
+    let subject_str: &str = subject_digest.as_ref();
     let subject_dir = format!(
         "streams/refs/{REFERRER_REF_PREFIX}{}",
-        encode_tag(subject_digest)
+        encode_tag(subject_str)
     );
     let _ = unlinkat(repo.repo_fd(), &subject_dir, AtFlags::REMOVEDIR);
     Ok(())
@@ -881,7 +918,10 @@ pub fn cleanup_dangling_referrers<ObjectID: FsVerityHashValue>(
     }
 
     for encoded_subject in &subject_dirs {
-        let subject_digest = decode_tag(encoded_subject);
+        let subject_digest_str = decode_tag(encoded_subject);
+        let subject_digest: OciDigest = subject_digest_str
+            .parse()
+            .with_context(|| format!("Parsing subject digest '{subject_digest_str}'"))?;
 
         // Check if the subject manifest still exists in the repository
         if has_manifest(repo, &subject_digest)?.is_some() {
@@ -1008,6 +1048,9 @@ pub enum OciFsckError {
 
     #[error("fsck: ref-resolve-failed: {name}: {detail}")]
     RefResolveFailed { name: String, detail: String },
+
+    #[error("fsck: invalid-ref-name: {name}: leading '@' is reserved for digest references")]
+    InvalidRefName { name: String },
 }
 
 /// Results from an OCI-level filesystem consistency check.
@@ -1093,6 +1136,14 @@ pub async fn oci_fsck<ObjectID: FsVerityHashValue>(
     // Check all tagged OCI images
     let refs = list_refs(repo).context("listing OCI refs")?;
     for (name, manifest_digest) in refs {
+        if name.starts_with('@') {
+            result.images_checked += 1;
+            result.images_corrupted += 1;
+            result
+                .errors
+                .push(OciFsckError::InvalidRefName { name: name.clone() });
+            continue;
+        }
         fsck_single_image(repo, &name, &manifest_digest, &mut result);
     }
 
@@ -1133,7 +1184,7 @@ pub async fn oci_fsck_image<ObjectID: FsVerityHashValue>(
 fn fsck_single_image<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     name: &str,
-    manifest_digest: &str,
+    manifest_digest: &OciDigest,
     result: &mut OciFsckResult,
 ) {
     result.images_checked += 1;
@@ -1158,13 +1209,13 @@ fn fsck_single_image<ObjectID: FsVerityHashValue>(
         }
     };
 
-    let computed_digest = hash(&manifest_data);
-    if manifest_digest != computed_digest {
+    let computed_digest = hash_sha256(&manifest_data);
+    if *manifest_digest != computed_digest {
         result.images_corrupted += 1;
         result.errors.push(OciFsckError::ManifestDigestMismatch {
             name: name.to_string(),
             expected: manifest_digest.to_string(),
-            actual: computed_digest,
+            actual: computed_digest.to_string(),
         });
         return;
     }
@@ -1183,7 +1234,7 @@ fn fsck_single_image<ObjectID: FsVerityHashValue>(
     };
 
     // 3. Verify config reference exists in manifest's named refs
-    let config_digest = manifest.config().digest().to_string();
+    let config_digest = manifest.config().digest().clone();
     let config_key = format!("config:{config_digest}");
     let config_verity = match manifest_named_refs.get(config_key.as_str()) {
         Some(v) => v.clone(),
@@ -1191,7 +1242,7 @@ fn fsck_single_image<ObjectID: FsVerityHashValue>(
             result.images_corrupted += 1;
             result.errors.push(OciFsckError::ConfigRefMissing {
                 name: name.to_string(),
-                digest: config_digest,
+                digest: config_digest.to_string(),
             });
             return;
         }
@@ -1216,13 +1267,13 @@ fn fsck_single_image<ObjectID: FsVerityHashValue>(
         }
     };
 
-    let computed_config = hash(&config_data);
+    let computed_config = hash_sha256(&config_data);
     if config_digest != computed_config {
         result.images_corrupted += 1;
         result.errors.push(OciFsckError::ConfigDigestMismatch {
             name: name.to_string(),
-            expected: config_digest,
-            actual: computed_config,
+            expected: config_digest.to_string(),
+            actual: computed_config.to_string(),
         });
         return;
     }
@@ -1244,20 +1295,32 @@ fn fsck_single_image<ObjectID: FsVerityHashValue>(
         };
 
         // Verify each layer diff_id has a corresponding named ref and stream
-        for diff_id in config.rootfs().diff_ids() {
-            let layer_verity = match config_named_refs.get(diff_id.as_str()) {
+        for diff_id_str in config.rootfs().diff_ids() {
+            let layer_verity = match config_named_refs.get(diff_id_str.as_str()) {
                 Some(v) => v,
                 None => {
                     result.errors.push(OciFsckError::LayerRefMissing {
                         name: name.to_string(),
-                        diff_id: diff_id.to_string(),
+                        diff_id: diff_id_str.to_string(),
+                    });
+                    continue;
+                }
+            };
+
+            let diff_id: OciDigest = match diff_id_str.parse() {
+                Ok(d) => d,
+                Err(e) => {
+                    result.errors.push(OciFsckError::LayerCheckFailed {
+                        name: name.to_string(),
+                        diff_id: diff_id_str.to_string(),
+                        detail: format!("Invalid diff_id: {e}"),
                     });
                     continue;
                 }
             };
 
             // Check the layer stream exists
-            let layer_id = crate::layer_identifier(diff_id);
+            let layer_id = crate::layer_identifier(&diff_id);
             match repo.has_stream(&layer_id) {
                 Ok(Some(_)) => {}
                 Ok(None) => {
@@ -1374,7 +1437,7 @@ pub struct SplitstreamInfo {
 /// The diff_id should be in the `sha256:...` format used by OCI.
 pub fn layer_info<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
-    diff_id: &str,
+    diff_id: &OciDigest,
 ) -> Result<LayerInfo> {
     let content_id = crate::layer_identifier(diff_id);
     let verity = repo
@@ -1430,7 +1493,7 @@ pub fn layer_info<ObjectID: FsVerityHashValue>(
 /// which includes path, size, mode, ownership, timestamps, and content references.
 pub fn layer_dumpfile<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
-    diff_id: &str,
+    diff_id: &OciDigest,
     output: &mut impl std::io::Write,
 ) -> Result<()> {
     let content_id = crate::layer_identifier(diff_id);
@@ -1457,7 +1520,7 @@ pub fn layer_dumpfile<ObjectID: FsVerityHashValue>(
 /// combining inline data with external object references.
 pub fn layer_tar<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
-    diff_id: &str,
+    diff_id: &OciDigest,
     output: &mut impl std::io::Write,
 ) -> Result<()> {
     let content_id = crate::layer_identifier(diff_id);
@@ -1479,12 +1542,11 @@ mod test {
     use composefs::fsverity::Sha256HashValue;
     use composefs::test::TestRepo;
     use containers_image_proxy::oci_spec::image::{
-        ConfigBuilder, DescriptorBuilder, Digest as OciDigest, ImageConfigurationBuilder,
-        ImageManifestBuilder, RootFsBuilder,
+        ConfigBuilder, DescriptorBuilder, ImageConfigurationBuilder, ImageManifestBuilder,
+        RootFsBuilder,
     };
     use std::fs::File;
     use std::io::Read;
-    use std::str::FromStr;
 
     /// Helper to create a synthetic container image in the repository.
     ///
@@ -1498,11 +1560,11 @@ mod test {
         repo: &Arc<Repository<Sha256HashValue>>,
         tag: Option<&str>,
         arch: &str,
-    ) -> (String, Sha256HashValue, String) {
+    ) -> (OciDigest, Sha256HashValue, OciDigest) {
         // Create a fake layer - in real usage this would be a tar splitstream
         // For testing the manifest/config storage, we just need valid references
         let layer_data = format!("fake-layer-{arch}").into_bytes();
-        let layer_digest = hash(&layer_data);
+        let layer_digest = hash_sha256(&layer_data);
 
         let mut layer_stream = repo.create_stream(crate::skopeo::TAR_LAYER_CONTENT_TYPE);
         layer_stream.write_external(&layer_data).unwrap();
@@ -1512,7 +1574,7 @@ mod test {
 
         let rootfs = RootFsBuilder::default()
             .typ("layers")
-            .diff_ids(vec![layer_digest.clone()])
+            .diff_ids(vec![layer_digest.to_string()])
             .build()
             .unwrap();
 
@@ -1527,10 +1589,10 @@ mod test {
             .unwrap();
 
         let config_json = config.to_string().unwrap();
-        let config_digest = hash(config_json.as_bytes());
+        let config_digest = hash_sha256(config_json.as_bytes());
 
         let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
-        config_stream.add_named_stream_ref(&layer_digest, &layer_verity);
+        config_stream.add_named_stream_ref(layer_digest.as_ref(), &layer_verity);
         config_stream
             .write_external(config_json.as_bytes())
             .unwrap();
@@ -1544,14 +1606,14 @@ mod test {
 
         let config_descriptor = DescriptorBuilder::default()
             .media_type(MediaType::ImageConfig)
-            .digest(OciDigest::from_str(&config_digest).unwrap())
+            .digest(config_digest.clone())
             .size(config_json.len() as u64)
             .build()
             .unwrap();
 
         let layer_descriptor = DescriptorBuilder::default()
             .media_type(MediaType::ImageLayerGzip)
-            .digest(OciDigest::from_str(&layer_digest).unwrap())
+            .digest(layer_digest.clone())
             .size(layer_data.len() as u64)
             .build()
             .unwrap();
@@ -1565,10 +1627,10 @@ mod test {
             .unwrap();
 
         let mut layer_verities = HashMap::new();
-        layer_verities.insert(layer_digest.into_boxed_str(), layer_verity);
+        layer_verities.insert(layer_digest.to_string().into_boxed_str(), layer_verity);
 
         let manifest_json = manifest.to_string().unwrap();
-        let manifest_digest = hash(manifest_json.as_bytes());
+        let manifest_digest = hash_sha256(manifest_json.as_bytes());
 
         let (_stored_digest, manifest_verity) = write_manifest(
             repo,
@@ -1585,9 +1647,13 @@ mod test {
 
     #[test]
     fn test_manifest_identifier() {
+        let digest: OciDigest =
+            "sha256:abc1230000000000000000000000000000000000000000000000000000000000"
+                .parse()
+                .unwrap();
         assert_eq!(
-            manifest_identifier("sha256:abc123"),
-            "oci-manifest-sha256:abc123"
+            manifest_identifier(&digest),
+            "oci-manifest-sha256:abc1230000000000000000000000000000000000000000000000000000000000"
         );
     }
 
@@ -1643,16 +1709,23 @@ mod test {
     }
 
     #[test]
-    fn test_hash() {
+    fn test_hash_sha256() {
         assert_eq!(
-            hash(b"hello world"),
+            hash_sha256(b"hello world").as_ref(),
             "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
         );
     }
 
     #[test]
     fn test_blob_identifier() {
-        assert_eq!(blob_identifier("sha256:abc123"), "oci-blob-sha256:abc123");
+        let digest: OciDigest =
+            "sha256:abc1230000000000000000000000000000000000000000000000000000000000"
+                .parse()
+                .unwrap();
+        assert_eq!(
+            blob_identifier(&digest),
+            "oci-blob-sha256:abc1230000000000000000000000000000000000000000000000000000000000"
+        );
     }
 
     #[test]
@@ -1663,7 +1736,7 @@ mod test {
         let data = b"This is some arbitrary blob data for an OCI artifact.";
         let (digest, verity) = write_blob(repo, data).unwrap();
 
-        assert!(digest.starts_with("sha256:"));
+        assert!(digest.as_ref().starts_with("sha256:"));
 
         // Read back with verity (fast path)
         let read_data = open_blob(&repo, &digest, Some(&verity)).unwrap();
@@ -1696,8 +1769,11 @@ mod test {
         let data = b"some blob data";
         let (_digest, _verity) = write_blob(repo, data).unwrap();
 
-        let bad_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
-        let result = open_blob::<Sha256HashValue>(&repo, bad_digest, None);
+        let bad_digest: OciDigest =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .parse()
+                .unwrap();
+        let result = open_blob::<Sha256HashValue>(&repo, &bad_digest, None);
         assert!(result.is_err());
     }
 
@@ -1778,10 +1854,7 @@ mod test {
     /// Helm chart, WASM module, or other non-container artifact.
     #[test]
     fn test_oci_artifact_roundtrip() {
-        use containers_image_proxy::oci_spec::image::{
-            DescriptorBuilder, Digest as OciDigest, ImageManifestBuilder,
-        };
-        use std::str::FromStr;
+        use containers_image_proxy::oci_spec::image::{DescriptorBuilder, ImageManifestBuilder};
 
         let test_repo = TestRepo::<Sha256HashValue>::new();
         let repo = &test_repo.repo;
@@ -1792,7 +1865,7 @@ mod test {
 
         // Create an empty config (common for artifacts)
         let empty_config = b"{}";
-        let config_digest = hash(empty_config);
+        let config_digest = hash_sha256(empty_config);
 
         let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
         config_stream.write_external(empty_config).unwrap();
@@ -1808,14 +1881,14 @@ mod test {
             .media_type(MediaType::Other(
                 "application/vnd.wasm.config.v1+json".to_string(),
             ))
-            .digest(OciDigest::from_str(&config_digest).unwrap())
+            .digest(config_digest.clone())
             .size(empty_config.len() as u64)
             .build()
             .unwrap();
 
         let blob_descriptor = DescriptorBuilder::default()
             .media_type(MediaType::Other("application/wasm".to_string()))
-            .digest(OciDigest::from_str(&blob_digest).unwrap())
+            .digest(blob_digest.clone())
             .size(wasm_bytes.len() as u64)
             .build()
             .unwrap();
@@ -1830,10 +1903,13 @@ mod test {
 
         let mut layer_verities = HashMap::new();
         // For artifacts, we use the blob digest as the "diff_id" equivalent
-        layer_verities.insert(blob_digest.clone().into_boxed_str(), blob_verity.clone());
+        layer_verities.insert(
+            blob_digest.to_string().into_boxed_str(),
+            blob_verity.clone(),
+        );
 
         let manifest_json = manifest.to_string().unwrap();
-        let manifest_digest = hash(manifest_json.as_bytes());
+        let manifest_digest = hash_sha256(manifest_json.as_bytes());
 
         let (stored_digest, manifest_verity) = write_manifest(
             &repo,
@@ -1850,8 +1926,8 @@ mod test {
         let opened = OciImage::open(&repo, &manifest_digest, Some(&manifest_verity)).unwrap();
 
         assert!(!opened.is_container_image()); // Not a container image
-        assert_eq!(opened.manifest_digest(), manifest_digest);
-        assert_eq!(opened.config_digest(), config_digest);
+        assert_eq!(opened.manifest_digest(), &manifest_digest);
+        assert_eq!(opened.config_digest(), &config_digest);
         assert_eq!(opened.layer_descriptors().len(), 1);
         assert_eq!(
             opened.layer_descriptors()[0].media_type(),
@@ -1859,7 +1935,7 @@ mod test {
         );
 
         let by_tag = OciImage::open_ref(&repo, "my-wasm-artifact:v1").unwrap();
-        assert_eq!(by_tag.manifest_digest(), manifest_digest);
+        assert_eq!(by_tag.manifest_digest(), &manifest_digest);
 
         let images = list_images(&repo).unwrap();
         assert_eq!(images.len(), 1);
@@ -1880,7 +1956,7 @@ mod test {
         let repo = &test_repo.repo;
 
         let sbom_data = br#"{"spdxVersion":"SPDX-2.3","name":"example"}"#;
-        let layer_digest = hash(sbom_data);
+        let layer_digest = hash_sha256(sbom_data);
 
         // Store the raw layer as an object with external ref splitstream
         let blob_object_id = repo.ensure_object(sbom_data).unwrap();
@@ -1896,9 +1972,9 @@ mod test {
 
         // The OCI 1.1 empty config: `{}` with the well-known digest
         let empty_config = b"{}";
-        let config_digest = hash(empty_config);
+        let config_digest = hash_sha256(empty_config);
         assert_eq!(
-            config_digest,
+            config_digest.as_ref(),
             "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
         );
 
@@ -1917,14 +1993,14 @@ mod test {
 
         let config_descriptor = DescriptorBuilder::default()
             .media_type(MediaType::EmptyJSON)
-            .digest(OciDigest::from_str(&config_digest).unwrap())
+            .digest(config_digest.clone())
             .size(empty_config.len() as u64)
             .build()
             .unwrap();
 
         let layer_descriptor = DescriptorBuilder::default()
             .media_type(MediaType::Other("text/spdx+json".to_string()))
-            .digest(OciDigest::from_str(&layer_digest).unwrap())
+            .digest(layer_digest.clone())
             .size(sbom_data.len() as u64)
             .build()
             .unwrap();
@@ -1942,10 +2018,13 @@ mod test {
         // Store manifest — layer_verities uses the layer digest as key
         // (same logic as ensure_config_with_layers when !is_image_config)
         let mut layer_verities = HashMap::new();
-        layer_verities.insert(layer_digest.clone().into_boxed_str(), layer_verity.clone());
+        layer_verities.insert(
+            layer_digest.to_string().into_boxed_str(),
+            layer_verity.clone(),
+        );
 
         let manifest_json = manifest.to_string().unwrap();
-        let manifest_digest = hash(manifest_json.as_bytes());
+        let manifest_digest = hash_sha256(manifest_json.as_bytes());
 
         let (_stored_digest, manifest_verity) = write_manifest(
             &repo,
@@ -2006,7 +2085,7 @@ mod test {
         let repo = &test_repo.repo;
 
         let sbom_data = br#"{"spdxVersion":"SPDX-2.3","name":"example"}"#;
-        let diff_id = hash(sbom_data);
+        let diff_id = hash_sha256(sbom_data);
 
         let object_id = repo.ensure_object(sbom_data).unwrap();
 
@@ -2043,16 +2122,13 @@ mod test {
     /// is preserved by GC when referenced from a tagged manifest.
     #[test]
     fn test_non_tar_artifact_gc() {
-        use containers_image_proxy::oci_spec::image::{
-            DescriptorBuilder, Digest as OciDigest, ImageManifestBuilder,
-        };
-        use std::str::FromStr;
+        use containers_image_proxy::oci_spec::image::{DescriptorBuilder, ImageManifestBuilder};
 
         let test_repo = TestRepo::<Sha256HashValue>::new();
         let repo = &test_repo.repo;
 
         let sbom_data = br#"{"spdxVersion":"SPDX-2.3","name":"example"}"#;
-        let diff_id = hash(sbom_data);
+        let diff_id = hash_sha256(sbom_data);
         let blob_object_id = repo.ensure_object(sbom_data).unwrap();
 
         let layer_content_id = crate::layer_identifier(&diff_id);
@@ -2066,7 +2142,7 @@ mod test {
             .unwrap();
 
         let config_bytes = b"{}";
-        let config_digest = hash(config_bytes);
+        let config_digest = hash_sha256(config_bytes);
         let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
         config_stream.write_external(config_bytes).unwrap();
         let config_verity = repo
@@ -2079,13 +2155,13 @@ mod test {
 
         let config_descriptor = DescriptorBuilder::default()
             .media_type(MediaType::ImageConfig)
-            .digest(OciDigest::from_str(&config_digest).unwrap())
+            .digest(config_digest.clone())
             .size(config_bytes.len() as u64)
             .build()
             .unwrap();
         let layer_descriptor = DescriptorBuilder::default()
             .media_type(MediaType::Other("text/spdx+json".to_string()))
-            .digest(OciDigest::from_str(&diff_id).unwrap())
+            .digest(diff_id.clone())
             .size(sbom_data.len() as u64)
             .build()
             .unwrap();
@@ -2098,10 +2174,10 @@ mod test {
             .unwrap();
 
         let mut layer_verities = HashMap::new();
-        layer_verities.insert(diff_id.clone().into_boxed_str(), layer_verity);
+        layer_verities.insert(diff_id.to_string().into_boxed_str(), layer_verity);
 
         let manifest_json = manifest.to_string().unwrap();
-        let manifest_digest = hash(manifest_json.as_bytes());
+        let manifest_digest = hash_sha256(manifest_json.as_bytes());
 
         let (_stored_digest, _manifest_verity) = write_manifest(
             &repo,
@@ -2153,15 +2229,15 @@ mod test {
         }
 
         let img1 = OciImage::open_ref(repo, "app:v1").unwrap();
-        assert_eq!(img1.manifest_digest(), digest1);
+        assert_eq!(img1.manifest_digest(), &digest1);
         assert_eq!(img1.manifest_verity(), &verity1);
 
         let img2 = OciImage::open_ref(repo, "app:v2").unwrap();
-        assert_eq!(img2.manifest_digest(), digest2);
+        assert_eq!(img2.manifest_digest(), &digest2);
         assert_eq!(img2.manifest_verity(), &verity2);
 
         let img3 = OciImage::open_ref(repo, "other:latest").unwrap();
-        assert_eq!(img3.manifest_digest(), digest3);
+        assert_eq!(img3.manifest_digest(), &digest3);
         assert_eq!(img3.manifest_verity(), &verity3);
     }
 
@@ -2185,7 +2261,7 @@ mod test {
         assert_eq!(images[0].manifest_digest, digest2);
 
         let img = OciImage::open(repo, &digest1, Some(&verity1)).unwrap();
-        assert_eq!(img.manifest_digest(), digest1);
+        assert_eq!(img.manifest_digest(), &digest1);
 
         let result = OciImage::open_ref(repo, "myapp:v1");
         assert!(result.is_err());
@@ -2210,6 +2286,62 @@ mod test {
 
         let result = resolve_ref::<Sha256HashValue>(repo, "nonexistent:tag");
         assert!(result.is_err());
+    }
+
+    /// Test that tag_image rejects names containing `@`.
+    #[test]
+    fn test_tag_rejects_leading_at_sign() {
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        let (digest, _, _) = create_test_image(repo, Some("valid:v1"), "amd64");
+
+        // Leading @ is rejected
+        let result = tag_image(repo, &digest, "@sha256:bad");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("'@' is reserved"), "unexpected error: {err}");
+
+        // @ in the middle is fine
+        let result = tag_image(repo, &digest, "name@digest");
+        assert!(result.is_ok());
+    }
+
+    /// Test that fsck catches refs starting with `@`.
+    #[tokio::test]
+    async fn test_oci_fsck_detects_invalid_ref_name() {
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        let (digest, _, _) = create_test_image(repo, Some("good:v1"), "amd64");
+
+        // Bypass validate_ref_name by creating the ref symlink directly
+        let bad_name = "@badref";
+        let ref_path = format!("streams/refs/{}", oci_ref_path(bad_name));
+        let manifest_id = manifest_identifier(&digest);
+        let target = format!("../../{manifest_id}");
+        repo.symlink(&ref_path, &target)
+            .expect("create bad ref symlink");
+
+        let result = oci_fsck(repo).await.unwrap();
+        assert!(
+            result.images_corrupted > 0,
+            "fsck should report corruption for @ in ref name"
+        );
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| matches!(e, OciFsckError::InvalidRefName { name } if name == bad_name)),
+            "fsck should report InvalidRefName error"
+        );
+        // The bad ref should be counted exactly once
+        let invalid_count = result
+            .errors
+            .iter()
+            .filter(|e| matches!(e, OciFsckError::InvalidRefName { .. }))
+            .count();
+        assert_eq!(invalid_count, 1, "should report exactly one InvalidRefName");
     }
 
     /// Test that tagging an existing manifest with a new name works.
@@ -2253,13 +2385,13 @@ mod test {
         assert!(images.is_empty());
 
         let img = OciImage::open(repo, &digest, Some(&verity)).unwrap();
-        assert_eq!(img.manifest_digest(), digest);
-        assert_eq!(img.config_digest(), config_digest);
+        assert_eq!(img.manifest_digest(), &digest);
+        assert_eq!(img.config_digest(), &config_digest);
         assert!(img.is_container_image());
         assert_eq!(img.architecture(), "amd64");
 
         let img2 = OciImage::open(repo, &digest, None).unwrap();
-        assert_eq!(img2.manifest_digest(), digest);
+        assert_eq!(img2.manifest_digest(), &digest);
     }
 
     /// Test fetching manifest and config from stored image.
@@ -2273,13 +2405,13 @@ mod test {
 
         let img = OciImage::open_ref(repo, "fetchtest:v1").unwrap();
 
-        assert_eq!(img.manifest_digest(), digest);
+        assert_eq!(img.manifest_digest(), &digest);
         assert_eq!(img.manifest_verity(), &verity);
         let manifest = img.manifest();
         assert_eq!(manifest.schema_version(), 2u32);
         assert_eq!(manifest.layers().len(), 1);
 
-        assert_eq!(img.config_digest(), config_digest);
+        assert_eq!(img.config_digest(), &config_digest);
         let config = img.config().expect("should have config");
         assert_eq!(config.architecture().to_string(), "amd64");
         assert_eq!(config.os().to_string(), "linux");
@@ -2297,8 +2429,11 @@ mod test {
         let test_repo = TestRepo::<Sha256HashValue>::new();
         let repo = &test_repo.repo;
 
-        let nonexistent = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
-        assert!(has_manifest(repo, nonexistent).unwrap().is_none());
+        let nonexistent: OciDigest =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .parse()
+                .unwrap();
+        assert!(has_manifest(repo, &nonexistent).unwrap().is_none());
 
         let (digest, verity, _) = create_test_image(repo, None, "amd64");
 
@@ -2306,7 +2441,7 @@ mod test {
         assert!(found.is_some());
         assert_eq!(found.unwrap(), verity);
 
-        assert!(has_manifest(repo, nonexistent).unwrap().is_none());
+        assert!(has_manifest(repo, &nonexistent).unwrap().is_none());
     }
 
     /// Test empty repository behavior.
@@ -2355,9 +2490,9 @@ mod test {
         assert_eq!(gc_result.streams_pruned, 0);
 
         let img = OciImage::open_ref(repo, "myapp:v1").unwrap();
-        assert_eq!(img.manifest_digest(), manifest_digest);
+        assert_eq!(img.manifest_digest(), &manifest_digest);
         assert_eq!(img.manifest_verity(), &manifest_verity);
-        assert_eq!(img.config_digest(), config_digest);
+        assert_eq!(img.config_digest(), &config_digest);
 
         let diff_ids = img.layer_diff_ids();
         assert_eq!(diff_ids.len(), 1);
@@ -2420,7 +2555,7 @@ mod test {
         let repo = &test_repo.repo;
 
         let shared_layer_data = b"shared-base-layer-content";
-        let shared_layer_digest = hash(shared_layer_data);
+        let shared_layer_digest = hash_sha256(shared_layer_data);
 
         let mut shared_layer_stream = repo.create_stream(crate::skopeo::TAR_LAYER_CONTENT_TYPE);
         shared_layer_stream
@@ -2438,10 +2573,10 @@ mod test {
         let create_image_with_shared_layer = |repo: &Arc<Repository<Sha256HashValue>>,
                                               tag: Option<&str>,
                                               extra_data: &[u8]|
-         -> (String, Sha256HashValue) {
+         -> (OciDigest, Sha256HashValue) {
             let rootfs = RootFsBuilder::default()
                 .typ("layers")
-                .diff_ids(vec![shared_layer_digest.clone()])
+                .diff_ids(vec![shared_layer_digest.to_string()])
                 .build()
                 .unwrap();
 
@@ -2458,10 +2593,10 @@ mod test {
                 .unwrap();
 
             let config_json = config.to_string().unwrap();
-            let config_digest = hash(config_json.as_bytes());
+            let config_digest = hash_sha256(config_json.as_bytes());
 
             let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
-            config_stream.add_named_stream_ref(&shared_layer_digest, &shared_layer_verity);
+            config_stream.add_named_stream_ref(shared_layer_digest.as_ref(), &shared_layer_verity);
             config_stream
                 .write_external(config_json.as_bytes())
                 .unwrap();
@@ -2475,14 +2610,14 @@ mod test {
 
             let config_descriptor = DescriptorBuilder::default()
                 .media_type(MediaType::ImageConfig)
-                .digest(OciDigest::from_str(&config_digest).unwrap())
+                .digest(config_digest.clone())
                 .size(config_json.len() as u64)
                 .build()
                 .unwrap();
 
             let layer_descriptor = DescriptorBuilder::default()
                 .media_type(MediaType::ImageLayerGzip)
-                .digest(OciDigest::from_str(&shared_layer_digest).unwrap())
+                .digest(shared_layer_digest.clone())
                 .size(shared_layer_data.len() as u64)
                 .build()
                 .unwrap();
@@ -2497,12 +2632,12 @@ mod test {
 
             let mut layer_verities = HashMap::new();
             layer_verities.insert(
-                shared_layer_digest.clone().into_boxed_str(),
+                shared_layer_digest.to_string().into_boxed_str(),
                 shared_layer_verity.clone(),
             );
 
             let manifest_json = manifest.to_string().unwrap();
-            let manifest_digest = hash(manifest_json.as_bytes());
+            let manifest_digest = hash_sha256(manifest_json.as_bytes());
 
             let (_stored_digest, manifest_verity) = write_manifest(
                 repo,
@@ -2529,7 +2664,7 @@ mod test {
 
         let img1 = OciImage::open(repo, &digest1, Some(&verity1)).unwrap();
         assert_eq!(img1.layer_diff_ids().len(), 1);
-        assert!(img1.layer_verity(&shared_layer_digest).is_some());
+        assert!(img1.layer_verity(shared_layer_digest.as_ref()).is_some());
 
         assert!(has_manifest(repo, &digest2).unwrap().is_none());
 
@@ -2562,7 +2697,7 @@ mod test {
         assert_eq!(gc_result.objects_removed, 0);
 
         let img = OciImage::open_ref(repo, "alias:latest").unwrap();
-        assert_eq!(img.manifest_digest(), manifest_digest);
+        assert_eq!(img.manifest_digest(), &manifest_digest);
         assert_eq!(img.manifest_verity(), &manifest_verity);
 
         let diff_ids = img.layer_diff_ids();
@@ -2622,7 +2757,7 @@ mod test {
         let (subject_digest, _, _) = create_test_image(repo, Some("subject:v1"), "amd64");
 
         let empty_config = b"{}";
-        let config_digest = hash(empty_config);
+        let config_digest = hash_sha256(empty_config);
         let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
         config_stream.write_external(empty_config).unwrap();
         let config_verity = repo
@@ -2640,14 +2775,14 @@ mod test {
 
             let config_descriptor = DescriptorBuilder::default()
                 .media_type(MediaType::EmptyJSON)
-                .digest(OciDigest::from_str(&config_digest).unwrap())
+                .digest(config_digest.clone())
                 .size(empty_config.len() as u64)
                 .build()
                 .unwrap();
 
             let layer_descriptor = DescriptorBuilder::default()
                 .media_type(MediaType::Other("application/octet-stream".to_string()))
-                .digest(OciDigest::from_str(&blob_digest).unwrap())
+                .digest(blob_digest.clone())
                 .size(blob_data.len() as u64)
                 .build()
                 .unwrap();
@@ -2661,10 +2796,10 @@ mod test {
                 .unwrap();
 
             let mut layer_verities = HashMap::new();
-            layer_verities.insert(blob_digest.into_boxed_str(), blob_verity);
+            layer_verities.insert(blob_digest.to_string().into_boxed_str(), blob_verity);
 
             let manifest_json = manifest.to_string().unwrap();
-            let manifest_digest = hash(manifest_json.as_bytes());
+            let manifest_digest = hash_sha256(manifest_json.as_bytes());
 
             write_manifest(
                 repo,
@@ -2683,10 +2818,10 @@ mod test {
         let referrers = list_referrers(repo, &subject_digest).unwrap();
         assert_eq!(referrers.len(), 2);
 
-        let found_digests: Vec<&str> = referrers.iter().map(|(d, _)| d.as_str()).collect();
+        let found_digests: Vec<&OciDigest> = referrers.iter().map(|(d, _)| d).collect();
         for expected in &artifact_digests {
             assert!(
-                found_digests.contains(&expected.as_str()),
+                found_digests.contains(&expected),
                 "Missing artifact {expected} in referrers"
             );
         }
@@ -2698,11 +2833,11 @@ mod test {
     fn create_test_artifact(
         repo: &Arc<Repository<Sha256HashValue>>,
         blob_data: &[u8],
-    ) -> (String, Sha256HashValue) {
+    ) -> (OciDigest, Sha256HashValue) {
         let (blob_digest, blob_verity) = write_blob(repo, blob_data).unwrap();
 
         let empty_config = b"{}";
-        let config_digest = hash(empty_config);
+        let config_digest = hash_sha256(empty_config);
 
         let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
         config_stream.write_external(empty_config).unwrap();
@@ -2716,14 +2851,14 @@ mod test {
 
         let config_descriptor = DescriptorBuilder::default()
             .media_type(MediaType::EmptyJSON)
-            .digest(OciDigest::from_str(&config_digest).unwrap())
+            .digest(config_digest.clone())
             .size(empty_config.len() as u64)
             .build()
             .unwrap();
 
         let layer_descriptor = DescriptorBuilder::default()
             .media_type(MediaType::Other("application/octet-stream".to_string()))
-            .digest(OciDigest::from_str(&blob_digest).unwrap())
+            .digest(blob_digest.clone())
             .size(blob_data.len() as u64)
             .build()
             .unwrap();
@@ -2737,10 +2872,10 @@ mod test {
             .unwrap();
 
         let mut layer_verities = HashMap::new();
-        layer_verities.insert(blob_digest.into_boxed_str(), blob_verity);
+        layer_verities.insert(blob_digest.to_string().into_boxed_str(), blob_verity);
 
         let manifest_json = manifest.to_string().unwrap();
-        let manifest_digest = hash(manifest_json.as_bytes());
+        let manifest_digest = hash_sha256(manifest_json.as_bytes());
 
         let (_stored_digest, manifest_verity) = write_manifest(
             repo,
@@ -2950,24 +3085,28 @@ mod test {
 
             #[test]
             fn hash_deterministic_and_prefixed(data in proptest::collection::vec(any::<u8>(), 0..4096)) {
-                let h1 = hash(&data);
-                let h2 = hash(&data);
+                let h1 = hash_sha256(&data);
+                let h2 = hash_sha256(&data);
                 prop_assert_eq!(&h1, &h2);
-                prop_assert!(h1.starts_with("sha256:"));
+                prop_assert!(AsRef::<str>::as_ref(&h1).starts_with("sha256:"));
             }
 
             #[test]
-            fn manifest_identifier_format(digest in "\\PC*") {
+            fn manifest_identifier_format(hex in "[0-9a-f]{64}") {
+                let digest_str = format!("sha256:{hex}");
+                let digest: OciDigest = digest_str.parse().unwrap();
                 let id = manifest_identifier(&digest);
                 prop_assert!(id.starts_with("oci-manifest-"));
-                prop_assert!(id.ends_with(&digest));
+                prop_assert!(id.ends_with(&digest_str));
             }
 
             #[test]
-            fn blob_identifier_format(digest in "\\PC*") {
+            fn blob_identifier_format(hex in "[0-9a-f]{64}") {
+                let digest_str = format!("sha256:{hex}");
+                let digest: OciDigest = digest_str.parse().unwrap();
                 let id = blob_identifier(&digest);
                 prop_assert!(id.starts_with("oci-blob-"));
-                prop_assert!(id.ends_with(&digest));
+                prop_assert!(id.ends_with(&digest_str));
             }
 
             #[test]
@@ -3086,7 +3225,8 @@ mod test {
 
         // Find the layer stream and its backing splitstream object, then
         // delete the stream symlink so the layer appears missing.
-        let layer_id = crate::layer_identifier(diff_ids[0]);
+        let diff_id_parsed: OciDigest = diff_ids[0].parse().unwrap();
+        let layer_id = crate::layer_identifier(&diff_id_parsed);
         let stream_symlink = test_repo.path().join(format!("streams/{layer_id}"));
         std::fs::remove_file(&stream_symlink).unwrap();
 
@@ -3179,7 +3319,7 @@ mod test {
 
         // Build a valid manifest JSON
         let layer_data = b"fake-layer-data";
-        let layer_digest = hash(layer_data);
+        let layer_digest = hash_sha256(layer_data);
 
         let mut layer_stream = repo.create_stream(crate::skopeo::TAR_LAYER_CONTENT_TYPE);
         layer_stream.write_external(layer_data).unwrap();
@@ -3189,7 +3329,7 @@ mod test {
 
         let rootfs = RootFsBuilder::default()
             .typ("layers")
-            .diff_ids(vec![layer_digest.clone()])
+            .diff_ids(vec![layer_digest.to_string()])
             .build()
             .unwrap();
         let cfg = ConfigBuilder::default().build().unwrap();
@@ -3201,11 +3341,11 @@ mod test {
             .build()
             .unwrap();
         let config_json = config.to_string().unwrap();
-        let config_digest = hash(config_json.as_bytes());
+        let config_digest = hash_sha256(config_json.as_bytes());
 
         // Store config normally
         let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
-        config_stream.add_named_stream_ref(&layer_digest, &layer_verity);
+        config_stream.add_named_stream_ref(layer_digest.as_ref(), &layer_verity);
         config_stream
             .write_external(config_json.as_bytes())
             .unwrap();
@@ -3219,13 +3359,13 @@ mod test {
 
         let config_descriptor = DescriptorBuilder::default()
             .media_type(MediaType::ImageConfig)
-            .digest(OciDigest::from_str(&config_digest).unwrap())
+            .digest(config_digest.clone())
             .size(config_json.len() as u64)
             .build()
             .unwrap();
         let layer_descriptor = DescriptorBuilder::default()
             .media_type(MediaType::ImageLayerGzip)
-            .digest(OciDigest::from_str(&layer_digest).unwrap())
+            .digest(layer_digest.clone())
             .size(layer_data.len() as u64)
             .build()
             .unwrap();
@@ -3238,7 +3378,7 @@ mod test {
             .unwrap();
 
         let manifest_json = manifest.to_string().unwrap();
-        let manifest_digest = hash(manifest_json.as_bytes());
+        let manifest_digest = hash_sha256(manifest_json.as_bytes());
 
         // Store manifest WITHOUT config named ref — this is the bug we test
         let manifest_id = manifest_identifier(&manifest_digest);
@@ -3285,7 +3425,7 @@ mod test {
         let (blob_digest, blob_verity) = write_blob(repo, blob_data).unwrap();
 
         let empty_config = b"{}";
-        let config_digest = hash(empty_config);
+        let config_digest = hash_sha256(empty_config);
         let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
         config_stream.write_external(empty_config).unwrap();
         let config_verity = repo
@@ -3298,13 +3438,13 @@ mod test {
 
         let config_descriptor = DescriptorBuilder::default()
             .media_type(MediaType::EmptyJSON) // NOT ImageConfig
-            .digest(OciDigest::from_str(&config_digest).unwrap())
+            .digest(config_digest.clone())
             .size(empty_config.len() as u64)
             .build()
             .unwrap();
         let layer_descriptor = DescriptorBuilder::default()
             .media_type(MediaType::Other("application/octet-stream".to_string()))
-            .digest(OciDigest::from_str(&blob_digest).unwrap())
+            .digest(blob_digest.clone())
             .size(blob_data.len() as u64)
             .build()
             .unwrap();
@@ -3317,10 +3457,10 @@ mod test {
             .unwrap();
 
         let mut layer_verities = HashMap::new();
-        layer_verities.insert(blob_digest.clone().into_boxed_str(), blob_verity);
+        layer_verities.insert(blob_digest.to_string().into_boxed_str(), blob_verity);
 
         let manifest_json = manifest.to_string().unwrap();
-        let manifest_digest = hash(manifest_json.as_bytes());
+        let manifest_digest = hash_sha256(manifest_json.as_bytes());
 
         write_manifest(
             repo,
@@ -3353,7 +3493,7 @@ mod test {
         let (blob_digest, _blob_verity) = write_blob(repo, blob_data).unwrap();
 
         let empty_config = b"{}";
-        let config_digest = hash(empty_config);
+        let config_digest = hash_sha256(empty_config);
         let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
         config_stream.write_external(empty_config).unwrap();
         let config_verity = repo
@@ -3366,13 +3506,13 @@ mod test {
 
         let config_descriptor = DescriptorBuilder::default()
             .media_type(MediaType::EmptyJSON)
-            .digest(OciDigest::from_str(&config_digest).unwrap())
+            .digest(config_digest.clone())
             .size(empty_config.len() as u64)
             .build()
             .unwrap();
         let layer_descriptor = DescriptorBuilder::default()
             .media_type(MediaType::Other("application/wasm".to_string()))
-            .digest(OciDigest::from_str(&blob_digest).unwrap())
+            .digest(blob_digest.clone())
             .size(blob_data.len() as u64)
             .build()
             .unwrap();
@@ -3388,7 +3528,7 @@ mod test {
         let layer_verities: HashMap<Box<str>, Sha256HashValue> = HashMap::new();
 
         let manifest_json = manifest.to_string().unwrap();
-        let manifest_digest = hash(manifest_json.as_bytes());
+        let manifest_digest = hash_sha256(manifest_json.as_bytes());
 
         write_manifest(
             repo,
@@ -3452,7 +3592,8 @@ mod test {
         // Corrupt the second image's layer
         let img = OciImage::open(repo, &manifest_digest2, Some(&manifest_verity2)).unwrap();
         let diff_ids = img.layer_diff_ids();
-        let layer_id = crate::layer_identifier(diff_ids[0]);
+        let diff_id_parsed: OciDigest = diff_ids[0].parse().unwrap();
+        let layer_id = crate::layer_identifier(&diff_id_parsed);
         let dir =
             cap_std::fs::Dir::open_ambient_dir(test_repo.path(), cap_std::ambient_authority())
                 .unwrap();
@@ -3477,7 +3618,7 @@ mod test {
         let repo = &test_repo.repo;
 
         let layer_data = b"layer-for-missing-ref-test";
-        let layer_digest = hash(layer_data);
+        let layer_digest = hash_sha256(layer_data);
 
         let mut layer_stream = repo.create_stream(crate::skopeo::TAR_LAYER_CONTENT_TYPE);
         layer_stream.write_external(layer_data).unwrap();
@@ -3487,7 +3628,7 @@ mod test {
 
         let rootfs = RootFsBuilder::default()
             .typ("layers")
-            .diff_ids(vec![layer_digest.clone()])
+            .diff_ids(vec![layer_digest.to_string()])
             .build()
             .unwrap();
         let cfg = ConfigBuilder::default().build().unwrap();
@@ -3499,7 +3640,7 @@ mod test {
             .build()
             .unwrap();
         let config_json = config.to_string().unwrap();
-        let config_digest = hash(config_json.as_bytes());
+        let config_digest = hash_sha256(config_json.as_bytes());
 
         // Store config WITHOUT the layer named ref — this is the bug
         let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
@@ -3517,13 +3658,13 @@ mod test {
 
         let config_descriptor = DescriptorBuilder::default()
             .media_type(MediaType::ImageConfig)
-            .digest(OciDigest::from_str(&config_digest).unwrap())
+            .digest(config_digest.clone())
             .size(config_json.len() as u64)
             .build()
             .unwrap();
         let layer_descriptor = DescriptorBuilder::default()
             .media_type(MediaType::ImageLayerGzip)
-            .digest(OciDigest::from_str(&layer_digest).unwrap())
+            .digest(layer_digest.clone())
             .size(layer_data.len() as u64)
             .build()
             .unwrap();
@@ -3536,9 +3677,9 @@ mod test {
             .unwrap();
 
         let mut layer_verities = HashMap::new();
-        layer_verities.insert(layer_digest.into_boxed_str(), layer_verity);
+        layer_verities.insert(layer_digest.to_string().into_boxed_str(), layer_verity);
         let manifest_json = manifest.to_string().unwrap();
-        let manifest_digest = hash(manifest_json.as_bytes());
+        let manifest_digest = hash_sha256(manifest_json.as_bytes());
 
         write_manifest(
             repo,

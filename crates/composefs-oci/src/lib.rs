@@ -23,6 +23,11 @@ pub use composefs;
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, Result, bail, ensure};
+/// OCI content-addressable digest type (e.g. `sha256:abcd...`).
+///
+/// Re-exported from `oci-spec` for convenience.
+pub use containers_image_proxy::oci_spec::image::Digest as OciDigest;
+
 use containers_image_proxy::ImageProxyConfig;
 use containers_image_proxy::oci_spec::image::ImageConfiguration;
 use sha2::{Digest, Sha256};
@@ -110,20 +115,20 @@ impl std::fmt::Display for ImportStats {
 #[derive(Debug)]
 pub struct PullResult<ObjectID> {
     /// The config digest (sha256:...).
-    pub config_digest: String,
+    pub config_digest: OciDigest,
     /// The fs-verity hash of the config splitstream.
     pub config_verity: ObjectID,
     /// Import statistics.
     pub stats: ImportStats,
 }
 
-type ContentAndVerity<ObjectID> = (String, ObjectID);
+type ContentAndVerity<ObjectID> = (OciDigest, ObjectID);
 
-fn layer_identifier(diff_id: &str) -> String {
+fn layer_identifier(diff_id: &OciDigest) -> String {
     format!("oci-layer-{diff_id}")
 }
 
-fn config_identifier(config: &str) -> String {
+fn config_identifier(config: &OciDigest) -> String {
     format!("oci-config-{config}")
 }
 
@@ -135,7 +140,7 @@ fn config_identifier(config: &str) -> String {
 /// Returns the fs-verity hash value and import statistics for the stored split stream.
 pub async fn import_layer<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
-    diff_id: &str,
+    diff_id: &OciDigest,
     name: Option<&str>,
     tar_stream: impl tokio::io::AsyncRead + Unpin,
 ) -> Result<(ObjectID, ImportStats)> {
@@ -165,7 +170,7 @@ pub async fn import_layer<ObjectID: FsVerityHashValue>(
 /// in composefs dumpfile format.
 pub fn ls_layer<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
-    diff_id: &str,
+    diff_id: &OciDigest,
 ) -> Result<()> {
     let mut split_stream = repo.open_stream(
         &layer_identifier(diff_id),
@@ -197,10 +202,24 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
     })
 }
 
-fn hash(bytes: &[u8]) -> String {
+/// Convert a SHA-256 hash output to an OCI content digest.
+pub(crate) fn sha256_output_to_digest(output: sha2::digest::Output<Sha256>) -> OciDigest {
+    let hex = hex::encode(output);
+    format!("sha256:{hex}")
+        .try_into()
+        .expect("sha256 hex should always produce a valid OCI digest")
+}
+
+/// Compute the SHA-256 content digest of `bytes`, returning an OCI digest
+/// (e.g. `sha256:abcd...`).
+pub(crate) fn sha256_content_digest(bytes: &[u8]) -> OciDigest {
     let mut context = Sha256::new();
     context.update(bytes);
-    format!("sha256:{}", hex::encode(context.finalize()))
+    sha256_output_to_digest(context.finalize())
+}
+
+fn hash_sha256(bytes: &[u8]) -> OciDigest {
+    sha256_content_digest(bytes)
 }
 
 /// Opens and parses a container configuration.
@@ -219,7 +238,7 @@ fn hash(bytes: &[u8]) -> String {
 /// in question, but you'll have to verity their content hashes yourself.
 pub fn open_config<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
-    config_digest: &str,
+    config_digest: &OciDigest,
     verity: Option<&ObjectID>,
 ) -> Result<(ImageConfiguration, HashMap<Box<str>, ObjectID>)> {
     let (data, named_refs) = oci_image::read_external_splitstream(
@@ -230,9 +249,9 @@ pub fn open_config<ObjectID: FsVerityHashValue>(
     )?;
 
     if verity.is_none() {
-        let computed = hash(&data);
+        let computed = hash_sha256(&data);
         ensure!(
-            config_digest == computed,
+            *config_digest == computed,
             "Config integrity check failed: expected {config_digest}, got {computed}"
         );
     }
@@ -255,7 +274,7 @@ pub fn write_config<ObjectID: FsVerityHashValue>(
 ) -> Result<ContentAndVerity<ObjectID>> {
     let json = config.to_string()?;
     let json_bytes = json.as_bytes();
-    let config_digest = hash(json_bytes);
+    let config_digest = hash_sha256(json_bytes);
     let mut stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
     for (name, value) in &refs {
         stream.add_named_stream_ref(name, value)
@@ -274,7 +293,7 @@ pub fn write_config<ObjectID: FsVerityHashValue>(
 /// Returns a tuple of (sha256 content hash, fs-verity hash value) for the updated configuration.
 pub fn seal<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
-    config_name: &str,
+    config_name: &OciDigest,
     config_verity: Option<&ObjectID>,
 ) -> Result<ContentAndVerity<ObjectID>> {
     let (mut config, refs) = open_config(repo, config_name, config_verity)?;
@@ -296,7 +315,7 @@ pub fn seal<ObjectID: FsVerityHashValue>(
 /// Returns an error if the container is not sealed or if mounting fails.
 pub fn mount<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
-    name: &str,
+    name: &OciDigest,
     mountpoint: &str,
     verity: Option<&ObjectID>,
 ) -> Result<()> {
@@ -312,7 +331,6 @@ mod test {
     use std::{fmt::Write, io::Read};
 
     use rustix::fs::CWD;
-    use sha2::{Digest, Sha256};
 
     use composefs::{fsverity::Sha256HashValue, repository::Repository, test::tempdir};
 
@@ -356,9 +374,7 @@ mod test {
     #[tokio::test]
     async fn test_layer() {
         let layer = example_layer();
-        let mut context = Sha256::new();
-        context.update(&layer);
-        let layer_id = format!("sha256:{}", hex::encode(context.finalize()));
+        let layer_id = hash_sha256(&layer);
 
         let (_repo_dir, repo) = create_test_repo();
         let (id, _stats) = import_layer(&repo, &layer_id, Some("name"), &layer[..])
@@ -402,7 +418,7 @@ mod test {
 
         let (config_digest, config_verity) = write_config(&repo, &config, refs.clone()).unwrap();
 
-        assert!(config_digest.starts_with("sha256:"));
+        assert!(config_digest.as_ref().starts_with("sha256:"));
 
         let (opened_config, opened_refs) =
             open_config(&repo, &config_digest, Some(&config_verity)).unwrap();
@@ -494,8 +510,11 @@ mod test {
 
         let (config_digest, _config_verity) = write_config(&repo, &config, HashMap::new()).unwrap();
 
-        let bad_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
-        let result = open_config::<Sha256HashValue>(&repo, bad_digest, None);
+        let bad_digest: OciDigest =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .parse()
+                .unwrap();
+        let result = open_config::<Sha256HashValue>(&repo, &bad_digest, None);
         assert!(result.is_err());
 
         let result = open_config::<Sha256HashValue>(&repo, &config_digest, None);

@@ -76,23 +76,27 @@ fn pull_image(
 }
 
 /// Compute the composefs image ID for a pulled OCI image.
+///
+/// The `config_digest` should be a bare OCI digest (e.g. `sha256:abc...`);
+/// this function adds the `@` prefix required by the CLI.
 fn compute_id(
     sh: &Shell,
     cfsctl: &std::path::Path,
     repo: &std::path::Path,
-    config_name: &str,
+    config_digest: &str,
     bootable: bool,
 ) -> Result<String> {
+    let at_digest = format!("@{config_digest}");
     let output = if bootable {
         cmd!(
             sh,
-            "{cfsctl} --insecure --repo {repo} oci compute-id --bootable {config_name}"
+            "{cfsctl} --insecure --repo {repo} oci compute-id --bootable {at_digest}"
         )
         .read()?
     } else {
         cmd!(
             sh,
-            "{cfsctl} --insecure --repo {repo} oci compute-id {config_name}"
+            "{cfsctl} --insecure --repo {repo} oci compute-id {at_digest}"
         )
         .read()?
     };

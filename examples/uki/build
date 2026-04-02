@@ -41,7 +41,7 @@ ${PODMAN_BUILD} \
 
 BASE_ID="$(cat tmp/base.iid)"
 ${CFSCTL} oci pull containers-storage:"${BASE_ID}"
-BASE_IMAGE_FSVERITY="$(${CFSCTL} oci compute-id --bootable "${BASE_ID}")"
+BASE_IMAGE_FSVERITY="$(${CFSCTL} oci compute-id --bootable "@${BASE_ID}")"
 
 ${PODMAN_BUILD} \
     --iidfile=tmp/final.iid \
@@ -53,7 +53,7 @@ ${PODMAN_BUILD} \
 
 FINAL_ID="$(cat tmp/final.iid)"
 ${CFSCTL} oci pull containers-storage:"${FINAL_ID}"
-${CFSCTL} oci prepare-boot "${FINAL_ID}" --bootdir tmp/efi
+${CFSCTL} oci prepare-boot "@${FINAL_ID}" --bootdir tmp/efi
 
 ../common/install-systemd-boot
 ../common/make-image "${os}-uki-efi.qcow2"

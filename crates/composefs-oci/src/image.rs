@@ -21,6 +21,8 @@ use composefs::{
     tree::{Directory, FileSystem, Inode, Leaf, Stat},
 };
 
+use containers_image_proxy::oci_spec::image::Digest as OciDigest;
+
 use crate::skopeo::TAR_LAYER_CONTENT_TYPE;
 use crate::tar::{TarEntry, TarItem};
 
@@ -100,7 +102,7 @@ pub fn process_entry<ObjectID: FsVerityHashValue>(
 /// be hashed to ensure that they match their claimed blob IDs.
 pub fn create_filesystem<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
-    config_name: &str,
+    config_name: &OciDigest,
     config_verity: Option<&ObjectID>,
 ) -> Result<FileSystem<ObjectID>> {
     let mut filesystem = FileSystem::new(Stat::uninitialized());
@@ -120,8 +122,11 @@ pub fn create_filesystem<ObjectID: FsVerityHashValue>(
                 repo.open_stream("", Some(layer_verity), Some(TAR_LAYER_CONTENT_TYPE))?;
             let mut context = DigestWrite(Sha256::new());
             layer_stream.cat(repo, &mut context)?;
-            let content_hash = format!("sha256:{}", hex::encode(context.finalize()));
-            ensure!(content_hash == *diff_id, "Layer has incorrect checksum");
+            let content_hash = crate::sha256_output_to_digest(context.finalize());
+            ensure!(
+                content_hash.as_ref() == diff_id,
+                "Layer has incorrect checksum"
+            );
         }
 
         let mut layer_stream =
@@ -308,9 +313,7 @@ mod test {
         append_tar_symlink(&mut builder, "bin", "usr/bin");
 
         let data = builder.into_inner().unwrap();
-        let mut ctx = Sha256::new();
-        ctx.update(&data);
-        let diff_id = format!("sha256:{}", hex::encode(ctx.finalize()));
+        let diff_id = crate::sha256_content_digest(&data).to_string();
         (data, diff_id)
     }
 
@@ -324,7 +327,8 @@ mod test {
         use std::ffi::OsStr;
         use std::sync::Arc;
 
-        let (tar_data, diff_id) = build_baseimage();
+        let (tar_data, diff_id_str) = build_baseimage();
+        let diff_id: OciDigest = diff_id_str.parse()?;
 
         let repo_dir = tempdir();
         let repo_path = repo_dir.path().join("repo");

@@ -363,9 +363,10 @@ fn test_oci_pull_and_inspect() -> Result<()> {
         .lines()
         .find_map(|l| l.strip_prefix("config").map(|s| s.trim().to_string()))
         .expect("config digest in pull output");
+    let at_config_digest = format!("@{config_digest}");
     let image_id = cmd!(
         sh,
-        "{cfsctl} --insecure --repo {repo} oci compute-id {config_digest}"
+        "{cfsctl} --insecure --repo {repo} oci compute-id {at_config_digest}"
     )
     .read()?;
     assert_eq!(
@@ -378,6 +379,58 @@ fn test_oci_pull_and_inspect() -> Result<()> {
     Ok(())
 }
 integration_test!(test_oci_pull_and_inspect);
+
+/// Verify that `oci compute-id` works with both a bare config digest and
+/// a ref name, producing the same result either way.
+fn test_oci_compute_id_by_ref() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let oci_layout = create_oci_layout(fixture_dir.path())?;
+
+    let pull_output = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci pull oci:{oci_layout} test-ref-image"
+    )
+    .read()?;
+
+    let config_digest = pull_output
+        .lines()
+        .find_map(|l| l.strip_prefix("config").map(|s| s.trim().to_string()))
+        .expect("config digest in pull output");
+
+    // compute-id via @digest
+    let at_config_digest = format!("@{config_digest}");
+    let id_by_digest = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci compute-id {at_config_digest}"
+    )
+    .read()?;
+
+    // compute-id via ref name
+    let id_by_ref = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci compute-id test-ref-image"
+    )
+    .read()?;
+
+    assert_eq!(
+        id_by_digest.trim(),
+        id_by_ref.trim(),
+        "compute-id should produce the same result whether given a digest or a ref"
+    );
+
+    assert_eq!(
+        id_by_ref.trim(),
+        OCI_LAYOUT_COMPOSEFS_ID,
+        "composefs image ID should match expected value"
+    );
+
+    Ok(())
+}
+integration_test!(test_oci_compute_id_by_ref);
 
 fn test_oci_layer_inspect() -> Result<()> {
     use composefs::dumpfile_parse::{Entry, Item};

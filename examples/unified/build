@@ -31,7 +31,7 @@ podman build \
 
 IMAGE_ID="$(cat tmp/iid)"
 ${CFSCTL} oci pull containers-storage:"${IMAGE_ID}"
-${CFSCTL} oci prepare-boot "${IMAGE_ID}" --bootdir tmp/efi
+${CFSCTL} oci prepare-boot "@${IMAGE_ID}" --bootdir tmp/efi
 
 ../common/install-systemd-boot
 ../common/make-image fedora-unified-efi.qcow2
