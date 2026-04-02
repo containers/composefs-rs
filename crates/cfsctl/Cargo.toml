@@ -27,7 +27,7 @@ clap = { version = "4.5.0", default-features = false, features = ["std", "help",
 comfy-table = { version = "7.1", default-features = false }
 composefs = { workspace = true }
 composefs-boot = { workspace = true }
-composefs-oci = { workspace = true, optional = true }
+composefs-oci = { workspace = true, optional = true, features = ["boot"] }
 composefs-http = { workspace = true, optional = true }
 env_logger = { version = "0.11.0", default-features = false }
 hex = { version = "0.4.0", default-features = false }
