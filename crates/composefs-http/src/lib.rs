@@ -204,14 +204,14 @@ impl<ObjectID: FsVerityHashValue> Downloader<ObjectID> {
             reader.cat(&self.repo, &mut context)?;
             let measured_checksum = format!("sha256:{}", hex::encode(context.finalize()));
 
-            if let Some(expected) = expected_checksum {
-                if measured_checksum != expected {
-                    bail!(
-                        "Splitstream id {id:?} should have checksum {} but is actually {}",
-                        hex::encode(expected),
-                        hex::encode(measured_checksum)
-                    );
-                }
+            if let Some(expected) = expected_checksum
+                && measured_checksum != expected
+            {
+                bail!(
+                    "Splitstream id {id:?} should have checksum {} but is actually {}",
+                    hex::encode(expected),
+                    hex::encode(measured_checksum)
+                );
             }
 
             if id == my_id {
