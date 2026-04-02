@@ -46,3 +46,8 @@ jobs:
 
       - name: Build and test bootc with local composefs-rs
         run: just bootc/test
+        env:
+          # Use bootc branch with OpenConfig API compatibility
+          # TODO: revert to main once bootc-dev/bootc#2044 is merged
+          COMPOSEFS_BOOTC_REPO: https://github.com/cgwalters/bootc
+          COMPOSEFS_BOOTC_REF: prep-composefs-manifest
