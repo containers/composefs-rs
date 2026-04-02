@@ -38,14 +38,21 @@ clone:
         git checkout FETCH_HEAD
     fi
 
-# Patch bootc's Cargo.toml to use the local composefs-rs checkout
-# The path is auto-detected and bind-mounted by bootc's `cargo xtask local-rust-deps`
+# Patch bootc's Cargo.toml to use the local composefs-rs checkout.
+#
+# The workspace dependency already has a `git` + `rev` pointing at the
+# composefs-rs commit this bootc branch is compatible with.  Bumping that
+# `rev` (done when the bootc branch is updated) busts the podman build
+# cache.  This recipe just adds a [patch] override so Cargo resolves from
+# the bind-mounted local source instead of fetching from git.
 patch: clone
     #!/bin/bash
     set -euo pipefail
     cd "$COMPOSEFS_BOOTC_PATH"
 
-    # Check if already patched
+    cfs_path="$_COMPOSEFS_SRC/crates/cfsctl"
+
+    # Check if already patched (idempotent)
     if grep -q 'Patched by composefs-rs' Cargo.toml 2>/dev/null; then
         echo "bootc already patched for composefs-rs"
         exit 0
@@ -53,23 +60,30 @@ patch: clone
 
     echo "Patching bootc Cargo.toml to use $_COMPOSEFS_SRC"
 
-    # Add [patch] section with the real local path.
-    # bootc only depends on `cfsctl` which re-exports the other composefs-rs crates.
-    # bootc's Justfile will auto-detect this via `cargo xtask local-rust-deps`
-    # and bind-mount it into the container build (mapping /home -> /var/home as needed)
-    {
-        echo ''
-        echo '# Patched by composefs-rs CI to test against local composefs-rs'
-        echo '[patch."https://github.com/composefs/composefs-rs"]'
-        echo "cfsctl = { path = \"$_COMPOSEFS_SRC/crates/cfsctl\" }"
-    } >> Cargo.toml
+    # Add or update the [patch] section with a path override
+    patch_value="cfsctl = { path = \"${cfs_path}\" } # Patched by composefs-rs"
+    if grep -q '^[[:space:]]*\[patch\."https://github.com/composefs/composefs-rs"\]' Cargo.toml; then
+        # Patch section already exists (uncommented) — replace the cfsctl line
+        sed -i '/^[[:space:]]*\[patch\."https:\/\/github.com\/composefs\/composefs-rs"\]/,/^$\|^\[/{
+            s|^cfsctl = .*|'"$patch_value"'|
+        }' Cargo.toml
+    else
+        # No patch section yet — append one
+        {
+            echo ''
+            echo '# Patched by composefs-rs CI to test against local composefs-rs'
+            echo '[patch."https://github.com/composefs/composefs-rs"]'
+            echo "$patch_value"
+        } >> Cargo.toml
+    fi
 
     # Patch the workspace lints to allow missing_docs for composefs-rs crates
     # bootc has workspace.lints.rust.missing_docs = "deny" but composefs-rs has undocumented items
     sed -i 's/missing_docs = "deny"/missing_docs = "allow"/' Cargo.toml
 
-    # Update Cargo.lock so the patch is recognized by cargo xtask local-rust-deps
-    cargo update cfsctl
+    # Cargo.lock will be updated on the next build/check.
+    # We intentionally don't run `cargo update` here because it rewrites
+    # the workspace dependency line in Cargo.toml (replacing git+rev with path).
 
     echo "bootc patched successfully"
 
@@ -92,16 +106,33 @@ test bootloader="systemd" filesystem="ext4" boot_type="uki" seal_state="sealed":
     echo "Running bootc composefs tests (bootloader={{bootloader}}, filesystem={{filesystem}}, boot_type={{boot_type}}, seal_state={{seal_state}})..."
     just test-composefs {{bootloader}} {{filesystem}} {{boot_type}} {{seal_state}}
 
-# Clean the bootc checkout and any patches
+# Clean the bootc checkout and any patches.
+# Refuses to delete if there are any uncommitted changes (tracked, untracked,
+# or ignored) to prevent accidentally losing work.
 clean:
     #!/bin/bash
     set -euo pipefail
-    if [ -d "$COMPOSEFS_BOOTC_PATH" ]; then
-        echo "Removing bootc checkout at $COMPOSEFS_BOOTC_PATH"
-        rm -rf "$COMPOSEFS_BOOTC_PATH"
-    else
+    if [ ! -d "$COMPOSEFS_BOOTC_PATH" ]; then
         echo "No bootc checkout found at $COMPOSEFS_BOOTC_PATH"
+        exit 0
     fi
+    cd "$COMPOSEFS_BOOTC_PATH"
+    if [ ! -d .git ]; then
+        echo "Not a git repo: $COMPOSEFS_BOOTC_PATH — removing"
+        rm -rf "$COMPOSEFS_BOOTC_PATH"
+        exit 0
+    fi
+    # Check for ANY local state: staged, unstaged, untracked, or ignored files
+    if ! git diff --quiet HEAD -- 2>/dev/null || \
+       ! git diff --cached --quiet HEAD -- 2>/dev/null || \
+       [ -n "$(git ls-files --others 2>/dev/null)" ]; then
+        echo "error: bootc checkout at $COMPOSEFS_BOOTC_PATH has uncommitted changes" >&2
+        echo "       Commit, stash, or manually 'rm -rf' if you're sure." >&2
+        git status --short
+        exit 1
+    fi
+    echo "Removing bootc checkout at $COMPOSEFS_BOOTC_PATH"
+    rm -rf "$COMPOSEFS_BOOTC_PATH"
 
 # Show current bootc integration configuration
 config:
