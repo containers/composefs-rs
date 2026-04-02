@@ -21,6 +21,8 @@ permissions:
 
 jobs:
   bootc-test:
+    # TODO: Re-enable once bootc-dev/bootc#2044 is merged
+    if: false
     name: Build and test bootc with local composefs-rs
     runs-on: ubuntu-24.04
     timeout-minutes: 120
