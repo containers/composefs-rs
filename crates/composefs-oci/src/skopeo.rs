@@ -14,7 +14,9 @@ use std::{iter::zip, sync::Arc};
 
 use anyhow::{Context, Result};
 use async_compression::tokio::bufread::{GzipDecoder, ZstdDecoder};
-use containers_image_proxy::oci_spec::image::{Descriptor, ImageConfiguration, MediaType};
+use containers_image_proxy::oci_spec::image::{
+    Descriptor, Digest as OciDigest, ImageConfiguration, MediaType,
+};
 use containers_image_proxy::{
     ConvertedLayerInfo, ImageProxy, ImageProxyConfig, OpenedImage, Transport,
 };
@@ -46,11 +48,11 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct PullResult<ObjectID: FsVerityHashValue> {
     /// The sha256 content digest of the manifest.
-    pub manifest_digest: String,
+    pub manifest_digest: OciDigest,
     /// The fs-verity ID of the manifest splitstream.
     pub manifest_verity: ObjectID,
     /// The sha256 content digest of the config.
-    pub config_digest: String,
+    pub config_digest: OciDigest,
     /// The fs-verity ID of the config splitstream.
     pub config_verity: ObjectID,
 }
@@ -142,7 +144,7 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
 
     pub async fn ensure_layer(
         &self,
-        diff_id: &str,
+        diff_id: &OciDigest,
         descriptor: &Descriptor,
         uncompressed_layer_info: Option<Arc<Vec<ConvertedLayerInfo>>>,
         layer_idx: usize,
@@ -269,14 +271,12 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
         manifest_layers: &[Descriptor],
         descriptor: &Descriptor,
     ) -> Result<(
-        String,
+        OciDigest,
         ObjectID,
-        // FIXME change this string to be Digest - actually we may want to go stronger and have a
-        // struct DiffID(Digest) newtype
         std::collections::HashMap<String, ObjectID>,
         ImportStats,
     )> {
-        let config_digest: &str = descriptor.digest().as_ref();
+        let config_digest = descriptor.digest();
         let content_id = config_identifier(config_digest);
 
         if let Some(config_id) = self.repo.has_stream(&content_id)? {
@@ -296,7 +296,7 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
                 .collect();
 
             Ok((
-                config_digest.to_string(),
+                descriptor.digest().clone(),
                 config_id,
                 layer_refs,
                 ImportStats::default(),
@@ -322,14 +322,16 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             // there are no diff_ids, so we use the manifest layer digests.
             // [1]: https://github.com/opencontainers/image-spec/blob/main/artifacts-guidance.md
             let is_image_config = *descriptor.media_type() == MediaType::ImageConfig;
-            let diff_ids: Vec<String> = if is_image_config {
+            let diff_ids: Vec<OciDigest> = if is_image_config {
                 let config = ImageConfiguration::from_reader(&raw_config[..])?;
-                config.rootfs().diff_ids().to_vec()
-            } else {
-                manifest_layers
+                config
+                    .rootfs()
+                    .diff_ids()
                     .iter()
-                    .map(|d| d.digest().to_string())
-                    .collect()
+                    .map(|s| s.parse().context("Invalid diff_id in config"))
+                    .collect::<Result<_>>()?
+            } else {
+                manifest_layers.iter().map(|d| d.digest().clone()).collect()
             };
 
             // Sort layers by size for parallel fetching
@@ -381,25 +383,28 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             let mut layer_refs = std::collections::HashMap::new();
             let mut stats = ImportStats::default();
             for (_, diff_id, verity, layer_stats) in results {
-                splitstream.add_named_stream_ref(&diff_id, &verity);
-                layer_refs.insert(diff_id, verity);
+                splitstream.add_named_stream_ref(diff_id.as_ref(), &verity);
+                layer_refs.insert(diff_id.to_string(), verity);
                 stats.merge(&layer_stats);
             }
 
             // Store config as external object for independent fsverity
             splitstream.write_external(&raw_config)?;
             let config_id = self.repo.write_stream(splitstream, &content_id, None)?;
-            Ok((config_digest.to_string(), config_id, layer_refs, stats))
+            Ok((descriptor.digest().clone(), config_id, layer_refs, stats))
         }
     }
 
     /// Pull the image, storing manifest, config, and all layers.
     pub async fn pull(self: &Arc<Self>) -> Result<(PullResult<ObjectID>, ImportStats)> {
-        let (manifest_digest, raw_manifest) = self
+        let (manifest_digest_str, raw_manifest) = self
             .proxy
             .fetch_manifest_raw_oci(&self.img)
             .await
             .context("Fetching manifest")?;
+        let manifest_digest: OciDigest = manifest_digest_str
+            .try_into()
+            .context("Invalid manifest digest from image proxy")?;
 
         let manifest = containers_image_proxy::oci_spec::image::ImageManifest::from_reader(
             raw_manifest.as_slice(),
@@ -483,7 +488,7 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
     imgref: &str,
     reference: Option<&str>,
     img_proxy_config: Option<ImageProxyConfig>,
-) -> Result<(String, ObjectID, ImportStats)> {
+) -> Result<(OciDigest, ObjectID, ImportStats)> {
     let (result, stats) = pull_image(repo, imgref, reference, img_proxy_config).await?;
     let (config_digest, config_verity) = result.into_config();
     Ok((config_digest, config_verity, stats))
