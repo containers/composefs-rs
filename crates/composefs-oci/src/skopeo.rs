@@ -477,6 +477,9 @@ pub async fn pull_image<ObjectID: FsVerityHashValue>(
     reference: Option<&str>,
     img_proxy_config: Option<ImageProxyConfig>,
 ) -> Result<(PullResult<ObjectID>, ImportStats)> {
+    // Fail fast if the repository is read-only, before starting any
+    // network or image-proxy work.
+    repo.ensure_writable()?;
     let op = Arc::new(ImageOp::new(repo, imgref, img_proxy_config).await?);
     let (result, stats) = op
         .pull()
