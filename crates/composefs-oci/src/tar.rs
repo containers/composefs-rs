@@ -172,7 +172,7 @@ pub async fn split_async<ObjectID: FsVerityHashValue>(
     content_type: u64,
 ) -> Result<(ObjectID, ImportStats)> {
     let semaphore = repo.write_semaphore();
-    let mut builder = SplitStreamBuilder::new(repo.clone(), content_type);
+    let mut builder = SplitStreamBuilder::new(repo.clone(), content_type)?;
     let mut parser = Parser::with_defaults();
     let mut buf = BytesMut::with_capacity(IO_BUF_CAPACITY);
     let mut need = HEADER_SIZE;

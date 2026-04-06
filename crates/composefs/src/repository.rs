@@ -100,8 +100,8 @@ use fn_error_context::context;
 use once_cell::sync::OnceCell;
 use rustix::{
     fs::{
-        AtFlags, CWD, Dir, FileType, FlockOperation, Mode, OFlags, flock, linkat, mkdirat, openat,
-        readlinkat, statat, syncfs, unlinkat,
+        Access, AtFlags, CWD, Dir, FileType, FlockOperation, Mode, OFlags, accessat, flock, linkat,
+        mkdirat, openat, readlinkat, statat, syncfs, unlinkat,
     },
     io::{Errno, Result as ErrnoResult},
 };
@@ -556,6 +556,17 @@ fn ensure_dir_and_openat(dirfd: impl AsFd, filename: &str, flags: OFlags) -> Err
         Err(other) => Err(other),
     }
 }
+
+/// A zero-sized proof token confirming that a [`Repository`] is writable.
+///
+/// Obtained by calling [`Repository::ensure_writable`], which performs a fast
+/// `faccessat(2)` check.  Write methods on `Repository` require this token
+/// internally so that the writable check is performed exactly once per
+/// top-level operation rather than at every leaf call.
+///
+/// Because the type is zero-sized, passing it around has no runtime cost.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WritableRepo;
 
 /// A content-addressable repository for composefs objects.
 ///
@@ -1038,8 +1049,9 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// done with everything, call `Repository::sync_async()`.
     #[context("Ensuring object asynchronously")]
     pub async fn ensure_object_async(self: &Arc<Self>, data: Vec<u8>) -> Result<ObjectID> {
+        let writable = self.ensure_writable_token()?;
         let self_ = Arc::clone(self);
-        tokio::task::spawn_blocking(move || self_.ensure_object(&data)).await?
+        tokio::task::spawn_blocking(move || self_.ensure_object_impl(&data, &writable)).await?
     }
 
     /// Create an O_TMPFILE in the objects directory for streaming writes.
@@ -1049,6 +1061,12 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// enable fs-verity, and link the file into the objects directory.
     #[context("Creating object tmpfile")]
     pub fn create_object_tmpfile(&self) -> Result<OwnedFd> {
+        let writable = self.ensure_writable_token()?;
+        self.create_object_tmpfile_impl(&writable)
+    }
+
+    #[context("Creating object tmpfile")]
+    pub(crate) fn create_object_tmpfile_impl(&self, _writable: &WritableRepo) -> Result<OwnedFd> {
         let objects_dir = self
             .objects_dir()
             .context("Getting objects directory for tmpfile creation")?;
@@ -1100,6 +1118,17 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         &self,
         file: File,
         size: u64,
+    ) -> Result<(ObjectID, ObjectStoreMethod)> {
+        let writable = self.ensure_writable_token()?;
+        self.finalize_object_tmpfile_impl(file, size, &writable)
+    }
+
+    #[context("Finalizing object tempfile")]
+    pub(crate) fn finalize_object_tmpfile_impl(
+        &self,
+        file: File,
+        size: u64,
+        _writable: &WritableRepo,
     ) -> Result<(ObjectID, ObjectStoreMethod)> {
         let ro_fd =
             reopen_tmpfile_ro(file).context("Re-opening tmpfile as read-only for verity")?;
@@ -1191,7 +1220,12 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// This is an internal helper that stores data assuming the caller has already
     /// computed the correct fs-verity digest. The digest is verified after storage.
     #[context("Storing object with ID {id:?}")]
-    fn store_object_with_id(&self, data: &[u8], id: &ObjectID) -> Result<()> {
+    fn store_object_with_id(
+        &self,
+        data: &[u8],
+        id: &ObjectID,
+        _writable: &WritableRepo,
+    ) -> Result<()> {
         let dirfd = self
             .objects_dir()
             .context("Getting objects directory for storage")?;
@@ -1287,8 +1321,23 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// done with everything, call `Repository::sync()`.
     #[context("Ensuring object exists in repository")]
     pub fn ensure_object(&self, data: &[u8]) -> Result<ObjectID> {
+        let writable = self.ensure_writable_token()?;
+        self.ensure_object_impl(data, &writable)
+    }
+
+    /// Like [`ensure_object`] but requires a [`WritableRepo`] token
+    /// instead of performing the check itself.
+    ///
+    /// This exists so that [`SplitStreamWriter`] (which carries a token)
+    /// can store objects without redundant `faccessat` calls.
+    #[context("Ensuring object exists in repository")]
+    pub(crate) fn ensure_object_impl(
+        &self,
+        data: &[u8],
+        writable: &WritableRepo,
+    ) -> Result<ObjectID> {
         let id: ObjectID = compute_verity(data);
-        self.store_object_with_id(data, &id)?;
+        self.store_object_with_id(data, &id, writable)?;
         Ok(id)
     }
 
@@ -1339,11 +1388,38 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(())
     }
 
+    /// Fast pre-flight check that the repository is writable.
+    ///
+    /// Uses `faccessat(W_OK)` to catch read-only mounts and permission
+    /// issues before starting expensive network or I/O work.  Callers
+    /// that want to fail early (e.g. before downloading an image) should
+    /// call this; individual write methods already check internally.
+    pub fn ensure_writable(&self) -> Result<()> {
+        self.ensure_writable_token()?;
+        Ok(())
+    }
+
+    /// Like [`ensure_writable`] but returns a proof token for internal use.
+    pub(crate) fn ensure_writable_token(&self) -> Result<WritableRepo> {
+        accessat(&self.repository, ".", Access::WRITE_OK, AtFlags::empty())
+            .context("Repository is not writable")?;
+        Ok(WritableRepo)
+    }
+
     /// Creates a SplitStreamWriter for writing a split stream.
     /// You should write the data to the returned object and then pass it to .store_stream() to
     /// store the result.
-    pub fn create_stream(self: &Arc<Self>, content_type: u64) -> SplitStreamWriter<ObjectID> {
-        SplitStreamWriter::new(self, content_type)
+    ///
+    /// The writable check is performed here so that callers cannot obtain
+    /// a writer without first verifying the repository is writable.
+    /// The [`WritableRepo`] token is carried by the writer so that
+    /// subsequent object writes skip redundant checks.
+    pub fn create_stream(
+        self: &Arc<Self>,
+        content_type: u64,
+    ) -> Result<SplitStreamWriter<ObjectID>> {
+        let writable = self.ensure_writable_token()?;
+        Ok(SplitStreamWriter::new(self, content_type, writable))
     }
 
     fn format_object_path(id: &ObjectID) -> String {
@@ -1393,6 +1469,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         content_identifier: &str,
         reference: Option<&str>,
     ) -> Result<ObjectID> {
+        let writable = *writer.writable();
         let object_id = writer.done().context("Finalizing split stream writer")?;
 
         // Right now we have:
@@ -1409,11 +1486,11 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
         let stream_path = Self::format_stream_path(content_identifier);
         let object_path = Self::format_object_path(&object_id);
-        self.symlink(&stream_path, &object_path)?;
+        self.symlink_impl(&stream_path, &object_path, &writable)?;
 
         if let Some(name) = reference {
             let reference_path = format!("streams/refs/{name}");
-            self.symlink(&reference_path, &stream_path)?;
+            self.symlink_impl(&reference_path, &stream_path, &writable)?;
         }
 
         Ok(object_id)
@@ -1434,15 +1511,16 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         content_identifier: &str,
         reference: Option<&str>,
     ) -> Result<()> {
+        let writable = self.ensure_writable_token()?;
         self.sync_async().await?;
 
         let stream_path = Self::format_stream_path(content_identifier);
         let object_path = Self::format_object_path(object_id);
-        self.symlink(&stream_path, &object_path)?;
+        self.symlink_impl(&stream_path, &object_path, &writable)?;
 
         if let Some(name) = reference {
             let reference_path = format!("streams/refs/{name}");
-            self.symlink(&reference_path, &stream_path)?;
+            self.symlink_impl(&reference_path, &stream_path, &writable)?;
         }
 
         Ok(())
@@ -1460,6 +1538,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         content_identifier: &str,
         reference: Option<&str>,
     ) -> Result<ObjectID> {
+        let writable = *writer.writable();
         let object_id = writer
             .done_async()
             .await
@@ -1469,11 +1548,11 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
         let stream_path = Self::format_stream_path(content_identifier);
         let object_path = Self::format_object_path(&object_id);
-        self.symlink(&stream_path, &object_path)?;
+        self.symlink_impl(&stream_path, &object_path, &writable)?;
 
         if let Some(name) = reference {
             let reference_path = format!("streams/refs/{name}");
-            self.symlink(&reference_path, &stream_path)?;
+            self.symlink_impl(&reference_path, &stream_path, &writable)?;
         }
 
         Ok(object_id)
@@ -1504,9 +1583,10 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// (e.g., `myapp/layer1`), and intermediate directories are created automatically.
     #[context("Naming stream '{content_identifier}' as '{name}'")]
     pub fn name_stream(&self, content_identifier: &str, name: &str) -> Result<()> {
+        let writable = self.ensure_writable_token()?;
         let stream_path = Self::format_stream_path(content_identifier);
         let reference_path = format!("streams/refs/{name}");
-        self.symlink(&reference_path, &stream_path)?;
+        self.symlink_impl(&reference_path, &stream_path, &writable)?;
         Ok(())
     }
 
@@ -1532,12 +1612,13 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         callback: impl FnOnce(&mut SplitStreamWriter<ObjectID>) -> Result<T>,
         reference: Option<&str>,
     ) -> Result<(ObjectID, T)> {
+        let writable = self.ensure_writable_token()?;
         let stream_path = Self::format_stream_path(content_identifier);
 
         let (object_id, extra) = match self.has_stream(content_identifier)? {
             Some(id) => (id, T::default()),
             None => {
-                let mut writer = self.create_stream(content_type);
+                let mut writer = self.create_stream(content_type)?;
                 let extra = callback(&mut writer).context("Writing stream content via callback")?;
                 let id = self.write_stream(writer, content_identifier, reference)?;
                 (id, extra)
@@ -1546,7 +1627,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
         if let Some(name) = reference {
             let reference_path = format!("streams/refs/{name}");
-            self.symlink(&reference_path, &stream_path)?;
+            self.symlink_impl(&reference_path, &stream_path, &writable)?;
         }
 
         Ok((object_id, extra))
@@ -1616,16 +1697,17 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// This function is not safe for untrusted users.
     #[context("Writing image to repository")]
     pub fn write_image(&self, name: Option<&str>, data: &[u8]) -> Result<ObjectID> {
-        let object_id = self.ensure_object(data)?;
+        let writable = self.ensure_writable_token()?;
+        let object_id = self.ensure_object_impl(data, &writable)?;
 
         let object_path = Self::format_object_path(&object_id);
         let image_path = format!("images/{}", object_id.to_hex());
 
-        self.symlink(&image_path, &object_path)?;
+        self.symlink_impl(&image_path, &object_path, &writable)?;
 
         if let Some(reference) = name {
             let ref_path = format!("images/refs/{reference}");
-            self.symlink(&ref_path, &image_path)?;
+            self.symlink_impl(&ref_path, &image_path, &writable)?;
         }
 
         Ok(object_id)
@@ -1710,11 +1792,21 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// Computes the correct relative path from the symlink location to the target,
     /// creating any necessary intermediate directories. Atomically replaces any
     /// existing symlink at the specified name.
-    #[context("Creating symlink from {name:?} to {target:?}")]
     pub fn symlink(
         &self,
         name: impl AsRef<Path> + std::fmt::Debug,
         target: impl AsRef<Path> + std::fmt::Debug,
+    ) -> anyhow::Result<()> {
+        let writable = self.ensure_writable_token()?;
+        self.symlink_impl(name, target, &writable)
+    }
+
+    #[context("Creating symlink from {name:?} to {target:?}")]
+    pub(crate) fn symlink_impl(
+        &self,
+        name: impl AsRef<Path> + std::fmt::Debug,
+        target: impl AsRef<Path> + std::fmt::Debug,
+        _writable: &WritableRepo,
     ) -> anyhow::Result<()> {
         let name = name.as_ref();
 
@@ -2058,6 +2150,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// An exclusive lock is held for the duration of this operation.
     #[context("Running garbage collection")]
     pub fn gc(&self, additional_roots: &[&str]) -> Result<GcResult> {
+        self.ensure_writable_token()?;
         flock(&self.repository, FlockOperation::LockExclusive)
             .context("Acquiring exclusive lock for GC")?;
         self.gc_impl(additional_roots, false)
@@ -2869,7 +2962,7 @@ mod tests {
         let obj1_id = repo.ensure_object(&obj1)?;
         let obj2_id: Sha512HashValue = compute_verity(&obj2);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj2)?;
         let _stream_id = repo.write_stream(writer, "test-stream", None)?;
 
@@ -2911,7 +3004,7 @@ mod tests {
         let obj1_id = repo.ensure_object(&obj1)?;
         let obj2_id: Sha512HashValue = compute_verity(&obj2);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj2)?;
         let _stream_id = repo.write_stream(writer, "test-stream", None)?;
 
@@ -2959,7 +3052,7 @@ mod tests {
         let obj1_id = repo.ensure_object(&obj1)?;
         let obj2_id: Sha512HashValue = compute_verity(&obj2);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj2)?;
         let _stream_id = repo.write_stream(writer, "test-stream", Some("ref-name"))?;
 
@@ -3011,12 +3104,12 @@ mod tests {
         let obj3_id: Sha512HashValue = compute_verity(&obj3);
         let obj4_id: Sha512HashValue = compute_verity(&obj4);
 
-        let mut writer1 = repo.create_stream(0);
+        let mut writer1 = repo.create_stream(0)?;
         writer1.write_external(&obj2)?;
         writer1.write_external(&obj3)?;
         let _stream1_id = repo.write_stream(writer1, "test-stream1", None)?;
 
-        let mut writer2 = repo.create_stream(0);
+        let mut writer2 = repo.create_stream(0)?;
         writer2.write_external(&obj2)?;
         writer2.write_external(&obj4)?;
         let _stream2_id = repo.write_stream(writer2, "test-stream2", None)?;
@@ -3077,11 +3170,11 @@ mod tests {
         let obj1_id = repo.ensure_object(&obj1)?;
         let obj2_id: Sha512HashValue = compute_verity(&obj2);
 
-        let mut writer1 = repo.create_stream(0);
+        let mut writer1 = repo.create_stream(0)?;
         writer1.write_external(&obj2)?;
         let stream1_id = repo.write_stream(writer1, "test-stream1", None)?;
 
-        let mut writer2 = repo.create_stream(0);
+        let mut writer2 = repo.create_stream(0)?;
         writer2.add_named_stream_ref("test-stream1", &stream1_id);
         let _stream2_id = repo.write_stream(writer2, "test-stream2", None)?;
 
@@ -3143,11 +3236,11 @@ mod tests {
         let obj1_id = repo.ensure_object(&obj1)?;
         let obj2_id: Sha512HashValue = compute_verity(&obj2);
 
-        let mut writer1 = repo.create_stream(0);
+        let mut writer1 = repo.create_stream(0)?;
         writer1.write_external(&obj2)?;
         let stream1_id = repo.write_stream(writer1, "test-stream1", None)?;
 
-        let mut writer2 = repo.create_stream(0);
+        let mut writer2 = repo.create_stream(0)?;
         writer2.add_named_stream_ref("different-table-name-for-test-stream1", &stream1_id);
         let _stream2_id = repo.write_stream(writer2, "test-stream2", None)?;
 
@@ -3213,24 +3306,24 @@ mod tests {
         let obj3_id: Sha512HashValue = compute_verity(&obj3);
         let obj4_id: Sha512HashValue = compute_verity(&obj4);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj2)?;
         let stream1_id = repo.write_stream(writer, "test-stream1", None)?;
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj3)?;
         let stream2_id = repo.write_stream(writer, "test-stream2", None)?;
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj4)?;
         let stream3_id = repo.write_stream(writer, "test-stream3", None)?;
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.add_named_stream_ref("test-stream1", &stream1_id);
         writer.add_named_stream_ref("test-stream2", &stream2_id);
         let _ref_stream1_id = repo.write_stream(writer, "ref-stream1", None)?;
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.add_named_stream_ref("test-stream1", &stream1_id);
         writer.add_named_stream_ref("test-stream3", &stream3_id);
         let _ref_stream2_id = repo.write_stream(writer, "ref-stream2", None)?;
@@ -3611,7 +3704,7 @@ mod tests {
         let _obj1_id = repo.ensure_object(&obj1)?;
         let _obj2_id: Sha512HashValue = compute_verity(&obj2);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj2)?;
         let _stream_id = repo.write_stream(writer, "test-stream", None)?;
         repo.sync()?;
@@ -3676,7 +3769,7 @@ mod tests {
         let obj = generate_test_data(64 * 1024, 0xEA);
         let _obj_verity: Sha512HashValue = compute_verity(&obj);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj)?;
         let _stream_id = repo.write_stream(writer, "test-stream", None)?;
         repo.sync()?;
@@ -3710,7 +3803,7 @@ mod tests {
         // Create a stream with an external reference to the object.
         // write_external calls ensure_object internally, so the object
         // will exist.
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj)?;
         let _stream_id = repo.write_stream(writer, "test-stream", None)?;
         repo.sync()?;
@@ -3979,12 +4072,12 @@ mod tests {
         let obj = generate_test_data(64 * 1024, 0xEA);
 
         // Create stream1 that references obj
-        let mut writer1 = repo.create_stream(0);
+        let mut writer1 = repo.create_stream(0)?;
         writer1.write_external(&obj)?;
         let stream1_id = repo.write_stream(writer1, "test-stream1", None)?;
 
         // Create stream2 with a named ref to stream1
-        let mut writer2 = repo.create_stream(0);
+        let mut writer2 = repo.create_stream(0)?;
         writer2.add_named_stream_ref("test-stream1", &stream1_id);
         let _stream2_id = repo.write_stream(writer2, "test-stream2", None)?;
         repo.sync()?;
@@ -4026,7 +4119,7 @@ mod tests {
 
         let obj = generate_test_data(64 * 1024, 0xEA);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj)?;
         // write_stream with reference creates a ref symlink
         let _stream_id = repo.write_stream(writer, "test-stream", Some("my-ref"))?;
@@ -4049,7 +4142,7 @@ mod tests {
 
         let obj = generate_test_data(64 * 1024, 0xEA);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj)?;
         let _stream_id = repo.write_stream(writer, "test-stream", None)?;
         repo.sync()?;

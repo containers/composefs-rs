@@ -91,6 +91,10 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
         imgref: &str,
         img_proxy_config: Option<ImageProxyConfig>,
     ) -> Result<Self> {
+        // Fail fast if the repository is not writable, before starting
+        // the image proxy or doing any network I/O.
+        repo.ensure_writable()?;
+
         // Detect transport from image reference
         let transport = Transport::try_from(imgref).context("Failed to get image transport")?;
 
@@ -243,7 +247,7 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
                     }
                 }
 
-                let mut stream = self.repo.create_stream(OCI_BLOB_CONTENT_TYPE);
+                let mut stream = self.repo.create_stream(OCI_BLOB_CONTENT_TYPE)?;
                 stream.add_external_size(size);
                 stream.write_reference(object_id)?;
                 // write_stream handles both object storage and stream
@@ -379,7 +383,7 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
                 .collect::<Result<_, _>>()?;
             results.sort_by_key(|(idx, _, _, _)| *idx);
 
-            let mut splitstream = self.repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+            let mut splitstream = self.repo.create_stream(OCI_CONFIG_CONTENT_TYPE)?;
             let mut layer_refs = std::collections::HashMap::new();
             let mut stats = ImportStats::default();
             for (_, diff_id, verity, layer_stats) in results {
@@ -425,7 +429,7 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             self.progress
                 .println(format!("Storing manifest {manifest_digest}"))?;
 
-            let mut splitstream = self.repo.create_stream(OCI_MANIFEST_CONTENT_TYPE);
+            let mut splitstream = self.repo.create_stream(OCI_MANIFEST_CONTENT_TYPE)?;
 
             let config_key = format!("config:{}", config_descriptor.digest());
             splitstream.add_named_stream_ref(&config_key, &config_verity);
