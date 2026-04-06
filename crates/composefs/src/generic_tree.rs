@@ -3,7 +3,7 @@
 
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     ffi::OsStr,
     path::{Component, Path},
     rc::Rc,
@@ -12,7 +12,7 @@ use std::{
 use thiserror::Error;
 
 /// File metadata similar to `struct stat` from POSIX.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Stat {
     /// File mode and permissions bits.
     pub st_mode: u32,
@@ -61,6 +61,21 @@ pub enum LeafContent<T> {
     Socket,
     /// A symbolic link pointing to the given target path.
     Symlink(Box<OsStr>),
+}
+
+impl<T> LeafContent<T> {
+    /// Maps `Regular(&T)` to `Regular(U)` via a fallible function,
+    /// passing all other variants through unchanged.
+    fn try_map_ref<U, E>(&self, f: impl FnOnce(&T) -> Result<U, E>) -> Result<LeafContent<U>, E> {
+        match self {
+            LeafContent::Regular(t) => Ok(LeafContent::Regular(f(t)?)),
+            LeafContent::BlockDevice(rdev) => Ok(LeafContent::BlockDevice(*rdev)),
+            LeafContent::CharacterDevice(rdev) => Ok(LeafContent::CharacterDevice(*rdev)),
+            LeafContent::Fifo => Ok(LeafContent::Fifo),
+            LeafContent::Socket => Ok(LeafContent::Socket),
+            LeafContent::Symlink(target) => Ok(LeafContent::Symlink(target.clone())),
+        }
+    }
 }
 
 /// A leaf node representing a non-directory file.
@@ -118,9 +133,50 @@ impl<T> Inode<T> {
             Inode::Leaf(leaf) => &leaf.stat,
         }
     }
+
+    fn try_map_regular_impl<U, E>(
+        self,
+        f: &mut impl FnMut(&T) -> Result<U, E>,
+        rc_map: &mut HashMap<*const Leaf<T>, Rc<Leaf<U>>>,
+    ) -> Result<Inode<U>, E> {
+        match self {
+            Inode::Directory(dir) => {
+                let new_dir = dir.try_map_regular_impl(f, rc_map)?;
+                Ok(Inode::Directory(Box::new(new_dir)))
+            }
+            Inode::Leaf(leaf_rc) => {
+                let ptr = Rc::as_ptr(&leaf_rc);
+                if let Some(existing) = rc_map.get(&ptr) {
+                    return Ok(Inode::Leaf(Rc::clone(existing)));
+                }
+                let new_content = leaf_rc.content.try_map_ref(f)?;
+                let new_leaf = Rc::new(Leaf {
+                    stat: leaf_rc.stat.clone(),
+                    content: new_content,
+                });
+                rc_map.insert(ptr, Rc::clone(&new_leaf));
+                Ok(Inode::Leaf(new_leaf))
+            }
+        }
+    }
 }
 
 impl<T> Directory<T> {
+    fn try_map_regular_impl<U, E>(
+        self,
+        f: &mut impl FnMut(&T) -> Result<U, E>,
+        rc_map: &mut HashMap<*const Leaf<T>, Rc<Leaf<U>>>,
+    ) -> Result<Directory<U>, E> {
+        let mut new_entries = BTreeMap::new();
+        for (name, inode) in self.entries {
+            new_entries.insert(name, inode.try_map_regular_impl(f, rc_map)?);
+        }
+        Ok(Directory {
+            stat: self.stat,
+            entries: new_entries,
+        })
+    }
+
     /// Creates a new directory with the given metadata.
     pub fn new(stat: Stat) -> Self {
         Self {
@@ -593,6 +649,23 @@ impl<T> FileSystem<T> {
         self.canonicalize_run()?;
         Ok(())
     }
+
+    /// Converts `FileSystem<T>` to `FileSystem<U>` by mapping regular file content.
+    ///
+    /// Applies `f` to each `LeafContent::Regular(T)` to produce `LeafContent::Regular(U)`.
+    /// All other leaf content variants (symlinks, devices, etc.) are passed through unchanged.
+    ///
+    /// Hardlink sharing is preserved: if multiple directory entries point to the same
+    /// `Rc<Leaf<T>>`, the resulting tree will have entries pointing to the same `Rc<Leaf<U>>`.
+    /// The mapping function is called exactly once per unique leaf.
+    pub fn try_map_regular<U, E>(
+        self,
+        mut f: impl FnMut(&T) -> Result<U, E>,
+    ) -> Result<FileSystem<U>, E> {
+        let mut rc_map: HashMap<*const Leaf<T>, Rc<Leaf<U>>> = HashMap::new();
+        let root = self.root.try_map_regular_impl(&mut f, &mut rc_map)?;
+        Ok(FileSystem { root })
+    }
 }
 
 #[cfg(test)]
@@ -1019,6 +1092,167 @@ mod tests {
 
         // Should succeed without error
         fs.canonicalize_run().unwrap();
+    }
+
+    #[test]
+    fn test_try_map_regular_basic() {
+        let mut fs = FileSystem::<u32>::new(stat_with_mtime(1));
+        let leaf = Rc::new(Leaf {
+            stat: stat_with_mtime(10),
+            content: LeafContent::Regular(42u32),
+        });
+        fs.root.insert(OsStr::new("file.txt"), Inode::Leaf(leaf));
+
+        let mapped = fs
+            .try_map_regular(|v: &u32| Ok::<String, std::fmt::Error>(format!("val={v}")))
+            .unwrap();
+
+        let content = mapped.root.get_file(OsStr::new("file.txt")).unwrap();
+        assert_eq!(content, "val=42");
+        assert_eq!(mapped.root.stat.st_mtim_sec, 1);
+    }
+
+    #[test]
+    fn test_try_map_regular_non_regular_passthrough() {
+        let mut fs = FileSystem::<u32>::new(default_stat());
+        fs.root.insert(
+            OsStr::new("link"),
+            Inode::Leaf(Rc::new(Leaf {
+                stat: stat_with_mtime(1),
+                content: LeafContent::Symlink(OsString::from("/target").into_boxed_os_str()),
+            })),
+        );
+        fs.root.insert(
+            OsStr::new("fifo"),
+            Inode::Leaf(Rc::new(Leaf {
+                stat: stat_with_mtime(2),
+                content: LeafContent::Fifo,
+            })),
+        );
+        fs.root.insert(
+            OsStr::new("sock"),
+            Inode::Leaf(Rc::new(Leaf {
+                stat: stat_with_mtime(3),
+                content: LeafContent::Socket,
+            })),
+        );
+        fs.root.insert(
+            OsStr::new("blk"),
+            Inode::Leaf(Rc::new(Leaf {
+                stat: stat_with_mtime(4),
+                content: LeafContent::BlockDevice(0x0801),
+            })),
+        );
+        fs.root.insert(
+            OsStr::new("chr"),
+            Inode::Leaf(Rc::new(Leaf {
+                stat: stat_with_mtime(5),
+                content: LeafContent::CharacterDevice(0x0501),
+            })),
+        );
+
+        let mapped = fs
+            .try_map_regular(|_: &u32| Ok::<String, std::fmt::Error>("unused".into()))
+            .unwrap();
+
+        // Verify each non-regular variant is preserved
+        match mapped.root.lookup(OsStr::new("link")) {
+            Some(Inode::Leaf(l)) => match &l.content {
+                LeafContent::Symlink(t) => assert_eq!(t.as_ref(), OsStr::new("/target")),
+                other => panic!("Expected Symlink, got {other:?}"),
+            },
+            other => panic!("Expected Leaf, got {other:?}"),
+        }
+        match mapped.root.lookup(OsStr::new("fifo")) {
+            Some(Inode::Leaf(l)) => assert!(matches!(l.content, LeafContent::Fifo)),
+            other => panic!("Expected Leaf/Fifo, got {other:?}"),
+        }
+        match mapped.root.lookup(OsStr::new("sock")) {
+            Some(Inode::Leaf(l)) => assert!(matches!(l.content, LeafContent::Socket)),
+            other => panic!("Expected Leaf/Socket, got {other:?}"),
+        }
+        match mapped.root.lookup(OsStr::new("blk")) {
+            Some(Inode::Leaf(l)) => match &l.content {
+                LeafContent::BlockDevice(rdev) => assert_eq!(*rdev, 0x0801),
+                other => panic!("Expected BlockDevice, got {other:?}"),
+            },
+            other => panic!("Expected Leaf, got {other:?}"),
+        }
+        match mapped.root.lookup(OsStr::new("chr")) {
+            Some(Inode::Leaf(l)) => match &l.content {
+                LeafContent::CharacterDevice(rdev) => assert_eq!(*rdev, 0x0501),
+                other => panic!("Expected CharacterDevice, got {other:?}"),
+            },
+            other => panic!("Expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_try_map_regular_hardlink_sharing() {
+        let mut fs = FileSystem::<u32>::new(default_stat());
+        let shared_leaf = Rc::new(Leaf {
+            stat: stat_with_mtime(10),
+            content: LeafContent::Regular(99u32),
+        });
+        // Insert the same Rc under two names (hardlink)
+        fs.root
+            .insert(OsStr::new("a"), Inode::Leaf(Rc::clone(&shared_leaf)));
+        fs.root
+            .insert(OsStr::new("b"), Inode::Leaf(Rc::clone(&shared_leaf)));
+
+        // Track how many times the mapping function is called
+        let call_count = RefCell::new(0u32);
+        let mapped = fs
+            .try_map_regular(|v: &u32| {
+                *call_count.borrow_mut() += 1;
+                Ok::<String, std::fmt::Error>(format!("mapped={v}"))
+            })
+            .unwrap();
+
+        // The mapping function should be called exactly once for the shared leaf
+        assert_eq!(*call_count.borrow(), 1);
+
+        // Both entries should point to the same Rc
+        let rc_a = match mapped.root.lookup(OsStr::new("a")) {
+            Some(Inode::Leaf(l)) => Rc::clone(l),
+            other => panic!("Expected Leaf, got {other:?}"),
+        };
+        let rc_b = match mapped.root.lookup(OsStr::new("b")) {
+            Some(Inode::Leaf(l)) => Rc::clone(l),
+            other => panic!("Expected Leaf, got {other:?}"),
+        };
+        assert!(Rc::ptr_eq(&rc_a, &rc_b));
+        assert_eq!(mapped.root.get_file(OsStr::new("a")).unwrap(), "mapped=99");
+    }
+
+    #[test]
+    fn test_try_map_regular_error_propagation() {
+        let mut fs = FileSystem::<u32>::new(default_stat());
+        fs.root.insert(
+            OsStr::new("ok"),
+            Inode::Leaf(Rc::new(Leaf {
+                stat: stat_with_mtime(1),
+                content: LeafContent::Regular(1u32),
+            })),
+        );
+        fs.root.insert(
+            OsStr::new("fail"),
+            Inode::Leaf(Rc::new(Leaf {
+                stat: stat_with_mtime(2),
+                content: LeafContent::Regular(0u32),
+            })),
+        );
+
+        let result = fs.try_map_regular(|v: &u32| {
+            if *v == 0 {
+                Err("cannot map zero")
+            } else {
+                Ok(v * 10)
+            }
+        });
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "cannot map zero");
     }
 
     #[test]
