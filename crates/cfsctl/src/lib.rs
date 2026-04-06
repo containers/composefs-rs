@@ -29,7 +29,6 @@ use std::{ffi::OsString, path::PathBuf};
 #[cfg(feature = "oci")]
 use std::{fs::create_dir_all, io::IsTerminal};
 
-#[cfg(any(feature = "oci", feature = "http"))]
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
@@ -573,11 +572,31 @@ pub async fn run_app(args: App) -> Result<()> {
         );
     }
 
-    if args.no_repo {
-        let effective_hash = args.hash.unwrap_or(HashType::Sha512);
+    // Commands that only need verity digests (no object storage) can
+    // run without opening a repository.
+    if args.no_repo
+        || matches!(
+            args.cmd,
+            Command::ComputeId { .. } | Command::CreateDumpfile { .. }
+        )
+    {
+        // If a repo path is available and --no-repo wasn't passed,
+        // try to read the hash type from the repo's metadata so that
+        // e.g. `cfsctl --repo <sha256-repo> compute-id` uses SHA-256
+        // instead of the default SHA-512.
+        let effective_hash = if !args.no_repo {
+            if let Ok(repo_path) = resolve_repo_path(&args) {
+                resolve_hash_type(&repo_path, args.hash)
+                    .unwrap_or(args.hash.unwrap_or(HashType::Sha512))
+            } else {
+                args.hash.unwrap_or(HashType::Sha512)
+            }
+        } else {
+            args.hash.unwrap_or(HashType::Sha512)
+        };
         return match effective_hash {
-            HashType::Sha256 => run_cmd_without_repo::<Sha256HashValue>(args),
-            HashType::Sha512 => run_cmd_without_repo::<Sha512HashValue>(args),
+            HashType::Sha256 => run_cmd_without_repo::<Sha256HashValue>(args).await,
+            HashType::Sha512 => run_cmd_without_repo::<Sha512HashValue>(args).await,
         };
     }
 
@@ -714,17 +733,25 @@ fn load_filesystem_from_oci_image<ObjectID: FsVerityHashValue>(
     Ok(fs)
 }
 
-fn load_filesystem_from_ondisk_fs<ObjectID: FsVerityHashValue>(
+async fn load_filesystem_from_ondisk_fs<ObjectID: FsVerityHashValue>(
     fs_opts: &FsReadOptions,
-    repo: Option<&Repository<ObjectID>>,
+    repo: Option<Arc<Repository<ObjectID>>>,
 ) -> Result<FileSystem<RegularFile<ObjectID>>> {
+    // The async API needs an OwnedFd; fs_opts.path is typically absolute
+    // so the dirfd is unused for path resolution, but required by the API.
+    let dirfd = rustix::fs::openat(
+        CWD,
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
     let mut fs = if fs_opts.no_propagate_usr_to_root {
-        composefs::fs::read_filesystem(CWD, &fs_opts.path, repo)?
+        composefs::fs::read_filesystem(dirfd, fs_opts.path.clone(), repo.clone()).await?
     } else {
-        composefs::fs::read_container_root(CWD, &fs_opts.path, repo)?
+        composefs::fs::read_container_root(dirfd, fs_opts.path.clone(), repo.clone()).await?
     };
     if fs_opts.bootable {
-        if let Some(repo) = repo {
+        if let Some(repo) = &repo {
             fs.transform_for_boot(repo)?;
         } else {
             let rootfd = rustix::fs::openat(
@@ -797,15 +824,15 @@ fn dump_file_impl(
 }
 
 /// Run commands that don't require a repository.
-pub fn run_cmd_without_repo<ObjectID: FsVerityHashValue>(args: App) -> Result<()> {
+pub async fn run_cmd_without_repo<ObjectID: FsVerityHashValue>(args: App) -> Result<()> {
     match args.cmd {
         Command::ComputeId { fs_opts } => {
-            let fs = load_filesystem_from_ondisk_fs::<ObjectID>(&fs_opts, None)?;
+            let fs = load_filesystem_from_ondisk_fs::<ObjectID>(&fs_opts, None).await?;
             let id = fs.compute_image_id();
             println!("{}", id.to_hex());
         }
         Command::CreateDumpfile { fs_opts } => {
-            let fs = load_filesystem_from_ondisk_fs::<ObjectID>(&fs_opts, None)?;
+            let fs = load_filesystem_from_ondisk_fs::<ObjectID>(&fs_opts, None).await?;
             fs.print_dumpfile()?;
         }
         _ => {
@@ -820,6 +847,7 @@ pub async fn run_cmd_with_repo<ObjectID>(repo: Repository<ObjectID>, args: App) 
 where
     ObjectID: FsVerityHashValue,
 {
+    let repo = Arc::new(repo);
     match args.cmd {
         Command::Init { .. } => {
             // Handled in run_app before we get here
@@ -841,7 +869,6 @@ where
         #[cfg(feature = "oci")]
         Command::Oci { cmd: oci_cmd } => match oci_cmd {
             OciCommand::ImportLayer { name, ref digest } => {
-                let repo = Arc::new(repo);
                 let (object_id, _stats) = composefs_oci::import_layer(
                     &repo,
                     digest,
@@ -899,9 +926,8 @@ where
             } => {
                 // If no explicit name provided, use the image reference as the tag
                 let tag_name = name.as_deref().unwrap_or(image);
-                let repo_arc = Arc::new(repo);
                 let (result, stats) =
-                    composefs_oci::pull_image(&repo_arc, image, Some(tag_name), None).await?;
+                    composefs_oci::pull_image(&repo, image, Some(tag_name), None).await?;
 
                 println!("manifest {}", result.manifest_digest);
                 println!("config   {}", result.config_digest);
@@ -917,7 +943,7 @@ where
 
                 if bootable {
                     let image_verity =
-                        composefs_oci::generate_boot_image(&repo_arc, &result.manifest_digest)?;
+                        composefs_oci::generate_boot_image(&repo, &result.manifest_digest)?;
                     println!("Boot image: {}", image_verity.to_hex());
                 }
             }
@@ -1088,18 +1114,13 @@ where
             fs_opts,
             ref image_name,
         } => {
-            let fs = load_filesystem_from_ondisk_fs(&fs_opts, Some(&repo))?;
+            let fs = load_filesystem_from_ondisk_fs(&fs_opts, Some(Arc::clone(&repo))).await?;
             let id = fs.commit_image(&repo, image_name.as_deref())?;
             println!("{}", id.to_id());
         }
-        Command::ComputeId { fs_opts } => {
-            let fs = load_filesystem_from_ondisk_fs(&fs_opts, Some(&repo))?;
-            let id = fs.compute_image_id();
-            println!("{}", id.to_hex());
-        }
-        Command::CreateDumpfile { fs_opts } => {
-            let fs = load_filesystem_from_ondisk_fs::<ObjectID>(&fs_opts, None)?;
-            fs.print_dumpfile()?;
+        Command::ComputeId { .. } | Command::CreateDumpfile { .. } => {
+            // Handled in run_app before opening the repo
+            unreachable!("compute-id and create-dumpfile are dispatched without a repo");
         }
         Command::Mount { name, mountpoint } => {
             repo.mount_at(&name, &mountpoint)?;
@@ -1165,7 +1186,7 @@ where
         }
         #[cfg(feature = "http")]
         Command::Fetch { url, name } => {
-            let (digest, verity) = composefs_http::download(&url, &name, Arc::new(repo)).await?;
+            let (digest, verity) = composefs_http::download(&url, &name, Arc::clone(&repo)).await?;
             println!("content {digest}");
             println!("verity {}", verity.to_hex());
         }

@@ -9,11 +9,13 @@ use std::{
     collections::{BTreeMap, HashMap},
     ffi::{CStr, OsStr},
     fs::File,
-    io::{Read, Write},
+    io::{BufRead, Read, Write},
     mem::MaybeUninit,
     os::unix::ffi::OsStrExt,
-    path::Path,
+    path::{Path, PathBuf},
     rc::Rc,
+    sync::Arc,
+    thread::available_parallelism,
 };
 
 use anyhow::{Context as _, Result, ensure};
@@ -27,12 +29,16 @@ use rustix::{
     },
     io::{Errno, read},
 };
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use zerocopy::IntoBytes;
 
 use crate::{
     INLINE_CONTENT_MAX_V0,
-    fsverity::{FsVerityHashValue, compute_verity},
+    fsverity::{FsVerityHashValue, FsVerityHasher},
+    generic_tree,
     repository::Repository,
+    shared_internals::IO_BUF_CAPACITY,
     tree::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
     util::proc_self_fd,
 };
@@ -160,110 +166,210 @@ pub fn write_to_path<ObjectID: FsVerityHashValue>(
     write_directory_contents(dir, &fd, repo)
 }
 
-/// Helper for reading filesystem trees from disk into composefs representation.
+// ---------------------------------------------------------------------------
+// Shared helpers for filesystem scanning
+// ---------------------------------------------------------------------------
+
+/// Read extended attributes from a file descriptor.
 ///
-/// Tracks hardlinks via inode numbers and optionally stores large file objects
-/// in a repository.
-#[derive(Debug)]
-pub struct FilesystemReader<'repo, ObjectID: FsVerityHashValue> {
-    repo: Option<&'repo Repository<ObjectID>>,
-    inodes: HashMap<(u64, u64), Rc<Leaf<ObjectID>>>,
+/// Uses `/proc/self/fd` to work around `O_PATH` fd limitations with
+/// `flistxattr`/`fgetxattr`. The symlink-following version is used,
+/// which correctly reads xattrs from symlinks themselves.
+///
+/// See <https://gist.github.com/allisonkarlitskaya/7a80f2ebb3314d80f45c653a1ba0e398>
+#[context("Reading extended attributes")]
+fn read_xattrs(fd: &OwnedFd) -> Result<BTreeMap<Box<OsStr>, Box<[u8]>>> {
+    let filename = proc_self_fd(fd);
+
+    let mut xattrs = BTreeMap::new();
+
+    let mut names = [MaybeUninit::new(0); 65536];
+    let (names, _) = listxattr(&filename, &mut names)?;
+
+    for name in names.split_inclusive(|c| *c == 0) {
+        let mut buffer = [MaybeUninit::new(0); 65536];
+        let name: &[u8] = name.as_bytes();
+        let name = CStr::from_bytes_with_nul(name)?;
+        let (value, _) = getxattr(&filename, name, &mut buffer)?;
+        let key = Box::from(OsStr::from_bytes(name.to_bytes()));
+        xattrs.insert(key, Box::from(value));
+    }
+
+    Ok(xattrs)
 }
 
-impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
-    #[context("Reading extended attributes")]
-    fn read_xattrs(fd: &OwnedFd) -> Result<BTreeMap<Box<OsStr>, Box<[u8]>>> {
-        // flistxattr() and fgetxattr() don't work with with O_PATH fds, so go via /proc/self/fd.
-        // Note: we want the symlink-following version of this call, which produces the correct
-        // behaviour even when trying to read xattrs from symlinks themselves.  See
-        // https://gist.github.com/allisonkarlitskaya/7a80f2ebb3314d80f45c653a1ba0e398
-        let filename = proc_self_fd(fd);
+/// Read file metadata and verify the file type matches expectations.
+#[context("Getting file stats")]
+fn stat_fd(fd: &OwnedFd, ifmt: FileType) -> Result<(rustix::fs::Stat, Stat)> {
+    let buf = fstat(fd)?;
 
-        let mut xattrs = BTreeMap::new();
+    ensure!(
+        FileType::from_raw_mode(buf.st_mode) == ifmt,
+        "File type changed between readdir() and fstat()"
+    );
 
-        let mut names = [MaybeUninit::new(0); 65536];
-        let (names, _) = listxattr(&filename, &mut names)?;
+    Ok((
+        buf,
+        Stat {
+            st_mode: buf.st_mode & 0o7777,
+            st_uid: buf.st_uid,
+            st_gid: buf.st_gid,
+            st_mtim_sec: buf.st_mtime as i64,
+            xattrs: RefCell::new(read_xattrs(fd)?),
+        },
+    ))
+}
 
-        for name in names.split_inclusive(|c| *c == 0) {
-            let mut buffer = [MaybeUninit::new(0); 65536];
-            let name: &[u8] = name.as_bytes();
-            let name = CStr::from_bytes_with_nul(name)?;
-            let (value, _) = getxattr(&filename, name, &mut buffer)?;
-            let key = Box::from(OsStr::from_bytes(name.to_bytes()));
-            xattrs.insert(key, Box::from(value));
+// ---------------------------------------------------------------------------
+// Unified filesystem scanner (scan phase)
+// ---------------------------------------------------------------------------
+
+/// Device and inode number pair identifying a unique file on a filesystem.
+///
+/// Used for hardlink deduplication during scanning: files sharing the
+/// same `(dev, ino)` are the same underlying inode and only need to
+/// be processed once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FileDevIno {
+    dev: u64,
+    ino: u64,
+}
+
+/// Represents a regular file during the scan phase, before verity
+/// computation and object storage.
+#[derive(Debug)]
+enum PendingFile {
+    /// Small file with inline content (≤ INLINE_CONTENT_MAX_V0 bytes).
+    Inline(Box<[u8]>),
+    /// Large file pending async processing. Stores the (dev, ino) key
+    /// for looking up the result after verity computation.
+    External { inode_key: FileDevIno, size: u64 },
+}
+
+/// Trait for handling large (external) files encountered during scanning.
+///
+/// The scanner calls [`handle`](Self::handle) for each large file,
+/// allowing the caller to control how files are processed — e.g.
+/// spawning async worker tasks for pipelined verity computation.
+trait ExternalFileHandler {
+    fn handle(&mut self, key: FileDevIno, fd: OwnedFd, size: u64);
+}
+
+/// Spawns a tokio task for each large file as soon as the scanner
+/// encounters it, enabling overlap between scanning and I/O.
+///
+/// Tasks are spawned into an externally-owned [`JoinSet`] so the
+/// caller can drain completed results while the scan continues.
+///
+/// Used by [`read_filesystem`] to pipeline verity computation
+/// with the directory walk.
+struct SpawnHandler<'a, ObjectID: FsVerityHashValue> {
+    semaphore: Arc<Semaphore>,
+    repo: Option<Arc<Repository<ObjectID>>>,
+    tasks: &'a mut JoinSet<Result<(FileDevIno, ObjectID)>>,
+}
+
+impl<ObjectID: FsVerityHashValue> ExternalFileHandler for SpawnHandler<'_, ObjectID> {
+    fn handle(&mut self, key: FileDevIno, fd: OwnedFd, size: u64) {
+        let repo = self.repo.clone();
+        let sem = self.semaphore.clone();
+        self.tasks.spawn(async move {
+            let _permit = sem.acquire().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            let id = if let Some(repo) = repo {
+                tokio::task::spawn_blocking(move || repo.ensure_object_from_fd(fd, size)).await??
+            } else {
+                tokio::task::spawn_blocking(move || compute_verity_from_fd::<ObjectID>(fd))
+                    .await??
+            };
+            Ok((key, id))
+        });
+    }
+}
+
+/// Walks a directory tree synchronously, collecting metadata and dispatching
+/// large files via an [`ExternalFileHandler`].
+///
+/// This is the single scan implementation used by both the sync and async
+/// filesystem reading paths. Small files are read inline during the scan;
+/// large files are dispatched to the handler, which may collect them for
+/// later processing or spawn tasks immediately.
+struct FilesystemScanner<H: ExternalFileHandler> {
+    inodes: HashMap<FileDevIno, Rc<generic_tree::Leaf<PendingFile>>>,
+    handler: H,
+}
+
+impl<H: ExternalFileHandler> FilesystemScanner<H> {
+    fn new(handler: H) -> Self {
+        Self {
+            inodes: HashMap::new(),
+            handler,
+        }
+    }
+
+    /// Scan the directory tree rooted at `name` (relative to `dirfd`).
+    fn scan(
+        &mut self,
+        dirfd: impl AsFd,
+        name: &OsStr,
+    ) -> Result<generic_tree::FileSystem<PendingFile>> {
+        let root = self.scan_directory(dirfd, name)?;
+        Ok(generic_tree::FileSystem { root })
+    }
+
+    #[context("Scanning directory {}", name.to_string_lossy())]
+    fn scan_directory(
+        &mut self,
+        dirfd: impl AsFd,
+        name: &OsStr,
+    ) -> Result<generic_tree::Directory<PendingFile>> {
+        let fd = openat(
+            dirfd,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+
+        let (_, stat) = stat_fd(&fd, FileType::Directory)?;
+        let mut directory = generic_tree::Directory::new(stat);
+
+        for item in Dir::read_from(&fd)? {
+            let entry = item?;
+            let child_name = OsStr::from_bytes(entry.file_name().to_bytes());
+
+            if child_name == "." || child_name == ".." {
+                continue;
+            }
+
+            let inode = self.scan_inode(&fd, child_name, entry.file_type())?;
+            directory.insert(child_name, inode);
         }
 
-        Ok(xattrs)
+        Ok(directory)
     }
 
-    #[context("Getting file stats")]
-    fn stat(fd: &OwnedFd, ifmt: FileType) -> Result<(rustix::fs::Stat, Stat)> {
-        let buf = fstat(fd)?;
-
-        ensure!(
-            FileType::from_raw_mode(buf.st_mode) == ifmt,
-            "File type changed
-            between readdir() and fstat()"
-        );
-
-        Ok((
-            buf,
-            Stat {
-                st_mode: buf.st_mode & 0o7777,
-                st_uid: buf.st_uid,
-                st_gid: buf.st_gid,
-                st_mtim_sec: buf.st_mtime as i64,
-                xattrs: RefCell::new(Self::read_xattrs(fd)?),
-            },
-        ))
-    }
-
-    #[context("Reading leaf content")]
-    fn read_leaf_content(
-        &mut self,
-        fd: OwnedFd,
-        buf: rustix::fs::Stat,
-    ) -> Result<LeafContent<ObjectID>> {
-        let content = match FileType::from_raw_mode(buf.st_mode) {
-            FileType::Directory | FileType::Unknown => unreachable!(),
-            FileType::RegularFile => {
-                let size = buf.st_size.try_into().context("size overflow")?;
-                let mut buffer = Vec::with_capacity(size);
-                if buf.st_size > 0 {
-                    read(fd, spare_capacity(&mut buffer))?;
-                }
-                let buffer = Box::from(buffer);
-
-                if buf.st_size > INLINE_CONTENT_MAX_V0 as i64 {
-                    let id = if let Some(repo) = self.repo {
-                        repo.ensure_object(&buffer)?
-                    } else {
-                        compute_verity(&buffer)
-                    };
-                    LeafContent::Regular(RegularFile::External(id, buf.st_size as u64))
-                } else {
-                    LeafContent::Regular(RegularFile::Inline(buffer))
-                }
-            }
-            FileType::Symlink => {
-                let target = readlinkat(fd, "", [])?;
-                LeafContent::Symlink(OsStr::from_bytes(target.as_bytes()).into())
-            }
-            FileType::CharacterDevice => LeafContent::CharacterDevice(buf.st_rdev),
-            FileType::BlockDevice => LeafContent::BlockDevice(buf.st_rdev),
-            FileType::Fifo => LeafContent::Fifo,
-            FileType::Socket => LeafContent::Socket,
-        };
-        Ok(content)
-    }
-
-    #[context("Reading leaf {}", name.to_string_lossy())]
-    fn read_leaf(
+    #[context("Scanning inode {}", name.to_string_lossy())]
+    fn scan_inode(
         &mut self,
         dirfd: &OwnedFd,
         name: &OsStr,
         ifmt: FileType,
-    ) -> Result<Rc<Leaf<ObjectID>>> {
+    ) -> Result<generic_tree::Inode<PendingFile>> {
+        if ifmt == FileType::Directory {
+            let dir = self.scan_directory(dirfd, name)?;
+            Ok(generic_tree::Inode::Directory(Box::new(dir)))
+        } else {
+            let leaf = self.scan_leaf(dirfd, name, ifmt)?;
+            Ok(generic_tree::Inode::Leaf(leaf))
+        }
+    }
+
+    #[context("Scanning leaf {}", name.to_string_lossy())]
+    fn scan_leaf(
+        &mut self,
+        dirfd: &OwnedFd,
+        name: &OsStr,
+        ifmt: FileType,
+    ) -> Result<Rc<generic_tree::Leaf<PendingFile>>> {
         let oflags = match ifmt {
             FileType::RegularFile => OFlags::RDONLY,
             _ => OFlags::PATH,
@@ -276,123 +382,113 @@ impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
             Mode::empty(),
         )?;
 
-        let (buf, stat) = Self::stat(&fd, ifmt)?;
+        let (buf, stat) = stat_fd(&fd, ifmt)?;
 
         // NB: We could check `st_nlink > 1` to find out if we should track a file as a potential
         // hardlink or not, but some filesystems (like fuse-overlayfs) can report this incorrectly.
         // Track all files.  https://github.com/containers/fuse-overlayfs/issues/435
-        let key = (buf.st_dev, buf.st_ino);
+        let key = FileDevIno {
+            dev: buf.st_dev,
+            ino: buf.st_ino,
+        };
         if let Some(leafref) = self.inodes.get(&key) {
             Ok(Rc::clone(leafref))
         } else {
-            let content = self.read_leaf_content(fd, buf)?;
-            let leaf = Rc::new(Leaf { stat, content });
+            let content = self.scan_leaf_content(fd, &buf)?;
+            let leaf = Rc::new(generic_tree::Leaf { stat, content });
             self.inodes.insert(key, Rc::clone(&leaf));
             Ok(leaf)
         }
     }
 
-    /// Reads a directory from disk into composefs representation.
-    ///
-    /// Recursively reads directory contents, tracking hardlinks and optionally
-    /// storing large file objects in the repository.
-    #[context("Reading directory {}", name.to_string_lossy())]
-    fn read_directory(&mut self, dirfd: impl AsFd, name: &OsStr) -> Result<Directory<ObjectID>> {
-        let fd = openat(
-            dirfd,
-            name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?;
-
-        let (_, stat) = Self::stat(&fd, FileType::Directory)?;
-        let mut directory = Directory::new(stat);
-
-        for item in Dir::read_from(&fd)? {
-            let entry = item?;
-            let name = OsStr::from_bytes(entry.file_name().to_bytes());
-
-            if name == "." || name == ".." {
-                continue;
-            }
-
-            let inode = self.read_inode(&fd, name, entry.file_type())?;
-            directory.insert(name, inode);
-        }
-
-        Ok(directory)
-    }
-
-    #[context("Reading inode {}", name.to_string_lossy())]
-    fn read_inode(
+    #[context("Reading leaf content")]
+    fn scan_leaf_content(
         &mut self,
-        dirfd: &OwnedFd,
-        name: &OsStr,
-        ifmt: FileType,
-    ) -> Result<Inode<ObjectID>> {
-        if ifmt == FileType::Directory {
-            let dir = self.read_directory(dirfd, name)?;
-            Ok(Inode::Directory(Box::new(dir)))
-        } else {
-            let leaf = self.read_leaf(dirfd, name, ifmt)?;
-            Ok(Inode::Leaf(leaf))
+        fd: OwnedFd,
+        buf: &rustix::fs::Stat,
+    ) -> Result<generic_tree::LeafContent<PendingFile>> {
+        let content = match FileType::from_raw_mode(buf.st_mode) {
+            FileType::Directory | FileType::Unknown => unreachable!(),
+            FileType::RegularFile => {
+                if buf.st_size > INLINE_CONTENT_MAX_V0 as i64 {
+                    // Large file: dispatch to handler for processing
+                    let key = FileDevIno {
+                        dev: buf.st_dev,
+                        ino: buf.st_ino,
+                    };
+                    self.handler.handle(key, fd, buf.st_size as u64);
+                    generic_tree::LeafContent::Regular(PendingFile::External {
+                        inode_key: key,
+                        size: buf.st_size as u64,
+                    })
+                } else {
+                    // Small file: read inline
+                    let size = buf.st_size.try_into().context("size overflow")?;
+                    let mut buffer = Vec::with_capacity(size);
+                    if buf.st_size > 0 {
+                        read(fd, spare_capacity(&mut buffer))?;
+                    }
+                    generic_tree::LeafContent::Regular(PendingFile::Inline(
+                        buffer.into_boxed_slice(),
+                    ))
+                }
+            }
+            FileType::Symlink => {
+                let target = readlinkat(fd, "", [])?;
+                generic_tree::LeafContent::Symlink(OsStr::from_bytes(target.as_bytes()).into())
+            }
+            FileType::CharacterDevice => generic_tree::LeafContent::CharacterDevice(buf.st_rdev),
+            FileType::BlockDevice => generic_tree::LeafContent::BlockDevice(buf.st_rdev),
+            FileType::Fifo => generic_tree::LeafContent::Fifo,
+            FileType::Socket => generic_tree::LeafContent::Socket,
+        };
+        Ok(content)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Resolution: PendingFile -> RegularFile<ObjectID>
+// ---------------------------------------------------------------------------
+
+/// Convert a `PendingFile` into a `RegularFile<ObjectID>` using pre-computed
+/// verity results for external files.
+fn resolve_pending_file<ObjectID: FsVerityHashValue>(
+    pf: &PendingFile,
+    results: &HashMap<FileDevIno, ObjectID>,
+) -> Result<RegularFile<ObjectID>> {
+    match pf {
+        PendingFile::Inline(data) => Ok(RegularFile::Inline(data.clone())),
+        PendingFile::External { inode_key, size } => {
+            let id = results
+                .get(inode_key)
+                .cloned()
+                .context("missing result for external file")?;
+            Ok(RegularFile::External(id, *size))
         }
     }
 }
 
-/// Load a filesystem tree from the given path.
+/// Compute fsverity digest by streaming from a file descriptor.
 ///
-/// If a repository is provided, all files found in the filesystem are
-/// stored in it. If `None`, fsverity digests are computed in memory
-/// without writing to disk — suitable for computing image IDs and
-/// dumpfiles without requiring O_TMPFILE support.
-#[context("Reading filesystem from {}", path.display())]
-pub fn read_filesystem<ObjectID: FsVerityHashValue>(
-    dirfd: impl AsFd,
-    path: &Path,
-    repo: Option<&Repository<ObjectID>>,
-) -> Result<FileSystem<ObjectID>> {
-    let mut reader = FilesystemReader {
-        repo,
-        inodes: HashMap::new(),
-    };
+/// Reads data in block-sized chunks, feeding each to the incremental
+/// hasher. Never holds more than one block in memory.
+fn compute_verity_from_fd<ObjectID: FsVerityHashValue>(source: OwnedFd) -> Result<ObjectID> {
+    let mut reader = std::io::BufReader::with_capacity(IO_BUF_CAPACITY, File::from(source));
+    let mut hasher = FsVerityHasher::<ObjectID>::new();
 
-    let root = reader.read_directory(dirfd, path.as_os_str())?;
+    loop {
+        let buf = reader
+            .fill_buf()
+            .context("Reading from fd for verity computation")?;
+        if buf.is_empty() {
+            break;
+        }
+        let chunk_size = buf.len().min(FsVerityHasher::<ObjectID>::BLOCK_SIZE);
+        hasher.add_block(&buf[..chunk_size]);
+        reader.consume(chunk_size);
+    }
 
-    Ok(FileSystem { root })
-}
-
-/// Load a filesystem tree from the given path, filtering xattrs with a predicate.
-///
-/// This is a wrapper around [`read_filesystem`] that filters extended attributes
-/// using the provided predicate. Only xattrs for which the predicate returns `true`
-/// are retained. This is useful when reading from a mounted filesystem where host
-/// xattrs may leak into the image.
-///
-/// # Example
-///
-/// ```ignore
-/// use composefs::fs::{read_filesystem_filtered, CONTAINER_XATTR_ALLOWLIST};
-///
-/// // Filter to only allow security.capability
-/// let fs = read_filesystem_filtered(dirfd, path, None, |name| {
-///     name.as_encoded_bytes() == b"security.capability"
-/// })?;
-/// ```
-#[context("Reading filtered filesystem from {}", path.display())]
-pub fn read_filesystem_filtered<ObjectID, F>(
-    dirfd: impl AsFd,
-    path: &Path,
-    repo: Option<&Repository<ObjectID>>,
-    xattr_filter: F,
-) -> Result<FileSystem<ObjectID>>
-where
-    ObjectID: FsVerityHashValue,
-    F: Fn(&OsStr) -> bool,
-{
-    let fs = read_filesystem(dirfd, path, repo)?;
-    fs.filter_xattrs(xattr_filter);
-    Ok(fs)
+    Ok(hasher.digest())
 }
 
 /// Default xattr allowlist for container filesystems.
@@ -416,35 +512,6 @@ pub fn is_allowed_container_xattr(name: &OsStr) -> bool {
         .any(|allowed| name.as_encoded_bytes() == allowed.as_bytes())
 }
 
-/// Load a container root filesystem from the given path.
-///
-/// This is a convenience wrapper around [`read_filesystem_filtered`] that also
-/// applies OCI container transformations via [`FileSystem::transform_for_oci`].
-///
-/// Equivalent to calling:
-/// ```ignore
-/// let mut fs = read_filesystem_filtered(dirfd, path, repo, is_allowed_container_xattr)?;
-/// fs.transform_for_oci()?;
-/// ```
-///
-/// This is the recommended way to read a container filesystem because:
-/// - OCI container runtimes don't preserve root directory metadata from layer tars
-/// - Host xattrs (especially `security.selinux`) can leak into mounted filesystems
-/// - `/run` should be empty (it's a tmpfs at runtime)
-/// - Podman/buildah's `RUN --mount` can leave directory stubs
-///
-/// By filtering xattrs and applying OCI transformations, we ensure consistent
-/// and reproducible composefs digests between build-time and install-time.
-pub fn read_container_root<ObjectID: FsVerityHashValue>(
-    dirfd: impl AsFd,
-    path: &Path,
-    repo: Option<&Repository<ObjectID>>,
-) -> Result<FileSystem<ObjectID>> {
-    let mut fs = read_filesystem_filtered(dirfd, path, repo, is_allowed_container_xattr)?;
-    fs.transform_for_oci()?;
-    Ok(fs)
-}
-
 /// Read the contents of a file.
 pub fn read_file<ObjectID: FsVerityHashValue>(
     file: &RegularFile<ObjectID>,
@@ -463,6 +530,92 @@ pub fn read_file<ObjectID: FsVerityHashValue>(
             Ok(data.into_boxed_slice())
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Async filesystem reading
+// ---------------------------------------------------------------------------
+
+/// Load a filesystem tree from the given path, parallelizing verity
+/// computation and object storage across available cores.
+///
+/// Hardlinks are deduplicated — each unique inode is processed only once.
+///
+/// If `repo` is `Some`, file objects are stored in the repository.
+/// If `None`, fsverity digests are computed without writing to disk.
+#[context("Async reading filesystem from {}", path.display())]
+pub async fn read_filesystem<ObjectID: FsVerityHashValue>(
+    dirfd: OwnedFd,
+    path: PathBuf,
+    repo: Option<Arc<Repository<ObjectID>>>,
+) -> Result<FileSystem<ObjectID>> {
+    let semaphore = repo
+        .as_ref()
+        .map(|r| r.write_semaphore())
+        .unwrap_or_else(|| {
+            let n = available_parallelism().map(|n| n.get()).unwrap_or(4);
+            Arc::new(Semaphore::new(n))
+        });
+
+    // The JoinSet lives here so completed tasks are drained after the
+    // scan returns, while structured concurrency ensures all tasks are
+    // cancelled on early exit.
+    let mut tasks = JoinSet::new();
+
+    // Phase 1: Scan with pipelined dispatch — worker tasks start while we
+    // are still walking the directory tree.
+    let pending_fs = tokio::task::block_in_place(|| {
+        let handler = SpawnHandler {
+            semaphore,
+            repo,
+            tasks: &mut tasks,
+        };
+        let mut scanner = FilesystemScanner::new(handler);
+        scanner.scan(&dirfd, path.as_os_str())
+    })?;
+
+    // Phase 2: Collect results as workers complete
+    let mut results = HashMap::new();
+    while let Some(result) = tasks.join_next().await {
+        let (key, id) = result??;
+        results.insert(key, id);
+    }
+
+    // Phase 3: Convert PendingFile -> RegularFile<ObjectID>
+    pending_fs.try_map_regular(|pf| resolve_pending_file(pf, &results))
+}
+
+/// Like [`read_filesystem`] but filters extended attributes using
+/// the provided predicate before returning.
+pub async fn read_filesystem_filtered<ObjectID, F>(
+    dirfd: OwnedFd,
+    path: PathBuf,
+    repo: Option<Arc<Repository<ObjectID>>>,
+    xattr_filter: F,
+) -> Result<FileSystem<ObjectID>>
+where
+    ObjectID: FsVerityHashValue,
+    F: Fn(&OsStr) -> bool,
+{
+    let fs = read_filesystem(dirfd, path, repo)
+        .await
+        .context("Reading filtered filesystem")?;
+    fs.filter_xattrs(xattr_filter);
+    Ok(fs)
+}
+
+/// Load a container root filesystem from the given path.
+///
+/// Wraps [`read_filesystem_filtered`] with the container xattr allowlist
+/// and applies OCI transformations via [`FileSystem::transform_for_oci`].
+pub async fn read_container_root<ObjectID: FsVerityHashValue>(
+    dirfd: OwnedFd,
+    path: PathBuf,
+    repo: Option<Arc<Repository<ObjectID>>>,
+) -> Result<FileSystem<ObjectID>> {
+    let mut fs = read_filesystem_filtered(dirfd, path, repo, is_allowed_container_xattr).await?;
+    fs.transform_for_oci()?;
+    Ok(fs)
 }
 
 #[cfg(test)]
