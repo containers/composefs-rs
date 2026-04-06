@@ -84,7 +84,7 @@ impl<ObjectID: FsVerityHashValue> Downloader<ObjectID> {
         let my_id = if is_symlink {
             ObjectID::from_object_pathname(&data)?
         } else {
-            self.repo.ensure_object(&data)?
+            self.repo.ensure_object_async(data.into()).await?
         };
         progress.inc(1);
 

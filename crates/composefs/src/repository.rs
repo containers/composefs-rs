@@ -82,7 +82,7 @@ use std::{
     ffi::{CStr, CString, OsStr, OsString},
     fmt,
     fs::{File, canonicalize},
-    io::{Read, Write},
+    io::{BufRead, Read, Write},
     os::{
         fd::{AsFd, BorrowedFd, OwnedFd},
         unix::ffi::OsStrExt,
@@ -113,6 +113,7 @@ use crate::{
         measure_verity, measure_verity_opt,
     },
     mount::{composefs_fsmount, mount_at},
+    shared_internals::IO_BUF_CAPACITY,
     splitstream::{SplitStreamReader, SplitStreamWriter},
     util::{ErrnoFilter, proc_self_fd, reopen_tmpfile_ro, replace_symlinkat},
 };
@@ -1054,11 +1055,63 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         tokio::task::spawn_blocking(move || self_.ensure_object_impl(&data, &writable)).await?
     }
 
+    /// Import an object by streaming from a file descriptor into a
+    /// tmpfile, without buffering the entire file in memory.
+    ///
+    /// In insecure mode the verity digest is computed while copying,
+    /// avoiding a second read pass.
+    #[context("Ensuring object from file descriptor")]
+    pub(crate) fn ensure_object_from_fd(&self, source: OwnedFd, size: u64) -> Result<ObjectID> {
+        let writable = self.ensure_writable_token()?;
+        let tmpfile_fd = self.create_object_tmpfile_impl(&writable)?;
+
+        if self.insecure {
+            // Insecure mode: compute verity digest while copying, avoiding
+            // a second read of the data in finalize_object_tmpfile_impl.
+            let mut hasher = FsVerityHasher::<ObjectID>::new();
+            let mut src = std::io::BufReader::with_capacity(IO_BUF_CAPACITY, File::from(source));
+            let mut dst = File::from(tmpfile_fd.try_clone()?);
+
+            loop {
+                let buf = src.fill_buf()?;
+                if buf.is_empty() {
+                    break;
+                }
+                let chunk = &buf[..buf.len().min(FsVerityHasher::<ObjectID>::BLOCK_SIZE)];
+                hasher.add_block(chunk);
+                dst.write_all(chunk)?;
+                let n = chunk.len();
+                src.consume(n);
+            }
+            drop(dst);
+
+            let id = hasher.digest();
+            let ro_fd = reopen_tmpfile_ro(File::from(tmpfile_fd))
+                .context("Re-opening tmpfile as read-only")?;
+            let objects_dir = self.objects_dir().context("Getting objects directory")?;
+            let (id, _method) = self.link_tmpfile_as_object(objects_dir, &ro_fd, &id, size)?;
+            Ok(id)
+        } else {
+            // Secure mode: let std::io::copy use copy_file_range for
+            // potential reflinks, then finalize_object_tmpfile_impl
+            // enables kernel verity and measures the digest.
+            let mut src = File::from(source);
+            let mut dst = File::from(tmpfile_fd.try_clone()?);
+            let copied = std::io::copy(&mut src, &mut dst)?;
+            ensure!(copied == size, "Expected {size} bytes, got {copied}");
+            drop(dst);
+
+            let (id, _method) =
+                self.finalize_object_tmpfile_impl(File::from(tmpfile_fd), size, &writable)?;
+            Ok(id)
+        }
+    }
+
     /// Create an O_TMPFILE in the objects directory for streaming writes.
     ///
     /// Returns the file descriptor for writing. The caller should write data to this fd,
-    /// then call `spawn_finalize_object_tmpfile()` to compute the verity digest,
-    /// enable fs-verity, and link the file into the objects directory.
+    /// then call [`finalize_object_tmpfile`](Self::finalize_object_tmpfile) to compute
+    /// the verity digest, enable fs-verity, and link the file into the objects directory.
     #[context("Creating object tmpfile")]
     pub fn create_object_tmpfile(&self) -> Result<OwnedFd> {
         let writable = self.ensure_writable_token()?;
@@ -1078,25 +1131,6 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         )
         .context("Opening temp file in objects directory")?;
         Ok(fd)
-    }
-
-    /// Spawn a background task that finalizes a tmpfile as an object.
-    ///
-    /// The task computes the fs-verity digest by reading the file, enables verity,
-    /// and links the file into the objects directory.
-    ///
-    /// Returns a handle that resolves to the ObjectID (fs-verity digest).
-    ///
-    /// # Arguments
-    /// * `tmpfile_fd` - The O_TMPFILE file descriptor with data already written
-    /// * `size` - The exact size in bytes of the data written to the tmpfile
-    pub fn spawn_finalize_object_tmpfile(
-        self: &Arc<Self>,
-        tmpfile_fd: OwnedFd,
-        size: u64,
-    ) -> tokio::task::JoinHandle<Result<(ObjectID, ObjectStoreMethod)>> {
-        let self_ = Arc::clone(self);
-        tokio::task::spawn_blocking(move || self_.finalize_object_tmpfile(tmpfile_fd.into(), size))
     }
 
     /// Finalize a tmpfile as an object.
@@ -1164,31 +1198,41 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                 .context("Computing verity digest in insecure mode")?
         };
 
-        // Check if object already exists
+        self.link_tmpfile_as_object(objects_dir, &ro_fd, &id, size)
+    }
+
+    /// Link a read-only tmpfile into the objects directory with dedup check.
+    ///
+    /// If an object with the same digest and size already exists, the
+    /// tmpfile is discarded and `AlreadyPresent` is returned.
+    fn link_tmpfile_as_object(
+        &self,
+        objects_dir: &OwnedFd,
+        ro_fd: &impl AsFd,
+        id: &ObjectID,
+        size: u64,
+    ) -> Result<(ObjectID, ObjectStoreMethod)> {
         let path = id.to_object_pathname();
 
         match statat(objects_dir, &path, AtFlags::empty()) {
             Ok(stat) if stat.st_size as u64 == size => {
-                // Object already exists with correct size, skip storage
-                return Ok((id, ObjectStoreMethod::AlreadyPresent));
+                return Ok((id.clone(), ObjectStoreMethod::AlreadyPresent));
             }
             _ => {}
         }
 
-        // Ensure parent directory exists
         let parent_dir = id.to_object_dir();
         let _ = mkdirat(objects_dir, &parent_dir, Mode::from_raw_mode(0o755));
 
-        // Link the file into the objects directory
         match linkat(
             CWD,
-            proc_self_fd(&ro_fd),
+            proc_self_fd(ro_fd),
             objects_dir,
             &path,
             AtFlags::SYMLINK_FOLLOW,
         ) {
-            Ok(()) => Ok((id, ObjectStoreMethod::Copied)),
-            Err(Errno::EXIST) => Ok((id, ObjectStoreMethod::AlreadyPresent)), // Race: another task created it
+            Ok(()) => Ok((id.clone(), ObjectStoreMethod::Copied)),
+            Err(Errno::EXIST) => Ok((id.clone(), ObjectStoreMethod::AlreadyPresent)),
             Err(e) => Err(e).context("Linking tmpfile into objects directory")?,
         }
     }
