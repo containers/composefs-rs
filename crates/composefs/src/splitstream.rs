@@ -35,7 +35,11 @@ use zerocopy::{
 };
 use zstd::stream::{read::Decoder, write::Encoder};
 
-use crate::{fsverity::FsVerityHashValue, repository::Repository, util::read_exactish};
+use crate::{
+    fsverity::FsVerityHashValue,
+    repository::{Repository, WritableRepo},
+    util::read_exactish,
+};
 
 const SPLITSTREAM_MAGIC: [u8; 11] = *b"SplitStream";
 const LG_BLOCKSIZE: u8 = 12; // TODO: hard-coded 4k.  make this generic later...
@@ -206,7 +210,7 @@ impl<ObjectID: FsVerityHashValue> std::fmt::Debug for SplitStreamEntry<ObjectID>
 ///
 /// # Example
 /// ```ignore
-/// let mut builder = SplitStreamBuilder::new(repo.clone(), content_type);
+/// let mut builder = SplitStreamBuilder::new(repo.clone(), content_type)?;
 /// builder.push_inline(header_bytes);
 /// builder.push_external(storage_handle, file_size);
 /// builder.push_inline(padding);
@@ -214,6 +218,7 @@ impl<ObjectID: FsVerityHashValue> std::fmt::Debug for SplitStreamEntry<ObjectID>
 /// ```
 pub struct SplitStreamBuilder<ObjectID: FsVerityHashValue> {
     repo: Arc<Repository<ObjectID>>,
+    writable: WritableRepo,
     entries: Vec<SplitStreamEntry<ObjectID>>,
     total_external_size: u64,
     total_inline_bytes: u64,
@@ -235,16 +240,21 @@ impl<ObjectID: FsVerityHashValue> std::fmt::Debug for SplitStreamBuilder<ObjectI
 
 impl<ObjectID: FsVerityHashValue> SplitStreamBuilder<ObjectID> {
     /// Create a new split stream builder.
-    pub fn new(repo: Arc<Repository<ObjectID>>, content_type: u64) -> Self {
-        Self {
+    ///
+    /// Performs an upfront writable check; the token is carried so that
+    /// the final `finish()` call can store objects without redundant checks.
+    pub fn new(repo: Arc<Repository<ObjectID>>, content_type: u64) -> Result<Self> {
+        let writable = repo.ensure_writable_token()?;
+        Ok(Self {
             repo,
+            writable,
             entries: Vec::new(),
             total_external_size: 0,
             total_inline_bytes: 0,
             content_type,
             stream_refs: UniqueVec::new(),
             named_refs: Default::default(),
-        }
+        })
     }
 
     /// Append inline data to the stream.
@@ -322,7 +332,7 @@ impl<ObjectID: FsVerityHashValue> SplitStreamBuilder<ObjectID> {
 
         // Second pass: build the splitstream using SplitStreamWriter
         // This gives us proper deduplication through UniqueVec
-        let mut writer = SplitStreamWriter::new(&self.repo, self.content_type);
+        let mut writer = SplitStreamWriter::new(&self.repo, self.content_type, self.writable);
 
         // Copy over stream refs and named refs
         for (name, idx) in &self.named_refs {
@@ -365,6 +375,10 @@ enum ResolvedEntry<ObjectID: FsVerityHashValue> {
 /// Writer for creating split stream format files with inline content and external object references.
 pub struct SplitStreamWriter<ObjectId: FsVerityHashValue> {
     repo: Arc<Repository<ObjectId>>,
+    /// Proof that the writable check was performed when this writer was
+    /// created.  Passed to [`Repository::ensure_object_impl`] so that
+    /// per-object writes skip redundant `faccessat` calls.
+    writable: WritableRepo,
     stream_refs: UniqueVec<ObjectId>,
     object_refs: UniqueVec<ObjectId>,
     named_refs: BTreeMap<Box<str>, usize>, // index into stream_refs
@@ -390,13 +404,26 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
         &self.repo
     }
 
+    /// Access the [`WritableRepo`] token carried by this writer.
+    pub(crate) fn writable(&self) -> &WritableRepo {
+        &self.writable
+    }
+
     /// Create a new split stream writer.
-    pub fn new(repo: &Arc<Repository<ObjectID>>, content_type: u64) -> Self {
+    ///
+    /// The `writable` token is carried so that subsequent object writes
+    /// (via [`write_external`] / [`done`]) skip redundant writable checks.
+    pub(crate) fn new(
+        repo: &Arc<Repository<ObjectID>>,
+        content_type: u64,
+        writable: WritableRepo,
+    ) -> Self {
         // SAFETY: we surely can't get an error writing the header to a Vec<u8>
         let writer = Encoder::new(vec![], 0).unwrap();
 
         Self {
             repo: Arc::clone(repo),
+            writable,
             content_type,
             inline_buffer: vec![],
             stream_refs: UniqueVec::new(),
@@ -491,9 +518,10 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
     /// Write externally-split data to the stream.
     ///
     /// The data is stored in the repository and a reference is written to the stream.
+    /// Uses the carried [`WritableRepo`] token to skip redundant writable checks.
     pub fn write_external(&mut self, data: &[u8]) -> Result<()> {
         self.total_size += data.len() as u64;
-        let id = self.repo.ensure_object(data)?;
+        let id = self.repo.ensure_object_impl(data, &self.writable)?;
         self.write_reference(id)
     }
 
@@ -501,9 +529,13 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
     ///
     /// The data is stored in the repository asynchronously and a reference is written to the stream.
     /// This method awaits the storage operation before returning.
+    /// Uses the carried [`WritableRepo`] token to skip redundant writable checks.
     pub async fn write_external_async(&mut self, data: Vec<u8>) -> Result<()> {
         self.total_size += data.len() as u64;
-        let id = self.repo.ensure_object_async(data).await?;
+        let self_ = Arc::clone(&self.repo);
+        let writable = self.writable;
+        let id = tokio::task::spawn_blocking(move || self_.ensure_object_impl(&data, &writable))
+            .await??;
         self.write_reference(id)
     }
 
@@ -599,8 +631,8 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
         buf.extend_from_slice(&stream);
         assert_eq!(buf.len() as u64, stream_end);
 
-        // Store the Vec<u8> into the repository
-        self.repo.ensure_object(&buf)
+        // Store the Vec<u8> into the repository (writable already checked)
+        self.repo.ensure_object_impl(&buf, &self.writable)
     }
 
     /// Finalizes the split stream asynchronously.
@@ -1014,7 +1046,7 @@ mod tests {
         let inline1 = generate_test_data(32, 0xAB);
         let inline2 = generate_test_data(48, 0xCD);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_inline(&inline1);
         writer.write_inline(&inline2);
         let stream_id = repo.write_stream(writer, "test-inline", None)?;
@@ -1041,7 +1073,7 @@ mod tests {
         // Compute expected fs-verity digest for this content
         let expected_digest: Sha256HashValue = compute_verity(&large_content);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&large_content)?;
         let stream_id = repo.write_stream(writer, "test-external", None)?;
 
@@ -1081,7 +1113,7 @@ mod tests {
         // Compute expected digest for the external content
         let expected_digest: Sha256HashValue = compute_verity(&file_content);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_inline(&header);
         writer.write_external(&file_content)?;
         writer.write_inline(&trailer);
@@ -1126,7 +1158,7 @@ mod tests {
         let expected_digest2: Sha256HashValue = compute_verity(&file2);
         let expected_digest3: Sha256HashValue = compute_verity(&file3);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&file1)?;
         writer.write_inline(&separator);
         writer.write_external(&file2)?;
@@ -1175,7 +1207,7 @@ mod tests {
         let repeated_digest: Sha256HashValue = compute_verity(&repeated_chunk);
         let unique_digest: Sha256HashValue = compute_verity(&unique_chunk);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&repeated_chunk)?;
         writer.write_external(&unique_chunk)?;
         writer.write_external(&repeated_chunk)?; // duplicate
@@ -1224,7 +1256,7 @@ mod tests {
         let expected_digest1: Sha256HashValue = compute_verity(&chunk1);
         let expected_digest2: Sha256HashValue = compute_verity(&chunk2);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_inline(&inline_data);
         writer.write_external(&chunk1)?;
         writer.write_external(&chunk2)?;
@@ -1263,7 +1295,7 @@ mod tests {
             // Compute expected digest
             let expected_digest: Sha256HashValue = compute_verity(&data);
 
-            let mut writer = repo.create_stream(0);
+            let mut writer = repo.create_stream(0)?;
             writer.write_external(&data)?;
             let stream_id = repo.write_stream(writer, "test-boundary", None)?;
 
@@ -1301,7 +1333,7 @@ mod tests {
         let repo = create_test_repo(&tmp.path().join("repo"))?;
         let content_type = 0xDEADBEEF_u64;
 
-        let mut writer = repo.create_stream(content_type);
+        let mut writer = repo.create_stream(content_type)?;
         writer.write_inline(b"test data");
         let stream_id = repo.write_stream(writer, "test-ctype", None)?;
 
@@ -1319,7 +1351,7 @@ mod tests {
         let inline_data = generate_test_data(100, 0x01);
         let external_data = generate_test_data(1000, 0x02);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_inline(&inline_data);
         writer.write_external(&external_data)?;
         let stream_id = repo.write_stream(writer, "test-size", None)?;
