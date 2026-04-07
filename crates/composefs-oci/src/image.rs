@@ -8,7 +8,7 @@
 //! and builds a complete filesystem by processing all layers in order. The `process_entry()` function
 //! handles individual tar entries and implements overlayfs whiteout semantics for proper layer merging.
 
-use std::{ffi::OsStr, os::unix::ffi::OsStrExt, rc::Rc};
+use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
 
 use anyhow::{Context, Result, ensure};
 use composefs::util::DigestWrite;
@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use composefs::{
     fsverity::FsVerityHashValue,
     repository::Repository,
-    tree::{Directory, FileSystem, Inode, Leaf, Stat},
+    tree::{Directory, FileSystem, Inode, Stat},
 };
 
 use containers_image_proxy::oci_spec::image::Digest as OciDigest;
@@ -53,13 +53,13 @@ pub fn process_entry<ObjectID: FsVerityHashValue>(
 
     let inode = match entry.item {
         TarItem::Directory => Inode::Directory(Box::from(Directory::new(entry.stat))),
-        TarItem::Leaf(content) => Inode::Leaf(Rc::new(Leaf {
-            stat: entry.stat,
-            content,
-        })),
+        TarItem::Leaf(content) => {
+            let id = filesystem.push_leaf(entry.stat, content);
+            Inode::leaf(id)
+        }
         TarItem::Hardlink(target) => {
             let (dir, filename) = filesystem.root.split(&target)?;
-            Inode::Leaf(dir.ref_leaf(filename)?)
+            Inode::leaf(dir.leaf_id(filename)?)
         }
     };
 
@@ -142,6 +142,13 @@ pub fn create_filesystem<ObjectID: FsVerityHashValue>(
     // See https://github.com/containers/composefs-rs/issues/132
     filesystem.transform_for_oci()?;
 
+    // Whiteout processing and layer merging can leave orphaned leaves.
+    filesystem.compact();
+
+    debug_assert!(
+        filesystem.fsck().is_ok(),
+        "create_filesystem produced invalid filesystem"
+    );
     Ok(filesystem)
 }
 
@@ -152,7 +159,7 @@ mod test {
         fsverity::Sha256HashValue,
         tree::{LeafContent, RegularFile, Stat},
     };
-    use std::{cell::RefCell, collections::BTreeMap, io::BufRead, path::PathBuf};
+    use std::{collections::BTreeMap, io::BufRead, path::PathBuf};
 
     use super::*;
 
@@ -164,7 +171,7 @@ mod test {
                 st_uid: 0,
                 st_gid: 0,
                 st_mtim_sec: 0,
-                xattrs: RefCell::new(BTreeMap::new()),
+                xattrs: BTreeMap::new(),
             },
             item: TarItem::Leaf(LeafContent::Regular(RegularFile::Inline([].into()))),
         }
@@ -178,7 +185,7 @@ mod test {
                 st_uid: 0,
                 st_gid: 0,
                 st_mtim_sec: 0,
-                xattrs: RefCell::new(BTreeMap::new()),
+                xattrs: BTreeMap::new(),
             },
             item: TarItem::Directory,
         }

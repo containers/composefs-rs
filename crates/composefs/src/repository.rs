@@ -3470,16 +3470,17 @@ mod tests {
     /// Make a test in-memory filesystem that only contains one externally referenced object
     fn make_test_fs(obj: &Sha512HashValue, size: u64) -> FileSystem<Sha512HashValue> {
         let mut fs: FileSystem<Sha512HashValue> = FileSystem::new(test_root_stat());
-        let inode = Inode::Leaf(std::rc::Rc::new(Leaf {
-            stat: Stat {
+        let leaf_id = fs.push_leaf(
+            Stat {
                 st_mode: 0o644,
                 st_uid: 0,
                 st_gid: 0,
                 st_mtim_sec: 0,
                 xattrs: Default::default(),
             },
-            content: LeafContent::Regular(RegularFile::External(obj.clone(), size)),
-        }));
+            LeafContent::Regular(RegularFile::External(obj.clone(), size)),
+        );
+        let inode = Inode::leaf(leaf_id);
         fs.root.insert(OsStr::new("data"), inode);
         fs
     }
@@ -3631,16 +3632,17 @@ mod tests {
         size2: u64,
     ) -> FileSystem<Sha512HashValue> {
         let mut fs = make_test_fs(obj1, size1);
-        let inode = Inode::Leaf(std::rc::Rc::new(Leaf {
-            stat: Stat {
+        let leaf_id = fs.push_leaf(
+            Stat {
                 st_mode: 0o644,
                 st_uid: 0,
                 st_gid: 0,
                 st_mtim_sec: 0,
                 xattrs: Default::default(),
             },
-            content: LeafContent::Regular(RegularFile::External(obj2.clone(), size2)),
-        }));
+            LeafContent::Regular(RegularFile::External(obj2.clone(), size2)),
+        );
+        let inode = Inode::leaf(leaf_id);
         fs.root.insert(OsStr::new("extra_data"), inode);
         fs
     }

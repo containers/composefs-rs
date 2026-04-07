@@ -2,11 +2,10 @@
 //! however the caller wants.
 
 use std::{
-    cell::RefCell,
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     ffi::OsStr,
+    marker::PhantomData,
     path::{Component, Path},
-    rc::Rc,
 };
 
 use thiserror::Error;
@@ -23,7 +22,13 @@ pub struct Stat {
     /// Modification time in seconds since Unix epoch.
     pub st_mtim_sec: i64,
     /// Extended attributes as key-value pairs.
-    pub xattrs: RefCell<BTreeMap<Box<OsStr>, Box<[u8]>>>,
+    pub xattrs: BTreeMap<Box<OsStr>, Box<[u8]>>,
+}
+
+impl Default for Stat {
+    fn default() -> Self {
+        Self::uninitialized()
+    }
 }
 
 impl Stat {
@@ -41,10 +46,14 @@ impl Stat {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
-            xattrs: RefCell::new(BTreeMap::new()),
+            xattrs: BTreeMap::new(),
         }
     }
 }
+
+/// Index into [`FileSystem`]'s leaves table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LeafId(pub usize);
 
 /// Content types for leaf nodes (non-directory files).
 #[derive(Debug)]
@@ -66,7 +75,10 @@ pub enum LeafContent<T> {
 impl<T> LeafContent<T> {
     /// Maps `Regular(&T)` to `Regular(U)` via a fallible function,
     /// passing all other variants through unchanged.
-    fn try_map_ref<U, E>(&self, f: impl FnOnce(&T) -> Result<U, E>) -> Result<LeafContent<U>, E> {
+    pub fn try_map_ref<U, E>(
+        &self,
+        f: impl FnOnce(&T) -> Result<U, E>,
+    ) -> Result<LeafContent<U>, E> {
         match self {
             LeafContent::Regular(t) => Ok(LeafContent::Regular(f(t)?)),
             LeafContent::BlockDevice(rdev) => Ok(LeafContent::BlockDevice(*rdev)),
@@ -101,8 +113,19 @@ pub struct Directory<T> {
 pub enum Inode<T> {
     /// A directory inode.
     Directory(Box<Directory<T>>),
-    /// A leaf inode (reference-counted to support hardlinks).
-    Leaf(Rc<Leaf<T>>),
+    /// A leaf inode, referencing an entry in the leaves table by index.
+    ///
+    /// The `PhantomData` ties the type parameter `T` to the enum without
+    /// requiring it to appear directly (since `LeafId` is type-erased).
+    /// Use [`Inode::leaf`] to construct this variant.
+    Leaf(LeafId, PhantomData<T>),
+}
+
+impl<T> Inode<T> {
+    /// Create a leaf inode referencing the given leaf table index.
+    pub fn leaf(id: LeafId) -> Self {
+        Inode::Leaf(id, PhantomData)
+    }
 }
 
 /// Errors that can occur when working with filesystem images.
@@ -123,60 +146,38 @@ pub enum ImageError {
     /// The entry exists but is not a regular file when a regular file was expected.
     #[error("Directory entry {0:?} is not a regular file")]
     IsNotRegular(Box<OsStr>),
+    /// A LeafId in the directory tree is out of bounds.
+    #[error("LeafId {0} is out of bounds (leaves table has {1} entries)")]
+    LeafIdOutOfBounds(usize, usize),
+    /// Leaves in the table are not referenced by any directory entry.
+    #[error("Orphaned leaves at indices {0:?}")]
+    OrphanedLeaves(Vec<usize>),
 }
 
 impl<T> Inode<T> {
     /// Returns a reference to the metadata for this inode.
-    pub fn stat(&self) -> &Stat {
+    ///
+    /// For leaf inodes, the `leaves` table is needed to resolve the `LeafId`.
+    pub fn stat<'a>(&'a self, leaves: &'a [Leaf<T>]) -> &'a Stat {
         match self {
             Inode::Directory(dir) => &dir.stat,
-            Inode::Leaf(leaf) => &leaf.stat,
+            Inode::Leaf(id, _) => &leaves[id.0].stat,
         }
     }
 
-    fn try_map_regular_impl<U, E>(
-        self,
-        f: &mut impl FnMut(&T) -> Result<U, E>,
-        rc_map: &mut HashMap<*const Leaf<T>, Rc<Leaf<U>>>,
-    ) -> Result<Inode<U>, E> {
+    /// Recursively changes the type parameter of an inode tree.
+    ///
+    /// [`LeafId`] indices pass through unchanged — only the phantom type
+    /// parameter on [`Inode::Leaf`] is updated.
+    fn retype<U>(self) -> Inode<U> {
         match self {
-            Inode::Directory(dir) => {
-                let new_dir = dir.try_map_regular_impl(f, rc_map)?;
-                Ok(Inode::Directory(Box::new(new_dir)))
-            }
-            Inode::Leaf(leaf_rc) => {
-                let ptr = Rc::as_ptr(&leaf_rc);
-                if let Some(existing) = rc_map.get(&ptr) {
-                    return Ok(Inode::Leaf(Rc::clone(existing)));
-                }
-                let new_content = leaf_rc.content.try_map_ref(f)?;
-                let new_leaf = Rc::new(Leaf {
-                    stat: leaf_rc.stat.clone(),
-                    content: new_content,
-                });
-                rc_map.insert(ptr, Rc::clone(&new_leaf));
-                Ok(Inode::Leaf(new_leaf))
-            }
+            Inode::Directory(dir) => Inode::Directory(Box::new(dir.retype::<U>())),
+            Inode::Leaf(id, _) => Inode::leaf(id),
         }
     }
 }
 
 impl<T> Directory<T> {
-    fn try_map_regular_impl<U, E>(
-        self,
-        f: &mut impl FnMut(&T) -> Result<U, E>,
-        rc_map: &mut HashMap<*const Leaf<T>, Rc<Leaf<U>>>,
-    ) -> Result<Directory<U>, E> {
-        let mut new_entries = BTreeMap::new();
-        for (name, inode) in self.entries {
-            new_entries.insert(name, inode.try_map_regular_impl(f, rc_map)?);
-        }
-        Ok(Directory {
-            stat: self.stat,
-            entries: new_entries,
-        })
-    }
-
     /// Creates a new directory with the given metadata.
     pub fn new(stat: Stat) -> Self {
         Self {
@@ -347,9 +348,10 @@ impl<T> Directory<T> {
         Ok((dir, filename))
     }
 
-    /// Takes a reference to the "leaf" file (not directory) with the given filename directly
-    /// contained in this directory.  This is usually done in preparation for creating a hardlink
-    /// or in order to avoid issues with the borrow checker when mutating the tree.
+    /// Returns the `LeafId` for the named non-directory entry.
+    ///
+    /// This is typically used to create hardlinks: directory entries sharing
+    /// the same `LeafId` are hardlinks to the same underlying leaf.
     ///
     /// # Arguments
     ///
@@ -358,13 +360,12 @@ impl<T> Directory<T> {
     ///
     /// # Return value
     ///
-    /// On success (the entry exists and is not a directory) the Rc is cloned and a new reference
-    /// is returned.
+    /// On success (the entry exists and is not a directory) the LeafId is returned.
     ///
     /// On failure, can return any number of errors from ImageError.
-    pub fn ref_leaf(&self, filename: &OsStr) -> Result<Rc<Leaf<T>>, ImageError> {
+    pub fn leaf_id(&self, filename: &OsStr) -> Result<LeafId, ImageError> {
         match self.entries.get(filename) {
-            Some(Inode::Leaf(leaf)) => Ok(Rc::clone(leaf)),
+            Some(Inode::Leaf(id, _)) => Ok(*id),
             Some(Inode::Directory(..)) => Err(ImageError::IsADirectory(Box::from(filename))),
             None => Err(ImageError::NotFound(Box::from(filename))),
         }
@@ -377,23 +378,31 @@ impl<T> Directory<T> {
     ///
     ///  * `filename`: the filename in the current directory.  If you need to support full
     ///    pathnames then you should call `Directory::split()` first.
+    ///  * `leaves`: the leaves table from the containing [`FileSystem`].
     ///
     /// # Return value
     ///
-    /// On success (the entry exists and is a regular file) then the return value is either:
-    ///  * the inline data
-    ///  * an external reference, with size information
+    /// On success (the entry exists and is a regular file) then a reference to the file
+    /// content `T` is returned.
     ///
     /// On failure, can return any number of errors from ImageError.
-    pub fn get_file<'a>(&'a self, filename: &OsStr) -> Result<&'a T, ImageError> {
-        self.get_file_opt(filename)?
+    pub fn get_file<'a>(
+        &'a self,
+        filename: &OsStr,
+        leaves: &'a [Leaf<T>],
+    ) -> Result<&'a T, ImageError> {
+        self.get_file_opt(filename, leaves)?
             .ok_or_else(|| ImageError::NotFound(Box::from(filename)))
     }
 
     /// Like [`Self::get_file()`] but maps [`ImageError::NotFound`] to [`Option`].
-    pub fn get_file_opt<'a>(&'a self, filename: &OsStr) -> Result<Option<&'a T>, ImageError> {
+    pub fn get_file_opt<'a>(
+        &'a self,
+        filename: &OsStr,
+        leaves: &'a [Leaf<T>],
+    ) -> Result<Option<&'a T>, ImageError> {
         match self.entries.get(filename) {
-            Some(Inode::Leaf(leaf)) => match &leaf.content {
+            Some(Inode::Leaf(id, _)) => match &leaves[id.0].content {
                 LeafContent::Regular(file) => Ok(Some(file)),
                 _ => Err(ImageError::IsNotRegular(filename.into())),
             },
@@ -489,12 +498,14 @@ impl<T> Directory<T> {
     ///
     /// Returns the maximum modification time among this directory's metadata
     /// and all files and subdirectories it contains.
-    pub fn newest_file(&self) -> i64 {
+    ///
+    /// The `leaves` table is needed to resolve leaf mtimes.
+    pub fn newest_file(&self, leaves: &[Leaf<T>]) -> i64 {
         let mut newest = self.stat.st_mtim_sec;
         for inode in self.entries.values() {
             let mtime = match inode {
-                Inode::Leaf(leaf) => leaf.stat.st_mtim_sec,
-                Inode::Directory(dir) => dir.newest_file(),
+                Inode::Leaf(id, _) => leaves[id.0].stat.st_mtim_sec,
+                Inode::Directory(dir) => dir.newest_file(leaves),
             };
             if mtime > newest {
                 newest = mtime;
@@ -502,13 +513,71 @@ impl<T> Directory<T> {
         }
         newest
     }
+
+    /// Recursively changes the type parameter of the directory tree.
+    ///
+    /// [`LeafId`] indices pass through unchanged — only the phantom type
+    /// parameter on [`Inode::Leaf`] is updated.
+    fn retype<U>(self) -> Directory<U> {
+        let entries = self
+            .entries
+            .into_iter()
+            .map(|(name, inode)| (name, inode.retype::<U>()))
+            .collect();
+        Directory {
+            stat: self.stat,
+            entries,
+        }
+    }
+
+    /// Counts how many times each LeafId is referenced in this directory tree.
+    fn count_leaf_refs(&self, refcount: &mut [u32]) {
+        for inode in self.entries.values() {
+            match inode {
+                Inode::Directory(dir) => dir.count_leaf_refs(refcount),
+                Inode::Leaf(id, _) => refcount[id.0] += 1,
+            }
+        }
+    }
+
+    /// Validates that all LeafIds are in bounds and counts references.
+    fn fsck_refs(&self, num_leaves: usize, refcount: &mut [u32]) -> Result<(), ImageError> {
+        for inode in self.entries.values() {
+            match inode {
+                Inode::Directory(dir) => dir.fsck_refs(num_leaves, refcount)?,
+                Inode::Leaf(id, _) => {
+                    if id.0 >= num_leaves {
+                        return Err(ImageError::LeafIdOutOfBounds(id.0, num_leaves));
+                    }
+                    refcount[id.0] += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Remaps all LeafIds in this directory tree using the given mapping.
+    fn remap_leaf_ids(&mut self, id_map: &[LeafId]) {
+        for inode in self.entries.values_mut() {
+            match inode {
+                Inode::Directory(dir) => dir.remap_leaf_ids(id_map),
+                Inode::Leaf(id, _) => *id = id_map[id.0],
+            }
+        }
+    }
 }
 
-/// A complete filesystem tree with a root directory.
+/// A complete filesystem tree with a root directory and a flat table of leaves.
+///
+/// Leaf nodes (non-directory files) are stored in a flat `Vec` and referenced
+/// by [`LeafId`] indices from the directory tree. This design is `Send + Sync`,
+/// supports hardlinks via shared `LeafId`, and avoids reference counting.
 #[derive(Debug)]
 pub struct FileSystem<T> {
     /// The root directory of the filesystem.
     pub root: Directory<T>,
+    /// Table of all leaf nodes; [`LeafId`] indexes into this vector.
+    pub leaves: Vec<Leaf<T>>,
 }
 
 impl<T> FileSystem<T> {
@@ -516,12 +585,20 @@ impl<T> FileSystem<T> {
     pub fn new(root_stat: Stat) -> Self {
         Self {
             root: Directory::new(root_stat),
+            leaves: Vec::new(),
         }
     }
 
     /// Sets the metadata for the root directory.
     pub fn set_root_stat(&mut self, stat: Stat) {
         self.root.stat = stat;
+    }
+
+    /// Pushes a new leaf into the leaves table and returns its [`LeafId`].
+    pub fn push_leaf(&mut self, stat: Stat, content: LeafContent<T>) -> LeafId {
+        let id = LeafId(self.leaves.len());
+        self.leaves.push(Leaf { stat, content });
+        id
     }
 
     /// Copies metadata from `/usr` to the root directory.
@@ -566,27 +643,50 @@ impl<T> FileSystem<T> {
 
     /// Applies a function to every [`Stat`] in the filesystem tree.
     ///
-    /// This visits the root directory and all descendants (directories and leaves),
-    /// calling the provided function with each node's `Stat`.
+    /// This visits the root directory and all descendant directories via the tree,
+    /// and each leaf stat exactly once via the flat leaves table.
     pub fn for_each_stat<F>(&self, f: F)
     where
         F: Fn(&Stat),
     {
-        fn visit_inode<T, F: Fn(&Stat)>(inode: &Inode<T>, f: &F) {
-            match inode {
-                Inode::Directory(dir) => visit_dir(dir, f),
-                Inode::Leaf(leaf) => f(&leaf.stat),
-            }
-        }
-
         fn visit_dir<T, F: Fn(&Stat)>(dir: &Directory<T>, f: &F) {
             f(&dir.stat);
-            for (_name, inode) in dir.entries.iter() {
-                visit_inode(inode, f);
+            for inode in dir.entries.values() {
+                if let Inode::Directory(subdir) = inode {
+                    visit_dir(subdir, f);
+                }
             }
         }
 
         visit_dir(&self.root, &f);
+        for leaf in &self.leaves {
+            f(&leaf.stat);
+        }
+    }
+
+    /// Applies a function to every [`Stat`] in the filesystem tree, mutably.
+    ///
+    /// This visits each directory stat via the tree, and each leaf stat exactly
+    /// once via the flat leaves table. No dedup needed since each leaf appears
+    /// exactly once in the table regardless of how many directory entries
+    /// reference it.
+    pub fn for_each_stat_mut<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&mut Stat),
+    {
+        fn visit_dir_mut<T, F: FnMut(&mut Stat)>(dir: &mut Directory<T>, f: &mut F) {
+            f(&mut dir.stat);
+            for inode in dir.entries.values_mut() {
+                if let Inode::Directory(subdir) = inode {
+                    visit_dir_mut(subdir, f);
+                }
+            }
+        }
+
+        visit_dir_mut(&mut self.root, &mut f);
+        for leaf in &mut self.leaves {
+            f(&mut leaf.stat);
+        }
     }
 
     /// Filters extended attributes across the entire filesystem tree.
@@ -595,12 +695,12 @@ impl<T> FileSystem<T> {
     /// This is useful for stripping build-time xattrs that shouldn't
     /// leak into the final image (e.g., `security.selinux` labels from
     /// the build host).
-    pub fn filter_xattrs<F>(&self, predicate: F)
+    pub fn filter_xattrs<F>(&mut self, predicate: F)
     where
         F: Fn(&OsStr) -> bool,
     {
-        self.for_each_stat(|stat| {
-            stat.xattrs.borrow_mut().retain(|k, _| predicate(k));
+        self.for_each_stat_mut(|stat| {
+            stat.xattrs.retain(|k, _| predicate(k));
         });
     }
 
@@ -655,26 +755,238 @@ impl<T> FileSystem<T> {
     /// Applies `f` to each `LeafContent::Regular(T)` to produce `LeafContent::Regular(U)`.
     /// All other leaf content variants (symlinks, devices, etc.) are passed through unchanged.
     ///
-    /// Hardlink sharing is preserved: if multiple directory entries point to the same
-    /// `Rc<Leaf<T>>`, the resulting tree will have entries pointing to the same `Rc<Leaf<U>>`.
+    /// Because hardlinks are index-based, directory tree indices pass through unchanged.
     /// The mapping function is called exactly once per unique leaf.
     pub fn try_map_regular<U, E>(
         self,
         mut f: impl FnMut(&T) -> Result<U, E>,
     ) -> Result<FileSystem<U>, E> {
-        let mut rc_map: HashMap<*const Leaf<T>, Rc<Leaf<U>>> = HashMap::new();
-        let root = self.root.try_map_regular_impl(&mut f, &mut rc_map)?;
-        Ok(FileSystem { root })
+        let new_leaves = self
+            .leaves
+            .into_iter()
+            .map(|leaf| {
+                let new_content = leaf.content.try_map_ref(&mut f)?;
+                Ok(Leaf {
+                    stat: leaf.stat,
+                    content: new_content,
+                })
+            })
+            .collect::<Result<_, E>>()?;
+        let root = self.root.retype::<U>();
+        Ok(FileSystem {
+            root,
+            leaves: new_leaves,
+        })
+    }
+
+    /// Removes unreferenced leaves and remaps all LeafIds.
+    ///
+    /// After removing entries from the tree, some leaves may become
+    /// unreferenced. This method compacts the leaves table by removing
+    /// dead entries and updating all LeafIds in the tree accordingly.
+    pub fn compact(&mut self) {
+        // 1. Count references to each LeafId
+        let mut refcount = vec![0u32; self.leaves.len()];
+        self.root.count_leaf_refs(&mut refcount);
+
+        // 2. Build old_id → new_id mapping, skipping dead entries
+        let mut id_map = vec![LeafId(0); self.leaves.len()];
+        let mut write_pos = 0;
+        for (old_id, &count) in refcount.iter().enumerate() {
+            if count > 0 {
+                id_map[old_id] = LeafId(write_pos);
+                write_pos += 1;
+            }
+        }
+
+        // 3. Compact the leaves vec (keep only live entries)
+        let mut new_leaves = Vec::with_capacity(write_pos);
+        for (old_id, leaf) in self.leaves.drain(..).enumerate() {
+            if refcount[old_id] > 0 {
+                new_leaves.push(leaf);
+            }
+        }
+        self.leaves = new_leaves;
+
+        // 4. Remap all LeafIds in the tree
+        self.root.remap_leaf_ids(&id_map);
+
+        debug_assert!(self.fsck().is_ok(), "compact() produced invalid filesystem");
+    }
+
+    /// Compute nlink counts for all leaves at once.
+    ///
+    /// Returns a `Vec` indexed by [`LeafId`] where each entry is the
+    /// number of directory entries referencing that leaf (i.e. the
+    /// hard link count).
+    pub fn nlinks(&self) -> Vec<u32> {
+        let mut refcount = vec![0u32; self.leaves.len()];
+        self.root.count_leaf_refs(&mut refcount);
+        refcount
+    }
+
+    /// Verify internal consistency of the filesystem.
+    ///
+    /// Checks that:
+    /// - All [`LeafId`] indices in the directory tree are within bounds
+    ///   of the leaves table
+    /// - All leaves in the table are referenced by at least one
+    ///   directory entry (no orphans)
+    ///
+    /// Returns `Ok(())` if the filesystem is consistent, or an error
+    /// describing the first inconsistency found.
+    pub fn fsck(&self) -> Result<(), ImageError> {
+        // Validate bounds and count references in one pass.
+        let mut refcount = vec![0u32; self.leaves.len()];
+        self.root.fsck_refs(self.leaves.len(), &mut refcount)?;
+
+        let orphans: Vec<usize> = refcount
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| **count == 0)
+            .map(|(i, _)| i)
+            .collect();
+        if !orphans.is_empty() {
+            return Err(ImageError::OrphanedLeaves(orphans));
+        }
+
+        Ok(())
+    }
+
+    /// Returns a [`DirectoryRef`] for the root directory.
+    pub fn as_dir(&self) -> DirectoryRef<'_, T> {
+        DirectoryRef {
+            dir: &self.root,
+            leaves: &self.leaves,
+        }
+    }
+
+    /// Returns a reference to the leaf with the given id.
+    pub fn leaf(&self, id: LeafId) -> &Leaf<T> {
+        &self.leaves[id.0]
+    }
+
+    /// Returns a mutable reference to the leaf with the given id.
+    pub fn leaf_mut(&mut self, id: LeafId) -> &mut Leaf<T> {
+        &mut self.leaves[id.0]
+    }
+}
+
+/// A read-only view of a [`Directory`] paired with the [`FileSystem`]'s
+/// leaves table, so that leaf-resolving methods don't need a separate
+/// `leaves` parameter.
+///
+/// Obtained via [`FileSystem::as_dir`] or [`DirectoryRef::get_directory`].
+#[derive(Debug)]
+pub struct DirectoryRef<'a, T> {
+    dir: &'a Directory<T>,
+    leaves: &'a [Leaf<T>],
+}
+
+// Manual Clone/Copy implementations to avoid requiring T: Clone/Copy,
+// since the struct only holds references.
+impl<T> Clone for DirectoryRef<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for DirectoryRef<'_, T> {}
+
+impl<T> std::ops::Deref for DirectoryRef<'_, T> {
+    type Target = Directory<T>;
+
+    fn deref(&self) -> &Self::Target {
+        self.dir
+    }
+}
+
+impl<'a, T> DirectoryRef<'a, T> {
+    /// Constructs a [`DirectoryRef`] from a directory reference and a leaves table.
+    ///
+    /// This is useful when you have a `&Directory<T>` obtained from tree
+    /// traversal (e.g., pattern matching on [`Inode::Directory`]) and want
+    /// to wrap it with its leaves table for convenient leaf resolution.
+    pub fn from_parts(dir: &'a Directory<T>, leaves: &'a [Leaf<T>]) -> Self {
+        DirectoryRef { dir, leaves }
+    }
+
+    /// Returns the underlying leaves table.
+    pub fn leaves(&self) -> &'a [Leaf<T>] {
+        self.leaves
+    }
+
+    /// Looks up a subdirectory by path, returning a new [`DirectoryRef`].
+    ///
+    /// Like [`Directory::get_directory`] but wraps the result in a
+    /// [`DirectoryRef`] that carries the leaves table.
+    pub fn get_directory_ref(&self, pathname: &OsStr) -> Result<DirectoryRef<'a, T>, ImageError> {
+        self.dir.get_directory(pathname).map(|dir| DirectoryRef {
+            dir,
+            leaves: self.leaves,
+        })
+    }
+
+    /// Looks up a subdirectory by path, returning `None` if not found.
+    ///
+    /// Like [`Directory::get_directory_opt`] but wraps the result in a
+    /// [`DirectoryRef`].
+    pub fn get_directory_ref_opt(
+        &self,
+        pathname: &OsStr,
+    ) -> Result<Option<DirectoryRef<'a, T>>, ImageError> {
+        self.dir.get_directory_opt(pathname).map(|opt| {
+            opt.map(|dir| DirectoryRef {
+                dir,
+                leaves: self.leaves,
+            })
+        })
+    }
+
+    /// Returns a reference to the leaf with the given id.
+    pub fn leaf(&self, id: LeafId) -> &'a Leaf<T> {
+        &self.leaves[id.0]
+    }
+
+    /// Splits a pathname into a [`DirectoryRef`] and the filename within it.
+    ///
+    /// Like [`Directory::split`] but wraps the resulting directory in a
+    /// [`DirectoryRef`].
+    pub fn split_ref<'n>(
+        &self,
+        pathname: &'n OsStr,
+    ) -> Result<(DirectoryRef<'a, T>, &'n OsStr), ImageError> {
+        let (dir, filename) = self.dir.split(pathname)?;
+        Ok((
+            DirectoryRef {
+                dir,
+                leaves: self.leaves,
+            },
+            filename,
+        ))
+    }
+
+    /// Returns the regular file content `T` for the named entry.
+    pub fn get_file(&self, filename: &OsStr) -> Result<&'a T, ImageError> {
+        self.dir.get_file(filename, self.leaves)
+    }
+
+    /// Like [`Self::get_file`] but maps not-found to `None`.
+    pub fn get_file_opt(&self, filename: &OsStr) -> Result<Option<&'a T>, ImageError> {
+        self.dir.get_file_opt(filename, self.leaves)
+    }
+
+    /// Recursively finds the newest modification time in this directory tree.
+    pub fn newest_file(&self) -> i64 {
+        self.dir.newest_file(self.leaves)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::ffi::{OsStr, OsString};
-    use std::rc::Rc;
 
     // We never store any actual data here
     #[derive(Debug, Default)]
@@ -687,7 +999,7 @@ mod tests {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
-            xattrs: RefCell::new(BTreeMap::new()),
+            xattrs: BTreeMap::new(),
         }
     }
 
@@ -698,24 +1010,28 @@ mod tests {
             st_uid: 1000,
             st_gid: 1000,
             st_mtim_sec: mtime,
-            xattrs: RefCell::new(BTreeMap::new()),
+            xattrs: BTreeMap::new(),
         }
     }
 
-    // Helper to create a simple Leaf (e.g., an empty inline file)
-    fn new_leaf_file(mtime: i64) -> Rc<Leaf<FileContents>> {
-        Rc::new(Leaf {
+    // Helper to create a leaf in the leaves vec and return the LeafId
+    fn push_leaf_file(leaves: &mut Vec<Leaf<FileContents>>, mtime: i64) -> LeafId {
+        let id = LeafId(leaves.len());
+        leaves.push(Leaf {
             stat: stat_with_mtime(mtime),
             content: LeafContent::Regular(FileContents::default()),
-        })
+        });
+        id
     }
 
-    // Helper to create a simple Leaf (symlink)
-    fn new_leaf_symlink(target: &str, mtime: i64) -> Rc<Leaf<FileContents>> {
-        Rc::new(Leaf {
+    // Helper to create a symlink leaf in the leaves vec and return the LeafId
+    fn push_leaf_symlink(leaves: &mut Vec<Leaf<FileContents>>, target: &str, mtime: i64) -> LeafId {
+        let id = LeafId(leaves.len());
+        leaves.push(Leaf {
             stat: stat_with_mtime(mtime),
             content: LeafContent::Symlink(OsString::from(target).into_boxed_os_str()),
-        })
+        });
+        id
     }
 
     // Helper to create an empty Directory Inode with a specific mtime
@@ -744,15 +1060,17 @@ mod tests {
 
     #[test]
     fn test_insert_and_get_leaf() {
+        let mut leaves = Vec::new();
+        let leaf_id = push_leaf_file(&mut leaves, 10);
+
         let mut dir = Directory::<FileContents>::new(default_stat());
-        let leaf = new_leaf_file(10);
-        dir.insert(OsStr::new("file.txt"), Inode::Leaf(Rc::clone(&leaf)));
+        dir.insert(OsStr::new("file.txt"), Inode::leaf(leaf_id));
         assert_eq!(dir.entries.len(), 1);
 
-        let retrieved_leaf_rc = dir.ref_leaf(OsStr::new("file.txt")).unwrap();
-        assert!(Rc::ptr_eq(&retrieved_leaf_rc, &leaf));
+        let retrieved_id = dir.leaf_id(OsStr::new("file.txt")).unwrap();
+        assert_eq!(retrieved_id, leaf_id);
 
-        let regular_file_content = dir.get_file(OsStr::new("file.txt")).unwrap();
+        let regular_file_content = dir.get_file(OsStr::new("file.txt"), &leaves).unwrap();
         assert!(matches!(regular_file_content, FileContents {}));
     }
 
@@ -775,9 +1093,12 @@ mod tests {
 
     #[test]
     fn test_get_directory_errors() {
-        let mut root = Directory::new(default_stat());
+        let mut leaves = Vec::new();
+        let leaf_id = push_leaf_file(&mut leaves, 30);
+
+        let mut root = Directory::<FileContents>::new(default_stat());
         root.insert(OsStr::new("dir1"), new_dir_inode(10));
-        root.insert(OsStr::new("file1"), Inode::Leaf(new_leaf_file(30)));
+        root.insert(OsStr::new("file1"), Inode::leaf(leaf_id));
 
         match root.get_directory(OsStr::new("nonexistent")) {
             Err(ImageError::NotFound(name)) => assert_eq!(name.to_str().unwrap(), "nonexistent"),
@@ -797,30 +1118,30 @@ mod tests {
 
     #[test]
     fn test_get_file_errors() {
-        let mut dir = Directory::new(default_stat());
-        dir.insert(OsStr::new("subdir"), new_dir_inode(10));
-        dir.insert(
-            OsStr::new("link.txt"),
-            Inode::Leaf(new_leaf_symlink("target", 20)),
-        );
+        let mut leaves = Vec::new();
+        let symlink_id = push_leaf_symlink(&mut leaves, "target", 20);
 
-        match dir.get_file(OsStr::new("nonexistent.txt")) {
+        let mut dir = Directory::<FileContents>::new(default_stat());
+        dir.insert(OsStr::new("subdir"), new_dir_inode(10));
+        dir.insert(OsStr::new("link.txt"), Inode::leaf(symlink_id));
+
+        match dir.get_file(OsStr::new("nonexistent.txt"), &leaves) {
             Err(ImageError::NotFound(name)) => {
                 assert_eq!(name.to_str().unwrap(), "nonexistent.txt")
             }
             _ => panic!("Expected NotFound"),
         }
         assert!(
-            dir.get_file_opt(OsStr::new("nonexistent.txt"))
+            dir.get_file_opt(OsStr::new("nonexistent.txt"), &leaves)
                 .unwrap()
                 .is_none()
         );
 
-        match dir.get_file(OsStr::new("subdir")) {
+        match dir.get_file(OsStr::new("subdir"), &leaves) {
             Err(ImageError::IsADirectory(name)) => assert_eq!(name.to_str().unwrap(), "subdir"),
             _ => panic!("Expected IsADirectory"),
         }
-        match dir.get_file(OsStr::new("link.txt")) {
+        match dir.get_file(OsStr::new("link.txt"), &leaves) {
             Err(ImageError::IsNotRegular(name)) => assert_eq!(name.to_str().unwrap(), "link.txt"),
             res => panic!("Expected IsNotRegular, got {res:?}"),
         }
@@ -828,8 +1149,11 @@ mod tests {
 
     #[test]
     fn test_remove() {
-        let mut dir = Directory::new(default_stat());
-        dir.insert(OsStr::new("file1.txt"), Inode::Leaf(new_leaf_file(10)));
+        let mut leaves = Vec::new();
+        let leaf_id = push_leaf_file(&mut leaves, 10);
+
+        let mut dir = Directory::<FileContents>::new(default_stat());
+        dir.insert(OsStr::new("file1.txt"), Inode::leaf(leaf_id));
         dir.insert(OsStr::new("subdir"), new_dir_inode(20));
         assert_eq!(dir.entries.len(), 2);
 
@@ -843,23 +1167,27 @@ mod tests {
 
     #[test]
     fn test_merge() {
-        let mut dir = Directory::new(default_stat());
+        let mut leaves = Vec::new();
+
+        let mut dir = Directory::<FileContents>::new(default_stat());
 
         // Merge Leaf onto empty
-        dir.merge(OsStr::new("item"), Inode::Leaf(new_leaf_file(10)));
+        let leaf_id = push_leaf_file(&mut leaves, 10);
+        dir.merge(OsStr::new("item"), Inode::leaf(leaf_id));
         assert_eq!(
             dir.entries
                 .get(OsStr::new("item"))
                 .unwrap()
-                .stat()
+                .stat(&leaves)
                 .st_mtim_sec,
             10
         );
 
         // Merge Directory onto existing Directory
+        let inner_leaf_id = push_leaf_file(&mut leaves, 85);
         let mut existing_dir_inode = new_dir_inode_with_stat(stat_with_mtime(80));
         if let Inode::Directory(ref mut ed_box) = existing_dir_inode {
-            ed_box.insert(OsStr::new("inner_file"), Inode::Leaf(new_leaf_file(85)));
+            ed_box.insert(OsStr::new("inner_file"), Inode::leaf(inner_leaf_id));
         }
         dir.insert(OsStr::new("merged_dir"), existing_dir_inode);
 
@@ -876,16 +1204,17 @@ mod tests {
         }
 
         // Merge Leaf onto Directory (replaces)
-        dir.merge(OsStr::new("merged_dir"), Inode::Leaf(new_leaf_file(100)));
+        let replace_leaf_id = push_leaf_file(&mut leaves, 100);
+        dir.merge(OsStr::new("merged_dir"), Inode::leaf(replace_leaf_id));
         assert!(matches!(
             dir.entries.get(OsStr::new("merged_dir")),
-            Some(Inode::Leaf(_))
+            Some(Inode::Leaf(..))
         ));
         assert_eq!(
             dir.entries
                 .get(OsStr::new("merged_dir"))
                 .unwrap()
-                .stat()
+                .stat(&leaves)
                 .st_mtim_sec,
             100
         );
@@ -893,8 +1222,11 @@ mod tests {
 
     #[test]
     fn test_clear() {
-        let mut dir = Directory::new(default_stat());
-        dir.insert(OsStr::new("file1"), Inode::Leaf(new_leaf_file(10)));
+        let mut leaves = Vec::new();
+        let leaf_id = push_leaf_file(&mut leaves, 10);
+
+        let mut dir = Directory::<FileContents>::new(default_stat());
+        dir.insert(OsStr::new("file1"), Inode::leaf(leaf_id));
         dir.stat.st_mtim_sec = 100;
 
         dir.clear();
@@ -904,36 +1236,42 @@ mod tests {
 
     #[test]
     fn test_newest_file() {
-        let mut root = Directory::new(stat_with_mtime(5));
-        assert_eq!(root.newest_file(), 5);
+        let mut leaves = Vec::new();
 
-        root.insert(OsStr::new("file1"), Inode::Leaf(new_leaf_file(10)));
-        assert_eq!(root.newest_file(), 10);
+        let mut root = Directory::new(stat_with_mtime(5));
+        assert_eq!(root.newest_file(&leaves), 5);
+
+        let leaf_id_10 = push_leaf_file(&mut leaves, 10);
+        root.insert(OsStr::new("file1"), Inode::leaf(leaf_id_10));
+        assert_eq!(root.newest_file(&leaves), 10);
 
         let subdir_stat = stat_with_mtime(15);
         let mut subdir = Box::new(Directory::new(subdir_stat));
-        subdir.insert(OsStr::new("subfile1"), Inode::Leaf(new_leaf_file(12)));
+        let leaf_id_12 = push_leaf_file(&mut leaves, 12);
+        subdir.insert(OsStr::new("subfile1"), Inode::leaf(leaf_id_12));
         root.insert(OsStr::new("subdir"), Inode::Directory(subdir));
-        assert_eq!(root.newest_file(), 15);
+        assert_eq!(root.newest_file(&leaves), 15);
 
         if let Some(Inode::Directory(sd)) = root.entries.get_mut(OsStr::new("subdir")) {
-            sd.insert(OsStr::new("subfile2"), Inode::Leaf(new_leaf_file(20)));
+            let leaf_id_20 = push_leaf_file(&mut leaves, 20);
+            sd.insert(OsStr::new("subfile2"), Inode::leaf(leaf_id_20));
         }
-        assert_eq!(root.newest_file(), 20);
+        assert_eq!(root.newest_file(&leaves), 20);
 
         root.stat.st_mtim_sec = 25;
-        assert_eq!(root.newest_file(), 25);
+        assert_eq!(root.newest_file(&leaves), 25);
     }
 
     #[test]
     fn test_iteration_entries_sorted_inodes() {
-        let mut dir = Directory::new(default_stat());
-        dir.insert(OsStr::new("b_file"), Inode::Leaf(new_leaf_file(10)));
+        let mut leaves = Vec::new();
+        let file_id = push_leaf_file(&mut leaves, 10);
+        let link_id = push_leaf_symlink(&mut leaves, "target", 30);
+
+        let mut dir = Directory::<FileContents>::new(default_stat());
+        dir.insert(OsStr::new("b_file"), Inode::leaf(file_id));
         dir.insert(OsStr::new("a_dir"), new_dir_inode(20));
-        dir.insert(
-            OsStr::new("c_link"),
-            Inode::Leaf(new_leaf_symlink("target", 30)),
-        );
+        dir.insert(OsStr::new("c_link"), Inode::leaf(link_id));
 
         let names_from_entries: Vec<&OsStr> = dir.entries().map(|(name, _)| name).collect();
         assert_eq!(names_from_entries.len(), 3); // BTreeMap iter is sorted
@@ -955,7 +1293,7 @@ mod tests {
         for inode in dir.inodes() {
             match inode {
                 Inode::Directory(_) => inode_types.push("dir"),
-                Inode::Leaf(_) => inode_types.push("leaf"),
+                Inode::Leaf(..) => inode_types.push("leaf"),
             }
         }
         assert_eq!(inode_types.len(), 3);
@@ -973,10 +1311,10 @@ mod tests {
             st_uid: 42,
             st_gid: 43,
             st_mtim_sec: 1234567890,
-            xattrs: RefCell::new(BTreeMap::from([(
+            xattrs: BTreeMap::from([(
                 Box::from(OsStr::new("security.selinux")),
                 Box::from(b"system_u:object_r:usr_t:s0".as_slice()),
-            )])),
+            )]),
         };
         let usr_dir = Directory {
             stat: usr_stat,
@@ -997,7 +1335,6 @@ mod tests {
             fs.root
                 .stat
                 .xattrs
-                .borrow()
                 .contains_key(OsStr::new("security.selinux"))
         );
     }
@@ -1019,7 +1356,7 @@ mod tests {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
-            xattrs: RefCell::new(BTreeMap::from([
+            xattrs: BTreeMap::from([
                 (
                     Box::from(OsStr::new("security.selinux")),
                     Box::from(b"label".as_slice()),
@@ -1032,20 +1369,20 @@ mod tests {
                     Box::from(OsStr::new("user.custom")),
                     Box::from(b"value".as_slice()),
                 ),
-            ])),
+            ]),
         };
-        let fs = FileSystem::<FileContents>::new(root_stat);
+        let mut fs = FileSystem::<FileContents>::new(root_stat);
 
         // Filter to keep only xattrs starting with "user."
         fs.filter_xattrs(|name| name.as_encoded_bytes().starts_with(b"user."));
 
-        let root_xattrs = fs.root.stat.xattrs.borrow();
-        assert_eq!(root_xattrs.len(), 1);
-        assert!(root_xattrs.contains_key(OsStr::new("user.custom")));
+        assert_eq!(fs.root.stat.xattrs.len(), 1);
+        assert!(fs.root.stat.xattrs.contains_key(OsStr::new("user.custom")));
     }
 
     #[test]
     fn test_canonicalize_run() {
+        let mut leaves = Vec::new();
         let mut fs = FileSystem::<FileContents>::new(default_stat());
 
         // Create /usr with specific mtime
@@ -1055,12 +1392,15 @@ mod tests {
 
         // Create /run with content and different mtime
         let mut run_dir = Directory::new(stat_with_mtime(99999));
-        run_dir.insert(OsStr::new("somefile"), Inode::Leaf(new_leaf_file(11111)));
+        let file_id = push_leaf_file(&mut leaves, 11111);
+        run_dir.insert(OsStr::new("somefile"), Inode::leaf(file_id));
         let mut subdir = Directory::new(stat_with_mtime(22222));
-        subdir.insert(OsStr::new("nested"), Inode::Leaf(new_leaf_file(33333)));
+        let nested_id = push_leaf_file(&mut leaves, 33333);
+        subdir.insert(OsStr::new("nested"), Inode::leaf(nested_id));
         run_dir.insert(OsStr::new("subdir"), Inode::Directory(Box::new(subdir)));
         fs.root
             .insert(OsStr::new("run"), Inode::Directory(Box::new(run_dir)));
+        fs.leaves = leaves;
 
         // Verify /run has content before
         assert_eq!(
@@ -1097,17 +1437,18 @@ mod tests {
     #[test]
     fn test_try_map_regular_basic() {
         let mut fs = FileSystem::<u32>::new(stat_with_mtime(1));
-        let leaf = Rc::new(Leaf {
+        fs.leaves.push(Leaf {
             stat: stat_with_mtime(10),
             content: LeafContent::Regular(42u32),
         });
-        fs.root.insert(OsStr::new("file.txt"), Inode::Leaf(leaf));
+        fs.root
+            .insert(OsStr::new("file.txt"), Inode::Leaf(LeafId(0), PhantomData));
 
         let mapped = fs
             .try_map_regular(|v: &u32| Ok::<String, std::fmt::Error>(format!("val={v}")))
             .unwrap();
 
-        let content = mapped.root.get_file(OsStr::new("file.txt")).unwrap();
+        let content = mapped.as_dir().get_file(OsStr::new("file.txt")).unwrap();
         assert_eq!(content, "val=42");
         assert_eq!(mapped.root.stat.st_mtim_sec, 1);
     }
@@ -1115,41 +1456,37 @@ mod tests {
     #[test]
     fn test_try_map_regular_non_regular_passthrough() {
         let mut fs = FileSystem::<u32>::new(default_stat());
-        fs.root.insert(
-            OsStr::new("link"),
-            Inode::Leaf(Rc::new(Leaf {
-                stat: stat_with_mtime(1),
-                content: LeafContent::Symlink(OsString::from("/target").into_boxed_os_str()),
-            })),
-        );
-        fs.root.insert(
-            OsStr::new("fifo"),
-            Inode::Leaf(Rc::new(Leaf {
-                stat: stat_with_mtime(2),
-                content: LeafContent::Fifo,
-            })),
-        );
-        fs.root.insert(
-            OsStr::new("sock"),
-            Inode::Leaf(Rc::new(Leaf {
-                stat: stat_with_mtime(3),
-                content: LeafContent::Socket,
-            })),
-        );
-        fs.root.insert(
-            OsStr::new("blk"),
-            Inode::Leaf(Rc::new(Leaf {
-                stat: stat_with_mtime(4),
-                content: LeafContent::BlockDevice(0x0801),
-            })),
-        );
-        fs.root.insert(
-            OsStr::new("chr"),
-            Inode::Leaf(Rc::new(Leaf {
-                stat: stat_with_mtime(5),
-                content: LeafContent::CharacterDevice(0x0501),
-            })),
-        );
+        fs.leaves.push(Leaf {
+            stat: stat_with_mtime(1),
+            content: LeafContent::Symlink(OsString::from("/target").into_boxed_os_str()),
+        });
+        fs.leaves.push(Leaf {
+            stat: stat_with_mtime(2),
+            content: LeafContent::Fifo,
+        });
+        fs.leaves.push(Leaf {
+            stat: stat_with_mtime(3),
+            content: LeafContent::Socket,
+        });
+        fs.leaves.push(Leaf {
+            stat: stat_with_mtime(4),
+            content: LeafContent::BlockDevice(0x0801),
+        });
+        fs.leaves.push(Leaf {
+            stat: stat_with_mtime(5),
+            content: LeafContent::CharacterDevice(0x0501),
+        });
+
+        fs.root
+            .insert(OsStr::new("link"), Inode::Leaf(LeafId(0), PhantomData));
+        fs.root
+            .insert(OsStr::new("fifo"), Inode::Leaf(LeafId(1), PhantomData));
+        fs.root
+            .insert(OsStr::new("sock"), Inode::Leaf(LeafId(2), PhantomData));
+        fs.root
+            .insert(OsStr::new("blk"), Inode::Leaf(LeafId(3), PhantomData));
+        fs.root
+            .insert(OsStr::new("chr"), Inode::Leaf(LeafId(4), PhantomData));
 
         let mapped = fs
             .try_map_regular(|_: &u32| Ok::<String, std::fmt::Error>("unused".into()))
@@ -1157,29 +1494,33 @@ mod tests {
 
         // Verify each non-regular variant is preserved
         match mapped.root.lookup(OsStr::new("link")) {
-            Some(Inode::Leaf(l)) => match &l.content {
+            Some(Inode::Leaf(id, _)) => match &mapped.leaf(*id).content {
                 LeafContent::Symlink(t) => assert_eq!(t.as_ref(), OsStr::new("/target")),
                 other => panic!("Expected Symlink, got {other:?}"),
             },
             other => panic!("Expected Leaf, got {other:?}"),
         }
         match mapped.root.lookup(OsStr::new("fifo")) {
-            Some(Inode::Leaf(l)) => assert!(matches!(l.content, LeafContent::Fifo)),
+            Some(Inode::Leaf(id, _)) => {
+                assert!(matches!(mapped.leaf(*id).content, LeafContent::Fifo))
+            }
             other => panic!("Expected Leaf/Fifo, got {other:?}"),
         }
         match mapped.root.lookup(OsStr::new("sock")) {
-            Some(Inode::Leaf(l)) => assert!(matches!(l.content, LeafContent::Socket)),
+            Some(Inode::Leaf(id, _)) => {
+                assert!(matches!(mapped.leaf(*id).content, LeafContent::Socket))
+            }
             other => panic!("Expected Leaf/Socket, got {other:?}"),
         }
         match mapped.root.lookup(OsStr::new("blk")) {
-            Some(Inode::Leaf(l)) => match &l.content {
+            Some(Inode::Leaf(id, _)) => match &mapped.leaf(*id).content {
                 LeafContent::BlockDevice(rdev) => assert_eq!(*rdev, 0x0801),
                 other => panic!("Expected BlockDevice, got {other:?}"),
             },
             other => panic!("Expected Leaf, got {other:?}"),
         }
         match mapped.root.lookup(OsStr::new("chr")) {
-            Some(Inode::Leaf(l)) => match &l.content {
+            Some(Inode::Leaf(id, _)) => match &mapped.leaf(*id).content {
                 LeafContent::CharacterDevice(rdev) => assert_eq!(*rdev, 0x0501),
                 other => panic!("Expected CharacterDevice, got {other:?}"),
             },
@@ -1190,58 +1531,59 @@ mod tests {
     #[test]
     fn test_try_map_regular_hardlink_sharing() {
         let mut fs = FileSystem::<u32>::new(default_stat());
-        let shared_leaf = Rc::new(Leaf {
+        // One leaf, two directory entries (hardlink)
+        fs.leaves.push(Leaf {
             stat: stat_with_mtime(10),
             content: LeafContent::Regular(99u32),
         });
-        // Insert the same Rc under two names (hardlink)
         fs.root
-            .insert(OsStr::new("a"), Inode::Leaf(Rc::clone(&shared_leaf)));
+            .insert(OsStr::new("a"), Inode::Leaf(LeafId(0), PhantomData));
         fs.root
-            .insert(OsStr::new("b"), Inode::Leaf(Rc::clone(&shared_leaf)));
+            .insert(OsStr::new("b"), Inode::Leaf(LeafId(0), PhantomData));
 
         // Track how many times the mapping function is called
-        let call_count = RefCell::new(0u32);
+        let mut call_count = 0u32;
         let mapped = fs
             .try_map_regular(|v: &u32| {
-                *call_count.borrow_mut() += 1;
+                call_count += 1;
                 Ok::<String, std::fmt::Error>(format!("mapped={v}"))
             })
             .unwrap();
 
-        // The mapping function should be called exactly once for the shared leaf
-        assert_eq!(*call_count.borrow(), 1);
+        // The mapping function should be called exactly once for the single leaf
+        assert_eq!(call_count, 1);
 
-        // Both entries should point to the same Rc
-        let rc_a = match mapped.root.lookup(OsStr::new("a")) {
-            Some(Inode::Leaf(l)) => Rc::clone(l),
+        // Both entries should point to the same LeafId
+        let id_a = match mapped.root.lookup(OsStr::new("a")) {
+            Some(Inode::Leaf(id, _)) => *id,
             other => panic!("Expected Leaf, got {other:?}"),
         };
-        let rc_b = match mapped.root.lookup(OsStr::new("b")) {
-            Some(Inode::Leaf(l)) => Rc::clone(l),
+        let id_b = match mapped.root.lookup(OsStr::new("b")) {
+            Some(Inode::Leaf(id, _)) => *id,
             other => panic!("Expected Leaf, got {other:?}"),
         };
-        assert!(Rc::ptr_eq(&rc_a, &rc_b));
-        assert_eq!(mapped.root.get_file(OsStr::new("a")).unwrap(), "mapped=99");
+        assert_eq!(id_a, id_b);
+        assert_eq!(
+            mapped.as_dir().get_file(OsStr::new("a")).unwrap(),
+            "mapped=99"
+        );
     }
 
     #[test]
     fn test_try_map_regular_error_propagation() {
         let mut fs = FileSystem::<u32>::new(default_stat());
-        fs.root.insert(
-            OsStr::new("ok"),
-            Inode::Leaf(Rc::new(Leaf {
-                stat: stat_with_mtime(1),
-                content: LeafContent::Regular(1u32),
-            })),
-        );
-        fs.root.insert(
-            OsStr::new("fail"),
-            Inode::Leaf(Rc::new(Leaf {
-                stat: stat_with_mtime(2),
-                content: LeafContent::Regular(0u32),
-            })),
-        );
+        fs.leaves.push(Leaf {
+            stat: stat_with_mtime(1),
+            content: LeafContent::Regular(1u32),
+        });
+        fs.leaves.push(Leaf {
+            stat: stat_with_mtime(2),
+            content: LeafContent::Regular(0u32),
+        });
+        fs.root
+            .insert(OsStr::new("ok"), Inode::Leaf(LeafId(0), PhantomData));
+        fs.root
+            .insert(OsStr::new("fail"), Inode::Leaf(LeafId(1), PhantomData));
 
         let result = fs.try_map_regular(|v: &u32| {
             if *v == 0 {
@@ -1257,6 +1599,7 @@ mod tests {
 
     #[test]
     fn test_transform_for_oci() {
+        let mut leaves = Vec::new();
         let mut fs = FileSystem::<FileContents>::new(default_stat());
 
         // Create /usr with specific metadata
@@ -1265,19 +1608,21 @@ mod tests {
             st_uid: 100,
             st_gid: 200,
             st_mtim_sec: 54321,
-            xattrs: RefCell::new(BTreeMap::from([(
+            xattrs: BTreeMap::from([(
                 Box::from(OsStr::new("user.test")),
                 Box::from(b"val".as_slice()),
-            )])),
+            )]),
         };
         fs.root
             .insert(OsStr::new("usr"), new_dir_inode_with_stat(usr_stat));
 
         // Create /run with content
         let mut run_dir = Directory::new(stat_with_mtime(99999));
-        run_dir.insert(OsStr::new("file"), Inode::Leaf(new_leaf_file(11111)));
+        let file_id = push_leaf_file(&mut leaves, 11111);
+        run_dir.insert(OsStr::new("file"), Inode::leaf(file_id));
         fs.root
             .insert(OsStr::new("run"), Inode::Directory(Box::new(run_dir)));
+        fs.leaves = leaves;
 
         // Transform for OCI
         fs.transform_for_oci().unwrap();
@@ -1292,5 +1637,147 @@ mod tests {
         let run = fs.root.get_directory(OsStr::new("run")).unwrap();
         assert!(run.entries.is_empty());
         assert_eq!(run.stat.st_mtim_sec, 54321);
+    }
+
+    #[test]
+    fn test_filesystem_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<FileSystem<u32>>();
+        assert_send_sync::<FileSystem<String>>();
+    }
+
+    #[test]
+    fn test_filesystem_hardlink_sharing() {
+        // Two directory entries pointing to the same LeafId
+        let mut fs = FileSystem::<u32>::new(default_stat());
+        fs.leaves.push(Leaf {
+            stat: stat_with_mtime(10),
+            content: LeafContent::Regular(99u32),
+        });
+        fs.root
+            .insert(OsStr::new("a"), Inode::Leaf(LeafId(0), PhantomData));
+        fs.root
+            .insert(OsStr::new("b"), Inode::Leaf(LeafId(0), PhantomData));
+
+        let id_a = fs.root.leaf_id(OsStr::new("a")).unwrap();
+        let id_b = fs.root.leaf_id(OsStr::new("b")).unwrap();
+        assert_eq!(id_a, id_b);
+    }
+
+    #[test]
+    fn test_try_map_regular_on_flat_fs() {
+        let mut fs = FileSystem::<u32>::new(default_stat());
+        fs.leaves.push(Leaf {
+            stat: stat_with_mtime(10),
+            content: LeafContent::Regular(42u32),
+        });
+        fs.leaves.push(Leaf {
+            stat: stat_with_mtime(20),
+            content: LeafContent::Symlink(OsString::from("/x").into_boxed_os_str()),
+        });
+        fs.root
+            .insert(OsStr::new("file"), Inode::Leaf(LeafId(0), PhantomData));
+        fs.root
+            .insert(OsStr::new("link"), Inode::Leaf(LeafId(1), PhantomData));
+
+        let mapped = fs
+            .try_map_regular(|v: &u32| Ok::<String, std::fmt::Error>(format!("val={v}")))
+            .unwrap();
+
+        // Check mapped leaf
+        match &mapped.leaf(LeafId(0)).content {
+            LeafContent::Regular(s) => assert_eq!(s, "val=42"),
+            other => panic!("Expected Regular, got {other:?}"),
+        }
+        // Non-regular passthrough
+        match &mapped.leaf(LeafId(1)).content {
+            LeafContent::Symlink(t) => assert_eq!(t.as_ref(), OsStr::new("/x")),
+            other => panic!("Expected Symlink, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_compact() {
+        let mut fs = FileSystem::<u32>::new(default_stat());
+        // Push 3 leaves; only reference 0 and 2
+        fs.leaves.push(Leaf {
+            stat: stat_with_mtime(10),
+            content: LeafContent::Regular(1u32),
+        });
+        fs.leaves.push(Leaf {
+            stat: stat_with_mtime(20),
+            content: LeafContent::Regular(2u32),
+        });
+        fs.leaves.push(Leaf {
+            stat: stat_with_mtime(30),
+            content: LeafContent::Regular(3u32),
+        });
+        fs.root
+            .insert(OsStr::new("a"), Inode::Leaf(LeafId(0), PhantomData));
+        fs.root
+            .insert(OsStr::new("c"), Inode::Leaf(LeafId(2), PhantomData));
+
+        fs.compact();
+
+        assert_eq!(fs.leaves.len(), 2);
+        // "a" should now be LeafId(0) and "c" should be LeafId(1)
+        let id_a = fs.root.leaf_id(OsStr::new("a")).unwrap();
+        let id_c = fs.root.leaf_id(OsStr::new("c")).unwrap();
+        assert_eq!(id_a, LeafId(0));
+        assert_eq!(id_c, LeafId(1));
+        // Verify content is correct after compaction
+        match &fs.leaf(id_a).content {
+            LeafContent::Regular(v) => assert_eq!(*v, 1),
+            _ => panic!("Wrong content"),
+        }
+        match &fs.leaf(id_c).content {
+            LeafContent::Regular(v) => assert_eq!(*v, 3),
+            _ => panic!("Wrong content"),
+        }
+    }
+
+    #[test]
+    fn test_nlink() {
+        let mut fs = FileSystem::<u32>::new(default_stat());
+        fs.leaves.push(Leaf {
+            stat: stat_with_mtime(10),
+            content: LeafContent::Regular(42u32),
+        });
+        fs.leaves.push(Leaf {
+            stat: stat_with_mtime(20),
+            content: LeafContent::Regular(99u32),
+        });
+        // Leaf 0 referenced twice (hardlink), leaf 1 referenced once
+        fs.root
+            .insert(OsStr::new("a"), Inode::Leaf(LeafId(0), PhantomData));
+        fs.root
+            .insert(OsStr::new("b"), Inode::Leaf(LeafId(0), PhantomData));
+        fs.root
+            .insert(OsStr::new("c"), Inode::Leaf(LeafId(1), PhantomData));
+
+        assert_eq!(fs.nlinks()[LeafId(0).0], 2);
+        assert_eq!(fs.nlinks()[LeafId(1).0], 1);
+
+        let nlinks = fs.nlinks();
+        assert_eq!(nlinks, vec![2, 1]);
+    }
+
+    #[test]
+    fn test_for_each_stat_mut() {
+        let mut fs = FileSystem::<u32>::new(stat_with_mtime(100));
+        fs.leaves.push(Leaf {
+            stat: stat_with_mtime(200),
+            content: LeafContent::Regular(1u32),
+        });
+        fs.root
+            .insert(OsStr::new("f"), Inode::Leaf(LeafId(0), PhantomData));
+
+        // Double all mtimes
+        fs.for_each_stat_mut(|stat| {
+            stat.st_mtim_sec *= 2;
+        });
+
+        assert_eq!(fs.root.stat.st_mtim_sec, 200);
+        assert_eq!(fs.leaves[0].stat.st_mtim_sec, 400);
     }
 }

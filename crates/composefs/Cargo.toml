@@ -33,6 +33,7 @@ xxhash-rust = { version = "0.8.2", default-features = false, features = ["xxh32"
 zerocopy = { version = "0.8.0", default-features = false, features = ["derive", "std"] }
 zstd = { version = "0.13.0", default-features = false }
 rand = { version = "0.10.0", default-features = true }
+tokio-stream = "0.1.18"
 
 [dev-dependencies]
 cap-std = { version = "4.0.0", default-features = false }

@@ -16,7 +16,7 @@ use anyhow::{Result, bail};
 use composefs::{
     fsverity::FsVerityHashValue,
     repository::Repository,
-    tree::{Directory, FileSystem, ImageError, Inode, LeafContent, RegularFile},
+    tree::{DirectoryRef, FileSystem, ImageError, Inode, LeafContent, RegularFile},
 };
 
 use crate::cmdline::{make_cmdline_composefs, split_cmdline};
@@ -226,7 +226,7 @@ impl<ObjectID: FsVerityHashValue> Type1Entry<ObjectID> {
     pub fn load(
         filename: &OsStr,
         file: &RegularFile<ObjectID>,
-        root: &Directory<ObjectID>,
+        root: DirectoryRef<'_, ObjectID>,
         repo: &Repository<ObjectID>,
     ) -> Result<Self> {
         let entry = BootLoaderEntryFile::new(from_utf8(&composefs::fs::read_file(file, repo)?)?);
@@ -234,7 +234,7 @@ impl<ObjectID: FsVerityHashValue> Type1Entry<ObjectID> {
         let mut files = HashMap::new();
         for key in ["linux", "initrd", "efi"] {
             for pathname in entry.get_values(key) {
-                let (dir, filename) = root.split(pathname.as_ref())?;
+                let (dir, filename) = root.split_ref(pathname.as_ref())?;
                 files.insert(Box::from(pathname), dir.get_file(filename)?.clone());
             }
         }
@@ -256,20 +256,22 @@ impl<ObjectID: FsVerityHashValue> Type1Entry<ObjectID> {
     /// # Returns
     ///
     /// A vector of all Type1Entry objects found in /boot/loader/entries
-    pub fn load_all(root: &Directory<ObjectID>, repo: &Repository<ObjectID>) -> Result<Vec<Self>> {
+    pub fn load_all(fs: &FileSystem<ObjectID>, repo: &Repository<ObjectID>) -> Result<Vec<Self>> {
         let mut entries = vec![];
+        let root = fs.as_dir();
 
-        match root.get_directory("/boot/loader/entries".as_ref()) {
+        match root.get_directory_ref("/boot/loader/entries".as_ref()) {
             Ok(entries_dir) => {
                 for (filename, inode) in entries_dir.entries() {
                     if !filename.as_bytes().ends_with(b".conf") {
                         continue;
                     }
 
-                    let Inode::Leaf(leaf) = inode else {
+                    let Inode::Leaf(leaf_id, _) = inode else {
                         bail!("/boot/loader/entries/{filename:?} is a directory");
                     };
 
+                    let leaf = fs.leaf(*leaf_id);
                     let LeafContent::Regular(file) = &leaf.content else {
                         bail!("/boot/loader/entries/{filename:?} is not a regular file");
                     };
@@ -336,7 +338,7 @@ impl<ObjectID: FsVerityHashValue> Type2Entry<ObjectID> {
     // Find UKI components, the UKI PE binary and other UKI addons,
     // if any, in the provided directory
     fn find_uki_components(
-        dir: &Directory<ObjectID>,
+        dir: DirectoryRef<'_, ObjectID>,
         entries: &mut Vec<Self>,
         path: &mut PathBuf,
         kver: &Option<Box<OsStr>>,
@@ -347,8 +349,9 @@ impl<ObjectID: FsVerityHashValue> Type2Entry<ObjectID> {
             // Collect all UKI extensions
             // Usually we'll find them in the root with directories ending in `.efi.extra.d` for kernel
             // specific addons. Global addons are found in `loader/addons`
-            if let Inode::Directory(dir) = inode {
-                Self::find_uki_components(dir, entries, path, kver)?;
+            if let Inode::Directory(subdir) = inode {
+                let subdir_ref = DirectoryRef::from_parts(subdir, dir.leaves());
+                Self::find_uki_components(subdir_ref, entries, path, kver)?;
                 path.pop();
                 continue;
             }
@@ -358,10 +361,11 @@ impl<ObjectID: FsVerityHashValue> Type2Entry<ObjectID> {
                 continue;
             }
 
-            let Inode::Leaf(leaf) = inode else {
+            let Inode::Leaf(leaf_id, _) = inode else {
                 bail!("{filename:?} is a directory");
             };
 
+            let leaf = dir.leaf(*leaf_id);
             let LeafContent::Regular(file) = &leaf.content else {
                 bail!("{filename:?} is not a regular file");
             };
@@ -392,10 +396,11 @@ impl<ObjectID: FsVerityHashValue> Type2Entry<ObjectID> {
     /// # Returns
     ///
     /// A vector of all Type2Entry objects found
-    pub fn load_all(root: &Directory<ObjectID>) -> Result<Vec<Self>> {
+    pub fn load_all(fs: &FileSystem<ObjectID>) -> Result<Vec<Self>> {
         let mut entries = vec![];
+        let root = fs.as_dir();
 
-        match root.get_directory("/boot/EFI/Linux".as_ref()) {
+        match root.get_directory_ref("/boot/EFI/Linux".as_ref()) {
             Ok(entries_dir) => {
                 Self::find_uki_components(entries_dir, &mut entries, &mut PathBuf::new(), &None)?
             }
@@ -403,15 +408,16 @@ impl<ObjectID: FsVerityHashValue> Type2Entry<ObjectID> {
             Err(other) => Err(other)?,
         };
 
-        match root.get_directory("/usr/lib/modules".as_ref()) {
+        match root.get_directory_ref("/usr/lib/modules".as_ref()) {
             Ok(modules_dir) => {
                 for (kver, inode) in modules_dir.entries() {
                     let Inode::Directory(dir) = inode else {
                         continue;
                     };
 
+                    let dir_ref = DirectoryRef::from_parts(dir, root.leaves());
                     Self::find_uki_components(
-                        dir,
+                        dir_ref,
                         &mut entries,
                         &mut PathBuf::new(),
                         &Some(Box::from(kver)),
@@ -490,20 +496,22 @@ initrd /{id}/initramfs.img
     /// # Returns
     ///
     /// A vector of all UsrLibModulesVmlinuz entries found
-    pub fn load_all(root: &Directory<ObjectID>) -> Result<Vec<Self>> {
+    pub fn load_all(fs: &FileSystem<ObjectID>) -> Result<Vec<Self>> {
         let mut entries = vec![];
+        let root = fs.as_dir();
 
-        match root.get_directory("/usr/lib/modules".as_ref()) {
+        match root.get_directory_ref("/usr/lib/modules".as_ref()) {
             Ok(modules_dir) => {
                 for (kver, inode) in modules_dir.entries() {
                     let Inode::Directory(dir) = inode else {
                         continue;
                     };
 
-                    if let Ok(vmlinuz) = dir.get_file("vmlinuz".as_ref()) {
+                    let dir_ref = DirectoryRef::from_parts(dir, root.leaves());
+                    if let Ok(vmlinuz) = dir_ref.get_file("vmlinuz".as_ref()) {
                         // TODO: maybe initramfs should be mandatory: the kernel isn't useful
                         // without it
-                        let initramfs = dir.get_file("initramfs.img".as_ref()).ok();
+                        let initramfs = dir_ref.get_file("initramfs.img".as_ref()).ok();
                         let os_release = root.get_file("/usr/lib/os-release".as_ref()).ok();
                         entries.push(Self {
                             kver: Box::from(std::str::from_utf8(kver.as_bytes())?),
@@ -556,13 +564,13 @@ pub fn get_boot_resources<ObjectID: FsVerityHashValue>(
 ) -> Result<Vec<BootEntry<ObjectID>>> {
     let mut entries = vec![];
 
-    for e in Type1Entry::load_all(&image.root, repo)? {
+    for e in Type1Entry::load_all(image, repo)? {
         entries.push(BootEntry::Type1(e));
     }
-    for e in Type2Entry::load_all(&image.root)? {
+    for e in Type2Entry::load_all(image)? {
         entries.push(BootEntry::Type2(e));
     }
-    for e in UsrLibModulesVmlinuz::load_all(&image.root)? {
+    for e in UsrLibModulesVmlinuz::load_all(image)? {
         entries.push(BootEntry::UsrLibModulesVmLinuz(e));
     }
 

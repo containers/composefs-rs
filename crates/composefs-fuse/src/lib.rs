@@ -13,7 +13,6 @@ use std::{
         fd::{AsFd, AsRawFd, OwnedFd},
         unix::ffi::OsStrExt,
     },
-    rc::Rc,
     time::{Duration, SystemTime},
 };
 
@@ -34,41 +33,98 @@ use rustix::{
 
 use composefs::{
     fsverity::FsVerityHashValue,
+    generic_tree::LeafId,
     mount::FsHandle,
     repository::Repository,
-    tree::{Directory, Inode, Leaf, LeafContent, RegularFile, Stat},
+    tree::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
 };
 
 const TTL: Duration = Duration::from_secs(1_000_000);
 
-#[derive(Debug, Clone)]
-enum InodeRef<'a, ObjectID: FsVerityHashValue> {
-    Directory(&'a Directory<ObjectID>, u64),
-    Leaf(&'a Rc<Leaf<ObjectID>>),
+/// FUSE inode number. Assigned eagerly at mount time.
+///
+/// Inode 1 is the root directory, then all other nodes get sequential
+/// numbers from a depth-first walk. The numbering is an internal FUSE
+/// concern and not exposed in the public API.
+type Ino = u64;
+
+/// Precomputed inode number assignments for the entire filesystem tree.
+///
+/// Directories are identified by pointer (stable because the tree is
+/// borrowed immutably for the lifetime of the FUSE session). Leaves
+/// are identified by `LeafId`.
+#[derive(Debug)]
+struct InodeMap<ObjectID: FsVerityHashValue> {
+    /// Directory pointer → inode number.
+    dir_inos: HashMap<*const Directory<ObjectID>, Ino>,
+    /// LeafId → inode number. Indexed by `LeafId.0`.
+    /// Hardlinked leaves (same `LeafId`) naturally get the same ino.
+    leaf_inos: Vec<Ino>,
 }
 
-#[derive(Debug)]
-enum OpenHandle {
-    Fd(OwnedFd),
-    Data(Box<[u8]>),
+impl<ObjectID: FsVerityHashValue> InodeMap<ObjectID> {
+    /// Walk the tree and assign sequential inode numbers.
+    fn build(fs: &FileSystem<ObjectID>) -> Self {
+        let mut next_ino: Ino = 1; // root = 1
+        let mut dir_inos = HashMap::new();
+        let mut leaf_inos = vec![0u64; fs.leaves.len()];
+
+        fn walk<O: FsVerityHashValue>(
+            dir: &Directory<O>,
+            next_ino: &mut Ino,
+            dir_inos: &mut HashMap<*const Directory<O>, Ino>,
+            leaf_inos: &mut [Ino],
+        ) {
+            let ino = *next_ino;
+            *next_ino += 1;
+            dir_inos.insert(dir as *const _, ino);
+
+            for (_, inode) in dir.entries() {
+                match inode {
+                    Inode::Directory(subdir) => walk(subdir, next_ino, dir_inos, leaf_inos),
+                    Inode::Leaf(id, _) => {
+                        if leaf_inos[id.0] == 0 {
+                            leaf_inos[id.0] = *next_ino;
+                            *next_ino += 1;
+                        }
+                        // Hardlinks: same LeafId keeps the same ino.
+                    }
+                }
+            }
+        }
+
+        walk(&fs.root, &mut next_ino, &mut dir_inos, &mut leaf_inos);
+        InodeMap {
+            dir_inos,
+            leaf_inos,
+        }
+    }
+
+    fn dir_ino(&self, dir: &Directory<ObjectID>) -> Ino {
+        self.dir_inos[&(dir as *const _)]
+    }
+
+    fn leaf_ino(&self, id: LeafId) -> Ino {
+        self.leaf_inos[id.0]
+    }
+
+    fn inode_ino(&self, inode: &Inode<ObjectID>) -> Ino {
+        match inode {
+            Inode::Directory(dir) => self.dir_ino(dir),
+            Inode::Leaf(id, _) => self.leaf_ino(*id),
+        }
+    }
+}
+
+/// A reference to a filesystem node, used for FUSE inode lookup.
+#[derive(Debug, Clone)]
+enum InodeRef<'a, ObjectID: FsVerityHashValue> {
+    Directory(&'a Directory<ObjectID>, Ino),
+    Leaf(LeafId, &'a Leaf<ObjectID>),
 }
 
 impl<'a, ObjectID: FsVerityHashValue> InodeRef<'a, ObjectID> {
-    fn new(inode: &'a Inode<ObjectID>, parent: u64) -> Self {
-        match inode {
-            Inode::Directory(dir) => InodeRef::Directory(dir, parent),
-            Inode::Leaf(leaf) => InodeRef::Leaf(leaf),
-        }
-    }
-
-    fn ino(&self) -> u64 {
-        match self {
-            InodeRef::Directory(dir, ..) => *dir as *const Directory<ObjectID> as u64,
-            InodeRef::Leaf(leaf) => Rc::as_ptr(leaf) as u64,
-        }
-    }
-
-    fn nlink(&self) -> u32 {
+    fn nlink(&self, nlink_map: &[u32]) -> u32 {
         (match self {
             InodeRef::Directory(dir, ..) => {
                 2 + dir
@@ -76,14 +132,14 @@ impl<'a, ObjectID: FsVerityHashValue> InodeRef<'a, ObjectID> {
                     .filter(|i| matches!(i, Inode::Directory(..)))
                     .count()
             }
-            InodeRef::Leaf(leaf) => Rc::strong_count(leaf),
+            InodeRef::Leaf(leaf_id, _) => nlink_map[leaf_id.0] as usize,
         }) as u32
     }
 
     fn rdev(&self) -> u32 {
         (match self {
             InodeRef::Directory(..) => 0,
-            InodeRef::Leaf(leaf) => match &leaf.content {
+            InodeRef::Leaf(_, leaf) => match &leaf.content {
                 LeafContent::BlockDevice(rdev) | LeafContent::CharacterDevice(rdev) => *rdev,
                 _ => 0,
             },
@@ -93,32 +149,28 @@ impl<'a, ObjectID: FsVerityHashValue> InodeRef<'a, ObjectID> {
     fn kind(&self) -> FileType {
         match self {
             InodeRef::Directory(..) => FileType::Directory,
-            InodeRef::Leaf(leaf) => Self::leaf_kind(leaf),
-        }
-    }
-
-    fn leaf_kind(leaf: &Leaf<ObjectID>) -> FileType {
-        match leaf.content {
-            LeafContent::BlockDevice(..) => FileType::BlockDevice,
-            LeafContent::CharacterDevice(..) => FileType::CharDevice,
-            LeafContent::Fifo => FileType::NamedPipe,
-            LeafContent::Regular(..) => FileType::RegularFile,
-            LeafContent::Socket => FileType::Socket,
-            LeafContent::Symlink(..) => FileType::Symlink,
+            InodeRef::Leaf(_, leaf) => match leaf.content {
+                LeafContent::BlockDevice(..) => FileType::BlockDevice,
+                LeafContent::CharacterDevice(..) => FileType::CharDevice,
+                LeafContent::Fifo => FileType::NamedPipe,
+                LeafContent::Regular(..) => FileType::RegularFile,
+                LeafContent::Socket => FileType::Socket,
+                LeafContent::Symlink(..) => FileType::Symlink,
+            },
         }
     }
 
     fn stat(&self) -> &'a Stat {
         match self {
             InodeRef::Directory(dir, ..) => &dir.stat,
-            InodeRef::Leaf(leaf) => &leaf.stat,
+            InodeRef::Leaf(_, leaf) => &leaf.stat,
         }
     }
 
     fn size(&self) -> u64 {
         match self {
             InodeRef::Directory(..) => 0,
-            InodeRef::Leaf(leaf) => match &leaf.content {
+            InodeRef::Leaf(_, leaf) => match &leaf.content {
                 LeafContent::Regular(RegularFile::Inline(data)) => data.len() as u64,
                 LeafContent::Regular(RegularFile::External(.., size)) => *size,
                 _ => 0,
@@ -126,12 +178,12 @@ impl<'a, ObjectID: FsVerityHashValue> InodeRef<'a, ObjectID> {
         }
     }
 
-    fn fileattr(&self) -> FileAttr {
+    fn fileattr(&self, ino: Ino, nlink_map: &[u32]) -> FileAttr {
         let stat = self.stat();
         let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_mtim_sec as u64);
 
         FileAttr {
-            ino: self.ino(),
+            ino,
             size: self.size(),
             blocks: 1,
             atime: mtime,
@@ -140,7 +192,7 @@ impl<'a, ObjectID: FsVerityHashValue> InodeRef<'a, ObjectID> {
             crtime: mtime,
             kind: self.kind(),
             perm: stat.st_mode as u16,
-            nlink: self.nlink(),
+            nlink: self.nlink(nlink_map),
             uid: stat.st_uid,
             gid: stat.st_gid,
             rdev: self.rdev(),
@@ -151,30 +203,34 @@ impl<'a, ObjectID: FsVerityHashValue> InodeRef<'a, ObjectID> {
 }
 
 #[derive(Debug)]
+enum OpenHandle {
+    Fd(OwnedFd),
+    Data(Box<[u8]>),
+}
+
+#[derive(Debug)]
 struct TreeFuse<'a, ObjectID: FsVerityHashValue> {
     repo: &'a Repository<ObjectID>,
-    inodes: HashMap<u64, InodeRef<'a, ObjectID>>,
-    attrs: HashMap<u64, FileAttr>,
+    fs: &'a FileSystem<ObjectID>,
+    inode_map: InodeMap<ObjectID>,
+    nlink_map: Vec<u32>,
+    inodes: HashMap<Ino, InodeRef<'a, ObjectID>>,
+    attrs: HashMap<Ino, FileAttr>,
     handles: HashMap<u64, OpenHandle>,
     next_fh: u64,
 }
 
 impl<'a, ObjectID: FsVerityHashValue> TreeFuse<'a, ObjectID> {
-    fn inode_ref(&mut self, inode: &'a Inode<ObjectID>, parent: u64) -> InodeRef<'a, ObjectID> {
-        let iref = InodeRef::new(inode, parent);
-        self.inodes.insert(iref.ino(), iref.clone());
-        iref
-    }
-
-    fn iref_fileattr(&mut self, iref: &InodeRef<ObjectID>) -> &FileAttr {
-        self.attrs.insert(iref.ino(), iref.fileattr());
-        self.attrs.get(&iref.ino()).unwrap()
-    }
-
-    fn inode_fileattr(&mut self, inode: &'a Inode<ObjectID>, parent: u64) -> &FileAttr {
-        let iref = self.inode_ref(inode, parent);
-        self.attrs.insert(iref.ino(), iref.fileattr());
-        self.attrs.get(&iref.ino()).unwrap()
+    fn register_inode(&mut self, inode: &'a Inode<ObjectID>, parent: Ino) -> (Ino, FileType) {
+        let ino = self.inode_map.inode_ino(inode);
+        let iref = match inode {
+            Inode::Directory(dir) => InodeRef::Directory(dir, parent),
+            Inode::Leaf(leaf_id, _) => InodeRef::Leaf(*leaf_id, self.fs.leaf(*leaf_id)),
+        };
+        let kind = iref.kind();
+        self.attrs.insert(ino, iref.fileattr(ino, &self.nlink_map));
+        self.inodes.insert(ino, iref);
+        (ino, kind)
     }
 }
 
@@ -189,13 +245,13 @@ impl<ObjectID: FsVerityHashValue> Filesystem for TreeFuse<'_, ObjectID> {
             log::error!("lookup({parent}, {name:?}) parent does not exist");
             return reply.error(Errno::BADF.raw_os_error());
         };
-
-        // dir is &&Directory which means it holds a reference to the image and also a reference to
-        // self.  Dereference to drop the spurious self-reference to allow further mutability.
         let dir = *dir;
 
         match dir.lookup(name) {
-            Some(inode) => reply.entry(&TTL, self.inode_fileattr(inode, parent), 0),
+            Some(inode) => {
+                let (ino, _) = self.register_inode(inode, parent);
+                reply.entry(&TTL, self.attrs.get(&ino).unwrap(), 0);
+            }
             None => reply.error(Errno::NOENT.raw_os_error()),
         }
     }
@@ -209,15 +265,15 @@ impl<ObjectID: FsVerityHashValue> Filesystem for TreeFuse<'_, ObjectID> {
             log::error!("getattr({ino}) inode does not exist");
             return reply.error(Errno::BADF.raw_os_error());
         };
-
-        // iref is &InodeRef which means it holds a reference to self.  Drop that.
         let iref = iref.clone();
 
-        reply.attr(&TTL, self.iref_fileattr(&iref));
+        let attr = iref.fileattr(ino, &self.nlink_map);
+        self.attrs.insert(ino, attr);
+        reply.attr(&TTL, self.attrs.get(&ino).unwrap());
     }
 
     fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
-        let Some(InodeRef::Leaf(leaf, ..)) = self.inodes.get(&ino) else {
+        let Some(InodeRef::Leaf(_, leaf)) = self.inodes.get(&ino) else {
             return reply.error(Errno::INVAL.raw_os_error());
         };
 
@@ -244,6 +300,7 @@ impl<ObjectID: FsVerityHashValue> Filesystem for TreeFuse<'_, ObjectID> {
             log::error!("readdir({ino}) inode is not a directory");
             return reply.error(Errno::BADF.raw_os_error());
         };
+        let (dir, parent) = (*dir, *parent);
 
         if offset == 0 {
             offset += 1;
@@ -254,16 +311,16 @@ impl<ObjectID: FsVerityHashValue> Filesystem for TreeFuse<'_, ObjectID> {
 
         if offset == 1 {
             offset += 1;
-            if reply.add(*parent, offset, FileType::Directory, "..") {
+            if reply.add(parent, offset, FileType::Directory, "..") {
                 return reply.ok();
             }
         }
 
         for (name, inode) in dir.sorted_entries().skip(offset as usize - 2) {
-            let iref = self.inode_ref(inode, ino);
+            let (child_ino, kind) = self.register_inode(inode, ino);
 
             offset += 1;
-            if reply.add(iref.ino(), offset, iref.kind(), name) {
+            if reply.add(child_ino, offset, kind, name) {
                 break;
             }
         }
@@ -295,7 +352,7 @@ impl<ObjectID: FsVerityHashValue> Filesystem for TreeFuse<'_, ObjectID> {
             return reply.error(Errno::BADF.raw_os_error());
         };
 
-        let xattrs = iref.stat().xattrs.borrow();
+        let xattrs = &iref.stat().xattrs;
         let Some(value) = xattrs.get(name) else {
             return reply.error(Errno::NODATA.raw_os_error());
         };
@@ -316,7 +373,7 @@ impl<ObjectID: FsVerityHashValue> Filesystem for TreeFuse<'_, ObjectID> {
         };
 
         let mut list = vec![];
-        for name in iref.stat().xattrs.borrow().keys() {
+        for name in iref.stat().xattrs.keys() {
             list.extend_from_slice(name.as_bytes());
             list.push(b'\0');
         }
@@ -337,7 +394,7 @@ impl<ObjectID: FsVerityHashValue> Filesystem for TreeFuse<'_, ObjectID> {
             return reply.error(Errno::BADF.raw_os_error());
         };
 
-        let InodeRef::Leaf(leaf) = iref else {
+        let InodeRef::Leaf(_, leaf) = iref else {
             log::error!("open({ino}) inode is a directory");
             return reply.error(Errno::BADF.raw_os_error());
         };
@@ -458,20 +515,30 @@ pub fn mount_fuse(dev_fuse: impl AsFd) -> anyhow::Result<OwnedFd> {
     )?)
 }
 
-/// Serves a FUSE filesystem exposing the content of `root`, backed by `repo`.
+/// Serves a FUSE filesystem exposing the content of `filesystem`, backed by `repo`.
 ///
 /// You should have called mount_fuse() on the dev_fuse fd to establish a mount point.
 pub fn serve_tree_fuse<'a, ObjectID: FsVerityHashValue>(
     dev_fuse: OwnedFd,
-    root: &'a Directory<ObjectID>,
+    filesystem: &'a FileSystem<ObjectID>,
     repo: &'a Repository<ObjectID>,
 ) -> std::io::Result<()> {
-    let fs = TreeFuse::<ObjectID> {
+    let inode_map = InodeMap::build(filesystem);
+    let nlink_map = filesystem.nlinks();
+
+    let root_ino = inode_map.dir_ino(&filesystem.root);
+    let root_ref = InodeRef::Directory(&filesystem.root, root_ino);
+    let root_attr = root_ref.fileattr(root_ino, &nlink_map);
+
+    let tf = TreeFuse::<ObjectID> {
         repo,
-        inodes: HashMap::from([(1, InodeRef::Directory(root, 1))]),
-        attrs: Default::default(),
+        fs: filesystem,
+        inode_map,
+        nlink_map,
+        inodes: HashMap::from([(root_ino, root_ref)]),
+        attrs: HashMap::from([(root_ino, root_attr)]),
         handles: Default::default(),
         next_fh: 1,
     };
-    Session::from_fd(fs, dev_fuse, SessionACL::All).run()
+    Session::from_fd(tf, dev_fuse, SessionACL::All).run()
 }

@@ -5,12 +5,10 @@
 //! reference collection for garbage collection.
 
 use core::mem::size_of;
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::ops::Range;
 use std::os::unix::ffi::OsStrExt;
-use std::rc::Rc;
 
 use anyhow::Context;
 use thiserror::Error;
@@ -27,6 +25,7 @@ use super::{
 };
 use crate::MAX_INLINE_CONTENT;
 use crate::fsverity::FsVerityHashValue;
+use crate::generic_tree::LeafId;
 use crate::tree;
 
 /// Rounds up a value to the nearest multiple of `to`
@@ -1118,7 +1117,7 @@ fn stat_from_inode_for_tree(img: &Image, inode: &InodeType) -> anyhow::Result<tr
         st_uid,
         st_gid,
         st_mtim_sec,
-        xattrs: RefCell::new(xattrs),
+        xattrs,
     })
 }
 
@@ -1313,19 +1312,21 @@ fn dir_entries<'a>(
 const MAX_DIRECTORY_DEPTH: usize = 4096 / 2;
 
 /// Per-leaf nlink tracking for post-traversal validation.
-struct NlinkEntry<ObjectID: FsVerityHashValue> {
+struct NlinkEntry {
     /// The on-disk nlink value from the inode header.
     expected: u32,
-    /// Reference to the leaf so we can check Rc::strong_count() later.
-    leaf: Rc<tree::Leaf<ObjectID>>,
+    /// The leaf ID for looking up actual nlink from the filesystem.
+    leaf_id: LeafId,
 }
 
 /// Mutable state threaded through the recursive directory traversal.
 struct TreeBuilder<ObjectID: FsVerityHashValue> {
-    /// Map from nid to first-seen leaf for hardlink detection.
-    hardlinks: HashMap<u64, Rc<tree::Leaf<ObjectID>>>,
+    /// Map from nid to first-seen LeafId for hardlink detection.
+    hardlinks: HashMap<u64, LeafId>,
     /// Map from nid to nlink tracking entry for post-traversal validation.
-    nlink_tracker: HashMap<u64, NlinkEntry<ObjectID>>,
+    nlink_tracker: HashMap<u64, NlinkEntry>,
+    /// Accumulated leaves for the filesystem being built.
+    leaves: Vec<tree::Leaf<ObjectID>>,
 }
 
 impl<ObjectID: FsVerityHashValue> TreeBuilder<ObjectID> {
@@ -1333,31 +1334,15 @@ impl<ObjectID: FsVerityHashValue> TreeBuilder<ObjectID> {
         Self {
             hardlinks: HashMap::new(),
             nlink_tracker: HashMap::new(),
+            leaves: Vec::new(),
         }
     }
 
-    /// Validate that every leaf's on-disk nlink matches the number of
-    /// references found during traversal.
-    fn validate_nlink(&self) -> anyhow::Result<()> {
-        for (nid, entry) in &self.nlink_tracker {
-            // strong_count includes: one per tree insertion + one held by
-            // nlink_tracker + possibly one in the hardlinks map.
-            let tracker_refs: usize = 1 + usize::from(self.hardlinks.contains_key(nid));
-            let tree_refs = Rc::strong_count(&entry.leaf)
-                .checked_sub(tracker_refs)
-                .expect("strong_count must be >= tracker_refs");
-            let tree_nlink: u32 = tree_refs
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("nlink overflow for inode nid {nid}"))?;
-            if entry.expected != tree_nlink {
-                anyhow::bail!(
-                    "nlink mismatch for inode nid {nid}: on-disk nlink is {}, \
-                     but found {tree_nlink} reference(s) in the directory tree",
-                    entry.expected,
-                );
-            }
-        }
-        Ok(())
+    /// Push a new leaf and return its LeafId.
+    fn push_leaf(&mut self, stat: tree::Stat, content: tree::LeafContent<ObjectID>) -> LeafId {
+        let id = LeafId(self.leaves.len());
+        self.leaves.push(tree::Leaf { stat, content });
+        id
     }
 }
 
@@ -1424,8 +1409,8 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
             dir.insert(name, tree::Inode::Directory(Box::new(child_dir)));
         } else {
             // Check if this is a hardlink (same nid seen before)
-            if let Some(existing_leaf) = builder.hardlinks.get(&nid) {
-                dir.insert(name, tree::Inode::Leaf(Rc::clone(existing_leaf)));
+            if let Some(&existing_leaf_id) = builder.hardlinks.get(&nid) {
+                dir.insert(name, tree::Inode::leaf(existing_leaf_id));
                 continue;
             }
 
@@ -1476,12 +1461,12 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
                 _ => anyhow::bail!("unknown file type {:#o} for {:?}", file_type, name),
             };
 
-            let leaf = Rc::new(tree::Leaf { stat, content });
+            let leaf_id = builder.push_leaf(stat, content);
 
             // Track for hardlink detection if nlink > 1
             let on_disk_nlink = child_inode.nlink();
             if on_disk_nlink > 1 {
-                builder.hardlinks.insert(nid, Rc::clone(&leaf));
+                builder.hardlinks.insert(nid, leaf_id);
             }
 
             // Track for post-traversal nlink validation
@@ -1490,10 +1475,10 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
                 .entry(nid)
                 .or_insert_with(|| NlinkEntry {
                     expected: on_disk_nlink,
-                    leaf: Rc::clone(&leaf),
+                    leaf_id,
                 });
 
-            dir.insert(name, tree::Inode::Leaf(leaf));
+            dir.insert(name, tree::Inode::leaf(leaf_id));
         }
     }
 
@@ -1532,7 +1517,7 @@ pub fn erofs_to_filesystem<ObjectID: FsVerityHashValue>(
     let root_inode = img.inode(root_nid)?;
 
     let root_stat = stat_from_inode_for_tree(&img, &root_inode)?;
-    let mut fs = tree::FileSystem::new(root_stat);
+    let mut root = tree::Directory::new(root_stat);
 
     let mut builder = TreeBuilder::new();
 
@@ -1542,14 +1527,34 @@ pub fn erofs_to_filesystem<ObjectID: FsVerityHashValue>(
         root_nid,
         root_nid,
         &root_inode,
-        &mut fs.root,
+        &mut root,
         &mut builder,
         0,
     )
     .context("reading root directory")?;
 
-    builder.validate_nlink()?;
+    let fs = tree::FileSystem {
+        root,
+        leaves: builder.leaves,
+    };
 
+    let nlink_map = fs.nlinks();
+    builder.nlink_tracker.iter().try_for_each(|(nid, entry)| {
+        let tree_nlink = nlink_map[entry.leaf_id.0];
+        if entry.expected != tree_nlink {
+            anyhow::bail!(
+                "nlink mismatch for inode nid {nid}: on-disk nlink is {}, \
+                 but found {tree_nlink} reference(s) in the directory tree",
+                entry.expected,
+            );
+        }
+        Ok(())
+    })?;
+
+    debug_assert!(
+        fs.fsck().is_ok(),
+        "erofs_to_filesystem produced invalid filesystem"
+    );
     Ok(fs)
 }
 
@@ -2094,14 +2099,13 @@ mod tests {
         let image = mkfs_erofs(&fs_orig);
         let fs_rt = erofs_to_filesystem::<Sha256HashValue>(&image).unwrap();
 
-        // Verify hardlink Rc sharing (scope the extra refs so strong_count
-        // is correct when write_dumpfile checks nlink)
+        // Verify hardlink sharing via LeafId
         {
-            let orig_leaf = fs_rt.root.ref_leaf(OsStr::new("original")).unwrap();
-            let hardlink_leaf = fs_rt.root.ref_leaf(OsStr::new("hardlink")).unwrap();
-            assert!(
-                Rc::ptr_eq(&orig_leaf, &hardlink_leaf),
-                "hardlink entries should share the same Rc"
+            let orig_id = fs_rt.root.leaf_id(OsStr::new("original")).unwrap();
+            let hardlink_id = fs_rt.root.leaf_id(OsStr::new("hardlink")).unwrap();
+            assert_eq!(
+                orig_id, hardlink_id,
+                "hardlink entries should share the same LeafId"
             );
         }
 

@@ -7,14 +7,12 @@
 //! The module handles file metadata, extended attributes, and hardlink tracking.
 
 use std::{
-    cell::RefCell,
     collections::{BTreeMap, HashMap},
     ffi::{OsStr, OsString},
     fmt,
     io::{BufWriter, Write},
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
-    rc::Rc,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -24,7 +22,8 @@ use rustix::fs::FileType;
 use crate::{
     dumpfile_parse::{Entry, Item},
     fsverity::FsVerityHashValue,
-    tree::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
+    generic_tree::LeafId,
+    tree::{Directory, FileSystem, Inode, LeafContent, RegularFile, Stat},
 };
 
 fn write_empty(writer: &mut impl fmt::Write) -> fmt::Result {
@@ -131,7 +130,7 @@ fn write_entry(
         write_empty(writer)?;
     }
 
-    for (key, value) in &*stat.xattrs.borrow() {
+    for (key, value) in &stat.xattrs {
         write!(writer, " ")?;
         write_escaped_raw(writer, key.as_bytes(), EscapeEquals::Yes)?;
         write!(writer, "=")?;
@@ -282,7 +281,9 @@ pub fn write_hardlink(writer: &mut impl fmt::Write, path: &Path, target: &OsStr)
 }
 
 struct DumpfileWriter<'a, W: Write, ObjectID: FsVerityHashValue> {
-    hardlinks: HashMap<*const Leaf<ObjectID>, OsString>,
+    hardlinks: HashMap<LeafId, OsString>,
+    fs: &'a FileSystem<ObjectID>,
+    nlink_map: &'a [u32],
     writer: &'a mut W,
 }
 
@@ -294,9 +295,11 @@ fn writeln_fmt(writer: &mut impl Write, f: impl Fn(&mut String) -> fmt::Result) 
 }
 
 impl<'a, W: Write, ObjectID: FsVerityHashValue> DumpfileWriter<'a, W, ObjectID> {
-    fn new(writer: &'a mut W) -> Self {
+    fn new(writer: &'a mut W, fs: &'a FileSystem<ObjectID>, nlink_map: &'a [u32]) -> Self {
         Self {
             hardlinks: HashMap::new(),
+            fs,
+            nlink_map,
             writer,
         }
     }
@@ -325,8 +328,8 @@ impl<'a, W: Write, ObjectID: FsVerityHashValue> DumpfileWriter<'a, W, ObjectID> 
                 Inode::Directory(dir) => {
                     self.write_dir(path, dir)?;
                 }
-                Inode::Leaf(leaf) => {
-                    self.write_leaf(path, leaf)?;
+                Inode::Leaf(leaf_id, _) => {
+                    self.write_leaf(path, *leaf_id)?;
                 }
             }
 
@@ -336,20 +339,20 @@ impl<'a, W: Write, ObjectID: FsVerityHashValue> DumpfileWriter<'a, W, ObjectID> 
     }
 
     #[context("Writing leaf to dumpfile: {}", path.display())]
-    fn write_leaf(&mut self, path: &Path, leaf: &Rc<Leaf<ObjectID>>) -> Result<()> {
-        let nlink = Rc::strong_count(leaf);
+    fn write_leaf(&mut self, path: &Path, leaf_id: LeafId) -> Result<()> {
+        let nlink = self.nlink_map[leaf_id.0] as usize;
 
         if nlink > 1 {
             // This is a hardlink.  We need to handle that specially.
-            let ptr = Rc::as_ptr(leaf);
-            if let Some(target) = self.hardlinks.get(&ptr) {
+            if let Some(target) = self.hardlinks.get(&leaf_id) {
                 return writeln_fmt(self.writer, |fmt| write_hardlink(fmt, path, target));
             }
 
             // @path gets modified all the time, so take a copy
-            self.hardlinks.insert(ptr, OsString::from(&path));
+            self.hardlinks.insert(leaf_id, OsString::from(&path));
         }
 
+        let leaf = self.fs.leaf(leaf_id);
         writeln_fmt(self.writer, |fmt| {
             write_leaf(fmt, path, &leaf.stat, &leaf.content, nlink)
         })
@@ -364,20 +367,23 @@ pub fn write_dumpfile(
     writer: &mut impl Write,
     fs: &FileSystem<impl FsVerityHashValue>,
 ) -> Result<()> {
+    let nlink_map = fs.nlinks();
     let path = PathBuf::from("/");
-    dump_single_dir(writer, &fs.root, path)
+    dump_single_dir(writer, &fs.root, fs, &nlink_map, path)
 }
 
 /// Write a single dir
-pub fn dump_single_dir(
+pub fn dump_single_dir<ObjectID: FsVerityHashValue>(
     writer: &mut impl Write,
-    dir: &Directory<impl FsVerityHashValue>,
+    dir: &Directory<ObjectID>,
+    fs: &FileSystem<ObjectID>,
+    nlink_map: &[u32],
     mut path: PathBuf,
 ) -> Result<()> {
     // default pipe capacity on Linux is 16 pages (65536 bytes), but
     // sometimes the BufWriter will write more than its capacity...
     let mut buffer = BufWriter::with_capacity(32768, writer);
-    let mut dfw = DumpfileWriter::new(&mut buffer);
+    let mut dfw = DumpfileWriter::new(&mut buffer, fs, nlink_map);
 
     dfw.write_dir(&mut path, dir)?;
     buffer.flush()?;
@@ -386,17 +392,19 @@ pub fn dump_single_dir(
 }
 
 /// Write a single file
-pub fn dump_single_file(
+pub fn dump_single_file<ObjectID: FsVerityHashValue>(
     writer: &mut impl Write,
-    file: &Rc<Leaf<impl FsVerityHashValue>>,
+    leaf_id: LeafId,
+    fs: &FileSystem<ObjectID>,
+    nlink_map: &[u32],
     path: PathBuf,
 ) -> Result<()> {
     // default pipe capacity on Linux is 16 pages (65536 bytes), but
     // sometimes the BufWriter will write more than its capacity...
     let mut buffer = BufWriter::with_capacity(32768, writer);
-    let mut dfw = DumpfileWriter::new(&mut buffer);
+    let mut dfw = DumpfileWriter::new(&mut buffer, fs, nlink_map);
 
-    dfw.write_leaf(&path, file)?;
+    dfw.write_leaf(&path, leaf_id)?;
     buffer.flush()?;
 
     Ok(())
@@ -408,7 +416,7 @@ pub fn dump_single_file(
 pub fn add_entry_to_filesystem<ObjectID: FsVerityHashValue>(
     fs: &mut FileSystem<ObjectID>,
     entry: Entry<'_>,
-    hardlinks: &mut HashMap<PathBuf, Rc<Leaf<ObjectID>>>,
+    hardlinks: &mut HashMap<PathBuf, LeafId>,
 ) -> Result<()> {
     let path = entry.path.as_ref();
 
@@ -425,14 +433,8 @@ pub fn add_entry_to_filesystem<ObjectID: FsVerityHashValue>(
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("Path has no filename: {path:?}"))?;
 
-    // Get or create parent directory
-    let parent_dir = if parent == Path::new("/") {
-        &mut fs.root
-    } else {
-        fs.root
-            .get_directory_mut(parent.as_os_str())
-            .with_context(|| format!("Parent directory not found: {parent:?}"))?
-    };
+    // Helper to push a leaf into the filesystem and return a LeafId
+    let push_leaf = |fs: &mut FileSystem<ObjectID>, stat, content| fs.push_leaf(stat, content);
 
     // Convert the entry to an inode
     let inode = match entry.item {
@@ -441,12 +443,11 @@ pub fn add_entry_to_filesystem<ObjectID: FsVerityHashValue>(
             Inode::Directory(Box::new(Directory::new(stat)))
         }
         Item::Hardlink { ref target } => {
-            // Look up the target in our hardlinks map and clone the Rc
-            let target_leaf = hardlinks
+            // Look up the target in our hardlinks map and reuse the LeafId
+            let existing_id = *hardlinks
                 .get(target.as_ref())
-                .ok_or_else(|| anyhow::anyhow!("Hardlink target not found: {target:?}"))?
-                .clone();
-            Inode::Leaf(target_leaf)
+                .ok_or_else(|| anyhow::anyhow!("Hardlink target not found: {target:?}"))?;
+            Inode::leaf(existing_id)
         }
         Item::RegularInline { ref content, .. } => {
             let stat = entry_to_stat(&entry);
@@ -455,7 +456,8 @@ pub fn add_entry_to_filesystem<ObjectID: FsVerityHashValue>(
                 std::borrow::Cow::Owned(d) => d.clone().into_boxed_slice(),
             };
             let content = LeafContent::Regular(RegularFile::Inline(data));
-            Inode::Leaf(Rc::new(Leaf { stat, content }))
+            let id = push_leaf(fs, stat, content);
+            Inode::leaf(id)
         }
         Item::Regular {
             size,
@@ -468,7 +470,8 @@ pub fn add_entry_to_filesystem<ObjectID: FsVerityHashValue>(
                 .ok_or_else(|| anyhow::anyhow!("External file missing fsverity digest"))?;
             let object_id = ObjectID::from_hex(digest)?;
             let content = LeafContent::Regular(RegularFile::External(object_id, size));
-            Inode::Leaf(Rc::new(Leaf { stat, content }))
+            let id = push_leaf(fs, stat, content);
+            Inode::leaf(id)
         }
         Item::Device { rdev, .. } => {
             let stat = entry_to_stat(&entry);
@@ -478,7 +481,8 @@ pub fn add_entry_to_filesystem<ObjectID: FsVerityHashValue>(
             } else {
                 LeafContent::CharacterDevice(rdev)
             };
-            Inode::Leaf(Rc::new(Leaf { stat, content }))
+            let id = push_leaf(fs, stat, content);
+            Inode::leaf(id)
         }
         Item::Symlink { ref target, .. } => {
             let stat = entry_to_stat(&entry);
@@ -487,19 +491,30 @@ pub fn add_entry_to_filesystem<ObjectID: FsVerityHashValue>(
                 std::borrow::Cow::Owned(t) => Box::from(t.as_os_str()),
             };
             let content = LeafContent::Symlink(target_os);
-            Inode::Leaf(Rc::new(Leaf { stat, content }))
+            let id = push_leaf(fs, stat, content);
+            Inode::leaf(id)
         }
         Item::Fifo { .. } => {
             let stat = entry_to_stat(&entry);
             let content = LeafContent::Fifo;
-            Inode::Leaf(Rc::new(Leaf { stat, content }))
+            let id = push_leaf(fs, stat, content);
+            Inode::leaf(id)
         }
     };
 
-    // Store Leafs in the hardlinks map for future hardlink lookups
-    if let Inode::Leaf(ref leaf) = inode {
-        hardlinks.insert(path.to_path_buf(), leaf.clone());
+    // Store LeafIds in the hardlinks map for future hardlink lookups
+    if let Inode::Leaf(id, _) = inode {
+        hardlinks.insert(path.to_path_buf(), id);
     }
+
+    // We need to get the parent_dir after pushing leaves (borrow checker)
+    let parent_dir = if parent == Path::new("/") {
+        &mut fs.root
+    } else {
+        fs.root
+            .get_directory_mut(parent.as_os_str())
+            .with_context(|| format!("Parent directory not found: {parent:?}"))?
+    };
 
     parent_dir.insert(filename, inode);
     Ok(())
@@ -525,7 +540,7 @@ fn entry_to_stat(entry: &Entry<'_>) -> Stat {
         st_uid: entry.uid,
         st_gid: entry.gid,
         st_mtim_sec: entry.mtime.sec as i64,
-        xattrs: RefCell::new(xattrs),
+        xattrs,
     }
 }
 
@@ -569,6 +584,10 @@ pub fn dumpfile_to_filesystem<ObjectID: FsVerityHashValue>(
         add_entry_to_filesystem(&mut fs, entry, &mut hardlinks)?;
     }
 
+    debug_assert!(
+        fs.fsck().is_ok(),
+        "dumpfile parsing produced invalid filesystem"
+    );
     Ok(fs)
 }
 
@@ -593,7 +612,7 @@ mod tests {
         assert!(fs.root.lookup(OsStr::new("symlink")).is_some());
 
         // Check inline file content
-        let small_file = fs.root.get_file(OsStr::new("small_file"))?;
+        let small_file = fs.as_dir().get_file(OsStr::new("small_file"))?;
         if let RegularFile::Inline(data) = small_file {
             assert_eq!(&**data, b"hello");
         } else {
@@ -625,29 +644,29 @@ mod tests {
         let dir1 = fs.root.get_directory(OsStr::new("dir1"))?;
         let hardlink2 = dir1.lookup(OsStr::new("hardlink2")).unwrap();
 
-        // All three should be Leaf inodes
-        let original_leaf = match original {
-            Inode::Leaf(l) => l,
+        // All three should be Leaf inodes with the same LeafId
+        let original_id = match original {
+            Inode::Leaf(id, _) => *id,
             _ => panic!("Expected Leaf inode"),
         };
-        let hardlink1_leaf = match hardlink1 {
-            Inode::Leaf(l) => l,
+        let hardlink1_id = match hardlink1 {
+            Inode::Leaf(id, _) => *id,
             _ => panic!("Expected Leaf inode"),
         };
-        let hardlink2_leaf = match hardlink2 {
-            Inode::Leaf(l) => l,
+        let hardlink2_id = match hardlink2 {
+            Inode::Leaf(id, _) => *id,
             _ => panic!("Expected Leaf inode"),
         };
 
-        // They should all point to the same Rc (same pointer)
-        assert!(Rc::ptr_eq(original_leaf, hardlink1_leaf));
-        assert!(Rc::ptr_eq(original_leaf, hardlink2_leaf));
+        // They should all share the same LeafId
+        assert_eq!(original_id, hardlink1_id);
+        assert_eq!(original_id, hardlink2_id);
 
-        // Verify the strong count is 3 (original + 2 hardlinks)
-        assert_eq!(Rc::strong_count(original_leaf), 3);
+        // Verify nlink count is 3 (original + 2 hardlinks)
+        assert_eq!(fs.nlinks()[original_id.0], 3);
 
         // Verify content
-        if let LeafContent::Regular(RegularFile::Inline(data)) = &original_leaf.content {
+        if let LeafContent::Regular(RegularFile::Inline(data)) = &fs.leaf(original_id).content {
             assert_eq!(&**data, b"hello_world");
         } else {
             panic!("Expected inline regular file");
@@ -666,7 +685,7 @@ mod tests {
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile)?;
         let link = fs.root.lookup(OsStr::new("link")).unwrap();
         match link {
-            Inode::Leaf(l) => match &l.content {
+            Inode::Leaf(id, _) => match &fs.leaf(*id).content {
                 LeafContent::Symlink(target) => assert_eq!(target.as_ref(), OsStr::new("-")),
                 other => panic!("expected symlink, got {other:?}"),
             },
@@ -690,9 +709,6 @@ mod tests {
     /// not treat specially.
     #[test]
     fn test_xattr_empty_and_dash_values_round_trip() -> Result<()> {
-        use std::cell::RefCell;
-        use std::collections::BTreeMap;
-
         let mut xattrs = BTreeMap::new();
         xattrs.insert(
             Box::from(OsStr::new("user.empty")),
@@ -708,19 +724,19 @@ mod tests {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
-            xattrs: RefCell::new(BTreeMap::new()),
+            xattrs: BTreeMap::new(),
         });
-        let leaf = std::rc::Rc::new(Leaf {
-            stat: Stat {
+        let leaf_id = fs.push_leaf(
+            Stat {
                 st_mode: 0o644,
                 st_uid: 0,
                 st_gid: 0,
                 st_mtim_sec: 0,
-                xattrs: RefCell::new(xattrs),
+                xattrs,
             },
-            content: LeafContent::Regular(RegularFile::Inline(b"test".to_vec().into())),
-        });
-        fs.root.insert(OsStr::new("f"), Inode::Leaf(leaf));
+            LeafContent::Regular(RegularFile::Inline(b"test".to_vec().into())),
+        );
+        fs.root.insert(OsStr::new("f"), Inode::leaf(leaf_id));
 
         let mut out = Vec::new();
         write_dumpfile(&mut out, &fs)?;
@@ -736,29 +752,25 @@ mod tests {
     /// hardlinks correctly.
     #[test]
     fn test_hardlink_write_round_trip() -> Result<()> {
-        use std::cell::RefCell;
-        use std::collections::BTreeMap;
-
         let stat = || Stat {
             st_mode: 0o644,
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
-            xattrs: RefCell::new(BTreeMap::new()),
+            xattrs: BTreeMap::new(),
         };
 
         let mut fs = FileSystem::<Sha256HashValue>::new(Stat {
             st_mode: 0o755,
             ..stat()
         });
-        let leaf = std::rc::Rc::new(Leaf {
-            stat: stat(),
-            content: LeafContent::Regular(RegularFile::Inline(b"data".to_vec().into())),
-        });
-        // Insert original + hardlink (same Rc)
-        fs.root
-            .insert(OsStr::new("original"), Inode::Leaf(leaf.clone()));
-        fs.root.insert(OsStr::new("link"), Inode::Leaf(leaf));
+        let leaf_id = fs.push_leaf(
+            stat(),
+            LeafContent::Regular(RegularFile::Inline(b"data".to_vec().into())),
+        );
+        // Insert original + hardlink (same LeafId)
+        fs.root.insert(OsStr::new("original"), Inode::leaf(leaf_id));
+        fs.root.insert(OsStr::new("link"), Inode::leaf(leaf_id));
 
         let mut out = Vec::new();
         write_dumpfile(&mut out, &fs)?;
@@ -766,11 +778,11 @@ mod tests {
 
         let fs2 = dumpfile_to_filesystem::<Sha256HashValue>(out_str)?;
 
-        // Verify the hardlink is preserved
+        // Verify the hardlink is preserved (same LeafId)
         let orig = fs2.root.lookup(OsStr::new("original")).unwrap();
         let link = fs2.root.lookup(OsStr::new("link")).unwrap();
         match (orig, link) {
-            (Inode::Leaf(a), Inode::Leaf(b)) => assert!(Rc::ptr_eq(a, b)),
+            (Inode::Leaf(a, _), Inode::Leaf(b, _)) => assert_eq!(a, b),
             _ => panic!("expected both to be leaves"),
         }
 

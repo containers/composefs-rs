@@ -5,11 +5,9 @@
 //! and metadata serialization.
 
 use std::{
-    cell::RefCell,
     collections::{BTreeMap, HashMap},
     mem::size_of,
     os::unix::ffi::OsStrExt,
-    rc::Rc,
 };
 
 use log::trace;
@@ -19,6 +17,7 @@ use zerocopy::{Immutable, IntoBytes};
 use crate::{
     erofs::{composefs::OverlayMetacopy, format, reader::round_up},
     fsverity::FsVerityHashValue,
+    generic_tree::LeafId,
     tree,
 };
 
@@ -419,7 +418,9 @@ impl<ObjectID: FsVerityHashValue> Inode<'_, ObjectID> {
 
 struct InodeCollector<'a, ObjectID: FsVerityHashValue> {
     inodes: Vec<Inode<'a, ObjectID>>,
-    hardlinks: HashMap<*const tree::Leaf<ObjectID>, usize>,
+    hardlinks: HashMap<LeafId, usize>,
+    fs: &'a tree::FileSystem<ObjectID>,
+    nlink_map: &'a [u32],
 }
 
 impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
@@ -442,7 +443,7 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
         }
 
         // Add the normal xattrs.  They're already listed in sorted order.
-        for (name, value) in RefCell::borrow(&stat.xattrs).iter() {
+        for (name, value) in stat.xattrs.iter() {
             let name = name.as_bytes();
 
             if let Some(escapee) = name.strip_prefix(b"trusted.overlay.") {
@@ -464,15 +465,16 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
         inode
     }
 
-    fn collect_leaf(&mut self, leaf: &'a Rc<tree::Leaf<ObjectID>>) -> usize {
-        let nlink = Rc::strong_count(leaf);
+    fn collect_leaf(&mut self, leaf_id: LeafId) -> usize {
+        let nlink = self.nlink_map[leaf_id.0] as usize;
 
         if nlink > 1
-            && let Some(inode) = self.hardlinks.get(&Rc::as_ptr(leaf))
+            && let Some(inode) = self.hardlinks.get(&leaf_id)
         {
             return *inode;
         }
 
+        let leaf = self.fs.leaf(leaf_id);
         let inode = self.push_inode(
             &leaf.stat,
             InodeContent::Leaf(Leaf {
@@ -482,7 +484,7 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
         );
 
         if nlink > 1 {
-            self.hardlinks.insert(Rc::as_ptr(leaf), inode);
+            self.hardlinks.insert(leaf_id, inode);
         }
 
         inode
@@ -513,7 +515,7 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
         for (name, inode) in dir.sorted_entries() {
             let child = match inode {
                 tree::Inode::Directory(dir) => self.collect_dir(dir, me),
-                tree::Inode::Leaf(leaf) => self.collect_leaf(leaf),
+                tree::Inode::Leaf(leaf_id, _) => self.collect_leaf(*leaf_id),
             };
             entries.push(DirEnt {
                 name: name.as_bytes(),
@@ -531,10 +533,15 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
         me
     }
 
-    pub fn collect(fs: &'a tree::FileSystem<ObjectID>) -> Vec<Inode<'a, ObjectID>> {
+    pub fn collect(
+        fs: &'a tree::FileSystem<ObjectID>,
+        nlink_map: &'a [u32],
+    ) -> Vec<Inode<'a, ObjectID>> {
         let mut this = Self {
             inodes: vec![],
             hardlinks: HashMap::new(),
+            fs,
+            nlink_map,
         };
 
         // '..' of the root directory is the root directory again
@@ -719,7 +726,8 @@ impl Output for FirstPass {
 /// Returns the complete EROFS image as a byte array.
 pub fn mkfs_erofs<ObjectID: FsVerityHashValue>(fs: &tree::FileSystem<ObjectID>) -> Box<[u8]> {
     // Create the intermediate representation: flattened inodes and shared xattrs
-    let mut inodes = InodeCollector::collect(fs);
+    let nlink_map = fs.nlinks();
+    let mut inodes = InodeCollector::collect(fs, &nlink_map);
     let xattrs = share_xattrs(&mut inodes);
 
     // Do a first pass with the writer to determine the layout

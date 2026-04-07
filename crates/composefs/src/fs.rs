@@ -5,7 +5,6 @@
 //! handling of hardlinks, extended attributes, and repository integration.
 
 use std::{
-    cell::RefCell,
     collections::{BTreeMap, HashMap},
     ffi::{CStr, OsStr},
     fs::File,
@@ -13,7 +12,6 @@ use std::{
     mem::MaybeUninit,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
-    rc::Rc,
     sync::Arc,
     thread::available_parallelism,
 };
@@ -31,6 +29,7 @@ use rustix::{
 };
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
+use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use zerocopy::IntoBytes;
 
 use crate::{
@@ -90,6 +89,7 @@ fn write_directory<ObjectID: FsVerityHashValue>(
     dir: &Directory<ObjectID>,
     dirfd: &OwnedFd,
     name: &OsStr,
+    fs: &FileSystem<ObjectID>,
     repo: &Repository<ObjectID>,
 ) -> Result<()> {
     match mkdirat(dirfd, name, dir.stat.st_mode.into()) {
@@ -98,7 +98,7 @@ fn write_directory<ObjectID: FsVerityHashValue>(
     }
 
     let fd = openat(dirfd, name, OFlags::PATH | OFlags::DIRECTORY, 0.into())?;
-    write_directory_contents(dir, &fd, repo)
+    write_directory_contents(dir, &fd, fs, repo)
 }
 
 #[context("Writing leaf {}", name.to_string_lossy())]
@@ -139,12 +139,13 @@ fn write_leaf<ObjectID: FsVerityHashValue>(
 fn write_directory_contents<ObjectID: FsVerityHashValue>(
     dir: &Directory<ObjectID>,
     fd: &OwnedFd,
+    fs: &FileSystem<ObjectID>,
     repo: &Repository<ObjectID>,
 ) -> Result<()> {
     for (name, inode) in dir.entries() {
         match inode {
-            Inode::Directory(dir) => write_directory(dir, fd, name, repo),
-            Inode::Leaf(leaf) => write_leaf(leaf, fd, name, repo),
+            Inode::Directory(dir) => write_directory(dir, fd, name, fs, repo),
+            Inode::Leaf(id, _) => write_leaf(fs.leaf(*id), fd, name, repo),
         }?;
     }
 
@@ -159,11 +160,11 @@ fn write_directory_contents<ObjectID: FsVerityHashValue>(
 #[context("Writing to path {}", output_dir.display())]
 pub fn write_to_path<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
-    dir: &Directory<ObjectID>,
+    fs: &FileSystem<ObjectID>,
     output_dir: &Path,
 ) -> Result<()> {
     let fd = openat(CWD, output_dir, OFlags::PATH | OFlags::DIRECTORY, 0.into())?;
-    write_directory_contents(dir, &fd, repo)
+    write_directory_contents(&fs.root, &fd, fs, repo)
 }
 
 // ---------------------------------------------------------------------------
@@ -200,7 +201,7 @@ fn read_xattrs(fd: &OwnedFd) -> Result<BTreeMap<Box<OsStr>, Box<[u8]>>> {
 
 /// Read file metadata and verify the file type matches expectations.
 #[context("Getting file stats")]
-fn stat_fd(fd: &OwnedFd, ifmt: FileType) -> Result<(rustix::fs::Stat, Stat)> {
+fn stat_fd(fd: &OwnedFd, ifmt: FileType) -> Result<(rustix::fs::Stat, generic_tree::Stat)> {
     let buf = fstat(fd)?;
 
     ensure!(
@@ -210,12 +211,12 @@ fn stat_fd(fd: &OwnedFd, ifmt: FileType) -> Result<(rustix::fs::Stat, Stat)> {
 
     Ok((
         buf,
-        Stat {
+        generic_tree::Stat {
             st_mode: buf.st_mode & 0o7777,
             st_uid: buf.st_uid,
             st_gid: buf.st_gid,
             st_mtim_sec: buf.st_mtime as i64,
-            xattrs: RefCell::new(read_xattrs(fd)?),
+            xattrs: read_xattrs(fd)?,
         },
     ))
 }
@@ -246,64 +247,44 @@ enum PendingFile {
     External { inode_key: FileDevIno, size: u64 },
 }
 
-/// Trait for handling large (external) files encountered during scanning.
+/// Sends large-file descriptors for concurrent async processing.
 ///
-/// The scanner calls [`handle`](Self::handle) for each large file,
-/// allowing the caller to control how files are processed — e.g.
-/// spawning async worker tasks for pipelined verity computation.
-trait ExternalFileHandler {
-    fn handle(&mut self, key: FileDevIno, fd: OwnedFd, size: u64);
+/// During the synchronous scan phase, large files are sent over a
+/// channel as they're discovered, allowing verity computation to
+/// begin while the scan is still running.
+struct ChannelHandler {
+    tx: tokio::sync::mpsc::Sender<(FileDevIno, OwnedFd, u64)>,
 }
 
-/// Spawns a tokio task for each large file as soon as the scanner
-/// encounters it, enabling overlap between scanning and I/O.
+/// Walks a directory tree synchronously, collecting metadata and recording
+/// large files in a [`CollectHandler`] for deferred async processing.
 ///
-/// Tasks are spawned into an externally-owned [`JoinSet`] so the
-/// caller can drain completed results while the scan continues.
-///
-/// Used by [`read_filesystem`] to pipeline verity computation
-/// with the directory walk.
-struct SpawnHandler<'a, ObjectID: FsVerityHashValue> {
-    semaphore: Arc<Semaphore>,
-    repo: Option<Arc<Repository<ObjectID>>>,
-    tasks: &'a mut JoinSet<Result<(FileDevIno, ObjectID)>>,
+/// This is the single scan implementation used by the async filesystem
+/// reading path. Small files are read inline during the scan; large files
+/// are pushed into the handler's pending list.
+struct FilesystemScanner {
+    inodes: HashMap<FileDevIno, generic_tree::LeafId>,
+    leaves: Vec<generic_tree::Leaf<PendingFile>>,
+    handler: ChannelHandler,
 }
 
-impl<ObjectID: FsVerityHashValue> ExternalFileHandler for SpawnHandler<'_, ObjectID> {
-    fn handle(&mut self, key: FileDevIno, fd: OwnedFd, size: u64) {
-        let repo = self.repo.clone();
-        let sem = self.semaphore.clone();
-        self.tasks.spawn(async move {
-            let _permit = sem.acquire().await.map_err(|e| anyhow::anyhow!("{e}"))?;
-            let id = if let Some(repo) = repo {
-                tokio::task::spawn_blocking(move || repo.ensure_object_from_fd(fd, size)).await??
-            } else {
-                tokio::task::spawn_blocking(move || compute_verity_from_fd::<ObjectID>(fd))
-                    .await??
-            };
-            Ok((key, id))
-        });
-    }
-}
-
-/// Walks a directory tree synchronously, collecting metadata and dispatching
-/// large files via an [`ExternalFileHandler`].
-///
-/// This is the single scan implementation used by both the sync and async
-/// filesystem reading paths. Small files are read inline during the scan;
-/// large files are dispatched to the handler, which may collect them for
-/// later processing or spawn tasks immediately.
-struct FilesystemScanner<H: ExternalFileHandler> {
-    inodes: HashMap<FileDevIno, Rc<generic_tree::Leaf<PendingFile>>>,
-    handler: H,
-}
-
-impl<H: ExternalFileHandler> FilesystemScanner<H> {
-    fn new(handler: H) -> Self {
+impl FilesystemScanner {
+    fn new(handler: ChannelHandler) -> Self {
         Self {
             inodes: HashMap::new(),
+            leaves: Vec::new(),
             handler,
         }
+    }
+
+    fn push_leaf(
+        &mut self,
+        stat: generic_tree::Stat,
+        content: generic_tree::LeafContent<PendingFile>,
+    ) -> generic_tree::LeafId {
+        let id = generic_tree::LeafId(self.leaves.len());
+        self.leaves.push(generic_tree::Leaf { stat, content });
+        id
     }
 
     /// Scan the directory tree rooted at `name` (relative to `dirfd`).
@@ -313,7 +294,10 @@ impl<H: ExternalFileHandler> FilesystemScanner<H> {
         name: &OsStr,
     ) -> Result<generic_tree::FileSystem<PendingFile>> {
         let root = self.scan_directory(dirfd, name)?;
-        Ok(generic_tree::FileSystem { root })
+        Ok(generic_tree::FileSystem {
+            root,
+            leaves: std::mem::take(&mut self.leaves),
+        })
     }
 
     #[context("Scanning directory {}", name.to_string_lossy())]
@@ -330,7 +314,7 @@ impl<H: ExternalFileHandler> FilesystemScanner<H> {
         )?;
 
         let (_, stat) = stat_fd(&fd, FileType::Directory)?;
-        let mut directory = generic_tree::Directory::new(stat);
+        let mut entries = BTreeMap::new();
 
         for item in Dir::read_from(&fd)? {
             let entry = item?;
@@ -341,10 +325,10 @@ impl<H: ExternalFileHandler> FilesystemScanner<H> {
             }
 
             let inode = self.scan_inode(&fd, child_name, entry.file_type())?;
-            directory.insert(child_name, inode);
+            entries.insert(Box::from(child_name), inode);
         }
 
-        Ok(directory)
+        Ok(generic_tree::Directory { stat, entries })
     }
 
     #[context("Scanning inode {}", name.to_string_lossy())]
@@ -358,8 +342,8 @@ impl<H: ExternalFileHandler> FilesystemScanner<H> {
             let dir = self.scan_directory(dirfd, name)?;
             Ok(generic_tree::Inode::Directory(Box::new(dir)))
         } else {
-            let leaf = self.scan_leaf(dirfd, name, ifmt)?;
-            Ok(generic_tree::Inode::Leaf(leaf))
+            let id = self.scan_leaf(dirfd, name, ifmt)?;
+            Ok(generic_tree::Inode::leaf(id))
         }
     }
 
@@ -369,7 +353,7 @@ impl<H: ExternalFileHandler> FilesystemScanner<H> {
         dirfd: &OwnedFd,
         name: &OsStr,
         ifmt: FileType,
-    ) -> Result<Rc<generic_tree::Leaf<PendingFile>>> {
+    ) -> Result<generic_tree::LeafId> {
         let oflags = match ifmt {
             FileType::RegularFile => OFlags::RDONLY,
             _ => OFlags::PATH,
@@ -391,13 +375,13 @@ impl<H: ExternalFileHandler> FilesystemScanner<H> {
             dev: buf.st_dev,
             ino: buf.st_ino,
         };
-        if let Some(leafref) = self.inodes.get(&key) {
-            Ok(Rc::clone(leafref))
+        if let Some(&id) = self.inodes.get(&key) {
+            Ok(id)
         } else {
             let content = self.scan_leaf_content(fd, &buf)?;
-            let leaf = Rc::new(generic_tree::Leaf { stat, content });
-            self.inodes.insert(key, Rc::clone(&leaf));
-            Ok(leaf)
+            let id = self.push_leaf(stat, content);
+            self.inodes.insert(key, id);
+            Ok(id)
         }
     }
 
@@ -411,12 +395,14 @@ impl<H: ExternalFileHandler> FilesystemScanner<H> {
             FileType::Directory | FileType::Unknown => unreachable!(),
             FileType::RegularFile => {
                 if buf.st_size > INLINE_CONTENT_MAX_V0 as i64 {
-                    // Large file: dispatch to handler for processing
+                    // Large file: record for deferred async processing
                     let key = FileDevIno {
                         dev: buf.st_dev,
                         ino: buf.st_ino,
                     };
-                    self.handler.handle(key, fd, buf.st_size as u64);
+                    // Ignore send errors — the receiver may have been
+                    // dropped if the async side hit an error and cancelled.
+                    let _ = self.handler.tx.blocking_send((key, fd, buf.st_size as u64));
                     generic_tree::LeafContent::Regular(PendingFile::External {
                         inode_key: key,
                         size: buf.st_size as u64,
@@ -539,11 +525,14 @@ pub fn read_file<ObjectID: FsVerityHashValue>(
 /// Load a filesystem tree from the given path, parallelizing verity
 /// computation and object storage across available cores.
 ///
+/// The directory scan and verity computation run concurrently: as the
+/// scan discovers large files, they are immediately dispatched for
+/// verity hashing on the async runtime while the scan continues.
+///
 /// Hardlinks are deduplicated — each unique inode is processed only once.
 ///
 /// If `repo` is `Some`, file objects are stored in the repository.
 /// If `None`, fsverity digests are computed without writing to disk.
-#[context("Async reading filesystem from {}", path.display())]
 pub async fn read_filesystem<ObjectID: FsVerityHashValue>(
     dirfd: OwnedFd,
     path: PathBuf,
@@ -557,32 +546,94 @@ pub async fn read_filesystem<ObjectID: FsVerityHashValue>(
             Arc::new(Semaphore::new(n))
         });
 
-    // The JoinSet lives here so completed tasks are drained after the
-    // scan returns, while structured concurrency ensures all tasks are
-    // cancelled on early exit.
-    let mut tasks = JoinSet::new();
+    // Channel for streaming work items from the scan thread to the
+    // async runtime. The scan sends (key, fd, size) as files are
+    // discovered; the async side spawns verity tasks immediately.
+    // The channel bound limits how far the scan can race ahead of
+    // verity processing, providing natural backpressure.
+    let (tx, rx) =
+        tokio::sync::mpsc::channel::<(FileDevIno, OwnedFd, u64)>(semaphore.available_permits());
 
-    // Phase 1: Scan with pipelined dispatch — worker tasks start while we
-    // are still walking the directory tree.
-    let pending_fs = tokio::task::block_in_place(|| {
-        let handler = SpawnHandler {
-            semaphore,
-            repo,
-            tasks: &mut tasks,
-        };
-        let mut scanner = FilesystemScanner::new(handler);
-        scanner.scan(&dirfd, path.as_os_str())
-    })?;
-
-    // Phase 2: Collect results as workers complete
-    let mut results = HashMap::new();
-    while let Some(result) = tasks.join_next().await {
-        let (key, id) = result??;
-        results.insert(key, id);
+    /// Result from a task in the join set — either the scan completed
+    /// or a verity computation finished.
+    enum TaskResult<ObjectID> {
+        Scan(generic_tree::FileSystem<PendingFile>),
+        Verity(FileDevIno, ObjectID),
     }
 
-    // Phase 3: Convert PendingFile -> RegularFile<ObjectID>
-    pending_fs.try_map_regular(|pf| resolve_pending_file(pf, &results))
+    // All work goes into a single JoinSet for structured concurrency.
+    let mut tasks: JoinSet<Result<TaskResult<ObjectID>>> = JoinSet::new();
+
+    // Scan the directory tree on a blocking thread, streaming work
+    // items over the channel as files are discovered.
+    tasks.spawn_blocking(move || {
+        let handler = ChannelHandler { tx };
+        let mut scanner = FilesystemScanner::new(handler);
+        let fs = scanner
+            .scan(&dirfd, path.as_os_str())
+            .with_context(|| format!("Async reading filesystem from {}", path.display()))?;
+        // Drop the sender so the receiver sees the channel close.
+        drop(scanner.handler);
+        Ok(TaskResult::Scan(fs))
+    });
+
+    // Map the channel into a stream that acquires a semaphore permit
+    // for each item, gating concurrency before we spawn blocking work.
+    let items = ReceiverStream::new(rx).then(|item| {
+        let sem = semaphore.clone();
+        async move {
+            let permit = sem.acquire_owned().await.unwrap();
+            (item, permit)
+        }
+    });
+    tokio::pin!(items);
+
+    // Spawn verity tasks as work items arrive from the scan,
+    // and collect results from completed tasks — all concurrently.
+    let mut results = HashMap::new();
+    let mut pending_fs = None;
+    let mut items_open = true;
+    loop {
+        tokio::select! {
+            item = items.next(), if items_open => {
+                match item {
+                    Some(((key, fd, size), permit)) => {
+                        let repo = repo.clone();
+                        tasks.spawn_blocking(move || {
+                            let _permit = permit;
+                            let id = if let Some(repo) = repo {
+                                repo.ensure_object_from_fd(fd, size)?
+                            } else {
+                                compute_verity_from_fd::<ObjectID>(fd)?
+                            };
+                            Ok(TaskResult::Verity(key, id))
+                        });
+                    }
+                    None => items_open = false,
+                }
+            }
+            result = tasks.join_next(), if !tasks.is_empty() => {
+                match result.expect("JoinSet not empty")?? {
+                    TaskResult::Scan(fs) => {
+                        assert!(pending_fs.is_none(), "scan task completed twice");
+                        pending_fs = Some(fs);
+                    }
+                    TaskResult::Verity(key, id) => { results.insert(key, id); }
+                }
+            }
+            else => break,
+        }
+    }
+
+    // Resolve PendingFile -> RegularFile using the computed verity digests.
+    let fs = pending_fs
+        .expect("scan task completed")
+        .try_map_regular(|pf| resolve_pending_file(pf, &results))?;
+    debug_assert!(
+        fs.fsck().is_ok(),
+        "read_filesystem produced invalid filesystem"
+    );
+    Ok(fs)
 }
 
 /// Like [`read_filesystem`] but filters extended attributes using
@@ -597,7 +648,7 @@ where
     ObjectID: FsVerityHashValue,
     F: Fn(&OsStr) -> bool,
 {
-    let fs = read_filesystem(dirfd, path, repo)
+    let mut fs = read_filesystem(dirfd, path, repo)
         .await
         .context("Reading filtered filesystem")?;
     fs.filter_xattrs(xattr_filter);
