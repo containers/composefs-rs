@@ -3690,7 +3690,7 @@ mod tests {
         Ok(())
     }
 
-    use crate::tree::{FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat};
+    use crate::tree::{FileSystem, Inode, LeafContent, RegularFile, Stat};
 
     /// Create a default root stat for test filesystems
     fn test_root_stat() -> Stat {

@@ -78,6 +78,21 @@ impl Image {
         &self.id
     }
 
+    /// Read the raw manifest JSON bytes.
+    ///
+    /// Returns the original manifest bytes as stored on disk, preserving
+    /// whitespace and field ordering for content-addressed hashing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest file cannot be read.
+    pub fn read_manifest_raw(&self) -> Result<Vec<u8>> {
+        let mut file = self.image_dir.open(MANIFEST_FILENAME)?;
+        let mut data = Vec::new();
+        file.read_to_end(&mut data)?;
+        Ok(data)
+    }
+
     /// Read and parse the image manifest.
     ///
     /// The manifest is stored as a JSON file named "manifest" in the image directory.

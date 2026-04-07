@@ -13,6 +13,8 @@
 #![forbid(unsafe_code)]
 
 pub mod boot;
+#[cfg(feature = "containers-storage")]
+pub mod cstor;
 pub mod image;
 pub mod oci_image;
 pub mod skopeo;
@@ -232,6 +234,10 @@ pub struct PullOptions<'a> {
 /// Result of a pull operation.
 #[derive(Debug)]
 pub struct PullResult<ObjectID> {
+    /// The manifest digest (sha256:...).
+    pub manifest_digest: OciDigest,
+    /// The fs-verity hash of the manifest splitstream.
+    pub manifest_verity: ObjectID,
     /// The config digest (sha256:...).
     pub config_digest: OciDigest,
     /// The fs-verity hash of the config splitstream.
@@ -341,11 +347,34 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
     reference: Option<&str>,
     opts: PullOptions<'_>,
 ) -> Result<PullResult<ObjectID>> {
-    let (config_digest, config_verity, stats) =
-        skopeo::pull(repo, imgref, reference, opts.img_proxy_config).await?;
+    #[cfg(feature = "containers-storage")]
+    if let Some(image_id) = cstor::parse_containers_storage_ref(imgref) {
+        let (((manifest_digest, manifest_verity), (config_digest, config_verity)), stats) =
+            cstor::import_from_containers_storage(
+                repo,
+                image_id,
+                reference,
+                opts.zerocopy,
+                opts.storage_root,
+                opts.additional_image_stores,
+            )
+            .await?;
+        return Ok(PullResult {
+            manifest_digest,
+            manifest_verity,
+            config_digest,
+            config_verity,
+            stats,
+        });
+    }
+
+    let (result, stats) =
+        skopeo::pull_image(repo, imgref, reference, opts.img_proxy_config).await?;
     Ok(crate::PullResult {
-        config_digest,
-        config_verity,
+        manifest_digest: result.manifest_digest,
+        manifest_verity: result.manifest_verity,
+        config_digest: result.config_digest,
+        config_verity: result.config_verity,
         stats,
     })
 }
