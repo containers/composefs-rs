@@ -868,25 +868,27 @@ mod test {
             "\
 / 0 40755 6 0 0 0 0.0 - - -
 /etc 0 40755 2 0 0 0 0.0 - - -
-/etc/hostname 9 100644 1 0 0 0 0.0 - testhost\\n -
+/etc/hostname 9 100644 1 0 0 0 0.0 - test-host -
 /etc/os-release 23 100644 1 0 0 0 0.0 - ID=test\\nVERSION_ID=1.0\\n -
-/etc/passwd 34 100644 1 0 0 0 0.0 - root:x:0:0:root:/root:/usr/bin/sh\\n -
+/etc/passwd 0 100644 1 0 0 0 0.0 - - -
 /tmp 0 40755 2 0 0 0 0.0 - - -
 /usr 0 40755 5 0 0 0 0.0 - - -
 /usr/bin 0 40755 2 0 0 0 0.0 - - -
-/usr/bin/busybox 22 100755 1 0 0 0 0.0 - busybox-binary-content -
+/usr/bin/busybox 0 100755 1 0 0 0 0.0 - - -
 /usr/bin/cat 7 120777 1 0 0 0 0.0 busybox - -
 /usr/bin/cp 7 120777 1 0 0 0 0.0 busybox - -
 /usr/bin/ls 7 120777 1 0 0 0 0.0 busybox - -
 /usr/bin/mv 7 120777 1 0 0 0 0.0 busybox - -
-/usr/bin/myapp 25 100755 1 0 0 0 0.0 - #!/usr/bin/sh\\necho\\x20hello\\n -
+/usr/bin/ping 7 120777 1 0 0 0 0.0 busybox - - security.capability=\\x02\\x00\\x00\\x02\\x00\\x20\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00
 /usr/bin/rm 7 120777 1 0 0 0 0.0 busybox - -
 /usr/bin/sh 7 120777 1 0 0 0 0.0 busybox - -
 /usr/lib 0 40755 2 0 0 0 0.0 - - -
 /usr/share 0 40755 3 0 0 0 0.0 - - -
-/usr/share/myapp 0 40755 2 0 0 0 0.0 - - -
-/usr/share/myapp/data.txt 16 100644 1 0 0 0 0.0 - application-data -
-/var 0 40755 2 0 0 0 0.0 - - -
+/usr/share/doc 0 40755 2 0 0 0 0.0 - - -
+/usr/share/doc/README 0 100644 1 0 0 0 0.0 - - -
+/var 0 40755 3 0 0 0 0.0 - - -
+/var/data 0 40755 2 0 0 0 0.0 - - -
+/var/data/app.json 0 100644 1 0 0 0 0.0 - - -
 "
         );
     }
