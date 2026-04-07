@@ -273,7 +273,7 @@ fn privileged_oci_pull_mount() -> Result<()> {
 
     // Verify file content at the mountpoint
     let hostname = std::fs::read_to_string(mountpoint.path().join("etc/hostname"))?;
-    ensure!(hostname == "testhost\n", "hostname mismatch: {hostname:?}");
+    ensure!(hostname == "test-host", "hostname mismatch: {hostname:?}");
 
     let os_release = std::fs::read_to_string(mountpoint.path().join("etc/os-release"))?;
     ensure!(
@@ -281,10 +281,12 @@ fn privileged_oci_pull_mount() -> Result<()> {
         "os-release missing ID: {os_release:?}"
     );
 
+    // busybox is a 4096-byte external file (random data seeded from size)
     let busybox = std::fs::read(mountpoint.path().join("usr/bin/busybox"))?;
     ensure!(
-        busybox == b"busybox-binary-content",
-        "busybox content mismatch"
+        busybox.len() == 4096,
+        "busybox size mismatch: expected 4096, got {}",
+        busybox.len()
     );
 
     let sh_target = std::fs::read_link(mountpoint.path().join("usr/bin/sh"))?;
@@ -293,10 +295,12 @@ fn privileged_oci_pull_mount() -> Result<()> {
         "sh symlink target mismatch: {sh_target:?}"
     );
 
-    let app_data = std::fs::read_to_string(mountpoint.path().join("usr/share/myapp/data.txt"))?;
+    // App layer has a 512-byte README (external, random data)
+    let readme = std::fs::read(mountpoint.path().join("usr/share/doc/README"))?;
     ensure!(
-        app_data == "application-data",
-        "app data mismatch: {app_data:?}"
+        readme.len() == 512,
+        "README size mismatch: expected 512, got {}",
+        readme.len()
     );
 
     ensure!(mountpoint.path().join("tmp").is_dir(), "/tmp missing");
