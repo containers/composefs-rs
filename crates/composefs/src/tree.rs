@@ -39,12 +39,16 @@ pub type Inode<T> = generic_tree::Inode<RegularFile<T>>;
 /// A complete filesystem tree, specialized for composefs regular files.
 pub type FileSystem<T> = generic_tree::FileSystem<RegularFile<T>>;
 
+/// A read-only view of a directory paired with its leaves table, specialized for composefs regular files.
+pub type DirectoryRef<'a, T> = generic_tree::DirectoryRef<'a, RegularFile<T>>;
+
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, collections::BTreeMap, ffi::OsStr, rc::Rc};
+    use std::{collections::BTreeMap, ffi::OsStr};
 
     use super::*;
     use crate::fsverity::Sha256HashValue;
+    use crate::generic_tree::LeafId;
 
     // Helper to create a Stat with a specific mtime
     fn stat_with_mtime(mtime: i64) -> Stat {
@@ -53,7 +57,7 @@ mod tests {
             st_uid: 1000,
             st_gid: 1000,
             st_mtim_sec: mtime,
-            xattrs: RefCell::new(BTreeMap::new()),
+            xattrs: BTreeMap::new(),
         }
     }
 
@@ -65,14 +69,6 @@ mod tests {
         }))
     }
 
-    // Helper to create a simple Leaf (e.g., an empty inline file)
-    fn new_leaf_file(mtime: i64) -> Rc<Leaf<Sha256HashValue>> {
-        Rc::new(Leaf {
-            stat: stat_with_mtime(mtime),
-            content: LeafContent::Regular(super::RegularFile::Inline(Default::default())),
-        })
-    }
-
     // Helper for default stat in tests
     fn default_stat() -> Stat {
         Stat {
@@ -80,21 +76,27 @@ mod tests {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
-            xattrs: RefCell::new(BTreeMap::new()),
+            xattrs: BTreeMap::new(),
         }
     }
 
     #[test]
     fn test_insert_and_get_leaf() {
+        let mut leaves: Vec<Leaf<Sha256HashValue>> = Vec::new();
+        let leaf_id = LeafId(leaves.len());
+        leaves.push(Leaf {
+            stat: stat_with_mtime(10),
+            content: LeafContent::Regular(super::RegularFile::Inline(Default::default())),
+        });
+
         let mut dir = Directory::<Sha256HashValue>::new(default_stat());
-        let leaf = new_leaf_file(10);
-        dir.insert(OsStr::new("file.txt"), Inode::Leaf(Rc::clone(&leaf)));
+        dir.insert(OsStr::new("file.txt"), Inode::leaf(leaf_id));
         assert_eq!(dir.entries.len(), 1);
 
-        let retrieved_leaf_rc = dir.ref_leaf(OsStr::new("file.txt")).unwrap();
-        assert!(Rc::ptr_eq(&retrieved_leaf_rc, &leaf));
+        let retrieved_id = dir.leaf_id(OsStr::new("file.txt")).unwrap();
+        assert_eq!(retrieved_id, leaf_id);
 
-        let regular_file_content = dir.get_file(OsStr::new("file.txt")).unwrap();
+        let regular_file_content = dir.get_file(OsStr::new("file.txt"), &leaves).unwrap();
         assert!(matches!(
             regular_file_content,
             super::RegularFile::Inline(_)

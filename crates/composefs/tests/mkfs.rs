@@ -1,12 +1,10 @@
 //! Tests for mkfs
 
 use std::{
-    cell::RefCell,
     collections::BTreeMap,
     ffi::OsStr,
     io::Write,
     process::{Command, Stdio},
-    rc::Rc,
 };
 
 use similar_asserts::assert_eq;
@@ -16,7 +14,7 @@ use composefs::{
     dumpfile::write_dumpfile,
     erofs::{debug::debug_img, writer::mkfs_erofs},
     fsverity::{FsVerityHashValue, Sha256HashValue},
-    tree::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
+    tree::{FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
 };
 
 fn default_stat() -> Stat {
@@ -25,7 +23,7 @@ fn default_stat() -> Stat {
         st_uid: 0,
         st_gid: 0,
         st_mtim_sec: 0,
-        xattrs: RefCell::new(BTreeMap::new()),
+        xattrs: BTreeMap::new(),
     }
 }
 
@@ -46,23 +44,21 @@ fn test_empty() {
 }
 
 fn add_leaf<ObjectID: FsVerityHashValue>(
-    dir: &mut Directory<ObjectID>,
+    fs: &mut FileSystem<ObjectID>,
     name: impl AsRef<OsStr>,
     content: LeafContent<ObjectID>,
 ) {
-    dir.insert(
-        name.as_ref(),
-        Inode::Leaf(Rc::new(Leaf {
-            content,
-            stat: Stat {
-                st_gid: 0,
-                st_uid: 0,
-                st_mode: 0,
-                st_mtim_sec: 0,
-                xattrs: RefCell::new(BTreeMap::new()),
-            },
-        })),
+    let leaf_id = fs.push_leaf(
+        Stat {
+            st_gid: 0,
+            st_uid: 0,
+            st_mode: 0,
+            st_mtim_sec: 0,
+            xattrs: BTreeMap::new(),
+        },
+        content,
     );
+    fs.root.insert(name.as_ref(), Inode::leaf(leaf_id));
 }
 
 fn simple(fs: &mut FileSystem<Sha256HashValue>) {
@@ -70,22 +66,22 @@ fn simple(fs: &mut FileSystem<Sha256HashValue>) {
         "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
     )
     .unwrap();
-    add_leaf(&mut fs.root, "fifo", LeafContent::Fifo);
+    add_leaf(fs, "fifo", LeafContent::Fifo);
     add_leaf(
-        &mut fs.root,
+        fs,
         "regular-inline",
         LeafContent::Regular(RegularFile::Inline((*b"hihi").into())),
     );
     add_leaf(
-        &mut fs.root,
+        fs,
         "regular-external",
         LeafContent::Regular(RegularFile::External(ext_id, 1234)),
     );
-    add_leaf(&mut fs.root, "chrdev", LeafContent::CharacterDevice(123));
-    add_leaf(&mut fs.root, "blkdev", LeafContent::BlockDevice(123));
-    add_leaf(&mut fs.root, "socket", LeafContent::Socket);
+    add_leaf(fs, "chrdev", LeafContent::CharacterDevice(123));
+    add_leaf(fs, "blkdev", LeafContent::BlockDevice(123));
+    add_leaf(fs, "socket", LeafContent::Socket);
     add_leaf(
-        &mut fs.root,
+        fs,
         "symlink",
         LeafContent::Symlink(OsStr::new("/target").into()),
     );

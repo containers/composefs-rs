@@ -772,6 +772,7 @@ fn dump_file_impl(
     backing_path_only: bool,
 ) -> Result<()> {
     let mut out = Vec::new();
+    let nlink_map = fs.nlinks();
 
     for file_path in files {
         let (dir, file) = fs.root.split(file_path.as_os_str())?;
@@ -787,14 +788,15 @@ fn dump_file_impl(
                     anyhow::bail!("{} is a directory", file_path.display());
                 }
 
-                dump_single_dir(&mut out, directory, file_path.clone())?
+                dump_single_dir(&mut out, directory, &fs, &nlink_map, file_path.clone())?
             }
 
-            Inode::Leaf(leaf) => {
+            Inode::Leaf(leaf_id, _) => {
                 use composefs::generic_tree::LeafContent::*;
                 use composefs::tree::RegularFile::*;
 
                 if backing_path_only {
+                    let leaf = fs.leaf(*leaf_id);
                     match &leaf.content {
                         Regular(f) => match f {
                             Inline(..) => println!("{} inline", file_path.display()),
@@ -810,7 +812,7 @@ fn dump_file_impl(
                     continue;
                 }
 
-                dump_single_file(&mut out, leaf, file_path.clone())?
+                dump_single_file(&mut out, *leaf_id, &fs, &nlink_map, file_path.clone())?
             }
         };
     }

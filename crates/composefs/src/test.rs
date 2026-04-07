@@ -113,12 +113,10 @@ impl<ObjectID: FsVerityHashValue> Default for TestRepo<ObjectID> {
 #[cfg(test)]
 pub(crate) mod proptest_strategies {
     use std::{
-        cell::RefCell,
         collections::BTreeMap,
         ffi::{OsStr, OsString},
         mem,
         os::unix::ffi::OsStringExt,
-        rc::Rc,
     };
 
     use proptest::prelude::*;
@@ -126,6 +124,7 @@ pub(crate) mod proptest_strategies {
     use crate::{
         INLINE_CONTENT_MAX_V0,
         fsverity::FsVerityHashValue,
+        generic_tree::LeafId,
         tree::{self, RegularFile},
     };
 
@@ -173,7 +172,7 @@ pub(crate) mod proptest_strategies {
                 st_uid: uid,
                 st_gid: gid,
                 st_mtim_sec: mtime,
-                xattrs: RefCell::new(xattrs),
+                xattrs,
             })
     }
 
@@ -449,30 +448,24 @@ pub(crate) mod proptest_strategies {
     ) -> tree::FileSystem<ObjectID> {
         let mut fs = tree::FileSystem::new(spec.root.stat);
 
-        let mut all_leaves: Vec<Rc<tree::Leaf<ObjectID>>> = Vec::new();
+        let mut all_leaf_ids: Vec<LeafId> = Vec::new();
         let mut used_names: std::collections::HashSet<OsString> = std::collections::HashSet::new();
 
         // Insert root-level leaves
         for (name, leaf_spec) in spec.root.leaves {
-            let leaf = Rc::new(tree::Leaf {
-                stat: leaf_spec.stat,
-                content: build_leaf_content(leaf_spec.content),
-            });
-            all_leaves.push(Rc::clone(&leaf));
+            let leaf_id = fs.push_leaf(leaf_spec.stat, build_leaf_content(leaf_spec.content));
+            all_leaf_ids.push(leaf_id);
             used_names.insert(name.clone());
-            fs.root.insert(&name, tree::Inode::Leaf(leaf));
+            fs.root.insert(&name, tree::Inode::leaf(leaf_id));
         }
 
         // Insert subdirectories
         for (dir_name, dir_spec) in spec.root.subdirs {
             let mut subdir = tree::Directory::new(dir_spec.stat);
             for (name, leaf_spec) in dir_spec.leaves {
-                let leaf = Rc::new(tree::Leaf {
-                    stat: leaf_spec.stat,
-                    content: build_leaf_content(leaf_spec.content),
-                });
-                all_leaves.push(Rc::clone(&leaf));
-                subdir.insert(&name, tree::Inode::Leaf(leaf));
+                let leaf_id = fs.push_leaf(leaf_spec.stat, build_leaf_content(leaf_spec.content));
+                all_leaf_ids.push(leaf_id);
+                subdir.insert(&name, tree::Inode::leaf(leaf_id));
             }
             used_names.insert(dir_name.clone());
             fs.root
@@ -481,16 +474,14 @@ pub(crate) mod proptest_strategies {
 
         // Insert hardlinks into the root directory
         for hl in &spec.hardlinks {
-            if !all_leaves.is_empty() {
-                let idx = hl.source_index % all_leaves.len();
+            if !all_leaf_ids.is_empty() {
+                let idx = hl.source_index % all_leaf_ids.len();
                 if used_names.insert(hl.link_name.clone()) {
-                    let leaf = Rc::clone(&all_leaves[idx]);
-                    fs.root.insert(&hl.link_name, tree::Inode::Leaf(leaf));
+                    let leaf_id = all_leaf_ids[idx];
+                    fs.root.insert(&hl.link_name, tree::Inode::leaf(leaf_id));
                 }
             }
         }
-        // Drop the temporary refs used for hardlink indexing
-        drop(all_leaves);
 
         fs
     }

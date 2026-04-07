@@ -36,8 +36,12 @@ fmt-check:
 fmt:
     cargo fmt --all
 
-# Run all checks (clippy + fmt + test)
-check: clippy check-feature-combos fmt-check test
+# Check that fuzz targets compile
+check-fuzz:
+    cargo check --manifest-path crates/composefs/fuzz/Cargo.toml
+
+# Run all checks (clippy + fmt + test + fuzz build)
+check: clippy check-feature-combos fmt-check test check-fuzz
 
 # Base image for test container builds.
 # Override to test on a different distro, e.g.:

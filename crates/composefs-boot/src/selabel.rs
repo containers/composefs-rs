@@ -26,7 +26,7 @@ use rustix::{
 use composefs::{
     fsverity::FsVerityHashValue,
     repository::Repository,
-    tree::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
+    tree::{Directory, DirectoryRef, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
 };
 
 /// The SELinux security context extended attribute name.
@@ -129,7 +129,7 @@ struct Policy {
 
 /// Open a file in the composefs store, handling inline vs external files.
 pub fn open_file<H: FsVerityHashValue>(
-    dir: &Directory<H>,
+    dir: DirectoryRef<'_, H>,
     filename: impl AsRef<OsStr>,
     repo: &Repository<H>,
 ) -> Result<Option<Box<dyn Read>>> {
@@ -238,18 +238,18 @@ impl Policy {
     }
 }
 
-fn relabel(stat: &Stat, path: &Path, ifmt: u8, policy: &mut Policy) {
-    let mut xattrs = stat.xattrs.borrow_mut();
+fn relabel(stat: &mut Stat, path: &Path, ifmt: u8, policy: &mut Policy) {
     let key = OsStr::new(XATTR_SECURITY_SELINUX);
 
     if let Some(label) = policy.lookup(path.as_os_str(), ifmt) {
-        xattrs.insert(Box::from(key), Box::from(label.as_bytes()));
+        stat.xattrs
+            .insert(Box::from(key), Box::from(label.as_bytes()));
     } else {
-        xattrs.remove(key);
+        stat.xattrs.remove(key);
     }
 }
 
-fn relabel_leaf<H: FsVerityHashValue>(leaf: &Leaf<H>, path: &Path, policy: &mut Policy) {
+fn relabel_leaf<H: FsVerityHashValue>(leaf: &mut Leaf<H>, path: &Path, policy: &mut Policy) {
     let ifmt = match leaf.content {
         LeafContent::Regular(..) => b'-',
         LeafContent::Fifo => b'p', // NB: 'pipe', not 'fifo'
@@ -258,25 +258,44 @@ fn relabel_leaf<H: FsVerityHashValue>(leaf: &Leaf<H>, path: &Path, policy: &mut 
         LeafContent::BlockDevice(..) => b'b',
         LeafContent::CharacterDevice(..) => b'c',
     };
-    relabel(&leaf.stat, path, ifmt, policy);
+    relabel(&mut leaf.stat, path, ifmt, policy);
 }
 
-fn relabel_inode<H: FsVerityHashValue>(inode: &Inode<H>, path: &mut PathBuf, policy: &mut Policy) {
-    match inode {
-        Inode::Directory(dir) => relabel_dir(dir, path, policy),
-        Inode::Leaf(leaf) => relabel_leaf(leaf, path, policy),
-    }
-}
+fn relabel_dir<H: FsVerityHashValue>(
+    dir: &mut Directory<H>,
+    leaves: &mut [Leaf<H>],
+    path: &mut PathBuf,
+    policy: &mut Policy,
+) {
+    use composefs::generic_tree::LeafId;
 
-fn relabel_dir<H: FsVerityHashValue>(dir: &Directory<H>, path: &mut PathBuf, policy: &mut Policy) {
-    relabel(&dir.stat, path, b'd', policy);
+    relabel(&mut dir.stat, path, b'd', policy);
 
-    for (name, inode) in dir.sorted_entries() {
-        path.push(name);
-        match policy.check_aliased(path.as_os_str()) {
-            Some(original) => relabel_inode(inode, &mut PathBuf::from(original), policy),
-            None => relabel_inode(inode, path, policy),
+    // Collect entry names and types to avoid borrow conflicts during mutation.
+    let children: Vec<(Box<OsStr>, Option<LeafId>)> = dir
+        .sorted_entries()
+        .map(|(name, inode)| {
+            let id = match inode {
+                Inode::Leaf(id, _) => Some(*id),
+                Inode::Directory(_) => None,
+            };
+            (Box::from(name), id)
+        })
+        .collect();
+
+    for (name, leaf_id) in children {
+        path.push(Path::new(&name));
+        let aliased_path = policy.check_aliased(path.as_os_str()).map(PathBuf::from);
+        let effective_path = aliased_path.as_deref().unwrap_or(path.as_path());
+
+        if let Some(id) = leaf_id {
+            relabel_leaf(&mut leaves[id.0], effective_path, policy);
+        } else {
+            let mut sub_path = effective_path.to_path_buf();
+            let subdir = dir.get_directory_mut(name.as_ref()).unwrap();
+            relabel_dir(subdir, leaves, &mut sub_path, policy);
         }
+
         path.pop();
     }
 }
@@ -293,11 +312,9 @@ fn parse_config(file: impl Read) -> Result<Option<String>> {
     Ok(None)
 }
 
-fn strip_selinux_labels<H: FsVerityHashValue>(fs: &FileSystem<H>) {
-    fs.for_each_stat(|stat| {
-        stat.xattrs
-            .borrow_mut()
-            .remove(OsStr::new(XATTR_SECURITY_SELINUX));
+fn strip_selinux_labels<H: FsVerityHashValue>(fs: &mut FileSystem<H>) {
+    fs.for_each_stat_mut(|stat| {
+        stat.xattrs.remove(OsStr::new(XATTR_SECURITY_SELINUX));
     });
 }
 
@@ -324,7 +341,8 @@ fn apply_policy<H: FsVerityHashValue>(fs: &mut FileSystem<H>, policy: Option<Pol
     match policy {
         Some(mut policy) => {
             let mut path = PathBuf::from("/");
-            relabel_dir(&fs.root, &mut path, &mut policy);
+            let FileSystem { root, leaves } = fs;
+            relabel_dir(root, leaves, &mut path, &mut policy);
             true
         }
         None => {
@@ -356,7 +374,8 @@ fn apply_policy<H: FsVerityHashValue>(fs: &mut FileSystem<H>, policy: Option<Pol
 pub fn selabel<H: FsVerityHashValue>(fs: &mut FileSystem<H>, repo: &Repository<H>) -> Result<bool> {
     // Build the policy while only borrowing fs.root immutably.
     let policy = {
-        let Some(etc_selinux) = fs.root.get_directory_opt("etc/selinux".as_ref())? else {
+        let root = fs.as_dir();
+        let Some(etc_selinux) = root.get_directory_ref_opt("etc/selinux".as_ref())? else {
             strip_selinux_labels(fs);
             return Ok(false);
         };
@@ -365,8 +384,8 @@ pub fn selabel<H: FsVerityHashValue>(fs: &mut FileSystem<H>, repo: &Repository<H
             |filename| open_file(etc_selinux, filename, repo),
             |policy_name, filename| {
                 let dir = etc_selinux
-                    .get_directory(policy_name.as_ref())?
-                    .get_directory("contexts/files".as_ref())?;
+                    .get_directory_ref(policy_name.as_ref())?
+                    .get_directory_ref("contexts/files".as_ref())?;
                 open_file(dir, filename, repo)
             },
         )?
@@ -438,7 +457,6 @@ mod tests {
     /// Get the SELinux label from a Stat's xattrs, if any.
     fn selinux_label(stat: &Stat) -> Option<String> {
         stat.xattrs
-            .borrow()
             .get(OsStr::new(XATTR_SECURITY_SELINUX))
             .map(|v| String::from_utf8_lossy(v).into())
     }
@@ -454,17 +472,18 @@ mod tests {
         let p = Path::new(path);
         let parent = p.parent().unwrap();
         let name = p.file_name().unwrap();
+        let root = fs.as_dir();
         let dir = if parent == Path::new("/") {
-            &fs.root
+            root
         } else {
-            fs.root.get_directory(parent.as_os_str()).unwrap()
+            root.get_directory_ref(parent.as_os_str()).unwrap()
         };
         match dir
             .lookup(name)
             .unwrap_or_else(|| panic!("{path} not found"))
         {
             Inode::Directory(d) => selinux_label(&d.stat),
-            Inode::Leaf(l) => selinux_label(&l.stat),
+            Inode::Leaf(leaf_id, _) => selinux_label(&fs.leaf(*leaf_id).stat),
         }
     }
 
@@ -484,26 +503,6 @@ mod tests {
     ) -> FileSystem<Sha256HashValue> {
         use composefs::dumpfile::write_dumpfile;
 
-        // Build a tree containing the SELinux policy files, serialize it
-        // via the dumpfile writer so escaping is handled correctly, then
-        // append the caller's additional entries and parse the whole thing.
-        let selinux_config = b"SELINUX=enforcing\nSELINUXTYPE=targeted\n";
-
-        let inline = |data: &[u8]| {
-            Inode::Leaf(std::rc::Rc::new(Leaf {
-                stat: Stat {
-                    st_mode: 0o100644,
-                    st_uid: 0,
-                    st_gid: 0,
-                    st_mtim_sec: 0,
-                    xattrs: Default::default(),
-                },
-                content: LeafContent::Regular(RegularFile::Inline(
-                    data.to_vec().into_boxed_slice(),
-                )),
-            }))
-        };
-
         let dir_stat = || Stat {
             st_mode: 0o40755,
             st_uid: 0,
@@ -513,6 +512,27 @@ mod tests {
         };
 
         let mut fs = FileSystem::<Sha256HashValue>::new(dir_stat());
+
+        // Helper: push an inline file leaf and return its Inode.
+        let push_inline =
+            |fs: &mut FileSystem<Sha256HashValue>, data: &[u8]| -> Inode<Sha256HashValue> {
+                let id = fs.push_leaf(
+                    Stat {
+                        st_mode: 0o100644,
+                        st_uid: 0,
+                        st_gid: 0,
+                        st_mtim_sec: 0,
+                        xattrs: Default::default(),
+                    },
+                    LeafContent::Regular(RegularFile::Inline(data.to_vec().into_boxed_slice())),
+                );
+                Inode::leaf(id)
+            };
+
+        // Build a tree containing the SELinux policy files, serialize it
+        // via the dumpfile writer so escaping is handled correctly, then
+        // append the caller's additional entries and parse the whole thing.
+        let selinux_config = b"SELINUX=enforcing\nSELINUXTYPE=targeted\n";
 
         // Create the directory tree
         for path in [
@@ -525,19 +545,26 @@ mod tests {
             let (dir, name) = fs.root.split_mut(path.as_ref()).unwrap();
             dir.insert(name, Inode::Directory(Box::new(Directory::new(dir_stat()))));
         }
+        let config_inode = push_inline(&mut fs, selinux_config);
         fs.root
             .get_directory_mut("etc/selinux".as_ref())
             .unwrap()
-            .insert(OsStr::new("config"), inline(selinux_config));
+            .insert(OsStr::new("config"), config_inode);
 
         // Insert file_contexts and extra policy files
+        let fc_inode = push_inline(&mut fs, file_contexts);
+        let extra_inodes: Vec<_> = extra_policy_files
+            .iter()
+            .map(|(name, content)| (name.to_string(), push_inline(&mut fs, content)))
+            .collect();
+
         let files_dir = fs
             .root
             .get_directory_mut("etc/selinux/targeted/contexts/files".as_ref())
             .unwrap();
-        files_dir.insert(OsStr::new("file_contexts"), inline(file_contexts));
-        for (name, content) in extra_policy_files {
-            files_dir.insert(OsStr::new(name), inline(content));
+        files_dir.insert(OsStr::new("file_contexts"), fc_inode);
+        for (name, inode) in extra_inodes {
+            files_dir.insert(OsStr::new(&name), inode);
         }
 
         // Serialize via the proper dumpfile writer, append extra entries, re-parse
