@@ -14,6 +14,7 @@ pub mod boot;
 pub mod image;
 pub mod oci_image;
 pub mod skopeo;
+pub mod splitfdstream;
 pub mod tar;
 
 /// Test utilities for building OCI images from dumpfile strings.
@@ -24,6 +25,10 @@ pub mod test_util;
 
 // Re-export the composefs crate for consumers who only need composefs-oci
 pub use composefs;
+
+pub use splitfdstream::{
+    CompleteImageImportResult, import_complete_image_from_splitfdstream, import_from_splitfdstream,
+};
 
 use std::{collections::HashMap, sync::Arc};
 
