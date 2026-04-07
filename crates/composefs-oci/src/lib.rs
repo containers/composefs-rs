@@ -868,25 +868,27 @@ mod test {
             "\
 / 0 40755 6 0 0 0 0.0 - - -
 /etc 0 40755 2 0 0 0 0.0 - - -
-/etc/hostname 9 100644 1 0 0 0 0.0 - testhost\\n -
+/etc/hostname 9 100644 1 0 0 0 0.0 - test-host -
 /etc/os-release 23 100644 1 0 0 0 0.0 - ID=test\\nVERSION_ID=1.0\\n -
-/etc/passwd 34 100644 1 0 0 0 0.0 - root:x:0:0:root:/root:/usr/bin/sh\\n -
+/etc/passwd 100 100644 1 0 0 0 0.0 f2/c4fd5735bd46db3b18d402ae87c5086c97c0e1321901cfd30f320b73ef25aa - f2c4fd5735bd46db3b18d402ae87c5086c97c0e1321901cfd30f320b73ef25aa
 /tmp 0 40755 2 0 0 0 0.0 - - -
 /usr 0 40755 5 0 0 0 0.0 - - -
 /usr/bin 0 40755 2 0 0 0 0.0 - - -
-/usr/bin/busybox 22 100755 1 0 0 0 0.0 - busybox-binary-content -
+/usr/bin/busybox 4096 100755 1 0 0 0 0.0 f0/f7e1e58fdd31f5792222087377a4a976760c416ecdf5f426193e608681b7a1 - f0f7e1e58fdd31f5792222087377a4a976760c416ecdf5f426193e608681b7a1
 /usr/bin/cat 7 120777 1 0 0 0 0.0 busybox - -
 /usr/bin/cp 7 120777 1 0 0 0 0.0 busybox - -
 /usr/bin/ls 7 120777 1 0 0 0 0.0 busybox - -
 /usr/bin/mv 7 120777 1 0 0 0 0.0 busybox - -
-/usr/bin/myapp 25 100755 1 0 0 0 0.0 - #!/usr/bin/sh\\necho\\x20hello\\n -
+/usr/bin/ping 7 120777 1 0 0 0 0.0 busybox - - security.capability=\\x02\\x00\\x00\\x02\\x00\\x20\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00
 /usr/bin/rm 7 120777 1 0 0 0 0.0 busybox - -
 /usr/bin/sh 7 120777 1 0 0 0 0.0 busybox - -
 /usr/lib 0 40755 2 0 0 0 0.0 - - -
 /usr/share 0 40755 3 0 0 0 0.0 - - -
-/usr/share/myapp 0 40755 2 0 0 0 0.0 - - -
-/usr/share/myapp/data.txt 16 100644 1 0 0 0 0.0 - application-data -
-/var 0 40755 2 0 0 0 0.0 - - -
+/usr/share/doc 0 40755 2 0 0 0 0.0 - - -
+/usr/share/doc/README 512 100644 1 0 0 0 0.0 51/44b8f80be57c3518f410d930e18c4e405387c82e4993c18265a1ba4a80263b - 5144b8f80be57c3518f410d930e18c4e405387c82e4993c18265a1ba4a80263b
+/var 0 40755 3 0 0 0 0.0 - - -
+/var/data 0 40755 2 0 0 0 0.0 - - -
+/var/data/app.json 256 100644 1 0 0 0 0.0 c9/21965b74ac1780bc437cec640b27186d85317b9afdb3dbb68626aed5ecd2b6 - c921965b74ac1780bc437cec640b27186d85317b9afdb3dbb68626aed5ecd2b6
 "
         );
     }
@@ -936,9 +938,10 @@ mod test {
         // Untag and GC — everything gets collected
         oci_image::untag_image(repo, "gctest:v1").unwrap();
         let gc2 = repo.gc(&[]).unwrap();
-        // 10 objects: 5 layer splitstreams + config JSON + manifest JSON
-        //   + EROFS image + new config splitstream + new manifest splitstream
-        assert_eq!(gc2.objects_removed, 10, "all objects collected after untag");
+        // 14 objects: 5 layer splitstreams + 4 external file objects
+        //   + config JSON + manifest JSON + EROFS image
+        //   + new config splitstream + new manifest splitstream
+        assert_eq!(gc2.objects_removed, 14, "all objects collected after untag");
         // 7 streams: 5 layers + 1 config + 1 manifest (tag ref removed by untag)
         assert_eq!(gc2.streams_pruned, 7, "all stream symlinks pruned");
         // 1 image: the EROFS symlink under images/
