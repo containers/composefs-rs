@@ -10,7 +10,7 @@ use std::{
     path::Path,
 };
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 
 use composefs::{fsverity::FsVerityHashValue, repository::Repository};
 
@@ -88,7 +88,9 @@ pub fn write_t2_simple<ObjectID: FsVerityHashValue>(
     create_dir_all(&efi_linux)?;
     let filename = efi_linux.join(t2.file_path);
     let content = composefs::fs::read_file(&t2.file, repo)?;
-    let (composefs, _) = get_cmdline_composefs::<ObjectID>(uki::get_cmdline(&content)?)?;
+    let cmdline = uki::get_cmdline(&content)?;
+    let (composefs, _) = get_cmdline_composefs::<ObjectID>(cmdline)
+        .with_context(|| format!("parsing UKI .cmdline section: {cmdline:?}"))?;
 
     ensure!(
         &composefs == root_id,

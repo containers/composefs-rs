@@ -49,10 +49,31 @@ pub fn get_cmdline_composefs<ObjectID: FsVerityHashValue>(
     cmdline: &str,
 ) -> Result<(ObjectID, bool)> {
     let id = get_cmdline_value(cmdline, "composefs=").context("composefs= value not found")?;
+    let expected_hex_len = size_of::<ObjectID>() * 2;
     if let Some(stripped) = id.strip_prefix('?') {
-        Ok((ObjectID::from_hex(stripped)?, true))
+        Ok((
+            ObjectID::from_hex(stripped).with_context(|| {
+                format!(
+                    "parsing composefs= hash: got {} hex chars, expected {} for {}",
+                    stripped.len(),
+                    expected_hex_len,
+                    ObjectID::ALGORITHM,
+                )
+            })?,
+            true,
+        ))
     } else {
-        Ok((ObjectID::from_hex(id)?, false))
+        Ok((
+            ObjectID::from_hex(id).with_context(|| {
+                format!(
+                    "parsing composefs= hash: got {} hex chars, expected {} for {}",
+                    id.len(),
+                    expected_hex_len,
+                    ObjectID::ALGORITHM,
+                )
+            })?,
+            false,
+        ))
     }
 }
 
