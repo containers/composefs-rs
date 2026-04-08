@@ -201,6 +201,16 @@ enum OciCommand {
         /// Optional human-readable name for the layer
         name: Option<String>,
     },
+    /// Imports a complete image from a splitfdstream server into the repository.
+    ImportImageSplitfdstream {
+        /// Path to the splitfdstream server socket
+        socket: PathBuf,
+        /// The image ID (manifest digest or tag)
+        image_id: String,
+        /// Tag name for imported image
+        #[clap(long)]
+        tag: Option<String>,
+    },
     /// List the contents of a stored tar layer
     LsLayer {
         /// Layer content digest, e.g. sha256:a1b2c3...
@@ -879,6 +889,27 @@ where
                 )
                 .await?;
                 println!("{}", object_id.to_id());
+            }
+            OciCommand::ImportImageSplitfdstream {
+                socket,
+                image_id,
+                tag,
+            } => {
+                let result = composefs_oci::import_complete_image_from_splitfdstream(
+                    &Arc::new(repo),
+                    &socket,
+                    &image_id,
+                    tag.as_deref(),
+                )?;
+
+                println!("Imported complete image:");
+                println!("  Manifest: {}", result.manifest_digest);
+                println!("  Config:   {}", result.config_digest);
+                println!("  Layers:   {}", result.layers_imported);
+                println!("  Size:     {} bytes", result.total_size_bytes);
+                if let Some(tag_name) = tag {
+                    println!("  Tagged:   {}", tag_name);
+                }
             }
             OciCommand::LsLayer { ref name } => {
                 composefs_oci::ls_layer(&repo, name)?;
