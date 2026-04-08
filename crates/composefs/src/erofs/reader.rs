@@ -952,6 +952,9 @@ pub enum ErofsReaderError {
     /// File type in directory entry doesn't match inode
     #[error("File type in dirent doesn't match type in inode")]
     FileTypeMismatch,
+    /// Duplicate directory entry name
+    #[error("Duplicate directory entry {0:?}")]
+    DuplicateEntry(Box<OsStr>),
 }
 
 type ReadResult<T> = Result<T, ErofsReaderError>;
@@ -1406,11 +1409,15 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
                 depth + 1,
             )
             .with_context(|| format!("reading directory {:?}", name))?;
-            dir.insert(name, tree::Inode::Directory(Box::new(child_dir)));
+            if !dir.insert(name, tree::Inode::Directory(Box::new(child_dir))) {
+                return Err(ErofsReaderError::DuplicateEntry(Box::from(name)).into());
+            }
         } else {
             // Check if this is a hardlink (same nid seen before)
             if let Some(&existing_leaf_id) = builder.hardlinks.get(&nid) {
-                dir.insert(name, tree::Inode::leaf(existing_leaf_id));
+                if !dir.insert(name, tree::Inode::leaf(existing_leaf_id)) {
+                    return Err(ErofsReaderError::DuplicateEntry(Box::from(name)).into());
+                }
                 continue;
             }
 
@@ -1478,7 +1485,9 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
                     leaf_id,
                 });
 
-            dir.insert(name, tree::Inode::leaf(leaf_id));
+            if !dir.insert(name, tree::Inode::leaf(leaf_id)) {
+                return Err(ErofsReaderError::DuplicateEntry(Box::from(name)).into());
+            }
         }
     }
 
@@ -2539,5 +2548,38 @@ mod tests {
                 round_trip_filesystem(&fs);
             }
         }
+    }
+
+    /// Regression test for a fuzzer-found crash where duplicate directory entry
+    /// names caused orphaned leaves (the second insert silently replaced the
+    /// first in the BTreeMap, leaving the first leaf unreferenced).
+    #[test]
+    fn test_duplicate_dirent_rejected() {
+        // Build a valid image with two files
+        let dumpfile = r#"/ 0 40755 2 0 0 0 1000.0 - - -
+/aaa 5 100644 1 0 0 0 1000.0 - hello -
+/bbb 5 100644 1 0 0 0 1000.0 - world -
+"#;
+        let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
+        let image = mkfs_erofs(&fs);
+
+        // Sanity: the unmodified image round-trips fine
+        erofs_to_filesystem::<Sha256HashValue>(&image).unwrap();
+
+        // Corrupt the image: rename "bbb" to "aaa" so there's a duplicate
+        let mut bad = image.clone();
+        let needle = b"bbb";
+        let pos = bad
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("filename not found in image");
+        bad[pos..pos + needle.len()].copy_from_slice(b"aaa");
+
+        let err = erofs_to_filesystem::<Sha256HashValue>(&bad).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Duplicate directory entry"),
+            "unexpected error: {msg}"
+        );
     }
 }

@@ -448,13 +448,15 @@ impl<T> Directory<T> {
     /// If the `filename` existed previously, the content is completely overwritten, including the
     /// case that it was a directory.
     ///
+    /// Returns `true` if the entry is new, `false` if it replaced an existing entry.
+    ///
     /// # Arguments
     ///
     ///  * `filename`: the filename in the current directory.  If you need to support full
     ///    pathnames then you should call `Directory::split()` first.
     ///  * `inode`: the inode to store under the `filename`
-    pub fn insert(&mut self, filename: &OsStr, inode: Inode<T>) {
-        self.entries.insert(Box::from(filename), inode);
+    pub fn insert(&mut self, filename: &OsStr, inode: Inode<T>) -> bool {
+        self.entries.insert(Box::from(filename), inode).is_none()
     }
 
     /// Removes the named file from the directory, if it exists.  If it doesn't exist, this is a
