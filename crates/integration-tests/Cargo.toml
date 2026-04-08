@@ -2,6 +2,8 @@
 name = "integration-tests"
 publish = false
 description = "Integration tests for composefs-rs (not published)"
+autobins = false
+autotests = false
 
 edition.workspace = true
 license.workspace = true
@@ -9,9 +11,19 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+# The integration test runner is declared as both [[bin]] (for the container
+# image build) and [[test]] (so nextest discovers the libtest-mimic tests).
+# The integration-tests crate is excluded from workspace default-members so
+# that plain `cargo test` does not run these; use `just test-integration`.
+# Cargo warns about the shared source file — this is harmless.
 [[bin]]
 name = "cfsctl-integration-tests"
 path = "src/main.rs"
+
+[[test]]
+name = "cfsctl-integration-tests"
+path = "src/main.rs"
+harness = false
 
 [[bin]]
 name = "test-cleanup"
