@@ -30,10 +30,10 @@ cstorage = { path = "../cstorage", version = "0.3.0", optional = true }
 hex = { version = "0.4.0", default-features = false }
 indicatif = { version = "0.18.0", default-features = false, features = ["tokio"] }
 log = { version = "0.4.8", default-features = false }
-oci-client = { version = "0.16", default-features = false, features = ["rustls-tls"], optional = true }
+oci-client = { version = "0.15", default-features = false, features = ["rustls-tls"], optional = true }
 oci-spec = { version = "0.8.0", default-features = false }
-ocidir = "0.6"
-cap-std-ext = "4.0"
+ocidir = "0.7"
+cap-std-ext = "5.0"
 openssl = "0.10"
 rustix = { version = "1.0.0", features = ["fs"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }

@@ -14,7 +14,6 @@ version.workspace = true
 anyhow = { version = "1.0", default-features = false, features = ["std"] }
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 cap-std = { version = "4.0", default-features = false }
-cap-std-ext = { version = "4.0", default-features = false }
 crc = { version = "3.0", default-features = false }
 flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
 jsonrpc-fdpass = { workspace = true, optional = true }
