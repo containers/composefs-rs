@@ -88,6 +88,118 @@ pub fn process_entry<ObjectID: FsVerityHashValue>(
     Ok(())
 }
 
+/// Compute per-layer composefs digests for an OCI image.
+///
+/// For each layer, builds a single-layer filesystem and computes its EROFS fsverity digest.
+/// These digests can be stored in a composefs signature artifact.
+///
+/// Per-layer digests are computed without `transform_for_oci()` since individual layers
+/// typically don't have the `/usr` directory needed for the OCI root metadata transform.
+///
+/// The final merged digest (the digest of the complete flattened filesystem with
+/// `transform_for_oci()` applied) can be obtained from `seal()` or `create_filesystem()`.
+///
+/// **Security note**: When `config_verity` is `None`, layer content is not verified against
+/// the config's diff_ids. Callers MUST provide a trusted `config_verity` when computing
+/// digests that will be used in signature artifacts. Without verity, a compromised repository
+/// could cause digests to be computed over substituted layer content.
+#[context("Computing per-layer digests")]
+pub fn compute_per_layer_digests<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    config_name: &OciDigest,
+    config_verity: Option<&ObjectID>,
+) -> Result<Vec<ObjectID>> {
+    let oc = crate::open_config(repo, config_name, config_verity)?;
+
+    let mut layer_digests = Vec::with_capacity(oc.config.rootfs().diff_ids().len());
+
+    for diff_id in oc.config.rootfs().diff_ids() {
+        let layer_verity = oc
+            .layer_refs
+            .get(diff_id.as_str())
+            .context("OCI config splitstream missing named ref to layer")?;
+
+        let mut single_fs = FileSystem::new(Stat::uninitialized());
+        let mut layer_stream =
+            repo.open_stream("", Some(layer_verity), Some(TAR_LAYER_CONTENT_TYPE))?;
+        while let Some(entry) = crate::tar::get_entry(&mut layer_stream)? {
+            process_entry(&mut single_fs, entry)?;
+        }
+        layer_digests.push(single_fs.compute_image_id());
+    }
+
+    Ok(layer_digests)
+}
+
+/// Computes the composefs merged digest (image ID) for an OCI container.
+///
+/// This is the fs-verity digest of the merged filesystem created from all layers.
+/// This digest is deterministic for a given OCI image and is used in signature
+/// artifacts as the "merged" entry.
+///
+/// If `config_verity` is given, it is used for fast lookup. Otherwise, the config
+/// and layers will be hashed to verify their content.
+#[context("Computing merged digest")]
+pub fn compute_merged_digest<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    config_name: &OciDigest,
+    config_verity: Option<&ObjectID>,
+) -> Result<ObjectID> {
+    let fs = create_filesystem(repo, config_name, config_verity)?;
+    Ok(fs.compute_image_id())
+}
+
+/// Compute per-layer EROFS images and their fs-verity digests.
+///
+/// Returns one `(erofs_bytes, digest)` pair per OCI layer, in manifest order.
+/// This is the same as `compute_per_layer_digests` but preserves the raw EROFS
+/// bytes for inclusion in composefs artifacts.
+///
+/// **Security note**: When `config_verity` is `None`, layer content is not verified against
+/// the config's diff_ids. Callers MUST provide a trusted `config_verity` when generating
+/// images that will be used in signature artifacts.
+#[context("Generating per-layer EROFS images")]
+pub fn generate_per_layer_images<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    config_name: &OciDigest,
+    config_verity: Option<&ObjectID>,
+) -> Result<Vec<(Box<[u8]>, ObjectID)>> {
+    let oc = crate::open_config(repo, config_name, config_verity)?;
+
+    let mut results = Vec::with_capacity(oc.config.rootfs().diff_ids().len());
+
+    for diff_id in oc.config.rootfs().diff_ids() {
+        let layer_verity = oc
+            .layer_refs
+            .get(diff_id.as_str())
+            .context("OCI config splitstream missing named ref to layer")?;
+
+        let mut single_fs = FileSystem::new(Stat::uninitialized());
+        let mut layer_stream =
+            repo.open_stream("", Some(layer_verity), Some(TAR_LAYER_CONTENT_TYPE))?;
+        while let Some(entry) = crate::tar::get_entry(&mut layer_stream)? {
+            process_entry(&mut single_fs, entry)?;
+        }
+        results.push(single_fs.generate_erofs_image());
+    }
+
+    Ok(results)
+}
+
+/// Generate the merged EROFS image and its fs-verity digest.
+///
+/// This is the same as `compute_merged_digest` but preserves the raw EROFS
+/// bytes for inclusion in composefs artifacts.
+#[context("Generating merged EROFS image")]
+pub fn generate_merged_image<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    config_name: &OciDigest,
+    config_verity: Option<&ObjectID>,
+) -> Result<(Box<[u8]>, ObjectID)> {
+    let fs = create_filesystem(repo, config_name, config_verity)?;
+    Ok(fs.generate_erofs_image())
+}
+
 /// Creates a filesystem from the given OCI container.  No special transformations are performed to
 /// make the filesystem bootable.
 ///
@@ -159,7 +271,11 @@ mod test {
         fsverity::Sha256HashValue,
         tree::{LeafContent, RegularFile, Stat},
     };
-    use std::{collections::BTreeMap, io::BufRead, path::PathBuf};
+    use std::{
+        collections::BTreeMap,
+        io::BufRead,
+        path::{Path, PathBuf},
+    };
 
     use super::*;
 
@@ -361,7 +477,7 @@ mod test {
         let by_path = |p: &str| -> &TarEntry<Sha256HashValue> {
             entries
                 .iter()
-                .find(|e| e.path == PathBuf::from(p))
+                .find(|e| e.path == Path::new(p))
                 .unwrap_or_else(|| panic!("missing entry for {p}"))
         };
 
@@ -494,7 +610,7 @@ mod test {
         // Find the *last* /bin entry, which should be the symlink.
         let bin_entries: Vec<_> = entries
             .iter()
-            .filter(|e| e.path == PathBuf::from("/bin"))
+            .filter(|e| e.path == Path::new("/bin"))
             .collect();
         assert!(
             bin_entries.len() >= 2,
@@ -523,6 +639,117 @@ mod test {
         );
 
         Ok(())
+    }
+
+    /// Helper to import a baseimage layer and create an OCI config for it.
+    /// Returns (config_digest, config_verity, diff_id).
+    fn import_baseimage_with_config(
+        repo: &std::sync::Arc<Repository<Sha256HashValue>>,
+    ) -> (OciDigest, Sha256HashValue, String) {
+        use oci_spec::image::{ImageConfigurationBuilder, RootFsBuilder};
+
+        let (layer_data, diff_id) = build_baseimage();
+        let diff_id_digest: OciDigest = diff_id.parse().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (layer_verity, _stats) = rt
+            .block_on(crate::import_layer(
+                repo,
+                &diff_id_digest,
+                None,
+                &mut layer_data.as_slice(),
+            ))
+            .unwrap();
+
+        let rootfs = RootFsBuilder::default()
+            .typ("layers")
+            .diff_ids(vec![diff_id.clone()])
+            .build()
+            .unwrap();
+        let config = ImageConfigurationBuilder::default()
+            .architecture("amd64")
+            .os("linux")
+            .rootfs(rootfs)
+            .build()
+            .unwrap();
+
+        let mut refs = std::collections::HashMap::new();
+        refs.insert(Box::from(diff_id.as_str()), layer_verity);
+
+        let (config_digest, config_verity) =
+            crate::write_config(repo, &config, refs, None, None).unwrap();
+        (config_digest, config_verity, diff_id)
+    }
+
+    #[test]
+    fn test_compute_per_layer_digests() {
+        use composefs::{repository::Repository, test::tempdir};
+        use rustix::fs::CWD;
+        use std::sync::Arc;
+
+        let repo_dir = tempdir();
+        let (repo, _) = Repository::<Sha256HashValue>::init_path(
+            CWD,
+            &repo_dir,
+            composefs::fsverity::Algorithm::SHA256,
+            false,
+        )
+        .unwrap();
+        let repo = Arc::new(repo);
+
+        let (config_digest, config_verity, _diff_id) = import_baseimage_with_config(&repo);
+
+        // Compute per-layer digests (with verity)
+        let digests =
+            compute_per_layer_digests(&repo, &config_digest, Some(&config_verity)).unwrap();
+        assert_eq!(digests.len(), 1, "expected exactly 1 per-layer digest");
+
+        // Determinism: calling again should produce the same result
+        let digests2 =
+            compute_per_layer_digests(&repo, &config_digest, Some(&config_verity)).unwrap();
+        assert_eq!(
+            digests, digests2,
+            "per-layer digests should be deterministic"
+        );
+
+        // Also works without verity (slower path that verifies content hashes)
+        let digests3 = compute_per_layer_digests(&repo, &config_digest, None).unwrap();
+        assert_eq!(
+            digests, digests3,
+            "verity and non-verity paths should agree"
+        );
+    }
+
+    #[test]
+    fn test_per_layer_digest_differs_from_merged() {
+        use composefs::{repository::Repository, test::tempdir};
+        use rustix::fs::CWD;
+        use std::sync::Arc;
+
+        let repo_dir = tempdir();
+        let (repo, _) = Repository::<Sha256HashValue>::init_path(
+            CWD,
+            &repo_dir,
+            composefs::fsverity::Algorithm::SHA256,
+            false,
+        )
+        .unwrap();
+        let repo = Arc::new(repo);
+
+        let (config_digest, config_verity, _diff_id) = import_baseimage_with_config(&repo);
+
+        let per_layer =
+            compute_per_layer_digests(&repo, &config_digest, Some(&config_verity)).unwrap();
+        assert_eq!(per_layer.len(), 1);
+
+        let merged_fs = create_filesystem(&repo, &config_digest, Some(&config_verity)).unwrap();
+        let merged_digest = merged_fs.compute_image_id();
+
+        // The merged filesystem applies transform_for_oci() which copies /usr metadata
+        // to the root, so the digests should differ.
+        assert_ne!(
+            per_layer[0], merged_digest,
+            "per-layer and merged digests should differ because of transform_for_oci"
+        );
     }
 
     #[test]
@@ -554,6 +781,269 @@ mod test {
         process_entry(&mut fs, file_entry("/b/.wh..wh..opq"))?; // opaque dir
         process_entry(&mut fs, file_entry("/c/.wh.c"))?; // single file
         assert_files(&fs, &["/", "/b", "/c", "/c/a"])?;
+
+        Ok(())
+    }
+
+    // --- Whiteout-specific tests ---
+
+    #[test]
+    fn test_whiteout_file_removes_entry() -> Result<()> {
+        let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
+
+        process_entry(&mut fs, dir_entry("/etc"))?;
+        process_entry(&mut fs, file_entry("/etc/hosts"))?;
+        process_entry(&mut fs, file_entry("/etc/passwd"))?;
+        assert_files(&fs, &["/", "/etc", "/etc/hosts", "/etc/passwd"])?;
+
+        // Whiteout hosts — only hosts should be removed
+        process_entry(&mut fs, file_entry("/etc/.wh.hosts"))?;
+        assert_files(&fs, &["/", "/etc", "/etc/passwd"])?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_whiteout_nonexistent_file_is_noop() -> Result<()> {
+        let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
+
+        process_entry(&mut fs, dir_entry("/etc"))?;
+        process_entry(&mut fs, file_entry("/etc/hosts"))?;
+        assert_files(&fs, &["/", "/etc", "/etc/hosts"])?;
+
+        // Whiteout a file that doesn't exist — should be a no-op
+        process_entry(&mut fs, file_entry("/etc/.wh.nosuchfile"))?;
+        assert_files(&fs, &["/", "/etc", "/etc/hosts"])?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_whiteout_directory() -> Result<()> {
+        let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
+
+        process_entry(&mut fs, dir_entry("/usr"))?;
+        process_entry(&mut fs, dir_entry("/usr/local"))?;
+        process_entry(&mut fs, file_entry("/usr/local/bin"))?;
+        process_entry(&mut fs, dir_entry("/etc"))?;
+        assert_files(&fs, &["/", "/etc", "/usr", "/usr/local", "/usr/local/bin"])?;
+
+        // Whiteout the directory /usr/local (removes the entire subtree)
+        process_entry(&mut fs, file_entry("/usr/.wh.local"))?;
+        assert_files(&fs, &["/", "/etc", "/usr"])?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_whiteout_in_root_directory() -> Result<()> {
+        let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
+
+        process_entry(&mut fs, dir_entry("/mydir"))?;
+        process_entry(&mut fs, file_entry("/toplevel"))?;
+        assert_files(&fs, &["/", "/mydir", "/toplevel"])?;
+
+        // Whiteout in root (no leading dir component)
+        process_entry(&mut fs, file_entry("/.wh.toplevel"))?;
+        assert_files(&fs, &["/", "/mydir"])?;
+
+        // Also works without leading slash
+        process_entry(&mut fs, file_entry(".wh.mydir"))?;
+        assert_files(&fs, &["/"])?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_whiteout_in_nested_directory() -> Result<()> {
+        let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
+
+        process_entry(&mut fs, dir_entry("/a"))?;
+        process_entry(&mut fs, dir_entry("/a/b"))?;
+        process_entry(&mut fs, dir_entry("/a/b/c"))?;
+        process_entry(&mut fs, file_entry("/a/b/c/deep"))?;
+        assert_files(&fs, &["/", "/a", "/a/b", "/a/b/c", "/a/b/c/deep"])?;
+
+        process_entry(&mut fs, file_entry("/a/b/c/.wh.deep"))?;
+        assert_files(&fs, &["/", "/a", "/a/b", "/a/b/c"])?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_opaque_whiteout_clears_directory() -> Result<()> {
+        let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
+
+        process_entry(&mut fs, dir_entry("/etc"))?;
+        process_entry(&mut fs, file_entry("/etc/hosts"))?;
+        process_entry(&mut fs, file_entry("/etc/passwd"))?;
+        process_entry(&mut fs, file_entry("/etc/resolv.conf"))?;
+        assert_files(
+            &fs,
+            &["/", "/etc", "/etc/hosts", "/etc/passwd", "/etc/resolv.conf"],
+        )?;
+
+        // Opaque whiteout — clears all entries in /etc
+        process_entry(&mut fs, file_entry("/etc/.wh..wh..opq"))?;
+        assert_files(&fs, &["/", "/etc"])?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_opaque_whiteout_then_add_new_entries() -> Result<()> {
+        // This is a very common pattern in container images: the layer
+        // marks a dir opaque (hiding all lower-layer contents), then
+        // adds new entries in the same directory.
+        let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
+
+        process_entry(&mut fs, dir_entry("/etc"))?;
+        process_entry(&mut fs, file_entry("/etc/old_config"))?;
+        process_entry(&mut fs, file_entry("/etc/another_old"))?;
+        assert_files(&fs, &["/", "/etc", "/etc/another_old", "/etc/old_config"])?;
+
+        // Opaque whiteout clears everything
+        process_entry(&mut fs, file_entry("/etc/.wh..wh..opq"))?;
+        assert_files(&fs, &["/", "/etc"])?;
+
+        // Then re-add new entries
+        process_entry(&mut fs, file_entry("/etc/new_config"))?;
+        process_entry(&mut fs, file_entry("/etc/new_other"))?;
+        assert_files(&fs, &["/", "/etc", "/etc/new_config", "/etc/new_other"])?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_multiple_whiteouts_in_single_layer() -> Result<()> {
+        let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
+
+        process_entry(&mut fs, dir_entry("/usr"))?;
+        process_entry(&mut fs, file_entry("/usr/a"))?;
+        process_entry(&mut fs, file_entry("/usr/b"))?;
+        process_entry(&mut fs, file_entry("/usr/c"))?;
+        process_entry(&mut fs, file_entry("/usr/d"))?;
+        assert_files(&fs, &["/", "/usr", "/usr/a", "/usr/b", "/usr/c", "/usr/d"])?;
+
+        // Multiple whiteouts in the same directory
+        process_entry(&mut fs, file_entry("/usr/.wh.a"))?;
+        process_entry(&mut fs, file_entry("/usr/.wh.c"))?;
+        assert_files(&fs, &["/", "/usr", "/usr/b", "/usr/d"])?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_double_whiteout_is_idempotent() -> Result<()> {
+        let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
+
+        process_entry(&mut fs, dir_entry("/d"))?;
+        process_entry(&mut fs, file_entry("/d/target"))?;
+        assert_files(&fs, &["/", "/d", "/d/target"])?;
+
+        // Whiteout the same file twice — the second is a no-op
+        process_entry(&mut fs, file_entry("/d/.wh.target"))?;
+        assert_files(&fs, &["/", "/d"])?;
+
+        process_entry(&mut fs, file_entry("/d/.wh.target"))?;
+        assert_files(&fs, &["/", "/d"])?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_whiteout_unusual_name_dot_wh_dot() -> Result<()> {
+        // ".wh..wh." (without trailing "opq") is a whiteout for a file
+        // literally named ".wh." — it is NOT an opaque whiteout.
+        // The code checks `whiteout == b".wh..opq"` for the complete
+        // filename ".wh..wh..opq", so ".wh..wh." won't match.
+        let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
+
+        process_entry(&mut fs, dir_entry("/d"))?;
+        process_entry(&mut fs, file_entry("/d/real_file"))?;
+        assert_files(&fs, &["/", "/d", "/d/real_file"])?;
+
+        // ".wh..wh." is interpreted as a whiteout for the file named ".wh."
+        // (strip ".wh." prefix → ".wh." remainder). Since no file named ".wh."
+        // exists, it's a no-op. Crucially, it is NOT treated as an opaque
+        // whiteout — those require the exact name ".wh..wh..opq".
+        process_entry(&mut fs, file_entry("/d/.wh..wh."))?;
+        assert_files(&fs, &["/", "/d", "/d/real_file"])?;
+
+        // Note: a tar entry named ".wh." is consumed as a whiteout for "" (empty
+        // name), which is effectively a no-op — the file is never stored.
+        process_entry(&mut fs, file_entry("/d/.wh."))?;
+        assert_files(&fs, &["/", "/d", "/d/real_file"])?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_whiteout_across_multiple_directories() -> Result<()> {
+        let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
+
+        process_entry(&mut fs, dir_entry("/a"))?;
+        process_entry(&mut fs, dir_entry("/b"))?;
+        process_entry(&mut fs, file_entry("/a/file1"))?;
+        process_entry(&mut fs, file_entry("/a/file2"))?;
+        process_entry(&mut fs, file_entry("/b/file1"))?;
+        process_entry(&mut fs, file_entry("/b/file2"))?;
+        assert_files(
+            &fs,
+            &[
+                "/", "/a", "/a/file1", "/a/file2", "/b", "/b/file1", "/b/file2",
+            ],
+        )?;
+
+        // Whiteout file1 in /a and file2 in /b independently
+        process_entry(&mut fs, file_entry("/a/.wh.file1"))?;
+        process_entry(&mut fs, file_entry("/b/.wh.file2"))?;
+        assert_files(&fs, &["/", "/a", "/a/file2", "/b", "/b/file1"])?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_opaque_whiteout_with_subdirectories() -> Result<()> {
+        // Opaque whiteout should clear subdirectories too
+        let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
+
+        process_entry(&mut fs, dir_entry("/parent"))?;
+        process_entry(&mut fs, dir_entry("/parent/child"))?;
+        process_entry(&mut fs, file_entry("/parent/child/deep"))?;
+        process_entry(&mut fs, file_entry("/parent/sibling"))?;
+        assert_files(
+            &fs,
+            &[
+                "/",
+                "/parent",
+                "/parent/child",
+                "/parent/child/deep",
+                "/parent/sibling",
+            ],
+        )?;
+
+        process_entry(&mut fs, file_entry("/parent/.wh..wh..opq"))?;
+        assert_files(&fs, &["/", "/parent"])?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_whiteout_then_recreate() -> Result<()> {
+        // Delete a file with whiteout, then re-add it in the same layer
+        let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
+
+        process_entry(&mut fs, dir_entry("/etc"))?;
+        process_entry(&mut fs, file_entry("/etc/config"))?;
+        assert_files(&fs, &["/", "/etc", "/etc/config"])?;
+
+        // Whiteout and then re-add
+        process_entry(&mut fs, file_entry("/etc/.wh.config"))?;
+        assert_files(&fs, &["/", "/etc"])?;
+
+        process_entry(&mut fs, file_entry("/etc/config"))?;
+        assert_files(&fs, &["/", "/etc", "/etc/config"])?;
 
         Ok(())
     }

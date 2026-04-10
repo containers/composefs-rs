@@ -9,13 +9,17 @@
 //! recursion — see [`require_privileged`].
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use xshell::{Shell, cmd};
 
-use crate::{cfsctl, integration_test};
+use composefs_oci::composefs::fsverity::Sha256HashValue;
+use composefs_oci::composefs::repository::Repository;
 
-/// Ensure we're running as root, or re-exec this test inside a VM.
+use crate::{cfsctl, create_oci_layout, integration_test};
+
+/// Ensure we're running in a privileged environment, or re-exec this test inside a VM.
 ///
 /// If already root (e.g. inside a bcvk VM), returns `Ok(None)` and the
 /// test proceeds normally.
@@ -26,7 +30,10 @@ use crate::{cfsctl, integration_test};
 /// the test already ran in the VM.
 ///
 /// If not root and no test image is configured, returns an error.
-fn require_privileged(test_name: &str) -> Result<Option<()>> {
+///
+/// This is also used by cstor tests which need user namespace support
+/// (via `podman unshare`) that may not be available on GHA runners.
+pub fn require_privileged(test_name: &str) -> Result<Option<()>> {
     if rustix::process::getuid().is_root() {
         return Ok(None);
     }
@@ -53,8 +60,71 @@ fn require_privileged(test_name: &str) -> Result<Option<()>> {
     Ok(Some(()))
 }
 
+/// Check if user namespaces work (needed for podman unshare).
+fn userns_works() -> bool {
+    std::process::Command::new("podman")
+        .args(["unshare", "true"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Ensure user namespace support is available, or re-exec this test inside a VM.
+///
+/// Unlike `require_privileged`, this doesn't require root — it just needs
+/// working user namespaces (for `podman unshare`). If user namespaces work,
+/// the test proceeds normally. Otherwise, it dispatches to a VM.
+///
+/// Returns `Ok(None)` if the test should proceed, `Ok(Some(()))` if it was
+/// dispatched to a VM and the caller should return immediately.
+pub fn require_userns(test_name: &str) -> Result<Option<()>> {
+    // If we're root (e.g. in VM), userns works
+    if rustix::process::getuid().is_root() {
+        return Ok(None);
+    }
+
+    // Check if userns works on this host
+    if userns_works() {
+        return Ok(None);
+    }
+
+    // userns doesn't work — delegate to a VM
+    if std::env::var_os("COMPOSEFS_IN_VM").is_some() {
+        bail!("COMPOSEFS_IN_VM is set but userns doesn't work — VM setup is broken");
+    }
+
+    let image = std::env::var("COMPOSEFS_TEST_IMAGE").map_err(|_| {
+        anyhow::anyhow!(
+            "user namespaces not available and COMPOSEFS_TEST_IMAGE not set; \
+             run `just build-test-image` or use `just test-integration-vm`"
+        )
+    })?;
+
+    let sh = Shell::new()?;
+    let bcvk = std::env::var("BCVK_PATH").unwrap_or_else(|_| "bcvk".into());
+    cmd!(
+        sh,
+        "{bcvk} ephemeral run-ssh {image} -- cfsctl-integration-tests --exact {test_name}"
+    )
+    .run()?;
+    Ok(Some(()))
+}
+
 /// A temporary directory backed by a loopback ext4 filesystem with verity support.
 ///
+fn require_fsverity_builtin_signatures() -> bool {
+    if crate::has_fsverity_builtin_signatures() {
+        return true;
+    }
+    // This is a kernel capability, not a missing dependency.
+    // CentOS/Fedora kernels don't enable CONFIG_FS_VERITY_BUILTIN_SIGNATURES.
+    // These tests only run on Debian/Ubuntu where it's enabled.
+    eprintln!("SKIP (kernel capability): CONFIG_FS_VERITY_BUILTIN_SIGNATURES not enabled");
+    false
+}
+
 /// tmpfs doesn't support fs-verity, so privileged tests that need verity
 /// (i.e. running cfsctl without `--insecure`) must use a real filesystem.
 /// This creates a sparse file, formats it as ext4 with the verity feature,
@@ -96,6 +166,34 @@ impl Drop for VerityTempDir {
             .arg(&self.mountpoint)
             .status();
     }
+}
+
+fn generate_test_cert(dir: &Path) -> Result<(PathBuf, PathBuf)> {
+    let sh = Shell::new()?;
+    let key_path = dir.join("test-key.pem");
+    let cert_path = dir.join("test-cert.pem");
+    cmd!(
+        sh,
+        "openssl req -x509 -newkey rsa:2048 -keyout {key_path} -out {cert_path} -days 1 -nodes -subj /CN=test-ca"
+    )
+    .run()?;
+    Ok((cert_path, key_path))
+}
+
+/// Pull a local OCI layout into a verity-enabled repo (no `--insecure`).
+fn pull_oci_image_verity(
+    sh: &Shell,
+    cfsctl: &Path,
+    repo: &Path,
+    oci_layout: &Path,
+    tag_name: &str,
+) -> Result<String> {
+    let output = cmd!(
+        sh,
+        "{cfsctl} --repo {repo} oci pull oci:{oci_layout} {tag_name}"
+    )
+    .read()?;
+    Ok(output)
 }
 
 fn privileged_check_root() -> Result<()> {
@@ -273,7 +371,7 @@ fn privileged_oci_pull_mount() -> Result<()> {
 
     // Verify file content at the mountpoint
     let hostname = std::fs::read_to_string(mountpoint.path().join("etc/hostname"))?;
-    ensure!(hostname == "testhost\n", "hostname mismatch: {hostname:?}");
+    ensure!(hostname == "test-host", "hostname mismatch: {hostname:?}");
 
     let os_release = std::fs::read_to_string(mountpoint.path().join("etc/os-release"))?;
     ensure!(
@@ -281,10 +379,12 @@ fn privileged_oci_pull_mount() -> Result<()> {
         "os-release missing ID: {os_release:?}"
     );
 
+    // busybox is a 4096-byte external file (random data seeded from size)
     let busybox = std::fs::read(mountpoint.path().join("usr/bin/busybox"))?;
     ensure!(
-        busybox == b"busybox-binary-content",
-        "busybox content mismatch"
+        busybox.len() == 4096,
+        "busybox size mismatch: expected 4096, got {}",
+        busybox.len()
     );
 
     let sh_target = std::fs::read_link(mountpoint.path().join("usr/bin/sh"))?;
@@ -293,10 +393,12 @@ fn privileged_oci_pull_mount() -> Result<()> {
         "sh symlink target mismatch: {sh_target:?}"
     );
 
-    let app_data = std::fs::read_to_string(mountpoint.path().join("usr/share/myapp/data.txt"))?;
+    // App layer has a 512-byte README (external, random data)
+    let readme = std::fs::read(mountpoint.path().join("usr/share/doc/README"))?;
     ensure!(
-        app_data == "application-data",
-        "app data mismatch: {app_data:?}"
+        readme.len() == 512,
+        "README size mismatch: expected 512, got {}",
+        readme.len()
     );
 
     ensure!(mountpoint.path().join("tmp").is_dir(), "/tmp missing");
@@ -427,3 +529,640 @@ fn privileged_pull_readonly_repo() -> Result<()> {
     Ok(())
 }
 integration_test!(privileged_pull_readonly_repo);
+
+// ============================================================================
+// Filesystem-specific reflink / hardlink tests
+// ============================================================================
+
+/// A temporary directory backed by a loop-mounted filesystem.
+///
+/// Supports ext4 (with verity) and XFS (with reflinks).  The backing sparse
+/// file is 512 MB — large enough for a synthetic OCI image in
+/// containers-storage plus a composefs repo.
+struct LoopTempDir {
+    mountpoint: PathBuf,
+    _backing: tempfile::TempDir,
+}
+
+impl LoopTempDir {
+    /// Create a loop-mounted ext4 filesystem with verity support.
+    fn ext4_verity() -> Result<Self> {
+        Self::create("mkfs.ext4", &["-q", "-O", "verity", "-b", "4096"])
+    }
+
+    /// Create a loop-mounted XFS filesystem with reflink support.
+    fn xfs_reflink() -> Result<Self> {
+        Self::create("mkfs.xfs", &["-q", "-m", "reflink=1"])
+    }
+
+    fn create(mkfs: &str, args: &[&str]) -> Result<Self> {
+        let backing = tempfile::tempdir()?;
+        let img = backing.path().join("fs.img");
+        let mountpoint = backing.path().join("mnt");
+        std::fs::create_dir(&mountpoint)?;
+
+        let sh = Shell::new()?;
+        cmd!(sh, "truncate -s 512M {img}").run()?;
+        cmd!(sh, "{mkfs} {args...} {img}").run()?;
+        cmd!(sh, "mount -o loop {img} {mountpoint}").run()?;
+
+        Ok(Self {
+            mountpoint,
+            _backing: backing,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.mountpoint
+    }
+}
+
+impl Drop for LoopTempDir {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("umount")
+            .arg(&self.mountpoint)
+            .status();
+    }
+}
+
+/// Create a minimal OCI directory image with files large enough to exercise
+/// the `ensure_object_from_file` path (> 64 bytes, the inline threshold).
+///
+/// Returns the path to the OCI directory.
+fn create_oci_layout_with_large_files(parent: &Path) -> Result<PathBuf> {
+    use cap_std_ext::cap_std;
+    use ocidir::oci_spec::image::{
+        ConfigBuilder, ImageConfigurationBuilder, Platform, PlatformBuilder, RootFsBuilder,
+    };
+
+    let oci_dir = parent.join("oci-image");
+    std::fs::create_dir_all(&oci_dir)?;
+
+    let dir = cap_std::fs::Dir::open_ambient_dir(&oci_dir, cap_std::ambient_authority())?;
+    let ocidir = ocidir::OciDir::ensure(dir)?;
+
+    let mut manifest = ocidir.new_empty_manifest()?.build()?;
+
+    let runtime_config = ConfigBuilder::default().build()?;
+    let rootfs = RootFsBuilder::default()
+        .typ("layers")
+        .diff_ids(Vec::<String>::new())
+        .build()?;
+    let mut config = ImageConfigurationBuilder::default()
+        .architecture("amd64")
+        .os("linux")
+        .rootfs(rootfs)
+        .config(runtime_config)
+        .build()?;
+
+    // Create a layer with several files > INLINE_CONTENT_MAX_V0 (64 bytes)
+    // so they go through the ensure_object_from_file path during cstor import.
+    // The image must have /usr (required by transform_for_oci).
+    let mut layer_builder = ocidir.create_layer(None)?;
+
+    // Add /usr directory (required by composefs OCI transformations)
+    let mut usr_hdr = tar::Header::new_gnu();
+    usr_hdr.set_entry_type(tar::EntryType::Directory);
+    usr_hdr.set_size(0);
+    usr_hdr.set_mode(0o755);
+    usr_hdr.set_uid(0);
+    usr_hdr.set_gid(0);
+    usr_hdr.set_mtime(1234567890);
+    usr_hdr.set_cksum();
+    layer_builder.append_data(&mut usr_hdr, "usr/", &[] as &[u8])?;
+
+    for i in 0..5u8 {
+        let data = vec![i.wrapping_mul(0x37); 4096];
+        let name = format!("usr/file_{i}.bin");
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(1234567890);
+        header.set_cksum();
+        layer_builder.append_data(&mut header, &name, &data[..])?;
+    }
+    let layer = layer_builder.into_inner()?.complete()?;
+
+    ocidir.push_layer(&mut manifest, &mut config, layer, "test layer", None);
+
+    let platform: Platform = PlatformBuilder::default()
+        .architecture("amd64")
+        .os("linux")
+        .build()?;
+    ocidir.insert_manifest_and_config(manifest, config, None, platform)?;
+
+    Ok(oci_dir)
+}
+
+/// Copy an OCI directory image into containers-storage on a specific filesystem.
+///
+/// Uses `skopeo copy` with the `[overlay@root+runroot]` syntax to target
+/// a containers-storage instance at the given mount point.
+///
+/// Returns the storage root path.
+fn copy_oci_to_cstor(sh: &Shell, oci_dir: &Path, mount: &Path) -> Result<PathBuf> {
+    let storage_root = mount.join("storage");
+    let run_root = mount.join("run");
+    std::fs::create_dir_all(&storage_root)?;
+    std::fs::create_dir_all(&run_root)?;
+
+    let oci_ref = format!("oci:{}", oci_dir.display());
+    let cstor_ref = format!(
+        "containers-storage:[overlay@{}+{}]test:latest",
+        storage_root.display(),
+        run_root.display()
+    );
+
+    // Run in a private mount namespace so that any bind mounts the overlay
+    // driver creates (e.g. on storage/overlay) don't leak into our namespace.
+    // This ensures the diff files we later open are on the raw filesystem,
+    // not behind a bind mount that would cause EXDEV on hardlinks.
+    cmd!(sh, "unshare -m skopeo copy {oci_ref} {cstor_ref}").run()?;
+
+    Ok(storage_root)
+}
+
+/// Open a repository at `path`, initializing it first.  Uses insecure mode
+/// so the tests work on filesystems without verity (XFS).
+fn init_insecure_repo_at(path: &Path) -> Result<Arc<Repository<Sha256HashValue>>> {
+    use composefs_oci::composefs::fsverity::Algorithm;
+
+    std::fs::create_dir_all(path)?;
+    let fd = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::RDONLY,
+        0.into(),
+    )?;
+    let (mut repo, _created) =
+        Repository::<Sha256HashValue>::init_path(&fd, ".", Algorithm::SHA256, false)?;
+    repo.set_insecure();
+    Ok(Arc::new(repo))
+}
+
+/// Pull a containers-storage image into a composefs repo with an explicit
+/// storage root, and return the import stats.
+fn cstor_pull_with_root(
+    storage_root: &Path,
+    repo: &Arc<Repository<Sha256HashValue>>,
+) -> Result<composefs_oci::ImportStats> {
+    let opts = composefs_oci::PullOptions {
+        storage_root: Some(storage_root),
+        ..Default::default()
+    };
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let pull_result = rt
+        .block_on(async {
+            composefs_oci::pull(repo, "containers-storage:test:latest", None, opts).await
+        })
+        .context("containers-storage pull failed")?;
+    Ok(pull_result.stats)
+}
+
+/// On ext4 (no reflink support), the import should skip FICLONE after the
+/// first probe fails and use hardlinks instead (zero-copy).  The `skopeo
+/// copy` step runs in `unshare -m` to prevent the overlay driver's bind
+/// mount from interfering with hardlinks.
+fn privileged_cstor_import_ext4_hardlink() -> Result<()> {
+    if require_privileged("privileged_cstor_import_ext4_hardlink")?.is_some() {
+        return Ok(());
+    }
+
+    let sh = Shell::new()?;
+    let fs = LoopTempDir::ext4_verity()?;
+
+    // Create a synthetic OCI image with files > 64 bytes
+    let oci_dir = create_oci_layout_with_large_files(fs.path())?;
+    let storage_root = copy_oci_to_cstor(&sh, &oci_dir, fs.path())?;
+
+    let repo = init_insecure_repo_at(&fs.path().join("repo"))?;
+    let stats = cstor_pull_with_root(&storage_root, &repo)?;
+
+    println!("ext4 import stats: {stats:?}");
+    ensure!(
+        stats.objects_reflinked == 0,
+        "ext4 should not reflink any objects, got {} reflinked",
+        stats.objects_reflinked,
+    );
+    // On same-device ext4 (no bind mount), hardlinks should succeed.
+    ensure!(
+        stats.objects_hardlinked > 0,
+        "ext4 same-device should hardlink objects, got 0 hardlinked (copied={})",
+        stats.objects_copied,
+    );
+    ensure!(
+        stats.objects_copied == 0,
+        "ext4 same-device should not need copies, got {} copied",
+        stats.objects_copied,
+    );
+    println!(
+        "ext4: {} hardlinked, {} already present",
+        stats.objects_hardlinked, stats.objects_already_present,
+    );
+
+    Ok(())
+}
+integration_test!(privileged_cstor_import_ext4_hardlink);
+
+/// On XFS with reflink support, importing from containers-storage on the same
+/// filesystem should use reflinks (zero-copy), and the import stats should
+/// show `objects_reflinked > 0`.
+fn privileged_cstor_import_xfs_reflink() -> Result<()> {
+    if require_privileged("privileged_cstor_import_xfs_reflink")?.is_some() {
+        return Ok(());
+    }
+
+    // Skip if mkfs.xfs is not available (e.g. Debian bootc images).
+    if !Path::new("/usr/sbin/mkfs.xfs").exists() && !Path::new("/sbin/mkfs.xfs").exists() {
+        println!("SKIP: mkfs.xfs not available");
+        return Ok(());
+    }
+
+    let sh = Shell::new()?;
+    let fs = LoopTempDir::xfs_reflink()?;
+
+    let oci_dir = create_oci_layout_with_large_files(fs.path())?;
+    let storage_root = copy_oci_to_cstor(&sh, &oci_dir, fs.path())?;
+
+    let repo = init_insecure_repo_at(&fs.path().join("repo"))?;
+    let stats = cstor_pull_with_root(&storage_root, &repo)?;
+
+    println!("XFS import stats: {stats:?}");
+    ensure!(
+        stats.objects_reflinked > 0,
+        "XFS should reflink objects, got 0 reflinked (hardlinked={}, copied={})",
+        stats.objects_hardlinked,
+        stats.objects_copied,
+    );
+    ensure!(
+        stats.objects_copied == 0,
+        "XFS same-device should not need copies, got {} copied",
+        stats.objects_copied,
+    );
+    println!(
+        "XFS: {} reflinked, {} already present",
+        stats.objects_reflinked, stats.objects_already_present,
+    );
+
+    Ok(())
+}
+integration_test!(privileged_cstor_import_xfs_reflink);
+
+/// Sign, then verify an OCI image on a verity-enabled filesystem.
+///
+/// This exercises the full signing pipeline with real fs-verity enforcement:
+/// pull into a verity repo, generate a cert, sign, and verify.
+fn privileged_sign_and_verify_with_verity() -> Result<()> {
+    if require_privileged("privileged_sign_and_verify_with_verity")?.is_some() {
+        return Ok(());
+    }
+
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let verity_dir = VerityTempDir::new()?;
+    let repo = verity_dir.path().join("repo");
+
+    let fixture_dir = tempfile::tempdir()?;
+    let oci_layout = create_oci_layout(fixture_dir.path())?;
+    pull_oci_image_verity(&sh, &cfsctl, &repo, &oci_layout, "test-image")?;
+
+    let cert_dir = tempfile::tempdir()?;
+    let (cert, key) = generate_test_cert(cert_dir.path())?;
+
+    let sign_output = cmd!(
+        sh,
+        "{cfsctl} --repo {repo} oci sign test-image --cert {cert} --key {key}"
+    )
+    .read()?;
+    ensure!(
+        sign_output.contains("sha256:"),
+        "expected artifact digest in sign output, got: {sign_output}"
+    );
+
+    let verify_output = cmd!(
+        sh,
+        "{cfsctl} --repo {repo} oci verify test-image --cert {cert}"
+    )
+    .read()?;
+    ensure!(
+        verify_output.contains("verified"),
+        "expected verification success, got: {verify_output}"
+    );
+
+    Ok(())
+}
+integration_test!(privileged_sign_and_verify_with_verity);
+
+/// Seal an OCI image, then sign and verify it on a verity-enabled filesystem.
+///
+/// Sealing embeds the composefs verity digest into the manifest. This test
+/// confirms that signing still works correctly on a sealed image.
+fn privileged_seal_then_sign() -> Result<()> {
+    if require_privileged("privileged_seal_then_sign")?.is_some() {
+        return Ok(());
+    }
+
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let verity_dir = VerityTempDir::new()?;
+    let repo = verity_dir.path().join("repo");
+
+    let fixture_dir = tempfile::tempdir()?;
+    let oci_layout = create_oci_layout(fixture_dir.path())?;
+    pull_oci_image_verity(&sh, &cfsctl, &repo, &oci_layout, "test-image")?;
+
+    // Seal the image first
+    let seal_output = cmd!(sh, "{cfsctl} --repo {repo} oci seal test-image").read()?;
+    ensure!(
+        !seal_output.trim().is_empty(),
+        "expected seal output with config/verity digests, got nothing"
+    );
+
+    // Then sign the sealed image
+    let cert_dir = tempfile::tempdir()?;
+    let (cert, key) = generate_test_cert(cert_dir.path())?;
+
+    let sign_output = cmd!(
+        sh,
+        "{cfsctl} --repo {repo} oci sign test-image --cert {cert} --key {key}"
+    )
+    .read()?;
+    ensure!(
+        sign_output.contains("sha256:"),
+        "expected artifact digest in sign output, got: {sign_output}"
+    );
+
+    // Verify the sealed+signed image
+    let verify_output = cmd!(
+        sh,
+        "{cfsctl} --repo {repo} oci verify test-image --cert {cert}"
+    )
+    .read()?;
+    ensure!(
+        verify_output.contains("verified"),
+        "expected verification success on sealed image, got: {verify_output}"
+    );
+
+    Ok(())
+}
+integration_test!(privileged_seal_then_sign);
+
+/// Inject a test certificate into the kernel's `.fs-verity` keyring.
+///
+/// This modifies kernel state and must run in an ephemeral VM to avoid
+/// polluting the host keyring. Requires `CONFIG_FS_VERITY_BUILTIN_SIGNATURES=y`.
+fn privileged_keyring_add_cert() -> Result<()> {
+    if require_privileged("privileged_keyring_add_cert")?.is_some() {
+        return Ok(());
+    }
+
+    if !require_fsverity_builtin_signatures() {
+        return Ok(());
+    }
+
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+
+    let cert_dir = tempfile::tempdir()?;
+    let (cert, _key) = generate_test_cert(cert_dir.path())?;
+
+    let output = cmd!(sh, "{cfsctl} keyring add-cert {cert}").read()?;
+    ensure!(
+        output.contains("Certificate added"),
+        "expected 'Certificate added' confirmation, got: {output}"
+    );
+
+    Ok(())
+}
+integration_test!(privileged_keyring_add_cert);
+
+/// Inject a cert into the kernel keyring, then sign and verify an OCI image
+/// on a verity-enabled filesystem.
+///
+/// This exercises the full kernel-level signature enforcement pipeline:
+/// cert injection into `.fs-verity` keyring, pull with real verity, sign,
+/// and verify. Requires `CONFIG_FS_VERITY_BUILTIN_SIGNATURES=y`.
+fn privileged_keyring_and_verify_with_verity() -> Result<()> {
+    if require_privileged("privileged_keyring_and_verify_with_verity")?.is_some() {
+        return Ok(());
+    }
+
+    if !require_fsverity_builtin_signatures() {
+        return Ok(());
+    }
+
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let verity_dir = VerityTempDir::new()?;
+    let repo = verity_dir.path().join("repo");
+    let fixture_dir = tempfile::tempdir()?;
+    let (cert, key) = generate_test_cert(fixture_dir.path())?;
+
+    // Inject cert into kernel's .fs-verity keyring
+    let add_output = cmd!(sh, "{cfsctl} keyring add-cert {cert}").read()?;
+    ensure!(
+        add_output.contains("Certificate added"),
+        "keyring add-cert failed: {add_output}"
+    );
+
+    // Pull an image with real verity (no --insecure)
+    let oci_layout = create_oci_layout(fixture_dir.path())?;
+    pull_oci_image_verity(&sh, &cfsctl, &repo, &oci_layout, "test-image")?;
+
+    // Sign the image
+    let sign_output = cmd!(
+        sh,
+        "{cfsctl} --repo {repo} oci sign test-image --cert {cert} --key {key}"
+    )
+    .read()?;
+    ensure!(
+        sign_output.contains("sha256:"),
+        "expected artifact digest in sign output, got: {sign_output}"
+    );
+
+    // Verify the image with the cert
+    let verify_output = cmd!(
+        sh,
+        "{cfsctl} --repo {repo} oci verify test-image --cert {cert}"
+    )
+    .read()?;
+    ensure!(
+        verify_output.contains("verified"),
+        "expected verification success, got: {verify_output}"
+    );
+
+    Ok(())
+}
+integration_test!(privileged_keyring_and_verify_with_verity);
+
+// ---------------------------------------------------------------------------
+// Kernel-level fsverity signature enforcement tests
+//
+// These tests exercise the kernel's require_signatures sysctl, which forces
+// all FS_IOC_ENABLE_VERITY calls to include a valid PKCS#7 signature whose
+// cert is in the `.fs-verity` keyring. They only work on kernels with
+// CONFIG_FS_VERITY_BUILTIN_SIGNATURES=y (Debian/Ubuntu).
+// ---------------------------------------------------------------------------
+
+const REQUIRE_SIGNATURES_PATH: &str = "/proc/sys/fs/verity/require_signatures";
+
+/// RAII guard that restores `require_signatures` to 0 on drop.
+///
+/// Kernel-level signature enforcement affects ALL verity operations system-wide,
+/// so we must restore it even if a test panics — otherwise subsequent tests in
+/// the same VM would be broken.
+struct RequireSignaturesGuard;
+
+impl RequireSignaturesGuard {
+    fn enable() -> Result<Self> {
+        std::fs::write(REQUIRE_SIGNATURES_PATH, "1")?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RequireSignaturesGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::write(REQUIRE_SIGNATURES_PATH, "0");
+    }
+}
+
+/// Test that the kernel rejects enabling fsverity without a signature when
+/// `require_signatures` is enabled.
+fn privileged_kernel_rejects_unsigned_verity() -> Result<()> {
+    if require_privileged("privileged_kernel_rejects_unsigned_verity")?.is_some() {
+        return Ok(());
+    }
+    if !require_fsverity_builtin_signatures() {
+        return Ok(());
+    }
+
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let verity_dir = VerityTempDir::new()?;
+
+    // Generate and inject a cert so the keyring is populated
+    let cert_dir = tempfile::tempdir()?;
+    let (cert, _key) = generate_test_cert(cert_dir.path())?;
+    cmd!(sh, "{cfsctl} keyring add-cert {cert}").run()?;
+
+    // Enable require_signatures — guard restores to 0 on drop
+    let _guard = RequireSignaturesGuard::enable()?;
+
+    // Write a test file on the verity-capable filesystem
+    let test_file = verity_dir.path().join("testfile");
+    std::fs::write(&test_file, "test content for unsigned verity\n")?;
+
+    // Try to enable fsverity without a signature using the fsverity CLI
+    let result = cmd!(sh, "fsverity enable {test_file}").run();
+
+    ensure!(
+        result.is_err(),
+        "expected fsverity enable WITHOUT signature to fail when require_signatures=1, \
+         but it succeeded"
+    );
+
+    Ok(())
+}
+integration_test!(privileged_kernel_rejects_unsigned_verity);
+
+/// Test that the kernel rejects a fsverity signature made with a key whose
+/// certificate is NOT in the kernel's `.fs-verity` keyring.
+fn privileged_kernel_rejects_wrong_signature() -> Result<()> {
+    if require_privileged("privileged_kernel_rejects_wrong_signature")?.is_some() {
+        return Ok(());
+    }
+    if !require_fsverity_builtin_signatures() {
+        return Ok(());
+    }
+
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let verity_dir = VerityTempDir::new()?;
+
+    // Generate two certs — only inject cert_a into the kernel keyring
+    let cert_dir_a = tempfile::tempdir()?;
+    let (cert_a, _key_a) = generate_test_cert(cert_dir_a.path())?;
+
+    let cert_dir_b = tempfile::tempdir()?;
+    let (cert_b, key_b) = generate_test_cert(cert_dir_b.path())?;
+
+    cmd!(sh, "{cfsctl} keyring add-cert {cert_a}").run()?;
+
+    let _guard = RequireSignaturesGuard::enable()?;
+
+    // Write a test file
+    let test_file = verity_dir.path().join("testfile");
+    std::fs::write(&test_file, "test content for wrong signature\n")?;
+
+    // Sign the file's verity digest with key_b (whose cert is NOT in the keyring)
+    let sig_file = verity_dir.path().join("wrong.sig");
+    cmd!(
+        sh,
+        "fsverity sign {test_file} {sig_file} --key {key_b} --cert {cert_b}"
+    )
+    .run()?;
+
+    // Try to enable verity with the wrong signature — kernel should reject
+    let result = cmd!(sh, "fsverity enable {test_file} --signature {sig_file}").run();
+
+    ensure!(
+        result.is_err(),
+        "expected fsverity enable with WRONG cert's signature to fail, but it succeeded"
+    );
+
+    Ok(())
+}
+integration_test!(privileged_kernel_rejects_wrong_signature);
+
+/// Test the positive case: kernel accepts a fsverity signature made with a
+/// key whose certificate IS in the `.fs-verity` keyring.
+fn privileged_kernel_accepts_valid_signature() -> Result<()> {
+    if require_privileged("privileged_kernel_accepts_valid_signature")?.is_some() {
+        return Ok(());
+    }
+    if !require_fsverity_builtin_signatures() {
+        return Ok(());
+    }
+
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let verity_dir = VerityTempDir::new()?;
+
+    // Generate cert and inject into kernel keyring
+    let cert_dir = tempfile::tempdir()?;
+    let (cert, key) = generate_test_cert(cert_dir.path())?;
+    cmd!(sh, "{cfsctl} keyring add-cert {cert}").run()?;
+
+    let _guard = RequireSignaturesGuard::enable()?;
+
+    // Write a test file
+    let test_file = verity_dir.path().join("testfile");
+    std::fs::write(&test_file, "test content for valid signature\n")?;
+
+    // Sign the file with the trusted key
+    let sig_file = verity_dir.path().join("valid.sig");
+    cmd!(
+        sh,
+        "fsverity sign {test_file} {sig_file} --key {key} --cert {cert}"
+    )
+    .run()?;
+
+    // Enable verity with the valid signature — should succeed
+    cmd!(sh, "fsverity enable {test_file} --signature {sig_file}").run()?;
+
+    // Verify the file now has a measurable verity digest
+    let digest_output = cmd!(sh, "fsverity measure {test_file}").read()?;
+    ensure!(
+        !digest_output.trim().is_empty(),
+        "expected fsverity measure to return a digest after enabling verity"
+    );
+    ensure!(
+        digest_output.contains("sha256:"),
+        "expected sha256 digest in fsverity measure output, got: {digest_output}"
+    );
+
+    Ok(())
+}
+integration_test!(privileged_kernel_accepts_valid_signature);
