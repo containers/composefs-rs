@@ -1035,11 +1035,9 @@ fn verify_image_signatures<ObjectID: FsVerityHashValue>(
 
             let digest_bytes = hex::decode(&entry.digest).context("invalid hex digest")?;
 
-            if verifier
-                .verify_raw(&signature_blob, algorithm.kernel_id(), &digest_bytes)
-                .is_err()
-            {
-                continue 'artifacts; // not signed with our cert, try next
+            match verifier.verify_raw(&signature_blob, algorithm.kernel_id(), &digest_bytes) {
+                Ok(()) => {}
+                Err(_) => continue 'artifacts, // not signed with our cert, try next
             }
             this_artifact_count += 1;
         }
@@ -1604,7 +1602,7 @@ where
                     println!("\nVerification passed ({verified_count} signatures verified)");
                 } else {
                     if !digest_ok_all {
-                        std::process::exit(1);
+                        anyhow::bail!("digest verification failed for one or more entries");
                     }
                     println!(
                         "\nDigest check passed. NOTE: no certificate provided, signatures were NOT cryptographically verified."
