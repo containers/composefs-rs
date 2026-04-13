@@ -1325,6 +1325,19 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         size: u64,
     ) -> Result<(ObjectID, ObjectStoreMethod)> {
         use crate::fsverity::enable_verity_with_retry;
+        use rustix::thread::{CapabilitySet, capabilities};
+
+        // AT_EMPTY_PATH linkat requires CAP_DAC_READ_SEARCH.  Check upfront
+        // so callers get a clear error instead of a confusing ENOENT.
+        let has_cap = capabilities(None)
+            .map(|caps| caps.effective.contains(CapabilitySet::DAC_READ_SEARCH))
+            .unwrap_or(false);
+        if !has_cap {
+            anyhow::bail!(
+                "hardlinking objects requires CAP_DAC_READ_SEARCH \
+                 (run as root or use the copy fallback)"
+            );
+        }
 
         let objects_dir = self.objects_dir()?;
 

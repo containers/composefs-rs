@@ -170,6 +170,30 @@ impl std::fmt::Display for OciReference {
     }
 }
 
+/// CLI representation of [`composefs_oci::LocalFetchOpt`].
+#[cfg(feature = "oci")]
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
+enum LocalFetchCli {
+    /// Do not use native containers-storage import; use skopeo.
+    #[default]
+    Disabled,
+    /// Use native import with reflink/hardlink/copy fallback.
+    Auto,
+    /// Use native import; error if zero-copy is not possible.
+    Zerocopy,
+}
+
+#[cfg(feature = "oci")]
+impl From<LocalFetchCli> for composefs_oci::LocalFetchOpt {
+    fn from(cli: LocalFetchCli) -> Self {
+        match cli {
+            LocalFetchCli::Disabled => Self::Disabled,
+            LocalFetchCli::Auto => Self::IfPossible,
+            LocalFetchCli::Zerocopy => Self::ZeroCopy,
+        }
+    }
+}
+
 /// Common options for operations using OCI config manifest streams that may transform the image rootfs
 #[cfg(feature = "oci")]
 #[derive(Debug, Parser)]
@@ -226,6 +250,10 @@ enum OciCommand {
         /// Also generate a bootable EROFS image from the pulled OCI image
         #[arg(long)]
         bootable: bool,
+        /// Controls whether containers-storage: references use the native
+        /// import path with zero-copy reflink/hardlink support.
+        #[arg(long, value_enum, default_value_t = LocalFetchCli::Disabled)]
+        local_fetch: LocalFetchCli,
     },
     /// List all tagged OCI images in the repository
     #[clap(name = "images")]
@@ -925,23 +953,23 @@ where
                 ref image,
                 name,
                 bootable,
+                local_fetch,
             } => {
                 // If no explicit name provided, use the image reference as the tag
                 let tag_name = name.as_deref().unwrap_or(image);
-                let (result, stats) =
-                    composefs_oci::pull_image(&repo, image, Some(tag_name), None).await?;
+
+                let opts = composefs_oci::PullOptions {
+                    local_fetch: local_fetch.into(),
+                    ..Default::default()
+                };
+
+                let result = composefs_oci::pull(&repo, image, Some(tag_name), opts).await?;
 
                 println!("manifest {}", result.manifest_digest);
                 println!("config   {}", result.config_digest);
                 println!("verity   {}", result.manifest_verity.to_hex());
                 println!("tagged   {tag_name}");
-                println!(
-                    "objects  {} copied, {} already present, {} bytes copied, {} bytes inlined",
-                    stats.objects_copied,
-                    stats.objects_already_present,
-                    stats.bytes_copied,
-                    stats.bytes_inlined,
-                );
+                println!("objects  {}", result.stats);
 
                 if bootable {
                     let image_verity =

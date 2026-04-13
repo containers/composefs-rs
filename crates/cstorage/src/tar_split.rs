@@ -18,7 +18,7 @@
 //! - Type 2 (SegmentType): Raw TAR header bytes and padding (base64-encoded)
 //! - CRC64-ISO algorithm for checksums
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Seek};
 use std::os::fd::OwnedFd;
 
 use base64::prelude::*;
@@ -610,8 +610,8 @@ impl TarSplitFdStream {
                                 if let Some(ref crc64_b64) = crc64 {
                                     self.verify_crc64(&mut file, crc64_b64, file_size)?;
 
-                                    // Reopen file since we consumed it for CRC check
-                                    file = self.open_file_in_chain(path)?;
+                                    // Seek back to start after CRC verification consumed the file
+                                    file.rewind().map_err(StorageError::Io)?;
                                 }
 
                                 // Convert to OwnedFd and return

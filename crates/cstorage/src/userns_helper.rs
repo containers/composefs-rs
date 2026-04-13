@@ -158,7 +158,7 @@ pub struct GetImageResult {
     /// Image names.
     pub names: Vec<String>,
     /// Layer diff IDs (sha256:...).
-    pub layer_diff_ids: Vec<String>,
+    pub layer_diff_ids: Vec<oci_spec::image::Digest>,
     /// Storage layer IDs (internal IDs used by containers-storage).
     pub storage_layer_ids: Vec<String>,
 }
@@ -657,11 +657,11 @@ fn handle_get_image(
         }
     };
 
-    let diff_ids: Vec<String> = config
+    let diff_ids: Vec<oci_spec::image::Digest> = config
         .rootfs()
         .diff_ids()
         .iter()
-        .map(|s| s.to_string())
+        .map(|s| s.parse().expect("config diff_id should be valid digest"))
         .collect();
 
     let storage_layer_ids = match image.storage_layer_ids(std::slice::from_ref(&storage)) {
