@@ -599,6 +599,17 @@ fn ensure_dir_and_openat(dirfd: impl AsFd, filename: &str, flags: OFlags) -> Err
     }
 }
 
+/// Create a directory under `dirfd` if it doesn't already exist.
+///
+/// Returns `Ok(())` on success or if the directory already exists.
+/// Propagates all other errors from `mkdirat`.
+fn ensure_dir_at(dirfd: impl AsFd, path: &str, mode: Mode) -> ErrnoResult<()> {
+    match mkdirat(dirfd, path, mode) {
+        Ok(()) | Err(Errno::EXIST) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// A zero-sized proof token confirming that a [`Repository`] is writable.
 ///
 /// Obtained by calling [`Repository::ensure_writable`], which performs a fast
@@ -1354,7 +1365,8 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
         // Ensure parent directory exists (e.g. objects/4e/)
         let parent_dir = id.to_object_dir();
-        let _ = mkdirat(objects_dir, &parent_dir, Mode::from_raw_mode(0o755));
+        ensure_dir_at(objects_dir, &parent_dir, Mode::from_raw_mode(0o755))
+            .context("creating object parent directory")?;
 
         // Hardlink the source file directly into objects/<hash>.
         // Use AT_EMPTY_PATH to link by fd, which avoids the kernel's
@@ -1458,7 +1470,8 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         }
 
         let parent_dir = id.to_object_dir();
-        let _ = mkdirat(objects_dir, &parent_dir, Mode::from_raw_mode(0o755));
+        ensure_dir_at(objects_dir, &parent_dir, Mode::from_raw_mode(0o755))
+            .context("creating object parent directory")?;
 
         match linkat(
             CWD,
