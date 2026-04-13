@@ -13,6 +13,8 @@
 #![forbid(unsafe_code)]
 
 pub mod boot;
+#[cfg(feature = "containers-storage")]
+pub mod cstor;
 pub mod image;
 pub mod oci_image;
 pub mod skopeo;
@@ -201,37 +203,56 @@ impl std::fmt::Display for ImportStats {
     }
 }
 
+/// Controls whether and how the `containers-storage:` native import path
+/// is used when pulling images.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum LocalFetchOpt {
+    /// Do not use the native containers-storage import path; fall through
+    /// to skopeo.
+    #[default]
+    Disabled,
+    /// Use native containers-storage import with reflink → hardlink → copy
+    /// fallback chain.
+    IfPossible,
+    /// Use native containers-storage import but error if zero-copy
+    /// (reflink or hardlink) is not possible.
+    ZeroCopy,
+}
+
 /// Options for a [`pull`] operation.
 ///
 /// Use `Default::default()` for the common case (skopeo transport, no
-/// zero-copy requirement).
+/// containers-storage import).
 #[derive(Debug, Default)]
 pub struct PullOptions<'a> {
     /// Image proxy configuration passed to skopeo (ignored for
-    /// `containers-storage:` references).
+    /// `containers-storage:` references when `local_fetch` is not
+    /// [`Disabled`](LocalFetchOpt::Disabled)).
     pub img_proxy_config: Option<ImageProxyConfig>,
 
-    /// If `true`, the containers-storage import path will error instead of
-    /// falling back to a data copy when neither reflink nor hardlink succeeds.
-    /// Intended for bootc's unified storage layout where the composefs repo
-    /// and containers-storage are always on the same filesystem.
-    pub zerocopy: bool,
+    /// Controls whether the native containers-storage import path is used.
+    /// See [`LocalFetchOpt`] for details.
+    pub local_fetch: LocalFetchOpt,
 
     /// Explicit containers-storage root.  When set, auto-discovery is skipped
     /// and only this path (plus any `additional_image_stores`) is searched.
-    /// Only relevant for `containers-storage:` references.
+    /// Only relevant when `local_fetch` is not [`Disabled`](LocalFetchOpt::Disabled).
     pub storage_root: Option<&'a std::path::Path>,
 
     /// Additional read-only image stores to search beyond the primary
     /// (auto-discovered or explicit) store.  Equivalent to the
     /// `additionalimagestore=` option in containers/storage.
-    /// Only relevant for `containers-storage:` references.
+    /// Only relevant when `local_fetch` is not [`Disabled`](LocalFetchOpt::Disabled).
     pub additional_image_stores: &'a [&'a std::path::Path],
 }
 
 /// Result of a pull operation.
 #[derive(Debug)]
 pub struct PullResult<ObjectID> {
+    /// The manifest digest (sha256:...).
+    pub manifest_digest: OciDigest,
+    /// The fs-verity hash of the manifest splitstream.
+    pub manifest_verity: ObjectID,
     /// The config digest (sha256:...).
     pub config_digest: OciDigest,
     /// The fs-verity hash of the config splitstream.
@@ -329,11 +350,12 @@ pub fn ls_layer<ObjectID: FsVerityHashValue>(
 /// Pull the target image, and add the provided tag. If this is a mountable
 /// image (i.e. not an artifact), it is *not* unpacked by default.
 ///
-/// When the `containers-storage` feature is enabled and the image reference
-/// starts with `containers-storage:`, this uses the native cstor import path
-/// which supports zero-copy reflinks/hardlinks. Otherwise, it uses skopeo.
+/// When the `containers-storage` feature is enabled, the image reference
+/// starts with `containers-storage:`, **and** [`PullOptions::local_fetch`]
+/// is not [`LocalFetchOpt::Disabled`], this uses the native cstor import path
+/// which supports zero-copy reflinks/hardlinks.  Otherwise, it uses skopeo.
 ///
-/// See [`PullOptions`] for tunable knobs (zero-copy mode, extra storage
+/// See [`PullOptions`] for tunable knobs (local-copy mode, extra storage
 /// roots, image proxy configuration).
 pub async fn pull<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
@@ -341,11 +363,37 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
     reference: Option<&str>,
     opts: PullOptions<'_>,
 ) -> Result<PullResult<ObjectID>> {
-    let (config_digest, config_verity, stats) =
-        skopeo::pull(repo, imgref, reference, opts.img_proxy_config).await?;
+    #[cfg(feature = "containers-storage")]
+    if opts.local_fetch != LocalFetchOpt::Disabled
+        && let Some(image_id) = cstor::parse_containers_storage_ref(imgref)
+    {
+        let zerocopy = opts.local_fetch == LocalFetchOpt::ZeroCopy;
+        let (((manifest_digest, manifest_verity), (config_digest, config_verity)), stats) =
+            cstor::import_from_containers_storage(
+                repo,
+                image_id,
+                reference,
+                zerocopy,
+                opts.storage_root,
+                opts.additional_image_stores,
+            )
+            .await?;
+        return Ok(PullResult {
+            manifest_digest,
+            manifest_verity,
+            config_digest,
+            config_verity,
+            stats,
+        });
+    }
+
+    let (result, stats) =
+        skopeo::pull_image(repo, imgref, reference, opts.img_proxy_config).await?;
     Ok(crate::PullResult {
-        config_digest,
-        config_verity,
+        manifest_digest: result.manifest_digest,
+        manifest_verity: result.manifest_verity,
+        config_digest: result.config_digest,
+        config_verity: result.config_verity,
         stats,
     })
 }
@@ -1265,5 +1313,247 @@ mod test {
             "0 new + 0 already present objects; 0 B stored, 0 B inlined"
         );
         assert_eq!(empty.total_objects(), 0);
+    }
+
+    /// End-to-end test: multi-layer OCI image with nontrivial whiteout usage.
+    ///
+    /// Builds three tar layers exercising individual file whiteouts (`.wh.<name>`)
+    /// and opaque directory whiteouts (`.wh..wh..opq`), imports them through the
+    /// full OCI pipeline (tar → splitstream → OCI config/manifest → EROFS), and
+    /// verifies the resulting filesystem contains exactly the expected files.
+    #[tokio::test]
+    async fn test_whiteout_multi_layer_import() {
+        use composefs::test::TestRepo;
+        use containers_image_proxy::oci_spec::image::{
+            ConfigBuilder, DescriptorBuilder, ImageConfigurationBuilder, ImageManifestBuilder,
+            MediaType, RootFsBuilder,
+        };
+
+        // --- Tar builder helpers (local to this test) ---
+
+        fn tar_dir(builder: &mut ::tar::Builder<Vec<u8>>, name: &str) {
+            let mut header = ::tar::Header::new_ustar();
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_mode(0o755);
+            header.set_entry_type(::tar::EntryType::Directory);
+            header.set_size(0);
+            builder
+                .append_data(&mut header, name, std::io::empty())
+                .unwrap();
+        }
+
+        fn tar_file(builder: &mut ::tar::Builder<Vec<u8>>, name: &str, content: &[u8]) {
+            let mut header = ::tar::Header::new_ustar();
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_mode(0o644);
+            header.set_entry_type(::tar::EntryType::Regular);
+            header.set_size(content.len() as u64);
+            builder.append_data(&mut header, name, content).unwrap();
+        }
+
+        /// Zero-length regular file — used for `.wh.<name>` and `.wh..wh..opq` entries.
+        fn tar_whiteout(builder: &mut ::tar::Builder<Vec<u8>>, name: &str) {
+            tar_file(builder, name, &[]);
+        }
+
+        // --- Build the three layers ---
+
+        // Layer 1 (base): create initial filesystem
+        let layer1 = {
+            let mut b = ::tar::Builder::new(vec![]);
+            tar_dir(&mut b, "etc");
+            tar_file(&mut b, "etc/config.toml", b"[server]\nport = 8080\n");
+            tar_file(&mut b, "etc/hosts", b"127.0.0.1 localhost\n");
+            tar_dir(&mut b, "usr");
+            tar_dir(&mut b, "usr/bin");
+            tar_file(&mut b, "usr/bin/app", b"#!/bin/sh\necho hello\n");
+            tar_dir(&mut b, "usr/lib");
+            tar_file(&mut b, "usr/lib/old-lib.so", b"fake-old-lib-content");
+            tar_file(&mut b, "usr/lib/shared.so", b"fake-shared-lib-content");
+            tar_dir(&mut b, "tmp");
+            tar_dir(&mut b, "tmp/cache");
+            tar_file(&mut b, "tmp/cache/data.bin", b"cached-data-payload");
+            tar_file(&mut b, "tmp/cache/index.db", b"cached-index-payload");
+            b.into_inner().unwrap()
+        };
+
+        // Layer 2 (whiteout + modify):
+        //  - delete /etc/hosts (file whiteout)
+        //  - delete /usr/lib/old-lib.so (file whiteout)
+        //  - add /etc/hosts.new (replacement)
+        //  - opaque whiteout on /tmp/cache (clears data.bin + index.db)
+        //  - add /tmp/cache/fresh.bin (re-populate after opaque)
+        let layer2 = {
+            let mut b = ::tar::Builder::new(vec![]);
+            tar_dir(&mut b, "etc");
+            tar_whiteout(&mut b, "etc/.wh.hosts");
+            tar_file(&mut b, "etc/hosts.new", b"127.0.0.1 localhost.new\n");
+            tar_dir(&mut b, "usr");
+            tar_dir(&mut b, "usr/lib");
+            tar_whiteout(&mut b, "usr/lib/.wh.old-lib.so");
+            tar_dir(&mut b, "tmp");
+            tar_dir(&mut b, "tmp/cache");
+            tar_whiteout(&mut b, "tmp/cache/.wh..wh..opq");
+            tar_file(&mut b, "tmp/cache/fresh.bin", b"fresh-cache-content");
+            b.into_inner().unwrap()
+        };
+
+        // Layer 3 (more whiteouts):
+        //  - delete /usr/bin/app (file whiteout)
+        //  - add /usr/bin/app-v2 (replacement)
+        let layer3 = {
+            let mut b = ::tar::Builder::new(vec![]);
+            tar_dir(&mut b, "usr");
+            tar_dir(&mut b, "usr/bin");
+            tar_whiteout(&mut b, "usr/bin/.wh.app");
+            tar_file(&mut b, "usr/bin/app-v2", b"#!/bin/sh\necho hello v2\n");
+            b.into_inner().unwrap()
+        };
+
+        // --- Import layers and build OCI image ---
+
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        let layers_data = [&layer1[..], &layer2[..], &layer3[..]];
+        let mut layer_digests = Vec::new();
+        let mut layer_verities_map: HashMap<Box<str>, composefs::fsverity::Sha256HashValue> =
+            HashMap::new();
+        let mut layer_descriptors = Vec::new();
+
+        for tar_data in &layers_data {
+            let digest = hash_sha256(tar_data);
+            let (verity, _stats) = import_layer(repo, &digest, None, *tar_data).await.unwrap();
+
+            let descriptor = DescriptorBuilder::default()
+                .media_type(MediaType::ImageLayerGzip)
+                .digest(digest.clone())
+                .size(tar_data.len() as u64)
+                .build()
+                .unwrap();
+
+            layer_verities_map.insert(digest.to_string().into_boxed_str(), verity);
+            layer_digests.push(digest.to_string());
+            layer_descriptors.push(descriptor);
+        }
+
+        // Build OCI config
+        let rootfs = RootFsBuilder::default()
+            .typ("layers")
+            .diff_ids(layer_digests.clone())
+            .build()
+            .unwrap();
+
+        let cfg = ConfigBuilder::default().build().unwrap();
+
+        let config = ImageConfigurationBuilder::default()
+            .architecture("amd64")
+            .os("linux")
+            .rootfs(rootfs)
+            .config(cfg)
+            .build()
+            .unwrap();
+
+        let config_json = config.to_string().unwrap();
+        let config_digest = hash_sha256(config_json.as_bytes());
+
+        let mut config_stream = repo.create_stream(skopeo::OCI_CONFIG_CONTENT_TYPE).unwrap();
+        for (digest, verity) in &layer_verities_map {
+            config_stream.add_named_stream_ref(digest, verity);
+        }
+        config_stream
+            .write_external(config_json.as_bytes())
+            .unwrap();
+        let config_verity = repo
+            .write_stream(config_stream, &config_identifier(&config_digest), None)
+            .unwrap();
+
+        // Build OCI manifest
+        let config_descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::ImageConfig)
+            .digest(config_digest.clone())
+            .size(config_json.len() as u64)
+            .build()
+            .unwrap();
+
+        let manifest = ImageManifestBuilder::default()
+            .schema_version(2u32)
+            .media_type(MediaType::ImageManifest)
+            .config(config_descriptor)
+            .layers(layer_descriptors)
+            .build()
+            .unwrap();
+
+        let manifest_json = manifest.to_string().unwrap();
+        let manifest_digest = hash_sha256(manifest_json.as_bytes());
+
+        let (_stored_digest, manifest_verity) = oci_image::write_manifest(
+            repo,
+            &manifest,
+            &manifest_digest,
+            &config_verity,
+            &layer_verities_map,
+            Some("whiteout-test:v1"),
+        )
+        .unwrap();
+
+        // --- Create the EROFS image ---
+
+        let erofs_id = ensure_oci_composefs_erofs(
+            repo,
+            &manifest_digest,
+            Some(&manifest_verity),
+            Some("whiteout-test:v1"),
+        )
+        .unwrap()
+        .expect("container image should produce EROFS");
+
+        // --- Verify the flattened filesystem ---
+
+        let erofs_data = repo.read_object(&erofs_id).unwrap();
+        let fs =
+            composefs::erofs::reader::erofs_to_filesystem::<Sha256HashValue>(&erofs_data).unwrap();
+        let mut dump = Vec::new();
+        composefs::dumpfile::write_dumpfile(&mut dump, &fs).unwrap();
+        let dump = String::from_utf8(dump).unwrap();
+
+        // Extract just the paths from the dumpfile for structural verification
+        let paths: Vec<&str> = dump.lines().map(|l| l.split_once(' ').unwrap().0).collect();
+
+        // Files that SHOULD exist after all three layers
+        let expected_present = [
+            "/",
+            "/etc",
+            "/etc/config.toml", // layer 1, survived
+            "/etc/hosts.new",   // layer 2 addition
+            "/tmp",
+            "/tmp/cache",
+            "/tmp/cache/fresh.bin", // layer 2, after opaque whiteout
+            "/usr",
+            "/usr/bin",
+            "/usr/bin/app-v2", // layer 3 replacement
+            "/usr/lib",
+            "/usr/lib/shared.so", // layer 1, survived
+        ];
+
+        // Files that MUST NOT exist (removed by whiteouts)
+        let must_not_exist = [
+            "/etc/hosts",          // deleted by layer 2 file whiteout
+            "/usr/lib/old-lib.so", // deleted by layer 2 file whiteout
+            "/usr/bin/app",        // deleted by layer 3 file whiteout
+            "/tmp/cache/data.bin", // cleared by layer 2 opaque whiteout
+            "/tmp/cache/index.db", // cleared by layer 2 opaque whiteout
+        ];
+
+        similar_asserts::assert_eq!(paths, expected_present);
+
+        for path in &must_not_exist {
+            assert!(
+                !paths.contains(path),
+                "{path} should have been removed by whiteout but is still present"
+            );
+        }
     }
 }
