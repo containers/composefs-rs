@@ -232,6 +232,18 @@ pub fn measure_verity_opt<H: FsVerityHashValue>(
     }
 }
 
+/// Check whether a file has fs-verity enabled, dispatching to the correct
+/// hash type based on the [`Algorithm`].
+///
+/// Returns `true` if verity is enabled, `false` if not (or if the filesystem
+/// does not support verity).
+pub(crate) fn has_verity(fd: impl AsFd, algorithm: Algorithm) -> Result<bool, MeasureVerityError> {
+    match algorithm {
+        Algorithm::Sha256 { .. } => Ok(measure_verity_opt::<Sha256HashValue>(fd)?.is_some()),
+        Algorithm::Sha512 { .. } => Ok(measure_verity_opt::<Sha512HashValue>(fd)?.is_some()),
+    }
+}
+
 /// Compare the fs-verity digest of the file versus the expected digest.
 ///
 /// This calls `measure_verity()` and verifies that the result is equal to the expected value.

@@ -99,6 +99,12 @@ pub struct App {
     #[clap(long)]
     require_verity: bool,
 
+    /// Don't automatically upgrade old-format repositories.
+    /// When set, commands will fail on repos without meta.json instead
+    /// of inferring metadata from existing objects.
+    #[clap(long)]
+    no_upgrade: bool,
+
     /// Don't open a repository. Only valid for commands that don't need one
     /// (compute-id, create-dumpfile).
     #[clap(long)]
@@ -537,13 +543,17 @@ fn resolve_repo_path(args: &App) -> Result<PathBuf> {
 /// Resolution order:
 /// 1. If `meta.json` exists, use its algorithm. Error if `--hash` was
 ///    explicitly passed and conflicts.
-/// 2. If no metadata, use `--hash` if given.
-/// 3. Otherwise default to sha512.
+/// 2. If no metadata and `upgrade` is true, infer from existing objects.
+/// 3. If no metadata and `upgrade` is false, error.
 ///
 /// Note: we read the metadata file directly here (rather than via
 /// `Repository::metadata`) because this runs *before* we know which
 /// generic `ObjectID` type to use — that's exactly what we're deciding.
-fn resolve_hash_type(repo_path: &Path, cli_hash: Option<HashType>) -> Result<HashType> {
+fn resolve_hash_type(
+    repo_path: &Path,
+    cli_hash: Option<HashType>,
+    upgrade: bool,
+) -> Result<HashType> {
     let repo_fd = rustix::fs::open(
         repo_path,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
@@ -551,13 +561,26 @@ fn resolve_hash_type(repo_path: &Path, cli_hash: Option<HashType>) -> Result<Has
     )
     .with_context(|| format!("opening repository {}", repo_path.display()))?;
 
-    let algorithm = read_repo_algorithm(&repo_fd)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "{REPO_METADATA_FILENAME} not found in {}; \
-             this repository must be initialized with `cfsctl init`",
-            repo_path.display(),
-        )
-    })?;
+    let algorithm = match read_repo_algorithm(&repo_fd)? {
+        Some(alg) => alg,
+        None if upgrade => {
+            // No meta.json — try to infer from objects (old-format repo).
+            // open_upgrade will write meta.json later when the repo is opened.
+            composefs::repository::infer_repo_algorithm(&repo_fd).with_context(|| {
+                format!(
+                    "no {REPO_METADATA_FILENAME} in {}; tried to infer algorithm from objects",
+                    repo_path.display(),
+                )
+            })?
+        }
+        None => {
+            anyhow::bail!(
+                "{REPO_METADATA_FILENAME} not found in {}; \
+                 this repository must be initialized with `cfsctl init`",
+                repo_path.display(),
+            );
+        }
+    };
 
     let detected = match algorithm {
         Algorithm::Sha256 { .. } => HashType::Sha256,
@@ -614,7 +637,7 @@ pub async fn run_app(args: App) -> Result<()> {
         // instead of the default SHA-512.
         let effective_hash = if !args.no_repo {
             if let Ok(repo_path) = resolve_repo_path(&args) {
-                resolve_hash_type(&repo_path, args.hash)
+                resolve_hash_type(&repo_path, args.hash, !args.no_upgrade)
                     .unwrap_or(args.hash.unwrap_or(HashType::Sha512))
             } else {
                 args.hash.unwrap_or(HashType::Sha512)
@@ -629,7 +652,7 @@ pub async fn run_app(args: App) -> Result<()> {
     }
 
     let repo_path = resolve_repo_path(&args)?;
-    let effective_hash = resolve_hash_type(&repo_path, args.hash)?;
+    let effective_hash = resolve_hash_type(&repo_path, args.hash, !args.no_upgrade)?;
 
     match effective_hash {
         HashType::Sha256 => run_cmd_with_repo(open_repo::<Sha256HashValue>(&args)?, args).await,
@@ -690,13 +713,18 @@ fn run_init(
     Ok(())
 }
 
-/// Open a repo
+/// Open a repo, auto-upgrading old-format repos unless `--no-upgrade` was passed.
 pub fn open_repo<ObjectID>(args: &App) -> Result<Repository<ObjectID>>
 where
     ObjectID: FsVerityHashValue,
 {
     let path = resolve_repo_path(args)?;
-    let mut repo = Repository::open_path(CWD, path)?;
+    let mut repo = if args.no_upgrade {
+        Repository::open_path(CWD, path)?
+    } else {
+        let (repo, _upgraded) = Repository::open_upgrade(CWD, path)?;
+        repo
+    };
     // Hidden --insecure flag for backward compatibility; the default
     // now is to inherit the repo config, but if it's specified we
     // disable requiring verity even if the repo says to use it.

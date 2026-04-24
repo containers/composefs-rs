@@ -31,7 +31,7 @@ pub use composefs;
 
 use std::{collections::HashMap, sync::Arc};
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 /// OCI content-addressable digest type (e.g. `sha256:abcd...`).
 ///
 /// Re-exported from `oci-spec` for convenience.
@@ -508,6 +508,71 @@ pub fn composefs_boot_erofs_for_manifest<ObjectID: FsVerityHashValue>(
     Ok(img.boot_image_ref().cloned())
 }
 
+/// Result of a repository upgrade operation.
+#[derive(Debug, Clone, Default)]
+pub struct UpgradeResult {
+    /// Number of images that already had EROFS (skipped).
+    pub already_current: u64,
+    /// Number of images that were upgraded (EROFS generated).
+    pub upgraded: u64,
+    /// Number of non-container images skipped (artifacts, etc.).
+    pub skipped_non_container: u64,
+}
+
+/// Upgrades all tagged OCI images in the repository to the current format.
+///
+/// For each tagged container image, this ensures a composefs EROFS image
+/// exists and is linked to the config splitstream. Images that already have
+/// an EROFS ref are skipped. Non-container images (artifacts) are also skipped.
+///
+/// This is the migration path for repositories created by older versions of
+/// composefs-rs (e.g. bootc ≤ 1.15.x) that did not generate EROFS at pull
+/// time. Old-format splitstream headers (pre-`repr(C)`) are read transparently;
+/// the rewritten config and manifest splitstreams use the current format.
+///
+/// After upgrading, callers should run [`Repository::gc`] to clean up
+/// unreferenced old config and manifest splitstream objects.
+pub fn upgrade_repo<ObjectID: FsVerityHashValue>(
+    repo: &Arc<Repository<ObjectID>>,
+) -> Result<UpgradeResult> {
+    let mut result = UpgradeResult::default();
+
+    for (tag, manifest_digest) in oci_image::list_refs(repo)? {
+        let img = oci_image::OciImage::open(repo, &manifest_digest, None)
+            .with_context(|| format!("opening image {tag}"))?;
+
+        if !img.is_container_image() {
+            tracing::debug!("skipping non-container image {tag}");
+            result.skipped_non_container += 1;
+            continue;
+        }
+
+        if img.image_ref().is_some() {
+            tracing::debug!("image {tag} already has EROFS ref, skipping");
+            result.already_current += 1;
+            continue;
+        }
+
+        let erofs_id = ensure_oci_composefs_erofs(
+            repo,
+            &manifest_digest,
+            Some(img.manifest_verity()),
+            Some(&tag),
+        )
+        .with_context(|| format!("generating EROFS for image {tag}"))?;
+
+        if erofs_id.is_some() {
+            tracing::info!("upgraded image {tag}");
+            result.upgraded += 1;
+        } else {
+            tracing::debug!("image {tag} produced no EROFS (not a container image?)");
+            result.skipped_non_container += 1;
+        }
+    }
+
+    Ok(result)
+}
+
 /// Writes a container configuration to the repository.
 ///
 /// Serializes the image configuration to JSON and stores it as a split stream with the
@@ -693,6 +758,35 @@ mod test {
     use composefs::{fsverity::Sha256HashValue, repository::Repository, test::tempdir};
 
     use super::*;
+
+    /// Expected composefs dumpfile output for the base test image created by
+    /// [`test_util::create_base_image`]. Used across multiple tests to verify
+    /// EROFS round-trip correctness.
+    const EXPECTED_BASE_IMAGE_DUMPFILE: &str = "\
+/ 0 40755 6 0 0 0 0.0 - - -
+/etc 0 40755 2 0 0 0 0.0 - - -
+/etc/hostname 9 100644 1 0 0 0 0.0 - test-host -
+/etc/os-release 23 100644 1 0 0 0 0.0 - ID=test\\nVERSION_ID=1.0\\n -
+/etc/passwd 100 100644 1 0 0 0 0.0 f2/c4fd5735bd46db3b18d402ae87c5086c97c0e1321901cfd30f320b73ef25aa - f2c4fd5735bd46db3b18d402ae87c5086c97c0e1321901cfd30f320b73ef25aa
+/tmp 0 40755 2 0 0 0 0.0 - - -
+/usr 0 40755 5 0 0 0 0.0 - - -
+/usr/bin 0 40755 2 0 0 0 0.0 - - -
+/usr/bin/busybox 4096 100755 1 0 0 0 0.0 f0/f7e1e58fdd31f5792222087377a4a976760c416ecdf5f426193e608681b7a1 - f0f7e1e58fdd31f5792222087377a4a976760c416ecdf5f426193e608681b7a1
+/usr/bin/cat 7 120777 1 0 0 0 0.0 busybox - -
+/usr/bin/cp 7 120777 1 0 0 0 0.0 busybox - -
+/usr/bin/ls 7 120777 1 0 0 0 0.0 busybox - -
+/usr/bin/mv 7 120777 1 0 0 0 0.0 busybox - -
+/usr/bin/ping 7 120777 1 0 0 0 0.0 busybox - - security.capability=\\x02\\x00\\x00\\x02\\x00\\x20\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00
+/usr/bin/rm 7 120777 1 0 0 0 0.0 busybox - -
+/usr/bin/sh 7 120777 1 0 0 0 0.0 busybox - -
+/usr/lib 0 40755 2 0 0 0 0.0 - - -
+/usr/share 0 40755 3 0 0 0 0.0 - - -
+/usr/share/doc 0 40755 2 0 0 0 0.0 - - -
+/usr/share/doc/README 512 100644 1 0 0 0 0.0 51/44b8f80be57c3518f410d930e18c4e405387c82e4993c18265a1ba4a80263b - 5144b8f80be57c3518f410d930e18c4e405387c82e4993c18265a1ba4a80263b
+/var 0 40755 3 0 0 0 0.0 - - -
+/var/data 0 40755 2 0 0 0 0.0 - - -
+/var/data/app.json 256 100644 1 0 0 0 0.0 c9/21965b74ac1780bc437cec640b27186d85317b9afdb3dbb68626aed5ecd2b6 - c921965b74ac1780bc437cec640b27186d85317b9afdb3dbb68626aed5ecd2b6
+";
 
     /// Create a test repository with meta.json in insecure mode.
     fn create_test_repo() -> (tempfile::TempDir, Arc<Repository<Sha256HashValue>>) {
@@ -1023,34 +1117,7 @@ mod test {
         let mut dump = Vec::new();
         composefs::dumpfile::write_dumpfile(&mut dump, &fs).unwrap();
         let dump = String::from_utf8(dump).unwrap();
-        similar_asserts::assert_eq!(
-            dump,
-            "\
-/ 0 40755 6 0 0 0 0.0 - - -
-/etc 0 40755 2 0 0 0 0.0 - - -
-/etc/hostname 9 100644 1 0 0 0 0.0 - test-host -
-/etc/os-release 23 100644 1 0 0 0 0.0 - ID=test\\nVERSION_ID=1.0\\n -
-/etc/passwd 100 100644 1 0 0 0 0.0 f2/c4fd5735bd46db3b18d402ae87c5086c97c0e1321901cfd30f320b73ef25aa - f2c4fd5735bd46db3b18d402ae87c5086c97c0e1321901cfd30f320b73ef25aa
-/tmp 0 40755 2 0 0 0 0.0 - - -
-/usr 0 40755 5 0 0 0 0.0 - - -
-/usr/bin 0 40755 2 0 0 0 0.0 - - -
-/usr/bin/busybox 4096 100755 1 0 0 0 0.0 f0/f7e1e58fdd31f5792222087377a4a976760c416ecdf5f426193e608681b7a1 - f0f7e1e58fdd31f5792222087377a4a976760c416ecdf5f426193e608681b7a1
-/usr/bin/cat 7 120777 1 0 0 0 0.0 busybox - -
-/usr/bin/cp 7 120777 1 0 0 0 0.0 busybox - -
-/usr/bin/ls 7 120777 1 0 0 0 0.0 busybox - -
-/usr/bin/mv 7 120777 1 0 0 0 0.0 busybox - -
-/usr/bin/ping 7 120777 1 0 0 0 0.0 busybox - - security.capability=\\x02\\x00\\x00\\x02\\x00\\x20\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00
-/usr/bin/rm 7 120777 1 0 0 0 0.0 busybox - -
-/usr/bin/sh 7 120777 1 0 0 0 0.0 busybox - -
-/usr/lib 0 40755 2 0 0 0 0.0 - - -
-/usr/share 0 40755 3 0 0 0 0.0 - - -
-/usr/share/doc 0 40755 2 0 0 0 0.0 - - -
-/usr/share/doc/README 512 100644 1 0 0 0 0.0 51/44b8f80be57c3518f410d930e18c4e405387c82e4993c18265a1ba4a80263b - 5144b8f80be57c3518f410d930e18c4e405387c82e4993c18265a1ba4a80263b
-/var 0 40755 3 0 0 0 0.0 - - -
-/var/data 0 40755 2 0 0 0 0.0 - - -
-/var/data/app.json 256 100644 1 0 0 0 0.0 c9/21965b74ac1780bc437cec640b27186d85317b9afdb3dbb68626aed5ecd2b6 - c921965b74ac1780bc437cec640b27186d85317b9afdb3dbb68626aed5ecd2b6
-"
-        );
+        similar_asserts::assert_eq!(dump, EXPECTED_BASE_IMAGE_DUMPFILE);
     }
 
     #[tokio::test]
@@ -1555,5 +1622,241 @@ mod test {
                 "{path} should have been removed by whiteout but is still present"
             );
         }
+    }
+
+    /// Verify that the full OCI pipeline works when all splitstreams use the
+    /// old (pre-repr(C)) header layout — the format that bootc <= 1.15.x wrote.
+    ///
+    /// Old-format writing stays on throughout, including EROFS generation, so
+    /// the rewritten config+manifest splitstreams are also old-format. This
+    /// exercises the complete read-old → write-old → read-old-again chain.
+    #[tokio::test]
+    async fn test_old_format_splitstream_oci_roundtrip() {
+        use composefs::test::TestRepo;
+
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        // Enable old-format writing for the entire test — layers, config,
+        // manifest, and the rewritten config+manifest after EROFS generation
+        // all get old-format headers.
+        repo.set_write_old_splitstream_format(true);
+        let img = test_util::create_base_image(repo, Some("old:v1")).await;
+
+        // Verify open_config still works with old-format splitstreams
+        let oci = oci_image::OciImage::open_ref(repo, "old:v1").unwrap();
+        let oc = open_config(repo, oci.config_digest(), Some(oci.config_verity())).unwrap();
+        assert_eq!(oc.config.architecture().to_string(), "amd64");
+        assert!(
+            oc.image_ref.is_none(),
+            "pre-EROFS image should have no image ref"
+        );
+
+        // Verify create_filesystem works (reads old-format layer splitstreams)
+        let fs =
+            image::create_filesystem(repo, oci.config_digest(), Some(oci.config_verity())).unwrap();
+        let mut fs_dump = Vec::new();
+        composefs::dumpfile::write_dumpfile(&mut fs_dump, &fs).unwrap();
+        assert!(
+            !fs_dump.is_empty(),
+            "filesystem should contain entries from old-format layers"
+        );
+
+        // Generate EROFS with old-format still enabled — the rewritten
+        // config+manifest splitstreams also get old-format headers.
+        let erofs_id = ensure_oci_composefs_erofs(
+            repo,
+            &img.manifest_digest,
+            Some(&img.manifest_verity),
+            Some("old:v1"),
+        )
+        .unwrap()
+        .expect("container image should produce EROFS");
+
+        // The rewritten config+manifest are old-format; verify we can
+        // still open the image and read back the EROFS ref through them.
+        let oci_after = oci_image::OciImage::open_ref(repo, "old:v1").unwrap();
+        assert_eq!(
+            oci_after.image_ref(),
+            Some(&erofs_id),
+            "old-format rewritten config should reference the EROFS image"
+        );
+
+        let erofs_data = repo.read_object(&erofs_id).unwrap();
+        let erofs_fs =
+            composefs::erofs::reader::erofs_to_filesystem::<Sha256HashValue>(&erofs_data).unwrap();
+        let mut dump = Vec::new();
+        composefs::dumpfile::write_dumpfile(&mut dump, &erofs_fs).unwrap();
+        let dump = String::from_utf8(dump).unwrap();
+        similar_asserts::assert_eq!(dump, EXPECTED_BASE_IMAGE_DUMPFILE);
+    }
+
+    /// Simulate upgrading from the pre-EROFS-at-pull-time layout with old-format
+    /// splitstreams. This covers the case of a system that was running
+    /// bootc <= 1.15.x (old splitstream format, no EROFS generated at pull)
+    /// and then upgrades to current code.
+    #[tokio::test]
+    async fn test_pre_erofs_pull_upgrade_with_old_format() {
+        use composefs::test::TestRepo;
+
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        // Write everything in old format — simulates bootc <= 1.15.x
+        repo.set_write_old_splitstream_format(true);
+        // create_base_image does NOT call ensure_oci_composefs_erofs,
+        // so this represents the "pre-EROFS-at-pull-time" layout.
+        let img = test_util::create_base_image(repo, Some("upgrade:v1")).await;
+        repo.set_write_old_splitstream_format(false);
+
+        // Verify image_ref is None (no EROFS yet)
+        let oci_before = oci_image::OciImage::open_ref(repo, "upgrade:v1").unwrap();
+        assert!(
+            oci_before.image_ref().is_none(),
+            "pre-EROFS pull should have no image ref"
+        );
+
+        // Upgrade: ensure_oci_composefs_erofs reads old-format splitstreams,
+        // generates EROFS, and rewrites config+manifest in new format.
+        let erofs_id = ensure_oci_composefs_erofs(
+            repo,
+            &img.manifest_digest,
+            Some(&img.manifest_verity),
+            Some("upgrade:v1"),
+        )
+        .unwrap()
+        .expect("container image should produce EROFS");
+
+        // Verify the OciImage now has image_ref
+        let oci_after = oci_image::OciImage::open_ref(repo, "upgrade:v1").unwrap();
+        assert_eq!(
+            oci_after.image_ref(),
+            Some(&erofs_id),
+            "config should reference the EROFS image after upgrade"
+        );
+
+        // Verify the EROFS image is accessible
+        assert!(
+            repo.open_image(&erofs_id.to_hex()).is_ok(),
+            "EROFS image should be accessible"
+        );
+
+        // Verify the EROFS content matches expected dumpfile
+        let erofs_data = repo.read_object(&erofs_id).unwrap();
+        let erofs_fs =
+            composefs::erofs::reader::erofs_to_filesystem::<Sha256HashValue>(&erofs_data).unwrap();
+        let mut dump = Vec::new();
+        composefs::dumpfile::write_dumpfile(&mut dump, &erofs_fs).unwrap();
+        let dump = String::from_utf8(dump).unwrap();
+        similar_asserts::assert_eq!(dump, EXPECTED_BASE_IMAGE_DUMPFILE);
+
+        // GC: old config+manifest splitstreams (2 objects) are now unreferenced
+        let gc1 = repo.gc(&[]).unwrap();
+        assert_eq!(
+            gc1.objects_removed, 2,
+            "old config+manifest splitstream objects"
+        );
+        assert_eq!(gc1.streams_pruned, 0);
+        assert_eq!(gc1.images_pruned, 0);
+
+        // Untag and GC — everything gets collected
+        oci_image::untag_image(repo, "upgrade:v1").unwrap();
+        let gc2 = repo.gc(&[]).unwrap();
+        assert_eq!(gc2.objects_removed, 14, "all objects collected after untag");
+        assert_eq!(gc2.streams_pruned, 7, "all stream symlinks pruned");
+        assert_eq!(gc2.images_pruned, 1, "EROFS image symlink pruned");
+    }
+
+    /// Verify that `upgrade_repo` walks all tagged images, generates EROFS for
+    /// those missing it, and is idempotent on subsequent runs.
+    #[tokio::test]
+    async fn test_upgrade_repo() {
+        use composefs::test::TestRepo;
+
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        // Simulate old-format pulls (no EROFS generated at pull time)
+        repo.set_write_old_splitstream_format(true);
+        let _img1 = test_util::create_base_image(repo, Some("app:v1")).await;
+        let _img2 = test_util::create_bootable_image(repo, Some("os:v1"), 1).await;
+        repo.set_write_old_splitstream_format(false);
+
+        // Verify neither image has an EROFS ref yet
+        let oci1 = oci_image::OciImage::open_ref(repo, "app:v1").unwrap();
+        assert!(
+            oci1.image_ref().is_none(),
+            "app:v1 should have no EROFS ref before upgrade"
+        );
+        let oci2 = oci_image::OciImage::open_ref(repo, "os:v1").unwrap();
+        assert!(
+            oci2.image_ref().is_none(),
+            "os:v1 should have no EROFS ref before upgrade"
+        );
+
+        // First upgrade: both images should be upgraded
+        let result = upgrade_repo(repo).unwrap();
+        assert_eq!(result.upgraded, 2, "both images should be upgraded");
+        assert_eq!(result.already_current, 0, "none should be already current");
+        assert_eq!(result.skipped_non_container, 0);
+
+        // Verify both images now have EROFS refs
+        let oci1_after = oci_image::OciImage::open_ref(repo, "app:v1").unwrap();
+        let erofs1 = oci1_after
+            .image_ref()
+            .expect("app:v1 should have EROFS ref after upgrade");
+        assert!(
+            repo.open_image(&erofs1.to_hex()).is_ok(),
+            "app:v1 EROFS image should be accessible"
+        );
+        let oci2_after = oci_image::OciImage::open_ref(repo, "os:v1").unwrap();
+        let erofs2 = oci2_after
+            .image_ref()
+            .expect("os:v1 should have EROFS ref after upgrade");
+        assert!(
+            repo.open_image(&erofs2.to_hex()).is_ok(),
+            "os:v1 EROFS image should be accessible"
+        );
+
+        // Second upgrade: idempotent — both should be skipped
+        let result2 = upgrade_repo(repo).unwrap();
+        assert_eq!(result2.upgraded, 0, "no images should need upgrading");
+        assert_eq!(result2.already_current, 2, "both should be already current");
+        assert_eq!(result2.skipped_non_container, 0);
+
+        // GC should collect old config+manifest splitstream objects
+        // (2 per image = 4 total)
+        let gc = repo.gc(&[]).unwrap();
+        assert_eq!(
+            gc.objects_removed, 4,
+            "old config+manifest splitstream objects from 2 images"
+        );
+
+        // EROFS images should survive GC
+        assert!(
+            repo.open_image(&erofs1.to_hex()).is_ok(),
+            "app:v1 EROFS image should survive GC"
+        );
+        assert!(
+            repo.open_image(&erofs2.to_hex()).is_ok(),
+            "os:v1 EROFS image should survive GC"
+        );
+
+        // Verify EROFS content is correct for the base image
+        let erofs_data = repo.read_object(erofs1).unwrap();
+        let fs =
+            composefs::erofs::reader::erofs_to_filesystem::<Sha256HashValue>(&erofs_data).unwrap();
+        let mut dump = Vec::new();
+        composefs::dumpfile::write_dumpfile(&mut dump, &fs).unwrap();
+        let dump = String::from_utf8(dump).unwrap();
+        // The base image EROFS should match what other tests produce
+        assert!(
+            dump.contains("/usr/bin/busybox"),
+            "EROFS should contain busybox"
+        );
+        assert!(
+            dump.contains("/etc/hostname"),
+            "EROFS should contain hostname"
+        );
     }
 }
