@@ -108,9 +108,9 @@ use rustix::{
 
 use crate::{
     fsverity::{
-        Algorithm, CompareVerityError, EnableVerityError, FsVerityHashValue, FsVerityHasher,
-        MeasureVerityError, compute_verity, enable_verity_maybe_copy, ensure_verity_equal,
-        measure_verity, measure_verity_opt,
+        Algorithm, CompareVerityError, DEFAULT_LG_BLOCKSIZE, EnableVerityError, FsVerityHashValue,
+        FsVerityHasher, MeasureVerityError, compute_verity, enable_verity_maybe_copy,
+        ensure_verity_equal, has_verity, measure_verity, measure_verity_opt,
     },
     mount::{composefs_fsmount, mount_at},
     shared_internals::IO_BUF_CAPACITY,
@@ -133,7 +133,7 @@ pub enum RepositoryOpenError {
     /// `meta.json` is missing but `objects/` exists, indicating an
     /// old-format repository that predates `meta.json`.
     #[error(
-        "{REPO_METADATA_FILENAME} not found; this appears to be an old-format repository — run `cfsctl init --reset-metadata` to migrate"
+        "{REPO_METADATA_FILENAME} not found; this appears to be an old-format repository — use Repository::open_upgrade() or `cfsctl init` to migrate"
     )]
     OldFormatRepository,
     /// `meta.json` exists but could not be parsed.
@@ -521,6 +521,110 @@ pub(crate) fn write_repo_metadata(
     Ok(())
 }
 
+/// Infer repository metadata by examining existing objects.
+///
+/// Walks `objects/` to find any stored object, determines the hash
+/// algorithm from the filename length, and probes for fs-verity.
+///
+/// Returns `(Algorithm, has_verity)` or an error if the objects
+/// directory is empty or the algorithm can't be determined.
+fn infer_metadata(repo_fd: &OwnedFd) -> Result<(Algorithm, bool)> {
+    let objects_fd = openat(
+        repo_fd,
+        "objects",
+        OFlags::RDONLY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .context("opening objects/ directory")?;
+
+    let dir = Dir::read_from(&objects_fd).context("reading objects/ directory")?;
+
+    for entry in dir {
+        let entry = entry.context("reading objects/ directory entry")?;
+        let subdir_name = entry.file_name().to_bytes();
+
+        if subdir_name == b"." || subdir_name == b".." {
+            continue;
+        }
+
+        // Each subdirectory should be a 2-char hex prefix
+        if subdir_name.len() != 2 {
+            continue;
+        }
+
+        let subdir_fd = openat(
+            &objects_fd,
+            entry.file_name(),
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .with_context(|| {
+            format!(
+                "opening objects/{} subdirectory",
+                entry.file_name().to_string_lossy()
+            )
+        })?;
+
+        let subdir = Dir::read_from(&subdir_fd).context("reading object subdirectory")?;
+        for obj_entry in subdir {
+            let obj_entry = obj_entry.context("reading object subdirectory entry")?;
+            let obj_name = obj_entry.file_name().to_bytes();
+
+            if obj_name == b"." || obj_name == b".." {
+                continue;
+            }
+
+            // Infer algorithm from filename length.
+            // Objects are stored as objects/XX/<remaining_hex>, where XX is the first
+            // byte (2 hex chars). The filename is the remaining bytes in hex.
+            // SHA-256: 32 bytes total → 62 hex char filename
+            // SHA-512: 64 bytes total → 126 hex char filename
+            let algorithm = match obj_name.len() {
+                62 => Algorithm::Sha256 {
+                    lg_blocksize: DEFAULT_LG_BLOCKSIZE,
+                },
+                126 => Algorithm::Sha512 {
+                    lg_blocksize: DEFAULT_LG_BLOCKSIZE,
+                },
+                _ => continue,
+            };
+
+            let obj_fd = openat(
+                &subdir_fd,
+                obj_entry.file_name(),
+                OFlags::RDONLY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .with_context(|| {
+                format!(
+                    "opening object file {}",
+                    obj_entry.file_name().to_string_lossy()
+                )
+            })?;
+
+            let has_verity =
+                has_verity(&obj_fd, algorithm).context("probing fs-verity on object")?;
+
+            return Ok((algorithm, has_verity));
+        }
+    }
+
+    bail!("no objects found in repository — cannot infer metadata");
+}
+
+/// Infer the repository algorithm by examining existing object filenames.
+///
+/// This is useful when `meta.json` is missing (old-format repos) and the
+/// caller needs to determine the hash type before constructing a typed
+/// [`Repository`].  For example, the CLI uses this to pick the correct
+/// `ObjectID` generic parameter before calling [`Repository::open_upgrade`].
+///
+/// Returns the inferred [`Algorithm`], or an error if the objects
+/// directory is empty or contains no recognizable filenames.
+pub fn infer_repo_algorithm(repo_fd: &OwnedFd) -> Result<Algorithm> {
+    Ok(infer_metadata(repo_fd)?.0)
+}
+
 /// How an object was stored in the repository.
 ///
 /// Returned by [`Repository::ensure_object_from_file`] to indicate
@@ -633,6 +737,11 @@ pub struct Repository<ObjectID: FsVerityHashValue> {
     write_semaphore: OnceCell<Arc<Semaphore>>,
     insecure: bool,
     metadata: RepoMetadata,
+    /// When true, SplitStreamWriter::done() writes old-format (pre-repr(C))
+    /// headers. Used to test backward compatibility with splitstreams
+    /// written before #[repr(C)] was added to SplitstreamHeader.
+    #[cfg(any(test, feature = "test"))]
+    write_old_splitstream_format: std::sync::atomic::AtomicBool,
     _data: std::marker::PhantomData<ObjectID>,
 }
 
@@ -895,6 +1004,24 @@ impl fmt::Display for FsckResult {
 }
 
 impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
+    /// Enable or disable writing old-format splitstream headers.
+    ///
+    /// When enabled, all splitstreams created via [`create_stream`] will be
+    /// written with the pre-`repr(C)` header layout, simulating data written
+    /// by composefs-rs versions before the `#[repr(C)]` fix.
+    #[cfg(any(test, feature = "test"))]
+    pub fn set_write_old_splitstream_format(&self, enabled: bool) {
+        self.write_old_splitstream_format
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether splitstream writers should use the old (pre-repr(C)) header format.
+    #[cfg(any(test, feature = "test"))]
+    pub(crate) fn write_old_splitstream_format(&self) -> bool {
+        self.write_old_splitstream_format
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Return the objects directory.
     pub fn objects_dir(&self) -> ErrnoResult<&OwnedFd> {
         self.objects
@@ -1027,8 +1154,61 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             write_semaphore: OnceCell::new(),
             insecure: !has_verity,
             metadata,
+            #[cfg(any(test, feature = "test"))]
+            write_old_splitstream_format: std::sync::atomic::AtomicBool::new(false),
             _data: std::marker::PhantomData,
         })
+    }
+
+    /// Open a repository, upgrading old-format repos that lack `meta.json`.
+    ///
+    /// This method first tries [`open_path`](Self::open_path). If that fails
+    /// with [`OldFormatRepository`](RepositoryOpenError::OldFormatRepository),
+    /// it infers the algorithm and verity mode from existing objects,
+    /// writes `meta.json`, and retries the open.
+    ///
+    /// This is the non-destructive upgrade path for repositories created
+    /// by composefs-rs versions that predated `meta.json`.
+    ///
+    /// Returns `(repo, upgraded)` where `upgraded` is true if `meta.json`
+    /// was written.
+    pub fn open_upgrade(dirfd: impl AsFd, path: impl AsRef<Path>) -> Result<(Self, bool)> {
+        let path = path.as_ref();
+
+        match Self::open_path(&dirfd, path) {
+            Ok(repo) => Ok((repo, false)),
+            Err(RepositoryOpenError::OldFormatRepository) => {
+                let repo_fd = openat(
+                    &dirfd,
+                    path,
+                    OFlags::RDONLY | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .with_context(|| format!("opening repository directory {}", path.display()))?;
+
+                let (algorithm, has_verity) = infer_metadata(&repo_fd)?;
+
+                if !algorithm.is_compatible::<ObjectID>() {
+                    bail!(
+                        "inferred algorithm {} is not compatible with this repository type \
+                         (expected {})",
+                        algorithm,
+                        Algorithm::for_hash::<ObjectID>(),
+                    );
+                }
+
+                let meta = RepoMetadata::new(algorithm);
+                write_repo_metadata(&repo_fd, &meta, has_verity)?;
+
+                drop(repo_fd);
+
+                let repo = Self::open_path(&dirfd, path)
+                    .context("opening repository after writing meta.json")?;
+
+                Ok((repo, true))
+            }
+            Err(other) => Err(other.into()),
+        }
     }
 
     /// Read, parse, and probe verity on `meta.json`.
@@ -4769,5 +4949,150 @@ mod tests {
 
         // Verify Debug impl works
         assert_eq!(format!("{:?}", ObjectStoreMethod::Hardlinked), "Hardlinked");
+    }
+
+    // ---- open_upgrade tests ----
+
+    #[test]
+    fn test_open_upgrade_sha256() {
+        let tmp = tempdir();
+        let repo_path = tmp.path().join("repo");
+
+        // Create a repo, store an object, then remove meta.json to
+        // simulate an old-format repository.
+        let (repo, _) =
+            Repository::<Sha256HashValue>::init_path(CWD, &repo_path, Algorithm::SHA256, false)
+                .unwrap();
+        let data = b"hello world";
+        let obj_id = repo.ensure_object(data).unwrap();
+        drop(repo);
+
+        std::fs::remove_file(repo_path.join(REPO_METADATA_FILENAME)).unwrap();
+
+        // open_path should fail with OldFormatRepository
+        assert!(matches!(
+            Repository::<Sha256HashValue>::open_path(CWD, &repo_path),
+            Err(RepositoryOpenError::OldFormatRepository)
+        ));
+
+        // open_upgrade should infer metadata and succeed
+        let (repo, upgraded) =
+            Repository::<Sha256HashValue>::open_upgrade(CWD, &repo_path).unwrap();
+        assert!(upgraded);
+        assert!(repo_path.join(REPO_METADATA_FILENAME).exists());
+
+        // Verify the algorithm was inferred correctly
+        let meta = read_repo_metadata(
+            &openat(
+                CWD,
+                &repo_path,
+                OFlags::RDONLY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(meta.algorithm.is_compatible::<Sha256HashValue>());
+
+        // The repo should work — read back the object
+        let read_data = repo.read_object(&obj_id).unwrap();
+        assert_eq!(&read_data[..], data);
+
+        // Second call should not upgrade
+        drop(repo);
+        let (_repo, upgraded) =
+            Repository::<Sha256HashValue>::open_upgrade(CWD, &repo_path).unwrap();
+        assert!(!upgraded);
+    }
+
+    #[test]
+    fn test_open_upgrade_sha512() {
+        let tmp = tempdir();
+        let repo_path = tmp.path().join("repo");
+
+        let (repo, _) =
+            Repository::<Sha512HashValue>::init_path(CWD, &repo_path, Algorithm::SHA512, false)
+                .unwrap();
+        let data = b"sha512 test data";
+        let obj_id = repo.ensure_object(data).unwrap();
+        drop(repo);
+
+        std::fs::remove_file(repo_path.join(REPO_METADATA_FILENAME)).unwrap();
+
+        let (repo, upgraded) =
+            Repository::<Sha512HashValue>::open_upgrade(CWD, &repo_path).unwrap();
+        assert!(upgraded);
+
+        let meta = read_repo_metadata(
+            &openat(
+                CWD,
+                &repo_path,
+                OFlags::RDONLY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(meta.algorithm.is_compatible::<Sha512HashValue>());
+
+        let read_data = repo.read_object(&obj_id).unwrap();
+        assert_eq!(&read_data[..], data);
+    }
+
+    #[test]
+    fn test_open_upgrade_algorithm_mismatch() {
+        // Create a sha512 repo, remove meta.json, then try to
+        // open_upgrade as sha256 — should fail with algorithm mismatch.
+        let tmp = tempdir();
+        let repo_path = tmp.path().join("repo");
+
+        let (repo, _) =
+            Repository::<Sha512HashValue>::init_path(CWD, &repo_path, Algorithm::SHA512, false)
+                .unwrap();
+        repo.ensure_object(b"some data").unwrap();
+        drop(repo);
+
+        std::fs::remove_file(repo_path.join(REPO_METADATA_FILENAME)).unwrap();
+
+        let err = Repository::<Sha256HashValue>::open_upgrade(CWD, &repo_path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not compatible"),
+            "expected algorithm mismatch error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_open_upgrade_empty_objects() {
+        // An old-format repo with an empty objects/ directory should
+        // fail because we can't infer the algorithm.
+        let tmp = tempdir();
+        let repo_path = tmp.path().join("repo");
+        mkdirat(CWD, &repo_path, Mode::from_raw_mode(0o755)).unwrap();
+        mkdirat(CWD, &repo_path.join("objects"), Mode::from_raw_mode(0o755)).unwrap();
+
+        let err = Repository::<Sha256HashValue>::open_upgrade(CWD, &repo_path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no objects found"),
+            "expected 'no objects found' error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_open_upgrade_already_initialized() {
+        // open_upgrade on a repo that already has meta.json should
+        // return upgraded=false.
+        let tmp = tempdir();
+        let repo_path = tmp.path().join("repo");
+
+        Repository::<Sha256HashValue>::init_path(CWD, &repo_path, Algorithm::SHA256, false)
+            .unwrap();
+
+        let (_repo, upgraded) =
+            Repository::<Sha256HashValue>::open_upgrade(CWD, &repo_path).unwrap();
+        assert!(!upgraded);
     }
 }

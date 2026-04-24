@@ -76,6 +76,97 @@ struct SplitstreamInfo {
     pub stream_size: U64,       // total uncompressed size of inline chunks and external chunks
 }
 
+/// Old layout of SplitstreamHeader, without `#[repr(C)]`.
+/// The Rust compiler reorders fields for alignment — the const asserts below
+/// verify the resulting layout matches what bootc <= 1.15.x actually wrote.
+#[derive(Debug, FromBytes, Immutable, IntoBytes, KnownLayout)]
+struct OldSplitstreamHeader {
+    pub magic: [u8; 11],
+    pub version: u8,
+    pub _flags: U16,
+    pub algorithm: u8,
+    pub lg_blocksize: u8,
+    pub info: FileRange,
+}
+
+/// Old layout of SplitstreamInfo, without `#[repr(C)]`.
+#[derive(Debug, FromBytes, Immutable, IntoBytes, KnownLayout)]
+struct OldSplitstreamInfo {
+    pub stream_refs: FileRange,
+    pub object_refs: FileRange,
+    pub stream: FileRange,
+    pub named_refs: FileRange,
+    pub content_type: U64,
+    pub stream_size: U64,
+}
+
+// FileRange: both old and new layouts should be identical (two U64 fields, uniform alignment)
+const _: () = {
+    assert!(std::mem::offset_of!(FileRange, start) == 0);
+    assert!(std::mem::offset_of!(FileRange, end) == 8);
+    assert!(std::mem::size_of::<FileRange>() == 16);
+};
+
+// SplitstreamHeader: verify old layout DIFFERS from new layout
+const _: () = {
+    // New (repr(C)) layout: magic at 0, info at 16
+    assert!(std::mem::offset_of!(SplitstreamHeader, magic) == 0);
+    assert!(std::mem::offset_of!(SplitstreamHeader, info) == 16);
+    assert!(std::mem::size_of::<SplitstreamHeader>() == 32);
+
+    // Old (no repr(C)) layout: info at 0, magic at 18
+    assert!(std::mem::offset_of!(OldSplitstreamHeader, info) == 0);
+    assert!(std::mem::offset_of!(OldSplitstreamHeader, _flags) == 16);
+    assert!(std::mem::offset_of!(OldSplitstreamHeader, magic) == 18);
+    assert!(std::mem::offset_of!(OldSplitstreamHeader, version) == 29);
+    assert!(std::mem::offset_of!(OldSplitstreamHeader, algorithm) == 30);
+    assert!(std::mem::offset_of!(OldSplitstreamHeader, lg_blocksize) == 31);
+    assert!(std::mem::size_of::<OldSplitstreamHeader>() == 32);
+};
+
+// SplitstreamInfo: verify old and new layouts are IDENTICAL
+// (all fields are 8-byte aligned, no reason for compiler to reorder)
+const _: () = {
+    assert!(
+        std::mem::offset_of!(SplitstreamInfo, stream_refs)
+            == std::mem::offset_of!(OldSplitstreamInfo, stream_refs)
+    );
+    assert!(
+        std::mem::offset_of!(SplitstreamInfo, object_refs)
+            == std::mem::offset_of!(OldSplitstreamInfo, object_refs)
+    );
+    assert!(
+        std::mem::offset_of!(SplitstreamInfo, stream)
+            == std::mem::offset_of!(OldSplitstreamInfo, stream)
+    );
+    assert!(
+        std::mem::offset_of!(SplitstreamInfo, named_refs)
+            == std::mem::offset_of!(OldSplitstreamInfo, named_refs)
+    );
+    assert!(
+        std::mem::offset_of!(SplitstreamInfo, content_type)
+            == std::mem::offset_of!(OldSplitstreamInfo, content_type)
+    );
+    assert!(
+        std::mem::offset_of!(SplitstreamInfo, stream_size)
+            == std::mem::offset_of!(OldSplitstreamInfo, stream_size)
+    );
+    assert!(std::mem::size_of::<SplitstreamInfo>() == std::mem::size_of::<OldSplitstreamInfo>());
+};
+
+impl From<OldSplitstreamHeader> for SplitstreamHeader {
+    fn from(old: OldSplitstreamHeader) -> Self {
+        Self {
+            magic: old.magic,
+            version: old.version,
+            _flags: old._flags,
+            algorithm: old.algorithm,
+            lg_blocksize: old.lg_blocksize,
+            info: old.info,
+        }
+    }
+}
+
 impl FileRange {
     fn len(&self) -> Result<u64> {
         self.end
@@ -386,6 +477,9 @@ pub struct SplitStreamWriter<ObjectId: FsVerityHashValue> {
     total_size: u64,
     writer: Encoder<'static, Vec<u8>>,
     content_type: u64,
+    /// When true, done() writes old-format (pre-repr(C)) headers.
+    #[cfg(any(test, feature = "test"))]
+    write_old_format: bool,
 }
 
 impl<ObjectID: FsVerityHashValue> std::fmt::Debug for SplitStreamWriter<ObjectID> {
@@ -431,6 +525,8 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
             named_refs: Default::default(),
             total_size: 0,
             writer,
+            #[cfg(any(test, feature = "test"))]
+            write_old_format: repo.write_old_splitstream_format(),
         }
     }
 
@@ -631,6 +727,14 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
         buf.extend_from_slice(&stream);
         assert_eq!(buf.len() as u64, stream_end);
 
+        // If test mode requests old-format headers, rewrite the header in place
+        #[cfg(any(test, feature = "test"))]
+        let buf = if self.write_old_format {
+            new_to_old_format(&buf)
+        } else {
+            buf
+        };
+
         // Store the Vec<u8> into the repository (writable already checked)
         self.repo.ensure_object_impl(&buf, &self.writable)
     }
@@ -702,9 +806,22 @@ impl<ObjectID: FsVerityHashValue> SplitStreamReader<ObjectID> {
         let header = SplitstreamHeader::read_from_io(&mut file)
             .map_err(|e| Error::msg(format!("Error reading splitstream header: {e:?}")))?;
 
-        if header.magic != SPLITSTREAM_MAGIC {
-            bail!("Invalid splitstream header magic value");
-        }
+        let header = if header.magic != SPLITSTREAM_MAGIC {
+            // Try interpreting as old layout (pre-repr(C) fix, bootc <= 1.15.x)
+            file.seek(SeekFrom::Start(0))
+                .context("Seeking back to start for old-format header")?;
+            let old_header = OldSplitstreamHeader::read_from_io(&mut file).map_err(|e| {
+                Error::msg(format!(
+                    "Error reading old-format splitstream header: {e:?}"
+                ))
+            })?;
+            if old_header.magic != SPLITSTREAM_MAGIC {
+                bail!("Invalid splitstream header magic value");
+            }
+            old_header.into()
+        } else {
+            header
+        };
 
         if header.version != 0 {
             bail!("Invalid splitstream version {}", header.version);
@@ -962,6 +1079,31 @@ impl<ObjectID: FsVerityHashValue> Read for SplitStreamReader<ObjectID> {
             Err(e) => Err(std::io::Error::other(e)),
         }
     }
+}
+
+/// Convert a new-format splitstream to old (pre-repr(C)) header layout.
+/// Takes the raw bytes of a valid new-format splitstream and returns bytes
+/// with the header rewritten to match the compiler-reordered layout.
+/// Only the 32-byte header changes; the rest of the file is identical.
+#[cfg(any(test, feature = "test"))]
+pub fn new_to_old_format(new_format: &[u8]) -> Vec<u8> {
+    assert!(new_format.len() >= size_of::<SplitstreamHeader>());
+    let (header, _) = SplitstreamHeader::ref_from_prefix(new_format).unwrap();
+    assert_eq!(header.magic, SPLITSTREAM_MAGIC, "input must be new-format");
+
+    let old_header = OldSplitstreamHeader {
+        info: header.info,
+        _flags: header._flags,
+        magic: header.magic,
+        version: header.version,
+        algorithm: header.algorithm,
+        lg_blocksize: header.lg_blocksize,
+    };
+
+    let mut result = Vec::with_capacity(new_format.len());
+    result.extend_from_slice(old_header.as_bytes());
+    result.extend_from_slice(&new_format[size_of::<SplitstreamHeader>()..]);
+    result
 }
 
 #[cfg(test)]
@@ -1359,6 +1501,95 @@ mod tests {
         let reader = repo.open_stream("test-size", Some(&stream_id), None)?;
         assert_eq!(reader.total_size, 1100, "total size should be tracked");
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_old_format_header_differs_from_new() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let mut writer = repo.create_stream(0)?;
+        writer.write_inline(b"hello");
+        let stream_id = repo.write_stream(writer, "test-old-hdr", None)?;
+
+        let new_bytes = repo.read_object(&stream_id)?;
+        let old_bytes = new_to_old_format(&new_bytes);
+
+        // New format starts with magic, old format should NOT
+        assert_eq!(&new_bytes[..11], b"SplitStream");
+        assert_ne!(
+            &old_bytes[..11],
+            b"SplitStream",
+            "old format should NOT start with magic"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_old_format_splitstream() -> Result<()> {
+        use std::io::Write as _;
+
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let inline_data = b"hello";
+        let mut writer = repo.create_stream(0)?;
+        writer.write_inline(inline_data);
+        let stream_id = repo.write_stream(writer, "test-old-read", None)?;
+
+        // Read the raw stored bytes, convert to old format, write to a temp file
+        let new_bytes = repo.read_object(&stream_id)?;
+        let old_bytes = new_to_old_format(&new_bytes);
+
+        let mut tmpfile = tempfile::NamedTempFile::new()?;
+        tmpfile.write_all(&old_bytes)?;
+        tmpfile.flush()?;
+
+        // Read back via the old-format file
+        let file = std::fs::File::open(tmpfile.path())?;
+        let mut old_reader = SplitStreamReader::<Sha256HashValue>::new(file, None)?;
+
+        assert_eq!(old_reader.total_size, inline_data.len() as u64);
+        assert_eq!(old_reader.content_type, 0);
+
+        let mut old_output = Vec::new();
+        std::io::Read::read_to_end(&mut old_reader, &mut old_output)?;
+
+        // Read back via the new-format (repo) for comparison
+        let mut new_reader = repo.open_stream("test-old-read", Some(&stream_id), None)?;
+        let mut new_output = Vec::new();
+        std::io::Read::read_to_end(&mut new_reader, &mut new_output)?;
+
+        assert_eq!(
+            old_output, new_output,
+            "old and new format must produce identical data"
+        );
+        assert_eq!(&old_output, inline_data);
+        Ok(())
+    }
+
+    #[test]
+    fn test_new_format_still_works() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let inline_data = b"world";
+        let mut writer = repo.create_stream(0)?;
+        writer.write_inline(inline_data);
+        let stream_id = repo.write_stream(writer, "test-new-fmt", None)?;
+
+        // Verify the stored bytes start with magic (new format)
+        let raw_bytes = repo.read_object(&stream_id)?;
+        assert_eq!(&raw_bytes[..11], b"SplitStream");
+
+        // Read back and verify content
+        let mut reader = repo.open_stream("test-new-fmt", Some(&stream_id), None)?;
+        assert_eq!(reader.total_size, inline_data.len() as u64);
+
+        let mut output = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut output)?;
+        assert_eq!(&output, inline_data);
         Ok(())
     }
 }
