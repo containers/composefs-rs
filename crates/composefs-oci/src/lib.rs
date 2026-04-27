@@ -16,7 +16,9 @@ pub mod boot;
 #[cfg(feature = "containers-storage")]
 pub mod cstor;
 pub mod image;
+pub mod layer;
 pub mod oci_image;
+pub mod oci_layout;
 pub mod skopeo;
 pub mod tar;
 
@@ -29,6 +31,7 @@ pub mod test_util;
 // Re-export the composefs crate for consumers who only need composefs-oci
 pub use composefs;
 
+use std::io::Read;
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, Result, ensure};
@@ -39,6 +42,7 @@ pub use containers_image_proxy::oci_spec::image::Digest as OciDigest;
 
 use containers_image_proxy::ImageProxyConfig;
 use containers_image_proxy::oci_spec::image::ImageConfiguration;
+use containers_image_proxy::oci_spec::image::{Descriptor, MediaType};
 use sha2::{Digest, Sha256};
 
 use composefs::{
@@ -418,6 +422,36 @@ fn hash_sha256(bytes: &[u8]) -> OciDigest {
     sha256_content_digest(bytes)
 }
 
+/// Extract ordered diff_ids from a config descriptor.
+///
+/// For standard container images (ImageConfig media type), parses the
+/// config JSON and returns `rootfs.diff_ids`. For artifacts with
+/// non-standard config types, falls back to using manifest layer
+/// digests as identifiers.
+/// Note: oci-spec models diff_ids as `Vec<String>` but they are actually
+/// OCI content digests.  We parse them here so the rest of the codebase
+/// can work with the strongly-typed `Digest`.
+pub(crate) fn extract_diff_ids(
+    media_type: &MediaType,
+    config_reader: impl Read,
+    manifest_layers: &[Descriptor],
+) -> Result<Vec<OciDigest>> {
+    if *media_type == MediaType::ImageConfig {
+        let config = ImageConfiguration::from_reader(config_reader)?;
+        config
+            .rootfs()
+            .diff_ids()
+            .iter()
+            .map(|s| s.parse().context("parsing diff_id from image config"))
+            .collect()
+    } else {
+        Ok(manifest_layers
+            .iter()
+            .map(|d: &Descriptor| d.digest().clone())
+            .collect())
+    }
+}
+
 /// Opens and parses a container configuration.
 ///
 /// Reads the OCI image configuration from the repository and returns an [`OpenConfig`]
@@ -613,8 +647,14 @@ pub fn write_config_raw<ObjectID: FsVerityHashValue>(
 ) -> Result<ContentAndVerity<ObjectID>> {
     let config_digest = hash_sha256(config_json);
     let mut stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE)?;
-    for (name, value) in &refs {
-        stream.add_named_stream_ref(name, value)
+    // Add refs in config-defined diff_id order for deterministic output.
+    // Parse the config to get the canonical ordering of diff_ids.
+    let config = ImageConfiguration::from_reader(config_json)?;
+    for diff_id_str in config.rootfs().diff_ids() {
+        let value = refs
+            .get(diff_id_str.as_str())
+            .with_context(|| format!("missing layer verity for diff_id {diff_id_str}"))?;
+        stream.add_named_stream_ref(diff_id_str, value);
     }
     if let Some(image_id) = image {
         stream.add_named_stream_ref(IMAGE_REF_KEY, image_id);
@@ -683,7 +723,11 @@ fn ensure_oci_composefs_erofs<ObjectID: FsVerityHashValue>(
     // Rewrite manifest with updated config verity, preserving layer verities.
     // The layer_refs from OciImage are the same as the manifest's layer refs
     // (both ultimately come from the config's diff_id → verity map).
-    let layer_verities = img.layer_refs().clone();
+    let layer_verities: Vec<_> = img
+        .layer_refs()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
 
     let (_new_manifest_digest, _new_manifest_verity) = oci_image::rewrite_manifest(
         repo,
@@ -735,7 +779,11 @@ fn ensure_oci_composefs_erofs_boot<ObjectID: FsVerityHashValue>(
     // Read original manifest JSON for rewriting
     let manifest_json = img.read_manifest_json(repo)?;
 
-    let layer_verities = img.layer_refs().clone();
+    let layer_verities: Vec<_> = img
+        .layer_refs()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
 
     let (_new_manifest_digest, _new_manifest_verity) = oci_image::rewrite_manifest(
         repo,
@@ -846,6 +894,58 @@ mod test {
 ");
     }
 
+    #[tokio::test]
+    async fn test_layer_import_stats() {
+        let layer = example_layer();
+        let layer_id = hash_sha256(&layer);
+
+        let (_repo_dir, repo) = create_test_repo();
+        let (_id, stats) = import_layer(&repo, &layer_id, Some("name"), &layer[..])
+            .await
+            .unwrap();
+
+        // The example layer has files of sizes 0, 4095, 4096, 4097.
+        // Files > INLINE_CONTENT_MAX (64 bytes) are stored as external objects.
+        // So 4095, 4096, and 4097 are all external → 3 objects copied.
+        assert_eq!(
+            stats.objects_copied, 3,
+            "three files above inline threshold should be external objects"
+        );
+        assert_eq!(stats.objects_already_present, 0);
+        assert!(
+            stats.bytes_copied > 0,
+            "bytes_copied should be nonzero for external objects"
+        );
+        assert!(
+            stats.bytes_inlined > 0,
+            "bytes_inlined should be nonzero (tar headers + small file)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_layer_import_deduplication_stats() {
+        let layer = example_layer();
+        let layer_id = hash_sha256(&layer);
+
+        let (_repo_dir, repo) = create_test_repo();
+
+        // First import
+        let (_id, stats1) = import_layer(&repo, &layer_id, None, &layer[..])
+            .await
+            .unwrap();
+        assert_eq!(stats1.objects_copied, 3);
+        assert_eq!(stats1.objects_already_present, 0);
+
+        // Re-import the same layer — the stream already exists so we get
+        // an early return with zero stats (idempotent).
+        let (_id, stats2) = import_layer(&repo, &layer_id, None, &layer[..])
+            .await
+            .unwrap();
+        assert_eq!(stats2.objects_copied, 0);
+        assert_eq!(stats2.objects_already_present, 0);
+        assert_eq!(stats2.bytes_copied, 0);
+    }
+
     #[test]
     fn test_write_and_open_config() {
         use containers_image_proxy::oci_spec::image::{ImageConfigurationBuilder, RootFsBuilder};
@@ -942,6 +1042,72 @@ mod test {
             object_refs[0], expected_verity,
             "External object verity should match independently computed verity of config JSON"
         );
+    }
+
+    #[tokio::test]
+    async fn test_config_verity_deterministic() -> Result<()> {
+        use containers_image_proxy::oci_spec::image::{ImageConfigurationBuilder, RootFsBuilder};
+
+        let (_repo_dir, repo) = create_test_repo();
+
+        // Create 3 distinct layers with different content
+        let mut layers = Vec::new();
+        for (name, size) in [("alpha", 1000), ("beta", 2000), ("gamma", 3000)] {
+            let mut builder = ::tar::Builder::new(vec![]);
+            append_data(&mut builder, name, size);
+            let layer = builder.into_inner().unwrap();
+
+            let diff_id = hash_sha256(&layer);
+
+            let (verity, _stats) = import_layer(&repo, &diff_id, None, &mut layer.as_slice())
+                .await
+                .unwrap();
+            layers.push((diff_id.to_string(), verity));
+        }
+
+        let diff_ids: Vec<String> = layers.iter().map(|(d, _)| d.clone()).collect();
+        let config = ImageConfigurationBuilder::default()
+            .architecture("amd64")
+            .os("linux")
+            .rootfs(
+                RootFsBuilder::default()
+                    .typ("layers")
+                    .diff_ids(diff_ids.clone())
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+
+        // Build refs HashMaps with different insertion orders to exercise
+        // that write_config uses config-defined diff_id order, not HashMap order.
+        let refs1: HashMap<Box<str>, Sha256HashValue> = layers
+            .iter()
+            .map(|(d, v)| (d.as_str().into(), v.clone()))
+            .collect();
+        let refs2: HashMap<Box<str>, Sha256HashValue> = layers
+            .iter()
+            .rev()
+            .map(|(d, v)| (d.as_str().into(), v.clone()))
+            .collect();
+
+        let (_digest1, verity1) = write_config(&repo, &config, refs1, None, None)?;
+        let (_digest2, verity2) = write_config(&repo, &config, refs2, None, None)?;
+
+        // The verity must be identical regardless of HashMap iteration order
+        assert_eq!(
+            verity1, verity2,
+            "config verity must be deterministic across calls"
+        );
+
+        // Hardcoded expected value to catch any accidental changes
+        assert_eq!(
+            verity1.to_hex(),
+            "4839518dea22749f8ff233e7f7baec65f23dd5336462f46ad6884769af84bf95",
+            "config verity changed unexpectedly"
+        );
+
+        Ok(())
     }
 
     #[test]
@@ -1264,12 +1430,17 @@ mod test {
         let new_manifest_digest = hash_sha256(new_manifest_json.as_bytes());
 
         oci_image::untag_image(repo, "nc:v1").unwrap();
+        let layer_verities: Vec<_> = oci_before
+            .layer_refs()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         let (_md, new_manifest_verity) = oci_image::write_manifest(
             repo,
             &new_manifest,
             &new_manifest_digest,
             &new_config_verity,
-            oci_before.layer_refs(),
+            &layer_verities,
             Some("nc:v1"),
         )
         .unwrap();
@@ -1556,12 +1727,16 @@ mod test {
         let manifest_json = manifest.to_string().unwrap();
         let manifest_digest = hash_sha256(manifest_json.as_bytes());
 
+        let layer_verities_vec: Vec<_> = layer_verities_map
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         let (_stored_digest, manifest_verity) = oci_image::write_manifest(
             repo,
             &manifest,
             &manifest_digest,
             &config_verity,
-            &layer_verities_map,
+            &layer_verities_vec,
             Some("whiteout-test:v1"),
         )
         .unwrap();

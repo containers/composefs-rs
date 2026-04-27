@@ -31,7 +31,7 @@ path = "src/cleanup.rs"
 
 [dependencies]
 anyhow = "1"
-cap-std-ext = "5.0"
+cap-std-ext = { workspace = true }
 composefs = { workspace = true }
 # Only the test_util module is used — for creating test OCI images.
 # All verification must go through the cfsctl CLI.
@@ -39,7 +39,7 @@ composefs-oci = { workspace = true, features = ["test", "boot", "containers-stor
 hex = "0.4"
 libtest-mimic = "0.8"
 linkme = "0.3"
-ocidir = "0.7"
+ocidir = { workspace = true }
 paste = "1"
 rustix = { version = "1", features = ["fs", "process"] }
 serde = { version = "1", features = ["derive"] }

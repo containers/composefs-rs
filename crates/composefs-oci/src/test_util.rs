@@ -291,12 +291,14 @@ async fn create_multi_layer_image(
     let manifest_json = manifest.to_string().unwrap();
     let manifest_digest = hash(manifest_json.as_bytes());
 
+    let layer_verities_vec: Vec<(Box<str>, Sha256HashValue)> =
+        layer_verities_map.into_iter().collect();
     let (_stored_digest, manifest_verity) = write_manifest(
         repo,
         &manifest,
         &manifest_digest,
         &config_verity,
-        &layer_verities_map,
+        &layer_verities_vec,
         tag,
     )
     .unwrap();

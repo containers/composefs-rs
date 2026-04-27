@@ -65,7 +65,11 @@ pub fn remove_boot_image<ObjectID: FsVerityHashValue>(
     )?;
 
     let manifest_json = img.read_manifest_json(repo)?;
-    let layer_verities = img.layer_refs().clone();
+    let layer_verities: Vec<_> = img
+        .layer_refs()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
 
     crate::oci_image::rewrite_manifest(
         repo,
