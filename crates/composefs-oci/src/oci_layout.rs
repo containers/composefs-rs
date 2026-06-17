@@ -17,7 +17,9 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Poll, ready};
 use std::thread::available_parallelism;
 
 use anyhow::{Context, Result};
@@ -25,8 +27,10 @@ use cap_std_ext::cap_std;
 use containers_image_proxy::oci_spec::image::{Descriptor, Digest as OciDigest, MediaType};
 use fn_error_context::context;
 use ocidir::{OciDir, OciRead, ResolvedManifest};
-use tokio::sync::Semaphore;
+use tokio::io::{AsyncRead, DuplexStream, ReadBuf};
+use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinSet;
+use tokio_util::io::SyncIoBridge;
 use tracing::debug;
 
 use composefs::fsverity::FsVerityHashValue;
@@ -40,6 +44,56 @@ use crate::skopeo::{OCI_CONFIG_CONTENT_TYPE, OCI_MANIFEST_CONTENT_TYPE};
 use crate::{ImportStats, config_identifier, layer_identifier};
 
 use crate::skopeo::PullResult;
+
+const READ_BUF_SIZE: usize = 128 * 1024;
+
+/// Adapts a synchronous `Read` into a [`tokio::io::AsyncRead`] by copying data
+/// through a [`tokio::io::duplex`] channel from a single blocking thread.
+///
+/// A failure in the blocking copy closes the duplex channel, which is
+/// indistinguishable from a clean end of stream, so the error is passed
+/// out-of-band and re-raised in place of that end of stream.
+struct BlockingReader {
+    stream: DuplexStream,
+    err: oneshot::Receiver<std::io::Error>,
+}
+
+impl BlockingReader {
+    fn new(mut reader: impl Read + Send + 'static) -> Self {
+        let (async_read, async_write) = tokio::io::duplex(READ_BUF_SIZE);
+        let (err_tx, err_rx) = oneshot::channel();
+        tokio::task::spawn_blocking(move || {
+            let mut writer = SyncIoBridge::new(async_write);
+            if let Err(err) = std::io::copy(&mut reader, &mut writer) {
+                // Send before dropping the bridge: the consumer only sees the
+                // end of the stream once the write half is closed, so by then
+                // the error is guaranteed to be available.
+                let _ = err_tx.send(err);
+            }
+        });
+        Self {
+            stream: async_read,
+            err: err_rx,
+        }
+    }
+}
+
+impl AsyncRead for BlockingReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let filled = buf.filled().len();
+        ready!(Pin::new(&mut self.stream).poll_read(cx, buf))?;
+        if buf.filled().len() == filled
+            && let Ok(err) = self.err.try_recv()
+        {
+            return Poll::Ready(Err(err));
+        }
+        Poll::Ready(Ok(()))
+    }
+}
 
 /// Parse an OCI layout reference like "/path/to/dir:tag" or "/path/to/dir".
 ///
@@ -436,6 +490,51 @@ impl crate::delta::DeltaBlobReader for OciDirBlobReader {
 mod tests {
     use super::*;
     use crate::progress::NullReporter;
+
+    /// A reader that yields `head`, then fails.
+    struct FailingReader {
+        head: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl Read for FailingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.head.read(buf)? {
+                0 => Err(std::io::Error::other("blob read failed")),
+                n => Ok(n),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_blocking_reader_propagates_error() {
+        use tokio::io::AsyncReadExt;
+
+        let head = vec![b'x'; 4096];
+        let mut reader = BlockingReader::new(Box::new(FailingReader {
+            head: std::io::Cursor::new(head.clone()),
+        }));
+
+        let mut buf = Vec::new();
+        let err = reader.read_to_end(&mut buf).await.unwrap_err();
+
+        assert_eq!(err.to_string(), "blob read failed");
+        assert_eq!(buf, head);
+    }
+
+    #[tokio::test]
+    async fn test_blocking_reader_clean_eof() {
+        use tokio::io::AsyncReadExt;
+
+        // Larger than the duplex buffer, so the copy blocks and completes only
+        // as the consumer drains it.
+        let data = vec![b'y'; READ_BUF_SIZE * 3 + 17];
+        let mut reader = BlockingReader::new(Box::new(std::io::Cursor::new(data.clone())));
+
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await.unwrap();
+
+        assert_eq!(buf, data);
+    }
 
     #[test]
     fn test_parse_oci_layout_ref() {
