@@ -878,8 +878,13 @@ impl OsImage {
         repo: &Arc<Repository<Sha256HashValue>>,
     ) -> composefs::tree::FileSystem<Sha256HashValue> {
         let img = self.build_oci(repo, None).await;
-        crate::image::create_filesystem(repo, &img.config_digest, None)
-            .expect("valid test filesystem")
+        crate::image::create_filesystem(
+            repo,
+            &img.config_digest,
+            None,
+            &composefs::generic_tree::OciTransformOptions::default(),
+        )
+        .expect("valid test filesystem")
     }
 }
 
@@ -959,7 +964,11 @@ pub fn create_test_bootable_oci_image(
     let rt = tokio::runtime::Runtime::new()?;
     let img = rt.block_on(create_bootable_image(&repo, Some(tag), 1));
     ensure_erofs_for_image(&repo, tag)?;
-    crate::boot::generate_boot_image(&repo, &img.manifest_digest)?;
+    crate::boot::generate_boot_image(
+        &repo,
+        &img.manifest_digest,
+        &composefs::generic_tree::OciTransformOptions::default(),
+    )?;
     Ok(())
 }
 

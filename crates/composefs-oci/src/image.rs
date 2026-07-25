@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 
 use composefs::{
     fsverity::FsVerityHashValue,
+    generic_tree::OciTransformOptions,
     repository::Repository,
     tree::{Directory, FileSystem, Inode, Stat},
 };
@@ -100,10 +101,14 @@ pub fn process_entry<ObjectID: FsVerityHashValue>(
 /// If `config_verity` is given it is used to get the OCI config splitstream by its fs-verity ID
 /// and the entire process is substantially faster.  If it is not given, the config and layers will
 /// be hashed to ensure that they match their claimed blob IDs.
+///
+/// Configurable OCI transform options (currently just the xattr filtering
+/// mode; see [`OciTransformOptions`]) are applied via `options`.
 pub fn create_filesystem<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     config_name: &OciDigest,
     config_verity: Option<&ObjectID>,
+    options: &OciTransformOptions,
 ) -> Result<FileSystem<ObjectID>> {
     let mut filesystem = FileSystem::new(Stat::uninitialized());
 
@@ -142,7 +147,7 @@ pub fn create_filesystem<ObjectID: FsVerityHashValue>(
     // compacts the leaves table, dropping any orphaned by whiteout processing
     // and layer merging above.
     // See https://github.com/containers/composefs-rs/issues/132
-    filesystem.transform_for_oci()?;
+    filesystem.transform_for_oci(options)?;
 
     debug_assert!(
         filesystem.fsck().is_ok(),
@@ -826,11 +831,16 @@ mod test {
         Ok(())
     }
 
+    /// Table-driven: `create_filesystem` must strip
+    /// non-allowlisted xattrs (e.g. host-leaked `security.selinux`) in every
+    /// mode, always keep `security.capability`, and keep `user.*` xattrs
+    /// only under `KeepUserXattrs` (issue #212 for the base stripping
+    /// behavior).
     #[tokio::test]
     async fn test_create_filesystem_filters_xattrs() -> Result<()> {
-        use composefs::{repository::Repository, test::tempdir};
+        use composefs::{generic_tree::XattrFiltering, repository::Repository, test::tempdir};
         use rustix::fs::CWD;
-        use std::{ffi::OsStr, sync::Arc};
+        use std::{cell::Cell, ffi::OsStr, sync::Arc};
 
         let repo_dir = tempdir();
         let repo_path = repo_dir.path().join("repo");
@@ -846,42 +856,52 @@ mod test {
 /etc 0 40755 2 0 0 0 0.0 - - - security.selinux=system_u:object_r:etc_t:s0
 /usr 0 40755 2 0 0 0 0.0 - - -
 /usr/bin 0 40755 2 0 0 0 0.0 - - -
-/usr/bin/foo 12 100755 1 0 0 0 0.0 - test_content - security.selinux=system_u:object_r:bin_t:s0 security.capability=\\x02\\x00\\x00\\x02\\x00\\x20\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00
+/usr/bin/foo 12 100755 1 0 0 0 0.0 - test_content - security.selinux=system_u:object_r:bin_t:s0 security.capability=\\x02\\x00\\x00\\x02\\x00\\x20\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00 user.testattr=hello
 ";
 
         let image = crate::test_util::create_multi_layer_image(&repo, None, &[layer_str]).await;
-        let fs = create_filesystem(&repo, &image.config_digest, None)?;
-
-        // The OCI tar path must strip non-allowlisted xattrs everywhere in the
-        // tree, identically to the mounted-filesystem path (issue #212).
-        use std::cell::Cell;
-        let has_selinux = Cell::new(false);
-        fs.for_each_stat(|stat| {
-            if stat.xattrs.contains_key(OsStr::new("security.selinux")) {
-                has_selinux.set(true);
-            }
-        });
-        assert!(
-            !has_selinux.get(),
-            "transform_for_oci should have stripped all security.selinux xattrs"
-        );
-
-        // Lookup /usr/bin/foo and check security.capability is preserved
-        let usr_dir = fs.root.get_directory(OsStr::new("usr"))?;
-        let bin_dir = usr_dir.get_directory(OsStr::new("bin"))?;
-        let leaf_id = bin_dir.leaf_id(OsStr::new("foo"))?;
-        let leaf = fs.leaf(leaf_id);
-
-        let cap_val = leaf
-            .stat
-            .xattrs
-            .get(OsStr::new("security.capability"))
-            .expect("security.capability should be preserved");
-
-        // Check if value matches
         let expected_cap =
             b"\x02\x00\x00\x02\x00\x20\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
-        assert_eq!(cap_val.as_ref(), expected_cap);
+
+        for (mode, keep_user_xattr) in [
+            (XattrFiltering::AllowlistOnly, false),
+            (XattrFiltering::KeepUserXattrs, true),
+        ] {
+            let options = composefs::generic_tree::OciTransformOptions { xattrs: mode };
+            let fs = create_filesystem(&repo, &image.config_digest, None, &options)?;
+
+            // The OCI tar path must strip non-allowlisted xattrs everywhere
+            // in the tree, identically to the mounted-filesystem path.
+            let has_selinux = Cell::new(false);
+            fs.for_each_stat(|stat| {
+                if stat.xattrs.contains_key(OsStr::new("security.selinux")) {
+                    has_selinux.set(true);
+                }
+            });
+            assert!(
+                !has_selinux.get(),
+                "{mode:?}: should have stripped all security.selinux xattrs"
+            );
+
+            // Lookup /usr/bin/foo and check security.capability and user.testattr
+            let usr_dir = fs.root.get_directory(OsStr::new("usr"))?;
+            let bin_dir = usr_dir.get_directory(OsStr::new("bin"))?;
+            let leaf_id = bin_dir.leaf_id(OsStr::new("foo"))?;
+            let leaf = fs.leaf(leaf_id);
+
+            let cap_val = leaf
+                .stat
+                .xattrs
+                .get(OsStr::new("security.capability"))
+                .unwrap_or_else(|| panic!("{mode:?}: security.capability should be preserved"));
+            assert_eq!(cap_val.as_ref(), expected_cap, "{mode:?}");
+
+            assert_eq!(
+                leaf.stat.xattrs.contains_key(OsStr::new("user.testattr")),
+                keep_user_xattr,
+                "{mode:?}: user.testattr presence"
+            );
+        }
 
         Ok(())
     }

@@ -339,6 +339,14 @@ struct OCIConfigFilesystemOptions {
     /// Whether bootable transformation should be performed on the image rootfs
     #[clap(long)]
     bootable: bool,
+    /// Which extended attributes to keep; see
+    /// [`composefs::generic_tree::XattrFiltering`]
+    #[clap(
+        long,
+        value_parser = clap::value_parser!(composefs::generic_tree::XattrFiltering),
+        default_value_t = composefs::generic_tree::XattrFiltering::AllowlistOnly
+    )]
+    xattrs: composefs::generic_tree::XattrFiltering,
 }
 
 /// Common options for operations using OCI config manifest streams
@@ -669,6 +677,16 @@ struct FsReadOptions {
     /// Don't copy /usr metadata to root directory (use if root already has well-defined metadata)
     #[clap(long)]
     no_propagate_usr_to_root: bool,
+    /// Which extended attributes to keep; see
+    /// [`composefs::generic_tree::XattrFiltering`]. Has no effect together
+    /// with --no-propagate-usr-to-root, since that skips the OCI transform
+    /// entirely.
+    #[clap(
+        long,
+        value_parser = clap::value_parser!(composefs::generic_tree::XattrFiltering),
+        default_value_t = composefs::generic_tree::XattrFiltering::AllowlistOnly
+    )]
+    xattrs: composefs::generic_tree::XattrFiltering,
 }
 
 /// Common options for mount commands (shared across regular, OCI, and ostree mount).
@@ -1520,8 +1538,15 @@ fn load_filesystem_from_oci_image<ObjectID: FsVerityHashValue>(
     let verity = verity_opt(&opts.base_config.config_verity)?;
     let (config_digest, config_verity) =
         resolve_oci_config(repo, &opts.base_config.config_name, verity)?;
-    let mut fs =
-        composefs_oci::image::create_filesystem(repo, &config_digest, config_verity.as_ref())?;
+    let transform_opts = composefs_oci::OciTransformOptions {
+        xattrs: opts.xattrs,
+    };
+    let mut fs = composefs_oci::image::create_filesystem(
+        repo,
+        &config_digest,
+        config_verity.as_ref(),
+        &transform_opts,
+    )?;
     if opts.bootable {
         fs.transform_for_boot(repo)?;
     }
@@ -1543,7 +1568,16 @@ async fn load_filesystem_from_ondisk_fs<ObjectID: FsVerityHashValue>(
     let mut fs = if fs_opts.no_propagate_usr_to_root {
         composefs::fs::read_filesystem(dirfd, fs_opts.path.clone(), repo.clone()).await?
     } else {
-        composefs::fs::read_container_root(dirfd, fs_opts.path.clone(), repo.clone()).await?
+        let transform_opts = composefs::generic_tree::OciTransformOptions {
+            xattrs: fs_opts.xattrs,
+        };
+        composefs::fs::read_container_root(
+            dirfd,
+            fs_opts.path.clone(),
+            repo.clone(),
+            &transform_opts,
+        )
+        .await?
     };
     if fs_opts.bootable {
         if let Some(repo) = &repo {
@@ -1661,6 +1695,9 @@ pub async fn run_cmd_without_repo<ObjectID: FsVerityHashValue>(args: App) -> Res
                 path,
                 bootable: true,
                 no_propagate_usr_to_root,
+                // compute-karg produces a karg for a sealed boot image; it
+                // doesn't expose an --xattrs flag of its own.
+                xattrs: composefs::generic_tree::XattrFiltering::AllowlistOnly,
             };
             let fs = load_filesystem_from_ondisk_fs::<ObjectID>(&fs_opts, None).await?;
             let version = erofs_version.unwrap_or_default();
@@ -1791,8 +1828,11 @@ where
                 println!("objects  {}", result.stats);
 
                 if bootable {
-                    let image_verity =
-                        composefs_oci::generate_boot_image(&repo, &result.manifest_digest)?;
+                    let image_verity = composefs_oci::generate_boot_image(
+                        &repo,
+                        &result.manifest_digest,
+                        &composefs_oci::OciTransformOptions::default(),
+                    )?;
                     println!("Boot image: {}", image_verity.to_hex());
                 }
             }
@@ -1990,6 +2030,7 @@ where
                     &repo,
                     &config_digest,
                     config_verity.as_ref(),
+                    &composefs_oci::OciTransformOptions::default(),
                 )?;
                 let entries = fs.transform_for_boot(&repo)?;
                 let ids = fs.commit_images(&repo, None)?;

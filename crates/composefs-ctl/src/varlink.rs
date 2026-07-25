@@ -862,6 +862,7 @@ async fn run_compute_id<ObjectID: FsVerityHashValue>(
     image: String,
     verity: Option<String>,
     bootable: bool,
+    xattrs: Option<composefs_oci::XattrFiltering>,
 ) -> std::result::Result<oci::OciComputeIdReply, oci::OciError> {
     let reference: crate::OciReference =
         image.parse().map_err(|e| oci::OciError::InternalError {
@@ -878,11 +879,18 @@ async fn run_compute_id<ObjectID: FsVerityHashValue>(
             }
         })?;
 
-    let mut fs =
-        composefs_oci::image::create_filesystem(repo, &config_digest, config_verity.as_ref())
-            .map_err(|e| oci::OciError::InternalError {
-                message: format!("{e:#}"),
-            })?;
+    let transform_opts = composefs_oci::OciTransformOptions {
+        xattrs: xattrs.unwrap_or_default(),
+    };
+    let mut fs = composefs_oci::image::create_filesystem(
+        repo,
+        &config_digest,
+        config_verity.as_ref(),
+        &transform_opts,
+    )
+    .map_err(|e| oci::OciError::InternalError {
+        message: format!("{e:#}"),
+    })?;
     if bootable {
         use composefs_boot::BootOps as _;
         fs.transform_for_boot(repo)
@@ -1375,13 +1383,14 @@ mod service_impl {
             image: String,
             verity: Option<String>,
             bootable: bool,
+            xattrs: Option<composefs_oci::XattrFiltering>,
         ) -> std::result::Result<OciComputeIdReply, OciError> {
             match self.lookup_oci(handle)? {
                 OpenRepo::Sha256(ref r) => {
-                    run_compute_id::<Sha256HashValue>(r, image, verity, bootable).await
+                    run_compute_id::<Sha256HashValue>(r, image, verity, bootable, xattrs).await
                 }
                 OpenRepo::Sha512(ref r) => {
-                    run_compute_id::<Sha512HashValue>(r, image, verity, bootable).await
+                    run_compute_id::<Sha512HashValue>(r, image, verity, bootable, xattrs).await
                 }
             }
         }
@@ -1402,6 +1411,7 @@ mod service_impl {
             local_fetch: String,
             storage_root: Option<String>,
             bootable: bool,
+            xattrs: Option<composefs_oci::XattrFiltering>,
         ) -> impl zlink::futures_util::Stream<
             Item = std::result::Result<zlink::Reply<PullProgress>, OciError>,
         > {
@@ -1412,12 +1422,26 @@ mod service_impl {
             // handle, yield a one-shot error stream (`pull_stream` and the
             // error path share the same boxed-trait-object return type).
             match self.repos.get(&handle).map(|entry| &entry.repo) {
-                Some(OpenRepo::Sha256(r)) => {
-                    pull_stream::<Sha256HashValue>(r.clone(), image, name, lf, sr, bootable, more)
-                }
-                Some(OpenRepo::Sha512(r)) => {
-                    pull_stream::<Sha512HashValue>(r.clone(), image, name, lf, sr, bootable, more)
-                }
+                Some(OpenRepo::Sha256(r)) => pull_stream::<Sha256HashValue>(
+                    r.clone(),
+                    image,
+                    name,
+                    lf,
+                    sr,
+                    bootable,
+                    xattrs,
+                    more,
+                ),
+                Some(OpenRepo::Sha512(r)) => pull_stream::<Sha512HashValue>(
+                    r.clone(),
+                    image,
+                    name,
+                    lf,
+                    sr,
+                    bootable,
+                    xattrs,
+                    more,
+                ),
                 None => {
                     use zlink::futures_util::stream;
                     Box::pin(stream::once(async move {
@@ -2426,6 +2450,7 @@ pub mod oci {
         local_fetch: composefs_oci::LocalFetchOpt,
         storage_root: Option<PathBuf>,
         bootable: bool,
+        xattrs: Option<composefs_oci::XattrFiltering>,
         more: bool,
     ) -> std::pin::Pin<
         Box<
@@ -2463,10 +2488,17 @@ pub mod oci {
                 })?;
 
             let boot_image = if bootable {
-                let id = composefs_oci::generate_boot_image(&repo, &result.manifest_digest)
-                    .map_err(|e| OciError::InternalError {
-                        message: format!("{e:#}"),
-                    })?;
+                let transform_opts = composefs_oci::OciTransformOptions {
+                    xattrs: xattrs.unwrap_or_default(),
+                };
+                let id = composefs_oci::generate_boot_image(
+                    &repo,
+                    &result.manifest_digest,
+                    &transform_opts,
+                )
+                .map_err(|e| OciError::InternalError {
+                    message: format!("{e:#}"),
+                })?;
                 Some(id.to_hex())
             } else {
                 None
@@ -2822,6 +2854,7 @@ pub mod proxy {
     /// Typed client for the `org.composefs.Oci` interface.
     #[cfg(feature = "oci")]
     #[zlink::proxy(interface = "org.composefs.Oci")]
+    #[allow(clippy::too_many_arguments)]
     pub trait OciProxy {
         /// List tagged OCI images.
         async fn list_images(
@@ -2863,6 +2896,7 @@ pub mod proxy {
             image: &str,
             verity: Option<&str>,
             bootable: bool,
+            xattrs: Option<composefs_oci::XattrFiltering>,
         ) -> zlink::Result<Result<OciComputeIdReply, OciError>>;
 
         /// Pull an OCI image, streaming progress frames.
@@ -2875,6 +2909,7 @@ pub mod proxy {
             local_fetch: &str,
             storage_root: Option<&str>,
             bootable: bool,
+            xattrs: Option<composefs_oci::XattrFiltering>,
         ) -> zlink::Result<impl Stream<Item = zlink::Result<Result<PullProgress, OciError>>>>;
 
         /// Query capability tokens supported by the service.
