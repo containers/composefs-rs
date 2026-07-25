@@ -716,8 +716,7 @@ pub(crate) async fn import_delta<ObjectID: FsVerityHashValue>(
         refs_map,
         None,
         None,
-        None,
-        None,
+        &HashMap::new(),
     )?;
 
     // Write manifest splitstream (using raw bytes to preserve original JSON)

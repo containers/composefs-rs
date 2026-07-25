@@ -1160,6 +1160,63 @@ fn test_compute_id_no_repo_matches_repo() -> Result<()> {
 }
 integration_test!(test_compute_id_no_repo_matches_repo);
 
+/// `--xattrs keep-user-xattrs` must change the digest when a `user.*` xattr
+/// is present (proving it was actually preserved), while the default mode
+/// must produce the same digest whether or not the xattr is set (proving
+/// it's stripped as before).
+fn test_compute_id_keep_user_xattrs() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+
+    let rootfs_dir = tempfile::tempdir()?;
+    let rootfs = create_test_rootfs(rootfs_dir.path())?;
+
+    let target_file = rootfs.join("usr/lib/readme.txt");
+
+    let compute_id = |keep_user_xattrs: bool| -> Result<String> {
+        let output = if keep_user_xattrs {
+            cmd!(
+                sh,
+                "{cfsctl} --no-repo compute-id --xattrs keep-user-xattrs {rootfs}"
+            )
+            .read()?
+        } else {
+            cmd!(sh, "{cfsctl} --no-repo compute-id {rootfs}").read()?
+        };
+        Ok(output.trim().to_string())
+    };
+
+    // First compute without xattr to get baseline
+    let id_plain = compute_id(false)?;
+
+    // Add the xattr
+    rustix::fs::setxattr(
+        &target_file,
+        c"user.testxattr",
+        b"testvalue",
+        rustix::fs::XattrFlags::CREATE,
+    )?;
+
+    // Compute default mode (should strip user.* xattrs and match baseline)
+    let id_xattr_default = compute_id(false)?;
+
+    // Compute keeping mode (should preserve user.* xattrs and differ)
+    let id_xattr_kept = compute_id(true)?;
+
+    assert_eq!(
+        id_plain, id_xattr_default,
+        "default mode should strip user.* xattrs, producing the same digest \
+         as a rootfs with no such xattr"
+    );
+    assert_ne!(
+        id_xattr_default, id_xattr_kept,
+        "--xattrs keep-user-xattrs should preserve user.* xattrs, changing the digest"
+    );
+
+    Ok(())
+}
+integration_test!(test_compute_id_keep_user_xattrs);
+
 fn test_create_dumpfile_no_repo() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;

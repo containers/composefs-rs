@@ -51,6 +51,7 @@ use serde::Serialize;
 use composefs::{
     erofs::format::{FormatEpoch, FormatVersion},
     fsverity::FsVerityHashValue,
+    generic_tree::XattrFiltering,
     repository::Repository,
 };
 
@@ -131,10 +132,10 @@ pub struct OciImage<ObjectID: FsVerityHashValue> {
     image_ref: Option<ObjectID>,
     /// The V1 EROFS image ObjectID linked to this config, if any
     image_ref_v1: Option<ObjectID>,
-    /// The V2 boot EROFS image ObjectID linked to this config, if any
-    boot_image_ref: Option<ObjectID>,
-    /// The V1 boot EROFS image ObjectID linked to this config, if any
-    boot_image_ref_v1: Option<ObjectID>,
+    /// Boot EROFS image refs linked to this config, keyed by their named-ref
+    /// key (which encodes both the format version and the xattr filtering
+    /// mode used to build it).
+    boot_image_refs: HashMap<Box<str>, ObjectID>,
     /// The fs-verity ID of the manifest splitstream
     manifest_verity: ObjectID,
 }
@@ -206,8 +207,7 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
         // Strip the EROFS image refs from layer_refs (they're not layers)
         let image_ref = layer_refs.remove(crate::IMAGE_REF_KEY);
         let image_ref_v1 = layer_refs.remove(crate::IMAGE_REF_KEY_V1);
-        let boot_image_ref = layer_refs.remove(crate::BOOT_IMAGE_REF_KEY);
-        let boot_image_ref_v1 = layer_refs.remove(crate::BOOT_IMAGE_REF_KEY_V1);
+        let (boot_image_refs, layer_refs) = crate::take_boot_image_refs(layer_refs);
 
         let manifest_verity = if let Some(v) = verity {
             v.clone()
@@ -231,8 +231,7 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
             layer_refs,
             image_ref,
             image_ref_v1,
-            boot_image_ref,
-            boot_image_ref_v1,
+            boot_image_refs,
             manifest_verity,
         })
     }
@@ -305,25 +304,44 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
         self.image_ref_v1.as_ref()
     }
 
-    /// Returns the boot EROFS image ObjectID for `version`, if present.
+    /// Returns the boot EROFS image ObjectID for `version` built with the
+    /// default ([`XattrFiltering::AllowlistOnly`]) xattr filtering mode, if
+    /// present.
     ///
     /// Maps `version` to its on-disk storage slot via [`FormatVersion::epoch`].
     /// No fallback — returns `None` if that specific format was not generated.
     pub fn boot_image_ref(&self, version: FormatVersion) -> Option<&ObjectID> {
-        match version.epoch() {
-            FormatEpoch::Epoch1 => self.boot_image_ref_v1.as_ref(),
-            FormatEpoch::Epoch2 => self.boot_image_ref.as_ref(),
-        }
+        self.boot_image_ref_for_mode(version, XattrFiltering::AllowlistOnly)
     }
 
-    /// Returns the V2 boot EROFS image ObjectID linked to this config, if any.
+    /// Returns the boot EROFS image ObjectID for `version` built with the
+    /// given xattr filtering `mode`, if present.
+    pub fn boot_image_ref_for_mode(
+        &self,
+        version: FormatVersion,
+        mode: XattrFiltering,
+    ) -> Option<&ObjectID> {
+        self.boot_image_refs
+            .get(&*crate::boot_image_ref_key(version, mode))
+    }
+
+    /// Returns the V2 boot EROFS image ObjectID linked to this config (default
+    /// xattr filtering mode), if any.
     pub fn boot_image_ref_v2(&self) -> Option<&ObjectID> {
-        self.boot_image_ref.as_ref()
+        self.boot_image_ref(FormatVersion::V2)
     }
 
-    /// Returns the V1 boot EROFS image ObjectID linked to this config, if any.
+    /// Returns the V1 boot EROFS image ObjectID linked to this config (default
+    /// xattr filtering mode), if any.
     pub fn boot_image_ref_v1(&self) -> Option<&ObjectID> {
-        self.boot_image_ref_v1.as_ref()
+        self.boot_image_ref(FormatVersion::V1)
+    }
+
+    /// Returns all boot EROFS image refs linked to this config (every format
+    /// version and xattr filtering mode that has been cached), keyed by their
+    /// named-ref key.
+    pub(crate) fn boot_image_refs(&self) -> &HashMap<Box<str>, ObjectID> {
+        &self.boot_image_refs
     }
 
     /// Returns the image architecture (empty string for artifacts).

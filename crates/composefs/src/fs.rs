@@ -36,6 +36,7 @@ use crate::{
     INLINE_CONTENT_MAX_V0,
     fsverity::{FsVerityHashValue, FsVerityHasher},
     generic_tree,
+    generic_tree::OciTransformOptions,
     repository::Repository,
     shared_internals::IO_BUF_CAPACITY,
     tree::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
@@ -932,16 +933,17 @@ where
 /// Load a container root filesystem from the given path.
 ///
 /// Applies OCI transformations via [`FileSystem::transform_for_oci`],
-/// which includes filtering xattrs to the container allowlist.
+/// which includes filtering xattrs per `options.xattrs`.
 pub async fn read_container_root<ObjectID: FsVerityHashValue>(
     dirfd: OwnedFd,
     path: PathBuf,
     repo: Option<Arc<Repository<ObjectID>>>,
+    options: &OciTransformOptions,
 ) -> Result<FileSystem<ObjectID>> {
     let mut fs = read_filesystem(dirfd, path, repo)
         .await
         .context("Reading container root")?;
-    fs.transform_for_oci()?;
+    fs.transform_for_oci(options)?;
     Ok(fs)
 }
 

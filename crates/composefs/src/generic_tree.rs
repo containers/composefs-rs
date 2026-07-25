@@ -31,6 +31,101 @@ pub fn is_allowed_container_xattr(name: &OsStr) -> bool {
         .any(|allowed| name.as_encoded_bytes() == allowed.as_bytes())
 }
 
+/// Controls which extended attributes [`FileSystem::transform_for_oci`]
+/// keeps when processing a filesystem for OCI container image consistency.
+///
+/// Implements [`std::str::FromStr`]/[`std::fmt::Display`] by hand using
+/// kebab-case names (`allowlist-only`, `keep-user-xattrs`) so it can be used
+/// directly as a CLI value (e.g. via `clap::value_parser!(XattrFiltering)`),
+/// and exposes [`Self::VARIANTS`] to enumerate every mode in preference
+/// order (default first) — useful for callers that need to find which mode
+/// produces a given digest. Behind the `varlink` feature it additionally
+/// derives `Serialize`/`Deserialize` and [`zlink_core::introspect::Type`], so
+/// it can be used as-is as a varlink wire parameter; there it serializes as
+/// the bare Rust variant name (e.g. `"AllowlistOnly"`), matching its
+/// introspected interface schema.
+///
+/// This is hand-rolled rather than derived (e.g. via `strum`) since there
+/// are currently only two variants; if this grows a handful more, revisit
+/// pulling in a derive crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+#[cfg_attr(
+    feature = "varlink",
+    derive(serde::Serialize, serde::Deserialize, zlink_core::introspect::Type),
+    zlink(crate = "zlink_core")
+)]
+pub enum XattrFiltering {
+    /// Unconditionally strip all xattrs except [`CONTAINER_XATTR_ALLOWLIST`].
+    ///
+    /// This is the historical default. It can cause composefs digest
+    /// mismatches when legitimate `user.*` xattrs present in an image are
+    /// stripped by one composefs-rs version but not another.
+    #[default]
+    AllowlistOnly,
+    /// Keep [`CONTAINER_XATTR_ALLOWLIST`] xattrs *and* `user.*` extended
+    /// attributes.
+    ///
+    /// Use this when the source of the filesystem is known to only ever
+    /// contain legitimate `user.*` xattrs (i.e. not host-leaked xattrs from
+    /// a mounted overlayfs), so that they can be preserved across digest
+    /// recomputation.
+    KeepUserXattrs,
+}
+
+impl XattrFiltering {
+    /// All variants, in preference order (default first).
+    ///
+    /// Hand-maintained since this type is `#[non_exhaustive]`: add new
+    /// variants here (and to the `Display`/`FromStr` impls below) when
+    /// extending this enum.
+    pub const VARIANTS: &'static [Self] = &[Self::AllowlistOnly, Self::KeepUserXattrs];
+}
+
+impl std::fmt::Display for XattrFiltering {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::AllowlistOnly => "allowlist-only",
+            Self::KeepUserXattrs => "keep-user-xattrs",
+        })
+    }
+}
+
+impl std::str::FromStr for XattrFiltering {
+    type Err = XattrFilteringParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "allowlist-only" => Ok(Self::AllowlistOnly),
+            "keep-user-xattrs" => Ok(Self::KeepUserXattrs),
+            _ => Err(XattrFilteringParseError::not_found(s)),
+        }
+    }
+}
+
+/// Error parsing a [`XattrFiltering`] value from a string.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("invalid xattr filtering mode {0:?} (expected {1})")]
+pub struct XattrFilteringParseError(String, String);
+
+impl XattrFilteringParseError {
+    fn not_found(s: &str) -> Self {
+        let expected = XattrFiltering::VARIANTS
+            .iter()
+            .map(|mode| format!("{:?}", mode.to_string()))
+            .collect::<Vec<_>>()
+            .join(" or ");
+        Self(s.to_owned(), expected)
+    }
+}
+
+/// Options controlling [`FileSystem::transform_for_oci`].
+#[derive(Debug, Clone, Default)]
+pub struct OciTransformOptions {
+    /// Which extended attributes to keep.
+    pub xattrs: XattrFiltering,
+}
+
 /// File metadata similar to `struct stat` from POSIX.
 #[derive(Debug, Clone)]
 pub struct Stat {
@@ -857,8 +952,10 @@ impl<T> FileSystem<T> {
     ///
     /// 1. [`Self::copy_root_metadata_from_usr`] - copies `/usr` metadata to root directory
     /// 2. [`Self::canonicalize_run`] - empties `/run` directory
-    /// 3. [`Self::filter_xattrs`] - filters xattrs to the container allowlist (strips
-    ///    host-leaked xattrs like build-time security.selinux; keeps security.capability)
+    /// 3. [`Self::filter_xattrs`] - filters xattrs according to `options.xattrs`
+    ///    (strips host-leaked xattrs like build-time security.selinux; keeps
+    ///    security.capability, and also `user.*` xattrs when
+    ///    [`XattrFiltering::KeepUserXattrs`] is selected)
     /// 4. [`Self::compact`] - removes leaves orphaned by the steps above (e.g. files
     ///    that were only referenced from the now-emptied `/run`)
     ///
@@ -871,10 +968,15 @@ impl<T> FileSystem<T> {
     /// # Errors
     ///
     /// Returns an error if `/usr` does not exist.
-    pub fn transform_for_oci(&mut self) -> Result<(), ImageError> {
+    pub fn transform_for_oci(&mut self, options: &OciTransformOptions) -> Result<(), ImageError> {
         self.copy_root_metadata_from_usr()?;
         self.canonicalize_run()?;
-        self.filter_xattrs(is_allowed_container_xattr);
+        match options.xattrs {
+            XattrFiltering::AllowlistOnly => self.filter_xattrs(is_allowed_container_xattr),
+            XattrFiltering::KeepUserXattrs => self.filter_xattrs(|name| {
+                is_allowed_container_xattr(name) || name.as_encoded_bytes().starts_with(b"user.")
+            }),
+        }
         // Emptying directories above can orphan leaves; drop them so the result
         // is fsck-clean for every construction path.
         self.compact();
@@ -1118,7 +1220,7 @@ impl<'a, T> DirectoryRef<'a, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::{OsStr, OsString};
 
     // We never store any actual data here
@@ -1763,7 +1865,8 @@ mod tests {
         fs.leaves = leaves;
 
         // Transform for OCI
-        fs.transform_for_oci().unwrap();
+        fs.transform_for_oci(&OciTransformOptions::default())
+            .unwrap();
 
         // Verify root metadata copied from /usr
         assert_eq!(fs.root.stat.st_mode, 0o750);
@@ -1777,123 +1880,113 @@ mod tests {
         assert_eq!(run.stat.st_mtim_sec, 54321);
     }
 
-    #[test]
-    fn test_transform_for_oci_filters_xattrs() {
+    /// Build a filesystem with `/usr` and `/testfile`, each carrying
+    /// `security.selinux`, `security.capability`, and `user.custom` xattrs,
+    /// then run [`FileSystem::transform_for_oci`] with the given
+    /// mode and return `(root_xattrs, usr_xattrs, file_xattrs)` as sets of
+    /// surviving xattr names, for the caller to assert against.
+    fn transform_for_oci_xattrs_with_mode(
+        mode: XattrFiltering,
+    ) -> (
+        BTreeSet<&'static str>,
+        BTreeSet<&'static str>,
+        BTreeSet<&'static str>,
+    ) {
+        let make_xattrs = || {
+            BTreeMap::from([
+                (
+                    Box::from(OsStr::new("security.selinux")),
+                    Box::from(b"selinux_label".as_slice()),
+                ),
+                (
+                    Box::from(OsStr::new("security.capability")),
+                    Box::from(b"cap".as_slice()),
+                ),
+                (
+                    Box::from(OsStr::new("user.custom")),
+                    Box::from(b"custom_value".as_slice()),
+                ),
+            ])
+        };
+
         let mut leaves = Vec::new();
         let mut fs = FileSystem::<FileContents>::new(default_stat());
 
-        // Create /usr with both allowed and filtered xattrs
         let usr_stat = Stat {
             st_mode: 0o750,
             st_uid: 100,
             st_gid: 200,
             st_mtim_sec: 54321,
             st_mtim_nsec: 0,
-            xattrs: BTreeMap::from([
-                (
-                    Box::from(OsStr::new("security.selinux")),
-                    Box::from(b"usr_selinux_label".as_slice()),
-                ),
-                (
-                    Box::from(OsStr::new("security.capability")),
-                    Box::from(b"usr_cap".as_slice()),
-                ),
-            ]),
+            xattrs: make_xattrs(),
         };
         fs.root
             .insert(OsStr::new("usr"), new_dir_inode_with_stat(usr_stat));
 
-        // Create a regular file in the tree with both xattrs as well
-        let file_stat = Stat {
+        let file_id = push_leaf_file(&mut leaves, 12345);
+        fs.leaves = leaves;
+        fs.leaves[file_id.0].stat = Stat {
             st_mode: 0o644,
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 12345,
             st_mtim_nsec: 0,
-            xattrs: BTreeMap::from([
-                (
-                    Box::from(OsStr::new("security.selinux")),
-                    Box::from(b"file_selinux_label".as_slice()),
-                ),
-                (
-                    Box::from(OsStr::new("security.capability")),
-                    Box::from(b"file_cap".as_slice()),
-                ),
-            ]),
+            xattrs: make_xattrs(),
         };
-        let file_id = push_leaf_file(&mut leaves, 12345);
-        fs.leaves = leaves;
-        // Update leaf's stat
-        fs.leaves[file_id.0].stat = file_stat;
-
-        // Place the file under root
         fs.root.insert(OsStr::new("testfile"), Inode::leaf(file_id));
 
-        // Transform for OCI
-        fs.transform_for_oci().unwrap();
+        fs.transform_for_oci(&OciTransformOptions { xattrs: mode })
+            .unwrap();
 
-        // Verify root metadata was copied from /usr and is filtered!
+        let xattr_names = |xattrs: &BTreeMap<Box<OsStr>, Box<[u8]>>| {
+            [
+                ("security.selinux", "security.selinux"),
+                ("security.capability", "security.capability"),
+                ("user.custom", "user.custom"),
+            ]
+            .into_iter()
+            .filter(|(name, _)| xattrs.contains_key(OsStr::new(name)))
+            .map(|(_, label)| label)
+            .collect()
+        };
+
+        // Root metadata (including xattrs) is copied from /usr, and /usr
+        // itself must also have been filtered.
         assert_eq!(fs.root.stat.st_mode, 0o750);
-        assert!(
-            !fs.root
-                .stat
-                .xattrs
-                .contains_key(OsStr::new("security.selinux"))
-        );
-        assert!(
-            fs.root
-                .stat
-                .xattrs
-                .contains_key(OsStr::new("security.capability"))
-        );
-        assert_eq!(
-            fs.root
-                .stat
-                .xattrs
-                .get(OsStr::new("security.capability"))
+        let root_xattrs = xattr_names(&fs.root.stat.xattrs);
+        let usr_xattrs = xattr_names(
+            &fs.root
+                .get_directory(OsStr::new("usr"))
                 .unwrap()
-                .as_ref(),
-            b"usr_cap"
+                .stat
+                .xattrs,
         );
+        let file_xattrs = xattr_names(&fs.leaves[file_id.0].stat.xattrs);
 
-        // Verify /usr itself was filtered
-        let usr_dir = fs.root.get_directory(OsStr::new("usr")).unwrap();
-        assert!(
-            !usr_dir
-                .stat
-                .xattrs
-                .contains_key(OsStr::new("security.selinux"))
-        );
-        assert!(
-            usr_dir
-                .stat
-                .xattrs
-                .contains_key(OsStr::new("security.capability"))
-        );
+        (root_xattrs, usr_xattrs, file_xattrs)
+    }
 
-        // Verify the file's xattrs are also filtered
-        let file_leaf = fs.leaves.get(file_id.0).unwrap();
-        assert!(
-            !file_leaf
-                .stat
-                .xattrs
-                .contains_key(OsStr::new("security.selinux"))
-        );
-        assert!(
-            file_leaf
-                .stat
-                .xattrs
-                .contains_key(OsStr::new("security.capability"))
-        );
-        assert_eq!(
-            file_leaf
-                .stat
-                .xattrs
-                .get(OsStr::new("security.capability"))
-                .unwrap()
-                .as_ref(),
-            b"file_cap"
-        );
+    #[test]
+    fn test_transform_for_oci_filters_xattrs() {
+        // security.capability is always kept; security.selinux is always
+        // stripped; user.* is kept only under KeepUserXattrs.
+        let cases = [
+            (
+                XattrFiltering::AllowlistOnly,
+                BTreeSet::from(["security.capability"]),
+            ),
+            (
+                XattrFiltering::KeepUserXattrs,
+                BTreeSet::from(["security.capability", "user.custom"]),
+            ),
+        ];
+
+        for (mode, expected) in cases {
+            let (root_xattrs, usr_xattrs, file_xattrs) = transform_for_oci_xattrs_with_mode(mode);
+            assert_eq!(root_xattrs, expected, "root xattrs for {mode:?}");
+            assert_eq!(usr_xattrs, expected, "/usr xattrs for {mode:?}");
+            assert_eq!(file_xattrs, expected, "file xattrs for {mode:?}");
+        }
     }
 
     #[test]
@@ -2113,5 +2206,26 @@ mod tests {
         // Check first and last entries
         assert!(fs.root.entries.contains_key(OsStr::new("00")));
         assert!(fs.root.entries.contains_key(OsStr::new("ff")));
+    }
+
+    #[test]
+    fn test_xattr_filtering_display_and_from_str_round_trip() {
+        for &mode in XattrFiltering::VARIANTS {
+            assert_eq!(mode.to_string().parse::<XattrFiltering>(), Ok(mode));
+        }
+        assert_eq!(XattrFiltering::AllowlistOnly.to_string(), "allowlist-only");
+        assert_eq!(
+            XattrFiltering::KeepUserXattrs.to_string(),
+            "keep-user-xattrs"
+        );
+    }
+
+    #[test]
+    fn test_xattr_filtering_from_str_rejects_unknown_value() {
+        let err = "bogus".parse::<XattrFiltering>().unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid xattr filtering mode \"bogus\" (expected \"allowlist-only\" or \"keep-user-xattrs\")"
+        );
     }
 }
