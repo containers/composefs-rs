@@ -32,8 +32,9 @@ pub(crate) enum MountMode {
 }
 
 fn in_init_user_namespace() -> bool {
-    std::fs::read_to_string("/proc/self/uid_map")
-        .map(|s| s.trim() == "0          0 4294967295")
+    const USER_NS_INIT_INO: u64 = 0xEFFF_FFFD;
+    std::fs::metadata("/proc/self/ns/user")
+        .map(|m| std::os::linux::fs::MetadataExt::st_ino(&m) == USER_NS_INIT_INO)
         .unwrap_or(false)
 }
 
