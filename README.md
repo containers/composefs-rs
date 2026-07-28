@@ -124,6 +124,10 @@ and adheres to the [CNCF Community Code of Conduct](https://github.com/cncf/foun
 See [GOVERNANCE.md](GOVERNANCE.md) for how the project is run, [MAINTAINERS.md](MAINTAINERS.md)
 for the current maintainers, and [SECURITY.md](SECURITY.md) for how to report a vulnerability.
 
+## Badges
+
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13857/badge)](https://www.bestpractices.dev/projects/13857)
+
 ## composefs-c
 
 The [C implementation](https://github.com/composefs/composefs)
