@@ -390,6 +390,18 @@ enum OciCommand {
         /// Also generate a bootable EROFS image from the pulled OCI image
         #[arg(long)]
         bootable: bool,
+        /// Recover a boot image built with an unknown xattr filtering mode
+        /// and EROFS format version, by searching every combination until
+        /// one matches this hex digest, instead of generating the boot
+        /// image with the default mode and the repository's format
+        /// version. Requires `--bootable`.
+        ///
+        /// This is for recovering from a UKI embedding a boot image digest
+        /// produced by an older composefs-rs release with different
+        /// defaults, against a repository whose format version is fixed
+        /// (see [`composefs_oci::find_matching_boot_image`]).
+        #[arg(long, requires = "bootable")]
+        expected_digest: Option<String>,
         /// Controls whether containers-storage: references use the native
         /// import path with zero-copy reflink/hardlink support.
         #[arg(long, value_enum, default_value_t = LocalFetchCli::Disabled)]
@@ -1807,8 +1819,16 @@ where
                 ref image,
                 name,
                 bootable,
+                expected_digest,
                 local_fetch,
             } => {
+                // Parse before pulling so a malformed digest fails fast,
+                // rather than after a potentially long-running fetch.
+                let expected_digest = expected_digest
+                    .map(|hex| ObjectID::from_hex(&hex))
+                    .transpose()
+                    .context("Parsing --expected-digest")?;
+
                 // If no explicit name provided, use the image reference as the tag
                 let tag_name = name.as_deref().unwrap_or(image);
 
@@ -1827,7 +1847,39 @@ where
                 println!("tagged   {tag_name}");
                 println!("objects  {}", result.stats);
 
-                if bootable {
+                if let Some(expected) = expected_digest {
+                    // `#[arg(requires = "bootable")]` on `expected_digest` guarantees
+                    // this, but assert it since `find_matching_boot_image` only
+                    // searches boot image (mode, format version) combinations, not
+                    // plain rootfs ones.
+                    assert!(
+                        bootable,
+                        "clap should have enforced --expected-digest requires --bootable"
+                    );
+                    match composefs_oci::find_matching_boot_image(
+                        &repo,
+                        &result.manifest_digest,
+                        &expected,
+                    )? {
+                        composefs_oci::BootImageMatch::Found {
+                            mode,
+                            version,
+                            digest,
+                        } => {
+                            println!(
+                                "Boot image: {} (xattr-mode={mode}, format-version={version:?})",
+                                digest.to_hex()
+                            );
+                        }
+                        composefs_oci::BootImageMatch::NotFound(tried) => {
+                            anyhow::bail!(
+                                "No boot image configuration matched expected digest \
+                                 {} (tried {tried} mode/version combinations)",
+                                expected.to_hex()
+                            );
+                        }
+                    }
+                } else if bootable {
                     let image_verity = composefs_oci::generate_boot_image(
                         &repo,
                         &result.manifest_digest,

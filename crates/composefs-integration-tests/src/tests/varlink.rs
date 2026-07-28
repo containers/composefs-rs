@@ -264,7 +264,16 @@ impl VarlinkService {
         self.rt.block_on(async {
             let mut conn = self.connect().await?;
             let stream = conn
-                .pull(self.handle, image, name, "disabled", None, bootable, None)
+                .pull(
+                    self.handle,
+                    image,
+                    name,
+                    "disabled",
+                    None,
+                    bootable,
+                    None,
+                    None,
+                )
                 .await?;
             zlink::futures_util::pin_mut!(stream);
             let mut frames = Vec::new();
