@@ -116,6 +116,14 @@ on-disk formats may still change.
 - Live chat: [Matrix channel](https://matrix.to/#/#composefs:matrix.org)
 - Async forums: [GitHub Discussions](https://github.com/composefs/composefs/discussions)
 
+## Governance
+
+composefs is a [Cloud Native Computing Foundation (CNCF) Sandbox project](https://www.cncf.io/sandbox-projects/)
+and adheres to the [CNCF Community Code of Conduct](https://github.com/cncf/foundation/blob/main/code-of-conduct.md).
+
+See [GOVERNANCE.md](GOVERNANCE.md) for how the project is run, [MAINTAINERS.md](MAINTAINERS.md)
+for the current maintainers, and [SECURITY.md](SECURITY.md) for how to report a vulnerability.
+
 ## composefs-c
 
 The [C implementation](https://github.com/composefs/composefs)
