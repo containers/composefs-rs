@@ -344,6 +344,10 @@ pub enum FormatEpoch {
 }
 
 impl FormatVersion {
+    /// The EROFS format versions relevant to boot images. Excludes the
+    /// legacy `V0` variant, which composefs-rs never produces for boot images.
+    pub const BOOT_VERSIONS: [FormatVersion; 2] = [FormatVersion::V1, FormatVersion::V2];
+
     /// Returns the [`FormatEpoch`] — the structural on-disk layout family.
     ///
     /// V0 and V1 both map to [`FormatEpoch::Epoch1`] (same EROFS layout, different
