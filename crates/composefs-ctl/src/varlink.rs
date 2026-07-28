@@ -1400,6 +1400,15 @@ mod service_impl {
         /// Emits zero or more intermediate [`PullProgress`] frames describing
         /// fetch progress (only when `more` is true), followed by exactly one
         /// terminal frame whose `completed` field is set, carrying the pull result.
+        ///
+        /// `expected_digest`, if set, requires `bootable` and is incompatible
+        /// with `xattrs`: instead of generating the boot image with a fixed
+        /// xattr filtering mode, every (mode, EROFS format version)
+        /// combination is searched until one produces this digest. See
+        /// [`composefs_oci::find_matching_boot_image`] for why this is
+        /// needed (e.g. a UKI embedding a digest produced by an older
+        /// composefs-rs release with different defaults, against a
+        /// repository whose format version is now fixed).
         #[zlink(interface = "org.composefs.Oci", more)]
         #[allow(clippy::too_many_arguments)]
         async fn pull(
@@ -1412,6 +1421,7 @@ mod service_impl {
             storage_root: Option<String>,
             bootable: bool,
             xattrs: Option<composefs_oci::XattrFiltering>,
+            expected_digest: Option<String>,
         ) -> impl zlink::futures_util::Stream<
             Item = std::result::Result<zlink::Reply<PullProgress>, OciError>,
         > {
@@ -1430,6 +1440,7 @@ mod service_impl {
                     sr,
                     bootable,
                     xattrs,
+                    expected_digest,
                     more,
                 ),
                 Some(OpenRepo::Sha512(r)) => pull_stream::<Sha512HashValue>(
@@ -1440,6 +1451,7 @@ mod service_impl {
                     sr,
                     bootable,
                     xattrs,
+                    expected_digest,
                     more,
                 ),
                 None => {
@@ -2304,6 +2316,12 @@ pub mod oci {
         /// Hex fs-verity of the generated boot EROFS image, when a bootable pull
         /// was requested; `None` otherwise.
         pub boot_image: Option<String>,
+        /// [`Display`](std::fmt::Display) rendering of the xattr filtering mode
+        /// used to produce `boot_image`; `None` unless `boot_image` is set.
+        pub boot_image_mode: Option<String>,
+        /// `Debug` rendering of the EROFS format version used to produce
+        /// `boot_image`; `None` unless `boot_image` is set.
+        pub boot_image_format_version: Option<String>,
     }
 
     impl PullProgress {
@@ -2445,6 +2463,11 @@ pub mod oci {
     /// The pull task uses [`tokio::task::spawn_local`], not [`tokio::spawn`]:
     /// `composefs_oci::pull` is `!Send` (the `get_layer` zlink proxy returns a
     /// `!Send` `ReplyStream`), and the server loop runs inside a `LocalSet`.
+    ///
+    /// `expected_digest` requires `bootable` and is mutually exclusive with
+    /// `xattrs` (searching for an unknown mode and pinning one are
+    /// contradictory requests); both are rejected up front with
+    /// [`OciError::InvalidRequest`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn pull_stream<ObjectID: FsVerityHashValue>(
         repo: Arc<Repository<ObjectID>>,
@@ -2454,6 +2477,7 @@ pub mod oci {
         storage_root: Option<PathBuf>,
         bootable: bool,
         xattrs: Option<composefs_oci::XattrFiltering>,
+        expected_digest: Option<String>,
         more: bool,
     ) -> std::pin::Pin<
         Box<
@@ -2463,6 +2487,38 @@ pub mod oci {
         >,
     > {
         use zlink::futures_util::stream;
+
+        if expected_digest.is_some() && !bootable {
+            return Box::pin(stream::once(async move {
+                Err(OciError::InvalidRequest {
+                    message: "expected_digest requires bootable".to_string(),
+                })
+            }));
+        }
+        if expected_digest.is_some() && xattrs.is_some() {
+            return Box::pin(stream::once(async move {
+                Err(OciError::InvalidRequest {
+                    message: "expected_digest and xattrs are mutually exclusive: \
+                              expected_digest searches every mode"
+                        .to_string(),
+                })
+            }));
+        }
+        // Parse eagerly so a malformed digest is rejected before the (potentially
+        // slow) pull runs, rather than surfacing only once it completes.
+        let expected_digest = match expected_digest
+            .map(|hex| ObjectID::from_hex(&hex).map(|id| (hex, id)))
+            .transpose()
+        {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                return Box::pin(stream::once(async move {
+                    Err(OciError::InvalidDigest {
+                        message: format!("invalid expected_digest: {e}"),
+                    })
+                }));
+            }
+        };
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<PullProgress>();
         // Only attach a progress reporter when the client wants streaming frames.
@@ -2490,10 +2546,36 @@ pub mod oci {
                     message: format!("{e:#}"),
                 })?;
 
-            let boot_image = if bootable {
-                let transform_opts = composefs_oci::OciTransformOptions {
-                    xattrs: xattrs.unwrap_or_default(),
-                };
+            let (boot_image, boot_image_mode, boot_image_format_version) = if !bootable {
+                (None, None, None)
+            } else if let Some((expected_hex, expected)) = expected_digest {
+                match composefs_oci::find_matching_boot_image(
+                    &repo,
+                    &result.manifest_digest,
+                    &expected,
+                )
+                .map_err(|e| OciError::InternalError {
+                    message: format!("{e:#}"),
+                })? {
+                    composefs_oci::BootImageMatch::Found {
+                        mode,
+                        version,
+                        digest,
+                    } => (
+                        Some(digest.to_hex()),
+                        Some(mode.to_string()),
+                        Some(format!("{version:?}")),
+                    ),
+                    composefs_oci::BootImageMatch::NotFound(tried) => {
+                        return Err(OciError::BootImageMismatch {
+                            expected: expected_hex,
+                            tried: tried as u64,
+                        });
+                    }
+                }
+            } else {
+                let mode = xattrs.unwrap_or_default();
+                let transform_opts = composefs_oci::OciTransformOptions { xattrs: mode };
                 let id = composefs_oci::generate_boot_image(
                     &repo,
                     &result.manifest_digest,
@@ -2502,9 +2584,11 @@ pub mod oci {
                 .map_err(|e| OciError::InternalError {
                     message: format!("{e:#}"),
                 })?;
-                Some(id.to_hex())
-            } else {
-                None
+                (
+                    Some(id.to_hex()),
+                    Some(mode.to_string()),
+                    Some(format!("{:?}", repo.erofs_version())),
+                )
             };
 
             let completed = PullProgress {
@@ -2515,6 +2599,8 @@ pub mod oci {
                     config_verity: result.config_verity.to_hex(),
                     stats: result.stats.to_string(),
                     boot_image,
+                    boot_image_mode,
+                    boot_image_format_version,
                 }),
                 ..PullProgress::empty()
             };
@@ -2644,6 +2730,16 @@ pub mod oci {
             fd_count: u64,
             /// The per-frame cap that was exceeded.
             max_per_frame: u64,
+        },
+        /// No combination of xattr filtering mode and EROFS format version
+        /// produced a boot image matching `expected` (see the `pull`
+        /// method's `expected_digest` parameter and
+        /// [`composefs_oci::find_matching_boot_image`]).
+        BootImageMismatch {
+            /// The expected digest that was searched for.
+            expected: String,
+            /// Number of (mode, version) combinations that were tried.
+            tried: u64,
         },
     }
 }
@@ -2904,6 +3000,7 @@ pub mod proxy {
 
         /// Pull an OCI image, streaming progress frames.
         #[zlink(more, rename = "Pull")]
+        #[allow(clippy::too_many_arguments)]
         async fn pull(
             &mut self,
             handle: u64,
@@ -2913,6 +3010,7 @@ pub mod proxy {
             storage_root: Option<&str>,
             bootable: bool,
             xattrs: Option<composefs_oci::XattrFiltering>,
+            expected_digest: Option<&str>,
         ) -> zlink::Result<impl Stream<Item = zlink::Result<Result<PullProgress, OciError>>>>;
 
         /// Query capability tokens supported by the service.
