@@ -134,7 +134,7 @@ work, but new feature development is happening here.
 
 ## License
 
-See [LICENSE-APACHE](LICENSE-APACHE) and [LICENSE-MIT](LICENSE-MIT).
+See [LICENSE](LICENSE) for details.
 
 ## Copyright
 
