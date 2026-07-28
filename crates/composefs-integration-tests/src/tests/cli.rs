@@ -309,6 +309,82 @@ pub(crate) fn create_oci_layout(parent: &std::path::Path) -> Result<std::path::P
     Ok(oci_dir)
 }
 
+/// Creates a minimal *bootable* OCI image layout directory for testing.
+///
+/// Like [`create_oci_layout`], but the single layer also contains empty
+/// `boot/` and `sysroot/` directories, which is the minimum
+/// [`composefs_boot::BootOps::transform_for_boot`] requires to succeed (it
+/// clears those two top-level directories and errors if either is absent).
+/// This is enough to exercise `--bootable` pulls end-to-end without needing
+/// real kernel/initramfs/UKI content, since [`find_matching_boot_image`]
+/// only cares about the resulting composefs image digest, not what a
+/// bootloader would do with it.
+///
+/// Returns the path to the OCI layout directory.
+///
+/// [`find_matching_boot_image`]: composefs_oci::find_matching_boot_image
+pub(crate) fn create_bootable_oci_layout(parent: &std::path::Path) -> Result<std::path::PathBuf> {
+    use cap_std_ext::cap_std;
+    use ocidir::oci_spec::image::{
+        ConfigBuilder, ImageConfigurationBuilder, Platform, PlatformBuilder, RootFsBuilder,
+    };
+
+    let oci_dir = parent.join("bootable-oci-image");
+    std::fs::create_dir_all(&oci_dir)?;
+
+    let dir = cap_std::fs::Dir::open_ambient_dir(&oci_dir, cap_std::ambient_authority())?;
+    let ocidir = ocidir::OciDir::ensure(dir)?;
+
+    let mut manifest = ocidir.new_empty_manifest()?.build()?;
+    let runtime_config = ConfigBuilder::default().build()?;
+    let rootfs = RootFsBuilder::default()
+        .typ("layers")
+        .diff_ids(Vec::<String>::new())
+        .build()?;
+    let mut config = ImageConfigurationBuilder::default()
+        .architecture("amd64")
+        .os("linux")
+        .rootfs(rootfs)
+        .config(runtime_config)
+        .build()?;
+
+    let mut layer_builder = ocidir.create_layer(None)?;
+    for path in ["usr/", "boot/", "sysroot/"] {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
+        header.set_mode(0o755);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(1234567890);
+        header.set_cksum();
+        layer_builder.append_data(&mut header, path, &[] as &[u8])?;
+    }
+    {
+        let data = b"hello from bootable test layer\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(1234567890);
+        header.set_cksum();
+        layer_builder.append_data(&mut header, "usr/hello.txt", &data[..])?;
+    }
+    let layer = layer_builder.into_inner()?.complete()?;
+
+    ocidir.push_layer(&mut manifest, &mut config, layer, "test layer", None);
+
+    let platform: Platform = PlatformBuilder::default()
+        .architecture("amd64")
+        .os("linux")
+        .build()?;
+
+    ocidir.insert_manifest_and_config(manifest, config, None, platform)?;
+
+    Ok(oci_dir)
+}
+
 fn test_oci_pull_and_inspect() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
@@ -2183,3 +2259,139 @@ fn test_oci_pull_v1_digest_stability() -> Result<()> {
     Ok(())
 }
 integration_test!(test_oci_pull_v1_digest_stability);
+
+/// Simulates the bootc boot-image recovery scenario (bootc-dev/bootc#2334):
+/// a repository whose EROFS format is permanently fixed to a legacy default
+/// (V2, since `FormatConfig` cannot change after `meta.json` is written)
+/// needs to recover a boot image digest that a UKI embedded from an older
+/// composefs-rs release using a different default format version (V1).
+///
+/// `cfsctl oci pull --bootable --expected-digest` must find and persist the
+/// match via `find_matching_boot_image`, without the caller needing to know
+/// which xattr filtering mode or format version originally produced the
+/// digest.
+fn test_oci_pull_bootable_expected_digest_recovers() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    // A repository whose format is fixed at V2, mirroring an old build that
+    // predates a newer default.
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let oci_layout = create_bootable_oci_layout(fixture_dir.path())?;
+
+    // Pull normally with --bootable: generates the boot image at the repo's
+    // fixed V2 format version, with the default xattr filtering mode.
+    let pull_output = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci pull oci:{oci_layout} bootme --bootable"
+    )
+    .read()?;
+    let v2_boot_image = pull_output
+        .lines()
+        .find_map(|l| l.strip_prefix("Boot image:").map(|s| s.trim().to_string()))
+        .expect("boot image digest in pull output");
+
+    // Compute what an *old* bootc build would have embedded in a UKI: the
+    // boot image digest at the then-default V1 format version, with the
+    // same (default) xattr filtering mode. `--erofs-version` overrides the
+    // repo's fixed format for this single invocation only — it never
+    // changes what `oci pull` itself would produce for this repo.
+    let expected_v1_digest = cmd!(
+        sh,
+        "{cfsctl} --insecure --erofs-version 1 --repo {repo} oci compute-id bootme --bootable"
+    )
+    .read()?;
+    let expected_v1_digest = expected_v1_digest.trim();
+
+    assert_ne!(
+        v2_boot_image, expected_v1_digest,
+        "V1 and V2 boot image digests must differ for recovery to be meaningful"
+    );
+
+    // Re-pull with --expected-digest set to the V1 digest: the repo cannot
+    // natively produce a V1 EROFS image (it is fixed to V2), so recovery
+    // must fall back to find_matching_boot_image's direct computation.
+    let recovery_output = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci pull oci:{oci_layout} bootme --bootable --expected-digest {expected_v1_digest}"
+    )
+    .read()?;
+
+    assert!(
+        recovery_output.contains(expected_v1_digest),
+        "recovery output should report the matched digest, got: {recovery_output}"
+    );
+    assert!(
+        recovery_output.contains("format-version=V1"),
+        "recovery output should report the matched format version, got: {recovery_output}"
+    );
+
+    Ok(())
+}
+integration_test!(test_oci_pull_bootable_expected_digest_recovers);
+
+/// If no (mode, version) combination could ever match `--expected-digest`,
+/// the pull must fail with a clear error reporting how many combinations
+/// were tried, rather than silently ignoring the mismatch.
+fn test_oci_pull_bootable_expected_digest_not_found() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let oci_layout = create_bootable_oci_layout(fixture_dir.path())?;
+
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci pull oci:{oci_layout} bootme"
+    )
+    .read()?;
+
+    // A well-formed but unattainable digest: no (mode, version) combination
+    // for this image can ever hash to all zeroes. The default repo hash
+    // algorithm is SHA-512 (128 hex chars); see `resolve_hash_type`.
+    let bogus_digest = "0".repeat(128);
+    let stderr = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci pull oci:{oci_layout} bootme --bootable --expected-digest {bogus_digest}"
+    )
+    .ignore_status()
+    .read_stderr()?;
+
+    assert!(
+        stderr.contains("tried") && stderr.contains("combinations"),
+        "error should report how many mode/version combinations were tried, got: {stderr}"
+    );
+
+    Ok(())
+}
+integration_test!(test_oci_pull_bootable_expected_digest_not_found);
+
+/// `--expected-digest` without `--bootable` is a contradictory request
+/// (there is no boot image to search for a match in the first place) and
+/// must be rejected by argument parsing before any work is attempted.
+fn test_oci_pull_expected_digest_requires_bootable() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let oci_layout = create_bootable_oci_layout(fixture_dir.path())?;
+
+    let bogus_digest = "0".repeat(64);
+    let stderr = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci pull oci:{oci_layout} bootme --expected-digest {bogus_digest}"
+    )
+    .ignore_status()
+    .read_stderr()?;
+
+    assert!(
+        stderr.contains("bootable"),
+        "clap should reject --expected-digest without --bootable, got: {stderr}"
+    );
+
+    Ok(())
+}
+integration_test!(test_oci_pull_expected_digest_requires_bootable);
