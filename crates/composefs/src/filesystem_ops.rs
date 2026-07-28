@@ -79,6 +79,61 @@ impl<ObjectID: FsVerityHashValue> FileSystem<ObjectID> {
         Ok(map.remove(&version).expect("format version must be in map"))
     }
 
+    /// Commits this filesystem as an EROFS image of the given `version`,
+    /// regardless of the repository's configured default/extra format versions.
+    ///
+    /// Useful when a caller needs a *non-default* format version committed
+    /// — e.g. one the repository wasn't configured to generate — but
+    /// doesn't already know the resulting digest. Callers that already have
+    /// (or want) the digest before deciding whether to persist should use
+    /// [`Self::compute_image_bytes`] followed by [`Repository::write_image`]
+    /// instead, to avoid serializing the tree twice.
+    ///
+    /// Note: Callers should ensure root metadata is set before calling this,
+    /// typically via `copy_root_metadata_from_usr()` or `set_root_stat()`.
+    #[context("Committing filesystem as EROFS image (explicit version)")]
+    pub fn commit_image_version(
+        &self,
+        repository: &Repository<ObjectID>,
+        version: FormatVersion,
+        image_name: Option<&str>,
+    ) -> Result<ObjectID> {
+        validate_filesystem(self)?;
+        let image_data = mkfs_erofs_inner(
+            self,
+            version,
+            #[cfg(test)]
+            None,
+        );
+        repository.write_image(image_name, &image_data)
+    }
+
+    /// Computes the EROFS image bytes for this filesystem at `version`,
+    /// along with their fsverity digest.
+    ///
+    /// Useful for callers that need to know the digest before deciding
+    /// whether to persist the image (e.g. matching against an expected
+    /// digest via `composefs_oci::boot::find_matching_boot_image`): they can
+    /// pass the returned bytes to [`Repository::write_image`] directly
+    /// instead of regenerating them via [`Self::commit_image_version`],
+    /// which would otherwise serialize the same tree a second time.
+    ///
+    /// Note: Callers should ensure root metadata is set before calling this,
+    /// typically via `copy_root_metadata_from_usr()` or `set_root_stat()`.
+    pub fn compute_image_bytes(&self, version: FormatVersion) -> (Box<[u8]>, ObjectID) {
+        // Callers are responsible for ensuring the tree is valid before calling this.
+        // In practice this is always called on freshly-built trees that don't have
+        // invalid constructs like hardlinked whiteouts.
+        let image_data = mkfs_erofs_inner(
+            self,
+            version,
+            #[cfg(test)]
+            None,
+        );
+        let id = compute_verity(&image_data);
+        (image_data, id)
+    }
+
     /// Computes the fsverity digest for this filesystem as an EROFS image.
     ///
     /// The digest depends on the EROFS format version: V1 and V2 produce
@@ -89,15 +144,7 @@ impl<ObjectID: FsVerityHashValue> FileSystem<ObjectID> {
     /// Note: Callers should ensure root metadata is set before calling this,
     /// typically via `copy_root_metadata_from_usr()` or `set_root_stat()`.
     pub fn compute_image_id(&self, version: FormatVersion) -> ObjectID {
-        // Callers are responsible for ensuring the tree is valid before calling this.
-        // In practice this is always called on freshly-built trees that don't have
-        // invalid constructs like hardlinked whiteouts.
-        compute_verity(&mkfs_erofs_inner(
-            self,
-            version,
-            #[cfg(test)]
-            None,
-        ))
+        self.compute_image_bytes(version).1
     }
 
     /// Prints this filesystem in dumpfile format to stdout.
