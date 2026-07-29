@@ -165,6 +165,120 @@ impl Drop for VerityTempDir {
     }
 }
 
+/// A temporary directory backed by `fuse-overlayfs`.
+///
+/// Unlike the kernel's overlayfs, `fuse-overlayfs` doesn't support
+/// `O_TMPFILE` (see bootc-dev/bootc#2340), which is exactly the
+/// configuration `bootc container ukify` runs into in CI environments
+/// (e.g. GitLab CI, or nested-overlay container build contexts) that use
+/// it as their storage driver. This is used to reproduce that failure
+/// mode and confirm the repository's named-tmpfile fallback handles it.
+struct FuseOverlayTempDir {
+    mountpoint: PathBuf,
+    _backing: tempfile::TempDir,
+}
+
+impl FuseOverlayTempDir {
+    fn new() -> Result<Self> {
+        let backing = tempfile::tempdir()?;
+        let lower = backing.path().join("lower");
+        let upper = backing.path().join("upper");
+        let work = backing.path().join("work");
+        let mountpoint = backing.path().join("merged");
+        for dir in [&lower, &upper, &work, &mountpoint] {
+            std::fs::create_dir(dir)?;
+        }
+
+        let sh = Shell::new()?;
+        cmd!(
+            sh,
+            "fuse-overlayfs -o lowerdir={lower},upperdir={upper},workdir={work} {mountpoint}"
+        )
+        .run()
+        .context("mounting fuse-overlayfs")?;
+
+        // Sanity check: confirm this mount really doesn't support
+        // O_TMPFILE, so the test actually exercises the fallback path
+        // rather than passing vacuously if fuse-overlayfs behavior changes.
+        match rustix::fs::openat(
+            rustix::fs::CWD,
+            &mountpoint,
+            rustix::fs::OFlags::RDWR | rustix::fs::OFlags::TMPFILE,
+            rustix::fs::Mode::from_raw_mode(0o644),
+        ) {
+            Err(rustix::io::Errno::OPNOTSUPP) => {}
+            Ok(_) => bail!(
+                "fuse-overlayfs at {} unexpectedly supports O_TMPFILE; \
+                 this test no longer exercises the fallback path",
+                mountpoint.display()
+            ),
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("unexpected error probing O_TMPFILE support on {mountpoint:?}")
+                });
+            }
+        }
+
+        std::fs::create_dir(mountpoint.join("repo"))?;
+
+        Ok(Self {
+            mountpoint,
+            _backing: backing,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.mountpoint
+    }
+}
+
+impl Drop for FuseOverlayTempDir {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("umount")
+            .arg(&self.mountpoint)
+            .status();
+    }
+}
+
+/// Reproduces bootc-dev/bootc#2340: on `fuse-overlayfs`, which doesn't
+/// support `O_TMPFILE`, ingesting object data used to fail outright with
+/// `EOPNOTSUPP` ("Opening temp file in objects directory"). This is
+/// exactly the path bootc's composefs digest computation exercises
+/// (`ensure_object_from_reader`, via `ensure_object_from_fd`) when reading
+/// a container rootfs through a storage backend without O_TMPFILE support.
+///
+/// Verifies the repository's named-tmpfile fallback lets object ingestion
+/// (including the dedup case) succeed and produce correct, retrievable
+/// objects on such filesystems.
+fn privileged_repo_on_fuse_overlayfs() -> Result<()> {
+    if require_privileged("privileged_repo_on_fuse_overlayfs")?.is_some() {
+        return Ok(());
+    }
+
+    let overlay = FuseOverlayTempDir::new()?;
+    let repo_path = overlay.path().join("repo");
+    let repo = init_insecure_repo_at::<Sha256HashValue>(
+        &repo_path,
+        composefs_oci::composefs::fsverity::Algorithm::Sha256 { lg_blocksize: 12 },
+    )?;
+
+    let data = b"bootc-dev/bootc#2340: O_TMPFILE fallback on fuse-overlayfs".repeat(1024);
+
+    // First call exercises the named-tmpfile fallback's rename-into-place path.
+    let id = repo.ensure_object_from_reader(data.as_slice(), data.len() as u64)?;
+    ensure!(
+        repo.read_object(&id)? == data,
+        "object content mismatch after storing via fuse-overlayfs fallback"
+    );
+
+    // Second call with identical data exercises the dedup (unlink) path.
+    let id2 = repo.ensure_object_from_reader(data.as_slice(), data.len() as u64)?;
+    ensure!(id == id2, "expected identical digest for identical content");
+
+    Ok(())
+}
+integration_test!(privileged_repo_on_fuse_overlayfs);
+
 fn privileged_check_root() -> Result<()> {
     if require_privileged("privileged_check_root")?.is_some() {
         return Ok(());

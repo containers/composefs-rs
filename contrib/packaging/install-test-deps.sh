@@ -11,12 +11,12 @@ set -euo pipefail
 
 case "${ID}" in
     centos|fedora|rhel)
-        pkg_install composefs openssl ostree podman skopeo xfsprogs
+        pkg_install composefs openssl ostree podman skopeo xfsprogs fuse-overlayfs
         ;;
     debian|ubuntu)
         pkg_install \
             openssl e2fsprogs bubblewrap openssh-server \
-            ostree podman skopeo
+            ostree podman skopeo fuse-overlayfs
 
         # OSTree symlink targets — /root, /home, /srv, etc. are symlinks
         # into /var on OSTree systems, so the target directories must exist.

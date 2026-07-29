@@ -100,8 +100,9 @@ use fn_error_context::context;
 use once_cell::sync::OnceCell;
 use rustix::{
     fs::{
-        Access, AtFlags, CWD, Dir, FileType, FlockOperation, Mode, OFlags, StatVfsMountFlags,
-        accessat, flock, fstatvfs, linkat, mkdirat, openat, readlinkat, statat, syncfs, unlinkat,
+        Access, AtFlags, CWD, Dir, FileType, FlockOperation, Mode, OFlags, RenameFlags,
+        StatVfsMountFlags, accessat, flock, fstatvfs, linkat, mkdirat, openat, readlinkat,
+        renameat_with, statat, syncfs, unlinkat,
     },
     io::{Errno, Result as ErrnoResult},
 };
@@ -116,7 +117,7 @@ use crate::{
     mount::{MountOptions, VerityRequirement, composefs_fsmount, mount_at},
     shared_internals::IO_BUF_CAPACITY,
     splitstream::{SplitStreamReader, SplitStreamWriter},
-    util::{ErrnoFilter, proc_self_fd, reopen_tmpfile_ro, replace_symlinkat},
+    util::{ErrnoFilter, generate_tmpname, proc_self_fd, reopen_tmpfile_ro, replace_symlinkat},
 };
 
 /// The filename used for repository metadata.
@@ -838,6 +839,103 @@ pub enum ObjectStoreMethod {
     AlreadyPresent,
 }
 
+/// A staging file for object data, created either as an anonymous
+/// O_TMPFILE (preferred: no directory entry, no cleanup needed) or,
+/// as a fallback for filesystems that don't support O_TMPFILE (e.g.
+/// some fuse-overlayfs configurations), a regular file with a
+/// temporary random name in the objects directory that must be
+/// explicitly renamed into place or unlinked.
+pub(crate) enum ObjectTmpfile {
+    /// An anonymous O_TMPFILE fd with no directory entry.
+    Anonymous(OwnedFd),
+    /// A regular file with a temporary name, used when O_TMPFILE isn't
+    /// supported by the underlying filesystem.
+    Named { fd: OwnedFd, name: String },
+}
+
+impl ObjectTmpfile {
+    /// Duplicate the underlying fd, e.g. for writing to it while keeping
+    /// `self` around to track the fallback name (if any).
+    fn try_clone(&self) -> std::io::Result<OwnedFd> {
+        match self {
+            ObjectTmpfile::Anonymous(fd) => fd.try_clone(),
+            ObjectTmpfile::Named { fd, .. } => fd.try_clone(),
+        }
+    }
+
+    /// The fallback temporary name, if this is a [`Named`](Self::Named) tmpfile.
+    fn name(&self) -> Option<&str> {
+        match self {
+            ObjectTmpfile::Anonymous(_) => None,
+            ObjectTmpfile::Named { name, .. } => Some(name),
+        }
+    }
+
+    /// Build a [`NamedTmpfileGuard`] tracking this tmpfile's fallback name
+    /// (a no-op guard for [`Anonymous`](Self::Anonymous) tmpfiles), to
+    /// protect it from leaking until cleanup responsibility is explicitly
+    /// handed off (e.g. to [`Repository::link_tmpfile_as_object`]).
+    fn guard<'a>(&self, objects_dir: &'a OwnedFd) -> NamedTmpfileGuard<'a> {
+        NamedTmpfileGuard::new(objects_dir, self.name().map(str::to_owned))
+    }
+
+    /// Consume `self`, returning the underlying file.  Callers that need
+    /// the fallback name after this point should retrieve it via
+    /// [`name`](Self::name) beforehand.
+    fn into_file(self) -> File {
+        match self {
+            ObjectTmpfile::Anonymous(fd) => File::from(fd),
+            ObjectTmpfile::Named { fd, .. } => File::from(fd),
+        }
+    }
+}
+
+impl AsFd for ObjectTmpfile {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        match self {
+            ObjectTmpfile::Anonymous(fd) => fd.as_fd(),
+            ObjectTmpfile::Named { fd, .. } => fd.as_fd(),
+        }
+    }
+}
+
+/// RAII guard that unlinks a fallback (named) object tmpfile on drop,
+/// unless disarmed first.
+///
+/// Used to avoid leaking the temporary file if an error occurs between
+/// its creation and the point where responsibility for it is handed off
+/// to [`Repository::link_tmpfile_as_object`], which either renames it
+/// into place or unlinks it itself (on dedup).
+pub(crate) struct NamedTmpfileGuard<'a> {
+    dirfd: &'a OwnedFd,
+    name: Option<String>,
+}
+
+impl<'a> NamedTmpfileGuard<'a> {
+    fn new(dirfd: &'a OwnedFd, name: Option<String>) -> Self {
+        Self { dirfd, name }
+    }
+
+    /// The fallback temp name being guarded, if any.
+    fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// Disarm the guard and return the name, transferring cleanup
+    /// responsibility to the caller.
+    fn disarm(mut self) -> Option<String> {
+        self.name.take()
+    }
+}
+
+impl Drop for NamedTmpfileGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(name) = &self.name {
+            let _ = unlinkat(self.dirfd, name, AtFlags::empty());
+        }
+    }
+}
+
 /// Per-operation context for [`Repository::ensure_object_from_file`].
 ///
 /// Create one of these at the start of a bulk import operation (e.g. importing
@@ -945,6 +1043,12 @@ pub struct Repository<ObjectID: FsVerityHashValue> {
     /// written before #[repr(C)] was added to SplitstreamHeader.
     #[cfg(any(test, feature = "test"))]
     write_old_splitstream_format: std::sync::atomic::AtomicBool,
+    /// When true, [`Repository::create_object_tmpfile_impl`] skips the
+    /// O_TMPFILE attempt and goes straight to the named-tmpfile fallback.
+    /// Used to test that fallback path without needing a real
+    /// O_TMPFILE-incapable filesystem.
+    #[cfg(any(test, feature = "test"))]
+    force_named_tmpfile: std::sync::atomic::AtomicBool,
     _data: std::marker::PhantomData<ObjectID>,
 }
 
@@ -1240,6 +1344,22 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Force object tmpfile creation to use the named-tmpfile fallback
+    /// (as if O_TMPFILE were unsupported), for testing.
+    #[cfg(any(test, feature = "test"))]
+    pub fn set_force_named_tmpfile(&self, enabled: bool) {
+        self.force_named_tmpfile
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether object tmpfile creation should skip straight to the
+    /// named-tmpfile fallback.
+    #[cfg(any(test, feature = "test"))]
+    fn force_named_tmpfile(&self) -> bool {
+        self.force_named_tmpfile
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Return the objects directory.
     pub fn objects_dir(&self) -> ErrnoResult<&OwnedFd> {
         self.objects
@@ -1410,6 +1530,8 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             erofs_version_override: None,
             #[cfg(any(test, feature = "test"))]
             write_old_splitstream_format: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "test"))]
+            force_named_tmpfile: std::sync::atomic::AtomicBool::new(false),
             _data: std::marker::PhantomData,
         })
     }
@@ -1622,12 +1744,17 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     #[context("Ensuring object from reader")]
     pub fn ensure_object_from_reader(&self, mut source: impl Read, size: u64) -> Result<ObjectID> {
         let writable = self.ensure_writable_token()?;
-        let tmpfile_fd = self.create_object_tmpfile_impl(&writable)?;
+        let objects_dir = self.objects_dir().context("Getting objects directory")?;
+        let tmpfile = self.create_object_tmpfile_impl(&writable)?;
+        // Protects the fallback tmpfile (if any) from leaking if we bail
+        // out (via `?`) before handing its name off to
+        // `link_tmpfile_as_object` / `finalize_object_tmpfile_impl`.
+        let guard = tmpfile.guard(objects_dir);
 
         if self.insecure {
             let mut hasher = FsVerityHasher::<ObjectID>::new();
             let mut src = std::io::BufReader::with_capacity(IO_BUF_CAPACITY, &mut source);
-            let mut dst = File::from(tmpfile_fd.try_clone()?);
+            let mut dst = File::from(tmpfile.try_clone()?);
 
             loop {
                 let buf = src.fill_buf()?;
@@ -1642,22 +1769,22 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             drop(dst);
 
             let id = hasher.digest();
-            let ro_fd = reopen_tmpfile_ro(File::from(tmpfile_fd))
+            let ro_fd = reopen_tmpfile_ro(tmpfile.into_file())
                 .context("Re-opening tmpfile as read-only")?;
-            let objects_dir = self.objects_dir().context("Getting objects directory")?;
-            let (id, _method) = self.link_tmpfile_as_object(objects_dir, &ro_fd, &id, size)?;
+            let (id, _method) =
+                self.link_tmpfile_as_object(objects_dir, &ro_fd, &id, size, guard)?;
             Ok(id)
         } else {
             // Secure mode: let std::io::copy use copy_file_range for
             // potential reflinks, then finalize_object_tmpfile_impl
             // enables kernel verity and measures the digest.
-            let mut dst = File::from(tmpfile_fd.try_clone()?);
+            let mut dst = File::from(tmpfile.try_clone()?);
             let copied = std::io::copy(&mut source, &mut dst)?;
             ensure!(copied == size, "Expected {size} bytes, got {copied}");
             drop(dst);
 
             let (id, _method) =
-                self.finalize_object_tmpfile_impl(File::from(tmpfile_fd), size, &writable)?;
+                self.finalize_object_tmpfile_impl(tmpfile, guard, size, &writable)?;
             Ok(id)
         }
     }
@@ -1667,14 +1794,13 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// Returns the file descriptor for writing. The caller should write data to this fd,
     /// then call [`finalize_object_tmpfile`](Self::finalize_object_tmpfile) to compute
     /// the verity digest, enable fs-verity, and link the file into the objects directory.
+    ///
+    /// Unlike the crate-internal streaming ingestion path, this public API
+    /// always uses O_TMPFILE with no fallback: callers (e.g. `cfsctl`) are
+    /// expected to hold a real anonymous tmpfile fd.
     #[context("Creating object tmpfile")]
     pub fn create_object_tmpfile(&self) -> Result<OwnedFd> {
-        let writable = self.ensure_writable_token()?;
-        self.create_object_tmpfile_impl(&writable)
-    }
-
-    #[context("Creating object tmpfile")]
-    pub(crate) fn create_object_tmpfile_impl(&self, _writable: &WritableRepo) -> Result<OwnedFd> {
+        let _writable = self.ensure_writable_token()?;
         let objects_dir = self
             .objects_dir()
             .context("Getting objects directory for tmpfile creation")?;
@@ -1686,6 +1812,64 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         )
         .context("Opening temp file in objects directory")?;
         Ok(fd)
+    }
+
+    /// Create a staging file for object data in the objects directory.
+    ///
+    /// Prefers an anonymous O_TMPFILE (no directory entry, no cleanup
+    /// needed if the caller bails out).  Falls back to a regular file
+    /// with a random temporary name when the underlying filesystem
+    /// doesn't support O_TMPFILE (`EOPNOTSUPP`), e.g. some fuse-overlayfs
+    /// configurations used in CI (see bootc-dev/bootc#2340).
+    #[context("Creating object tmpfile")]
+    pub(crate) fn create_object_tmpfile_impl(
+        &self,
+        _writable: &WritableRepo,
+    ) -> Result<ObjectTmpfile> {
+        let objects_dir = self
+            .objects_dir()
+            .context("Getting objects directory for tmpfile creation")?;
+
+        #[cfg(any(test, feature = "test"))]
+        if self.force_named_tmpfile() {
+            return self.create_named_object_tmpfile(objects_dir);
+        }
+
+        match openat(
+            objects_dir,
+            ".",
+            OFlags::RDWR | OFlags::TMPFILE | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o644),
+        ) {
+            Ok(fd) => Ok(ObjectTmpfile::Anonymous(fd)),
+            Err(Errno::OPNOTSUPP) => self.create_named_object_tmpfile(objects_dir),
+            Err(e) => Err(e).context("Opening temp file in objects directory")?,
+        }
+    }
+
+    /// Fallback for [`create_object_tmpfile_impl`](Self::create_object_tmpfile_impl):
+    /// create a regular file with a random temporary name in the objects
+    /// directory, for use on filesystems that don't support O_TMPFILE.
+    fn create_named_object_tmpfile(&self, objects_dir: &OwnedFd) -> Result<ObjectTmpfile> {
+        // A handful of retries is plenty: collisions on a 12-character
+        // random alphanumeric suffix are astronomically unlikely; this
+        // just guards against a freak collision.
+        for _ in 0..16 {
+            let name = generate_tmpname(".tmp-object-");
+            match openat(
+                objects_dir,
+                &name,
+                OFlags::CREATE | OFlags::EXCL | OFlags::RDWR | OFlags::CLOEXEC,
+                Mode::from_raw_mode(0o644),
+            ) {
+                Ok(fd) => return Ok(ObjectTmpfile::Named { fd, name }),
+                Err(Errno::EXIST) => continue,
+                Err(e) => {
+                    return Err(e).context("Creating fallback temp file in objects directory")?;
+                }
+            }
+        }
+        bail!("failed to create a uniquely-named fallback object tmpfile after 16 attempts")
     }
 
     /// Ensure an object exists by reflinking or hardlinking from a source file.
@@ -1753,8 +1937,9 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         // Try reflink first, unless a previous call on this device pair
         // already discovered that FICLONE is unsupported.
         if !ctx.is_reflink_unsupported(src_dev, dst_dev) {
-            let tmpfile_fd = self.create_object_tmpfile_impl(&writable)?;
-            let tmpfile = File::from(tmpfile_fd);
+            let objects_dir = self.objects_dir()?;
+            let tmpfile = self.create_object_tmpfile_impl(&writable)?;
+            let guard = tmpfile.guard(objects_dir);
 
             match ioctl_ficlone(&tmpfile, src) {
                 Ok(()) => {
@@ -1767,7 +1952,8 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                         stat.st_size
                     );
 
-                    let (object_id, method) = self.finalize_object_tmpfile(tmpfile, size)?;
+                    let (object_id, method) =
+                        self.finalize_object_tmpfile_impl(tmpfile, guard, size, &writable)?;
                     let method = match method {
                         ObjectStoreMethod::Copied => ObjectStoreMethod::Reflinked,
                         other => other,
@@ -1778,6 +1964,8 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                     // Record for this device pair so subsequent calls skip.
                     ctx.mark_reflink_unsupported(src_dev, dst_dev);
                     drop(tmpfile);
+                    // `guard` drops here too, cleaning up the fallback
+                    // tmpfile (if any) since it was never used.
                 }
                 Err(e) => {
                     return Err(e).context("Reflinking source file to objects directory")?;
@@ -1802,16 +1990,19 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         }
 
         // Final fallback: copy data into a new tmpfile.
-        let tmpfile_fd = self.create_object_tmpfile_impl(&writable)?;
-        let mut tmpfile = File::from(tmpfile_fd);
+        let objects_dir = self.objects_dir()?;
+        let tmpfile = self.create_object_tmpfile_impl(&writable)?;
+        let guard = tmpfile.guard(objects_dir);
         {
             use std::io::{Seek, SeekFrom};
+            let mut dst = File::from(tmpfile.try_clone()?);
             let mut src_clone = src.try_clone()?;
             src_clone.seek(SeekFrom::Start(0))?;
-            std::io::copy(&mut src_clone, &mut tmpfile)?;
+            std::io::copy(&mut src_clone, &mut dst)?;
         }
 
-        let (object_id, method) = self.finalize_object_tmpfile(tmpfile, size)?;
+        let (object_id, method) =
+            self.finalize_object_tmpfile_impl(tmpfile, guard, size, &writable)?;
         Ok((object_id, method))
     }
 
@@ -1918,23 +2109,41 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         size: u64,
     ) -> Result<(ObjectID, ObjectStoreMethod)> {
         let writable = self.ensure_writable_token()?;
-        self.finalize_object_tmpfile_impl(file, size, &writable)
-    }
-
-    #[context("Finalizing object tempfile")]
-    pub(crate) fn finalize_object_tmpfile_impl(
-        &self,
-        file: File,
-        size: u64,
-        _writable: &WritableRepo,
-    ) -> Result<(ObjectID, ObjectStoreMethod)> {
-        let ro_fd =
-            reopen_tmpfile_ro(file).context("Re-opening tmpfile as read-only for verity")?;
-
-        // Get objects_dir early since we may need it for verity copy
         let objects_dir = self
             .objects_dir()
             .context("Getting objects directory for finalization")?;
+        // The public API only ever hands us an anonymous O_TMPFILE (created
+        // via `create_object_tmpfile`), so there's no fallback name to track.
+        let guard = NamedTmpfileGuard::new(objects_dir, None);
+        self.finalize_object_tmpfile_impl(
+            ObjectTmpfile::Anonymous(file.into()),
+            guard,
+            size,
+            &writable,
+        )
+    }
+
+    /// Like [`finalize_object_tmpfile`](Self::finalize_object_tmpfile), but
+    /// also accepts the [`ObjectTmpfile`] wrapper produced by
+    /// [`create_object_tmpfile_impl`](Self::create_object_tmpfile_impl)
+    /// along with the [`NamedTmpfileGuard`] that's been protecting it since
+    /// creation, so the fallback temp name (for filesystems that don't
+    /// support O_TMPFILE) stays tracked and cleaned up on error.
+    #[context("Finalizing object tempfile")]
+    pub(crate) fn finalize_object_tmpfile_impl(
+        &self,
+        tmpfile: ObjectTmpfile,
+        guard: NamedTmpfileGuard<'_>,
+        size: u64,
+        _writable: &WritableRepo,
+    ) -> Result<(ObjectID, ObjectStoreMethod)> {
+        // Get objects_dir early since we may need it for verity copy.
+        let objects_dir = self
+            .objects_dir()
+            .context("Getting objects directory for finalization")?;
+
+        let ro_fd = reopen_tmpfile_ro(tmpfile.into_file())
+            .context("Re-opening tmpfile as read-only for verity")?;
 
         // Enable verity - the kernel reads the file and computes the digest.
         // Use enable_verity_maybe_copy to handle the case where forked processes
@@ -1962,24 +2171,39 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                 .context("Computing verity digest in insecure mode")?
         };
 
-        self.link_tmpfile_as_object(objects_dir, &ro_fd, &id, size)
+        self.link_tmpfile_as_object(objects_dir, &ro_fd, &id, size, guard)
     }
 
     /// Link a read-only tmpfile into the objects directory with dedup check.
     ///
     /// If an object with the same digest and size already exists, the
     /// tmpfile is discarded and `AlreadyPresent` is returned.
+    ///
+    /// `guard` protects the fallback (named) tmpfile, if any, from leaking:
+    /// it stays armed for the whole function and is only disarmed once the
+    /// tmpfile has actually been put in place, so any early return (e.g.
+    /// from `ensure_dir_at` failing) or the dedup/race paths below all
+    /// still clean it up via `Drop`.
+    ///
+    /// When there's a fallback name, the new object is put in place with
+    /// an atomic `renameat` (`RENAME_NOREPLACE`) instead of the
+    /// `linkat`-via-`/proc/self/fd` trick used for anonymous tmpfiles. If a
+    /// racing writer completes first for the same digest, the rename fails
+    /// with `EEXIST`; that's fine, we just discard our tmpfile and report
+    /// `AlreadyPresent`.
     fn link_tmpfile_as_object(
         &self,
         objects_dir: &OwnedFd,
         ro_fd: &impl AsFd,
         id: &ObjectID,
         size: u64,
+        guard: NamedTmpfileGuard,
     ) -> Result<(ObjectID, ObjectStoreMethod)> {
         let path = id.to_object_pathname();
 
         match statat(objects_dir, &path, AtFlags::empty()) {
             Ok(stat) if stat.st_size as u64 == size => {
+                // `guard` drops here, discarding our now-redundant tmpfile.
                 return Ok((id.clone(), ObjectStoreMethod::AlreadyPresent));
             }
             _ => {}
@@ -1988,6 +2212,26 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         let parent_dir = id.to_object_dir();
         ensure_dir_at(objects_dir, &parent_dir, Mode::from_raw_mode(0o755))
             .context("creating object parent directory")?;
+
+        if let Some(name) = guard.name() {
+            return match renameat_with(
+                objects_dir,
+                name,
+                objects_dir,
+                &path,
+                RenameFlags::NOREPLACE,
+            ) {
+                Ok(()) => {
+                    // Successfully in place; nothing left to clean up.
+                    guard.disarm();
+                    Ok((id.clone(), ObjectStoreMethod::Copied))
+                }
+                // Lost a race to a concurrent writer for the same digest;
+                // `guard` drops here, discarding our tmpfile.
+                Err(Errno::EXIST) => Ok((id.clone(), ObjectStoreMethod::AlreadyPresent)),
+                Err(e) => Err(e).context("Renaming tmpfile into objects directory")?,
+            };
+        }
 
         match linkat(
             CWD,
@@ -4672,6 +4916,58 @@ mod tests {
             repo.ensure_object_from_file(&temp_file, test_data.len() as u64, &mut ctx)?;
         assert_eq!(object_id, object_id_2);
         assert_eq!(method_2, ObjectStoreMethod::AlreadyPresent);
+
+        Ok(())
+    }
+
+    /// Collect any leftover `.tmp-*` fallback tmpfiles under `objects/`.
+    ///
+    /// Used to verify that the O_TMPFILE fallback path never leaks its
+    /// named temp files, whether the object was newly stored (renamed
+    /// into place) or deduplicated (unlinked).
+    fn stray_tmpfiles_in_objects(tmp: &TempDir) -> Result<Vec<PathBuf>> {
+        let objects_path = tmp.path().join("repo").join("objects");
+        let mut stray = Vec::new();
+        for subdir in std::fs::read_dir(&objects_path)? {
+            let subdir = subdir?;
+            if !subdir.file_type()?.is_dir() {
+                continue;
+            }
+            for entry in std::fs::read_dir(subdir.path())? {
+                let entry = entry?;
+                if entry.file_name().to_string_lossy().starts_with(".tmp-") {
+                    stray.push(entry.path());
+                }
+            }
+        }
+        Ok(stray)
+    }
+
+    /// On filesystems without O_TMPFILE support (e.g. some fuse-overlayfs
+    /// configurations, see bootc-dev/bootc#2340), `create_object_tmpfile_impl`
+    /// must fall back to a named temp file that gets renamed into place (or
+    /// unlinked on dedup) instead of erroring out.
+    #[test]
+    fn test_ensure_object_from_reader_named_tmpfile_fallback() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+        repo.set_force_named_tmpfile(true);
+
+        let test_data = generate_test_data(64 * 1024, 0xC5);
+
+        // First call creates the object via the named-tmpfile fallback.
+        let object_id =
+            repo.ensure_object_from_reader(test_data.as_slice(), test_data.len() as u64)?;
+        assert!(test_object_exists(&tmp, &object_id)?);
+        assert_eq!(repo.read_object(&object_id)?, test_data);
+        assert!(stray_tmpfiles_in_objects(&tmp)?.is_empty());
+
+        // Second call with identical data exercises the dedup path, which
+        // must not error and must not leave the fallback tmpfile behind.
+        let object_id_2 =
+            repo.ensure_object_from_reader(test_data.as_slice(), test_data.len() as u64)?;
+        assert_eq!(object_id, object_id_2);
+        assert!(stray_tmpfiles_in_objects(&tmp)?.is_empty());
 
         Ok(())
     }
