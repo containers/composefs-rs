@@ -11,9 +11,9 @@
 use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
 
 use anyhow::{Context, Result, ensure};
+use composefs::digest::{Digest, Sha256};
 use composefs::util::DigestWrite;
 use fn_error_context::context;
-use sha2::{Digest, Sha256};
 
 use composefs::{
     fsverity::FsVerityHashValue,

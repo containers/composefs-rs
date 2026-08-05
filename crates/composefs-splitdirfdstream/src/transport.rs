@@ -69,8 +69,8 @@ pub(crate) fn split_into_frames(fds: Vec<OwnedFd>, n_frames: usize) -> Vec<Vec<O
 /// Uses the first 8 bytes of SHA-256(id) interpreted as little-endian u64.
 /// The result is stable across runs for the same id string.
 pub fn seed_from_id(id: &str) -> u64 {
-    use sha2::Digest as _;
-    let hash = sha2::Sha256::digest(id.as_bytes());
+    let hash = openssl::hash::hash(openssl::hash::MessageDigest::sha256(), id.as_bytes())
+        .expect("SHA-256 hashing should not fail");
     u64::from_le_bytes(hash[..8].try_into().expect("sha256 is at least 8 bytes"))
 }
 

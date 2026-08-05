@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use crate::oci_image::write_manifest;
 use crate::skopeo::OCI_CONFIG_CONTENT_TYPE;
+use composefs::digest::{Digest, Sha256};
 use composefs::dumpfile_parse::{Entry, Item};
 use composefs::fsverity::Sha256HashValue;
 use composefs::repository::{Repository, RepositoryConfig};
@@ -30,7 +31,6 @@ use containers_image_proxy::oci_spec::image::{
     ImageManifestBuilder, MediaType, RootFsBuilder,
 };
 use rustix::fs::FileType;
-use sha2::{Digest, Sha256};
 
 fn hash(bytes: &[u8]) -> OciDigest {
     let mut context = Sha256::new();

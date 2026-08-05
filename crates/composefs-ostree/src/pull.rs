@@ -6,6 +6,7 @@
 //! shared objects.
 
 use anyhow::{Result, bail};
+use composefs::digest::{Digest, Sha256};
 use composefs::{
     fsverity::FsVerityHashValue,
     progress::{ComponentId, ProgressEvent, ProgressUnit, SharedReporter},
@@ -13,7 +14,6 @@ use composefs::{
     util::Sha256Digest,
 };
 use gvariant::aligned_bytes::AlignedBuf;
-use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
 use std::{fmt, sync::Arc};
 use tokio::sync::Semaphore;
@@ -248,7 +248,7 @@ impl<ObjectID: FsVerityHashValue, RepoType: OstreeRepo<ObjectID> + 'static>
         data: AlignedBuf,
     ) -> Result<()> {
         let data_sha = Sha256::digest(&*data);
-        if *data_sha != *id {
+        if data_sha != *id {
             bail!(
                 "Invalid {:?} checksum {:?}, expected {:?}",
                 obj_type,

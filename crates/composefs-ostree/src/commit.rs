@@ -9,7 +9,7 @@ use gvariant::aligned_bytes::{A8, AlignedBuf, AlignedSlice, TryAsAligned};
 use std::{fmt, io::Read, mem::size_of, sync::Arc};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use sha2::{Digest, Sha256};
+use composefs::digest::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap},
     ffi::OsStr,
@@ -210,7 +210,7 @@ impl<ObjectID: FsVerityHashValue> CommitWriter<ObjectID> {
 
         let commit = metadata.into_commit(root_tree_id, root_meta_id);
         let commit_data = commit.serialize();
-        let commit_id: Sha256Digest = Sha256::digest(&commit_data).into();
+        let commit_id: Sha256Digest = Sha256::digest(&commit_data);
         writer.insert(&commit_id, None, &commit_data);
         writer.set_commit_id(&commit_id);
 
@@ -256,7 +256,7 @@ impl<ObjectID: FsVerityHashValue> CommitWriter<ObjectID> {
             xattrs: stat_xattrs_to_vec(&dir.stat),
         };
         let dirmeta_data = dirmeta.serialize();
-        let dirmeta_id: Sha256Digest = Sha256::digest(&dirmeta_data).into();
+        let dirmeta_id: Sha256Digest = Sha256::digest(&dirmeta_data);
         writer.insert(&dirmeta_id, None, &dirmeta_data);
 
         let dirtree = OstreeDirTree {
@@ -264,7 +264,7 @@ impl<ObjectID: FsVerityHashValue> CommitWriter<ObjectID> {
             dirs: dir_entries,
         };
         let dirtree_data = dirtree.serialize();
-        let dirtree_id: Sha256Digest = Sha256::digest(&dirtree_data).into();
+        let dirtree_id: Sha256Digest = Sha256::digest(&dirtree_data);
         writer.insert(&dirtree_id, None, &dirtree_data);
 
         Ok((dirtree_id, dirmeta_id))
@@ -320,7 +320,7 @@ impl<ObjectID: FsVerityHashValue> CommitWriter<ObjectID> {
                     }
                     hasher.update(&buf[..n]);
                 }
-                let checksum: Sha256Digest = hasher.finalize().into();
+                let checksum: Sha256Digest = hasher.finalize();
                 writer.insert(&checksum, Some(obj_id), &zlib_header);
                 Ok(checksum)
             }
@@ -342,7 +342,7 @@ impl<ObjectID: FsVerityHashValue> CommitWriter<ObjectID> {
                 if let Some(ref bytes) = content {
                     hasher.update(bytes);
                 }
-                let checksum: Sha256Digest = hasher.finalize().into();
+                let checksum: Sha256Digest = hasher.finalize();
 
                 if let Some(bytes) = content {
                     let mut data = zlib_header;
@@ -692,7 +692,7 @@ impl<ObjectID: FsVerityHashValue> CommitReader<ObjectID> {
         })?;
 
         let dirmeta_sha = Sha256::digest(dirmeta);
-        if *dirmeta_sha != *dirmeta_id {
+        if dirmeta_sha != *dirmeta_id {
             bail!(
                 "Invalid dirmeta checksum {:?}, expected {:?}",
                 dirmeta_sha,

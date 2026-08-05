@@ -23,7 +23,6 @@ gvariant = { version = "0.5.1", default-features = true}
 hex = { version = "0.4.0", default-features = false, features = ["std"] }
 rand = { version = "0.10.0", default-features = false, features = ["thread_rng"] }
 rustix = { version = "1.0.0", default-features = false, features = ["fs", "mount", "process", "std"] }
-sha2 = { version = "0.11.0", default-features = false }
 zerocopy = { version = "0.8.0", default-features = false, features = ["derive", "std"] }
 reqwest = { version = "0.13.0", features = ["stream", "zstd"] }
 tokio = { version = "1.24.2", default-features = false, features = ["rt", "sync"] }

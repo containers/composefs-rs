@@ -14,9 +14,9 @@ use std::{
 
 use anyhow::{Result, bail};
 use bytes::Bytes;
+use composefs::digest::{Digest, Sha256};
 use composefs::util::DigestWrite;
 use reqwest::{Client, Response, Url};
-use sha2::{Digest, Sha256};
 use tokio::task::JoinSet;
 
 use composefs::progress::{ComponentId, NullReporter, ProgressEvent, ProgressUnit, SharedReporter};

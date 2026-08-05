@@ -13,10 +13,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
+use composefs::digest::{Digest, Sha256};
 use gvariant::aligned_bytes::{AlignedBuf, TryAsAligned};
 use gvariant::{Marker, Structure, gv};
 use rustix::fs::{Mode, OFlags, openat, seek};
-use sha2::{Digest, Sha256};
 
 use composefs::fsverity::FsVerityHashValue;
 use composefs::repository::Repository;
@@ -851,7 +851,7 @@ fn dispatch_open_splice_and_close<ObjectID: FsVerityHashValue>(
         let data = state.payload_slice(content_offset, content_len as u64)?;
 
         let actual = Sha256::digest(data);
-        if *actual != checksum {
+        if actual != checksum {
             bail!(
                 "metadata object checksum mismatch: expected {}, got {}",
                 hex::encode(checksum),
@@ -1065,7 +1065,7 @@ fn store_file_object<ObjectID: FsVerityHashValue>(
     hasher.update(&*regular_header);
     hasher.update(content);
     let actual = hasher.finalize();
-    if *actual != *expected_checksum {
+    if actual != *expected_checksum {
         bail!(
             "file object checksum mismatch: expected {}, got {}",
             hex::encode(expected_checksum),
@@ -1148,7 +1148,7 @@ pub fn apply_delta_offline<ObjectID: FsVerityHashValue>(
 
         // Verify checksum of raw part data
         let actual = Sha256::digest(&raw);
-        if *actual != header.checksum {
+        if actual != header.checksum {
             bail!(
                 "delta part {i} checksum mismatch: expected {}, got {}",
                 hex::encode(header.checksum),
