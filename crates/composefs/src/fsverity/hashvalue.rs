@@ -6,8 +6,8 @@
 
 use core::{fmt, hash::Hash, str::FromStr};
 
+use crate::digest::{Digest, FixedOutputReset, Output, Sha256, Sha512};
 use hex::FromHexError;
-use sha2::{Digest, Sha256, Sha512, digest::FixedOutputReset, digest::Output};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 /// Trait for fs-verity hash value types supporting SHA-256 and SHA-512.
@@ -164,7 +164,7 @@ pub struct Sha256HashValue([u8; 32]);
 
 impl From<Output<Sha256>> for Sha256HashValue {
     fn from(value: Output<Sha256>) -> Self {
-        Self(value.into())
+        Self(value)
     }
 }
 
@@ -183,7 +183,7 @@ pub struct Sha512HashValue([u8; 64]);
 
 impl From<Output<Sha512>> for Sha512HashValue {
     fn from(value: Output<Sha512>) -> Self {
-        Self(value.into())
+        Self(value)
     }
 }
 

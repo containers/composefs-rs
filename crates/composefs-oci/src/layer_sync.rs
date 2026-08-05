@@ -19,9 +19,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use cap_std_ext::cap_std;
+use composefs::digest::{Digest as _, Sha256};
 use composefs_splitdirfdstream::{Chunk, SplitdirfdstreamReader, SplitdirfdstreamWriter};
 use rustix::fs::{MemfdFlags, fstat, memfd_create};
-use sha2::{Digest as _, Sha256};
 
 use composefs::{
     INLINE_CONTENT_MAX_V0,

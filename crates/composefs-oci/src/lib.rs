@@ -59,10 +59,10 @@ use anyhow::{Context, Result, ensure};
 /// Re-exported from `oci-spec` for convenience.
 pub use containers_image_proxy::oci_spec::image::Digest as OciDigest;
 
+use composefs::digest::{Digest, Sha256};
 use containers_image_proxy::ImageProxyConfig;
 use containers_image_proxy::oci_spec::image::ImageConfiguration;
 use containers_image_proxy::oci_spec::image::{Descriptor, ImageManifest, MediaType};
-use sha2::{Digest, Sha256};
 
 use composefs::{
     erofs::format::{FormatEpoch, FormatVersion},
@@ -507,7 +507,7 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
 }
 
 /// Convert a SHA-256 hash output to an OCI content digest.
-pub(crate) fn sha256_output_to_digest(output: sha2::digest::Output<Sha256>) -> OciDigest {
+pub(crate) fn sha256_output_to_digest(output: composefs::digest::Output<Sha256>) -> OciDigest {
     let hex = hex::encode(output);
     format!("sha256:{hex}")
         .try_into()

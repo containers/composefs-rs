@@ -16,7 +16,6 @@ bytes = { version = "1.7.1", default-features = false }
 composefs = { workspace = true }
 hex = { version = "0.4.0", default-features = false }
 reqwest = { version = "0.13.0", features = ["zstd"] }
-sha2 = { version = "0.11.0", default-features = false }
 tokio = { version = "1.24.2", default-features = false }
 
 [dev-dependencies]

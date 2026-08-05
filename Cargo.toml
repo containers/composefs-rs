@@ -47,10 +47,6 @@ ocidir = "0.8.0"
 zlink = { version = "0.7", default-features = false, features = ["tokio", "introspection", "proxy", "server", "service", "tracing"] }
 zlink-core = { version = "0.7", default-features = false, features = ["introspection", "std", "tracing"] }
 
-[profile.dev.package.sha2]
-# this is *really* slow otherwise
-opt-level = 3
-
 [profile.profiling]
 inherits = "release"
 debug = true

@@ -45,6 +45,7 @@
 // exceptions carry a local `#[allow]` with justification. Test code is exempt.
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
+pub mod digest;
 pub mod dumpfile;
 pub mod dumpfile_parse;
 pub mod erofs;

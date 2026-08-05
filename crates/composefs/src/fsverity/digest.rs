@@ -5,7 +5,7 @@
 
 use core::mem::size_of;
 
-use sha2::Digest;
+use crate::digest::{Digest, FixedOutputReset};
 
 use super::FsVerityHashValue;
 

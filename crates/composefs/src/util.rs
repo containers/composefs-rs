@@ -4,8 +4,8 @@
 //! I/O utilities for reading data streams, SHA256 digest parsing, and
 //! filesystem operations like atomic symlink replacement.
 
+use crate::digest::Digest;
 use rand::{RngExt, distr::Alphanumeric};
-use sha2::Digest;
 use std::{
     io::{Error, ErrorKind, Read, Result},
     os::{
@@ -21,11 +21,10 @@ use rustix::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-/// Adapts a [`sha2::Digest`] hasher to implement [`std::io::Write`].
+/// Adapts a [`Digest`] hasher to implement [`std::io::Write`].
 ///
-/// sha2 0.11 removed its `std::io::Write` impl. This wrapper bridges
-/// the gap so that digest hashers can still be used with APIs that
-/// accept `impl Write` (e.g. [`SplitStreamReader::cat`]).
+/// This wrapper bridges the gap so that digest hashers can be used with
+/// APIs that accept `impl Write` (e.g. [`SplitStreamReader::cat`]).
 #[derive(Debug)]
 pub struct DigestWrite<D: Digest>(pub D);
 
@@ -42,7 +41,7 @@ impl<D: Digest> std::io::Write for DigestWrite<D> {
 
 impl<D: Digest> DigestWrite<D> {
     /// Consumes the wrapper and returns the computed digest.
-    pub fn finalize(self) -> sha2::digest::Output<D> {
+    pub fn finalize(self) -> crate::digest::Output<D> {
         self.0.finalize()
     }
 }

@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use cap_std::fs::Dir;
+use composefs::digest::{Digest, Sha256};
 use configparser::ini::Ini;
 use flate2::read::DeflateDecoder;
 use gvariant::aligned_bytes::{AlignedBuf, TryAsAligned};
@@ -13,7 +14,6 @@ use reqwest::{Client, StatusCode, Url, header};
 use rustix::fd::AsRawFd;
 use rustix::fs::{FileType, Mode, OFlags, fstat, getxattr, listxattr, openat, readlinkat};
 use rustix::io::Errno;
-use sha2::{Digest, Sha256};
 use std::ffi::CStr;
 use std::mem::MaybeUninit;
 use std::{
@@ -84,7 +84,7 @@ fn hash_and_store_file<ObjectID: FsVerityHashValue>(
     };
 
     let actual_checksum = hasher.finalize();
-    if *actual_checksum != *expected_checksum {
+    if actual_checksum != *expected_checksum {
         bail!(
             "Unexpected file checksum {}, expected {}",
             hex::encode(actual_checksum),
@@ -567,8 +567,8 @@ impl<ObjectID: FsVerityHashValue> RemoteRepo<ObjectID> {
             Some(data) => data,
             None => self.fetch_delta_part(from, to, index).await?,
         };
-        let actual = sha2::Sha256::digest(&raw);
-        if *actual != *expected_checksum {
+        let actual = Sha256::digest(&raw);
+        if actual != *expected_checksum {
             bail!(
                 "delta part {index} checksum mismatch: expected {}, got {}",
                 hex::encode(expected_checksum),
@@ -649,7 +649,7 @@ impl<ObjectID: FsVerityHashValue> RemoteRepo<ObjectID> {
             .context("Decompressing subsummary")?;
 
         let actual = Sha256::digest(&summary_data);
-        if *actual != checksum {
+        if actual != checksum {
             bail!(
                 "subsummary checksum mismatch: expected {}, got {}",
                 checksum_hex,
@@ -724,7 +724,7 @@ impl<ObjectID: FsVerityHashValue> RemoteRepo<ObjectID> {
             .await
             .with_context(|| format!("Reading summary from {url}"))?;
 
-        let data_checksum: Sha256Digest = Sha256::digest(&summary_data).into();
+        let data_checksum: Sha256Digest = Sha256::digest(&summary_data);
         let info = SummaryCacheInfo {
             etag,
             last_modified,
@@ -1332,7 +1332,7 @@ impl<ObjectID: FsVerityHashValue> LocalRepo<ObjectID> {
             return Ok(());
         }
 
-        let actual: Sha256Digest = Sha256::digest(data).into();
+        let actual: Sha256Digest = Sha256::digest(data);
         if actual != *checksum {
             bail!(
                 "metadata object checksum mismatch: expected {}, got {}",
@@ -1417,7 +1417,7 @@ impl<ObjectID: FsVerityHashValue> LocalRepo<ObjectID> {
             }
         }
 
-        let actual: Sha256Digest = hasher.finalize().into();
+        let actual: Sha256Digest = hasher.finalize();
         if actual != *checksum {
             bail!(
                 "file object checksum mismatch: expected {}, got {}",

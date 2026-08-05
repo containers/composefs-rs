@@ -201,24 +201,24 @@ fn read_uvarint(r: &mut impl io::BufRead) -> Result<u64> {
 }
 
 enum OciHasher {
-    Sha256(sha2::Sha256),
-    Sha384(sha2::Sha384),
-    Sha512(sha2::Sha512),
+    Sha256(composefs::digest::Sha256),
+    Sha384(composefs::digest::Sha384),
+    Sha512(composefs::digest::Sha512),
 }
 
 impl OciHasher {
     fn new(algorithm: &DigestAlgorithm) -> Result<Self> {
-        use sha2::Digest;
+        use composefs::digest::Digest;
         match algorithm {
-            &DigestAlgorithm::Sha256 => Ok(Self::Sha256(sha2::Sha256::new())),
-            &DigestAlgorithm::Sha384 => Ok(Self::Sha384(sha2::Sha384::new())),
-            &DigestAlgorithm::Sha512 => Ok(Self::Sha512(sha2::Sha512::new())),
+            &DigestAlgorithm::Sha256 => Ok(Self::Sha256(composefs::digest::Sha256::new())),
+            &DigestAlgorithm::Sha384 => Ok(Self::Sha384(composefs::digest::Sha384::new())),
+            &DigestAlgorithm::Sha512 => Ok(Self::Sha512(composefs::digest::Sha512::new())),
             other => bail!("Unsupported digest algorithm: {other}"),
         }
     }
 
     fn update(&mut self, data: &[u8]) {
-        use sha2::Digest;
+        use composefs::digest::Digest;
         match self {
             Self::Sha256(h) => h.update(data),
             Self::Sha384(h) => h.update(data),
@@ -227,7 +227,7 @@ impl OciHasher {
     }
 
     fn finalize(self) -> Result<OciDigest> {
-        use sha2::Digest;
+        use composefs::digest::Digest;
         let (algorithm, hex) = match self {
             Self::Sha256(h) => ("sha256", hex::encode(h.finalize())),
             Self::Sha384(h) => ("sha384", hex::encode(h.finalize())),
