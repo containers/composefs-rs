@@ -1,0 +1,69 @@
+name: Create Release PR
+
+on:
+  schedule:
+    # Run monthly on the 1st at 8:00 AM UTC
+    - cron: '0 8 1 * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version type to release, either "patch" (default) or "minor"'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  create-release-pr:
+    runs-on: ubuntu-latest
+    container: quay.io/coreos-assembler/fcos-buildroot:testing-devel
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Mark git checkout as safe
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Generate release changes
+        id: create_commit
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          cargo install cargo-edit
+
+          # Default to bumping a patch
+          cargo set-version --exclude composefs-capi --bump ${INPUT_VERSION:-patch}
+          VERSION=$(cargo read-manifest --manifest-path crates/composefs/Cargo.toml | jq -r '.version')
+
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v8
+        env:
+          VERSION: ${{ steps.create_commit.outputs.VERSION }}
+        with:
+          signoff: true
+          sign-commits: false
+          title: "Release ${{ env.VERSION }}"
+          commit-message: "Release ${{ env.VERSION }}"
+          branch: "release-${{ env.VERSION }}"
+          delete-branch: true
+          labels: release
+          body: |
+            ## Release ${{ env.VERSION }}
+
+            This is an automated release PR created by the scheduled release workflow.
+
+            ### Release Process
+
+            1. Review the changes in this PR
+            2. Ensure all tests pass
+            3. Merge the PR
+            4. The release tag will be automatically created and signed when this PR is merged
+
+            The release workflow will automatically trigger when the tag is pushed.
