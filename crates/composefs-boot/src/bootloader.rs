@@ -303,8 +303,10 @@ pub const EFI_ADDON_FILE_EXT: &str = ".addon.efi";
 pub enum PEType {
     /// A Unified Kernel Image
     Uki,
-    /// A UKI addon extension
+    /// A UKI addon scoped to the found UKI
     UkiAddon,
+    /// A global UKI addon applicable for all UKIs
+    GlobalUkiAddon,
 }
 
 /// Represents a Boot Loader Specification Type 2 entry (Unified Kernel Image).
@@ -346,16 +348,14 @@ impl<ObjectID: FsVerityHashValue> Type2Entry<ObjectID> {
         entries: &mut Vec<Self>,
         path: &mut PathBuf,
         kver: &Option<Box<OsStr>>,
+        global_addons: bool,
     ) -> Result<()> {
         for (filename, inode) in dir.entries() {
             path.push(filename);
 
-            // Collect all UKI extensions
-            // Usually we'll find them in the root with directories ending in `.efi.extra.d` for kernel
-            // specific addons. Global addons are found in `loader/addons`
             if let Inode::Directory(subdir) = inode {
                 let subdir_ref = DirectoryRef::from_parts(subdir, dir.leaves());
-                Self::find_uki_components(subdir_ref, entries, path, kver)?;
+                Self::find_uki_components(subdir_ref, entries, path, kver, global_addons)?;
                 path.pop();
                 continue;
             }
@@ -374,15 +374,22 @@ impl<ObjectID: FsVerityHashValue> Type2Entry<ObjectID> {
                 bail!("{filename:?} is not a regular file");
             };
 
+            let pe_type = if filename.as_bytes().ends_with(EFI_ADDON_FILE_EXT.as_bytes()) {
+                if global_addons {
+                    PEType::GlobalUkiAddon
+                } else {
+                    PEType::UkiAddon
+                }
+            } else {
+                // We already filter by .efi extension
+                PEType::Uki
+            };
+
             entries.push(Self {
                 kver: kver.clone(),
                 file_path: path.clone(),
                 file: file.clone(),
-                pe_type: if path.components().count() == 1 {
-                    PEType::Uki
-                } else {
-                    PEType::UkiAddon
-                },
+                pe_type,
             });
 
             path.pop();
@@ -404,13 +411,29 @@ impl<ObjectID: FsVerityHashValue> Type2Entry<ObjectID> {
         let mut entries = vec![];
         let root = fs.as_dir();
 
-        match root.get_directory_ref("/boot/EFI/Linux".as_ref()) {
-            Ok(entries_dir) => {
-                Self::find_uki_components(entries_dir, &mut entries, &mut PathBuf::new(), &None)?
-            }
-            Err(ImageError::NotFound(..)) => {}
-            Err(other) => Err(other)?,
-        };
+        // Collect all UKI extensions as well
+        // Usually we'll find them in the root with directories ending in `.efi.extra.d` for kernel
+        // specific addons. Global addons are found in `loader/addons`
+        let paths = [
+            // Gather UKI and deployment specific UKI Addons
+            ("/boot/EFI/Linux", false),
+            // Gather global UKI Addons if any
+            ("/boot/loader/addons", true),
+        ];
+
+        for (p, global_addons) in paths {
+            match root.get_directory_ref(p.as_ref()) {
+                Ok(entries_dir) => Self::find_uki_components(
+                    entries_dir,
+                    &mut entries,
+                    &mut PathBuf::new(),
+                    &None,
+                    global_addons,
+                )?,
+                Err(ImageError::NotFound(..)) => {}
+                Err(other) => Err(other)?,
+            };
+        }
 
         match root.get_directory_ref("/usr/lib/modules".as_ref()) {
             Ok(modules_dir) => {
@@ -425,6 +448,7 @@ impl<ObjectID: FsVerityHashValue> Type2Entry<ObjectID> {
                         &mut entries,
                         &mut PathBuf::new(),
                         &Some(Box::from(kver)),
+                        false,
                     )?;
                 }
             }
