@@ -1028,6 +1028,7 @@ pub(crate) struct WritableRepo;
 pub struct Repository<ObjectID: FsVerityHashValue> {
     repository: OwnedFd,
     objects: OnceCell<OwnedFd>,
+    images: OnceCell<OwnedFd>,
     write_semaphore: OnceCell<Arc<Semaphore>>,
     /// Optional override for the number of concurrent object writes.
     /// Set via [`set_write_concurrency`](Self::set_write_concurrency) before the semaphore
@@ -1366,6 +1367,12 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             .get_or_try_init(|| ensure_dir_and_openat(&self.repository, "objects", OFlags::PATH))
     }
 
+    /// Return the images directory.
+    pub fn images_dir(&self) -> ErrnoResult<&OwnedFd> {
+        self.images
+            .get_or_try_init(|| ensure_dir_and_openat(&self.repository, "images", OFlags::PATH))
+    }
+
     /// Override the maximum number of concurrent object writes.
     ///
     /// Must be called before the first use of [`write_semaphore`](Self::write_semaphore);
@@ -1523,6 +1530,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(Self {
             repository,
             objects: OnceCell::new(),
+            images: OnceCell::new(),
             write_semaphore: OnceCell::new(),
             write_concurrency: None,
             insecure: !has_verity,
