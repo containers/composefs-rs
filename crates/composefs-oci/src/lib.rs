@@ -923,7 +923,7 @@ fn ensure_oci_composefs_erofs_boot<ObjectID: FsVerityHashValue>(
     manifest_verity: Option<&ObjectID>,
     tag: Option<&str>,
     options: &composefs::generic_tree::OciTransformOptions,
-) -> Result<Option<ObjectID>> {
+) -> Result<Option<(ObjectID, composefs::tree::FileSystem<ObjectID>)>> {
     use composefs_boot::BootOps;
 
     let img = oci_image::OciImage::open(repo, manifest_digest, manifest_verity)?;
@@ -1004,7 +1004,7 @@ fn ensure_oci_composefs_erofs_boot<ObjectID: FsVerityHashValue>(
         tag,
     )?;
 
-    Ok(Some(boot_erofs_id))
+    Ok(Some((boot_erofs_id, fs)))
 }
 
 #[cfg(test)]

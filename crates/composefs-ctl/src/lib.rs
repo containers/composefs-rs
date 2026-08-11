@@ -1880,7 +1880,7 @@ where
                         }
                     }
                 } else if bootable {
-                    let image_verity = composefs_oci::generate_boot_image(
+                    let (image_verity, _) = composefs_oci::generate_boot_image(
                         &repo,
                         &result.manifest_digest,
                         &composefs_oci::OciTransformOptions::default(),
