@@ -138,7 +138,9 @@ pub(crate) fn take_boot_image_refs<ObjectID>(
 
 // Re-export key types for convenience
 #[cfg(feature = "boot")]
-pub use boot::{BootImageMatch, find_matching_boot_image, generate_boot_image};
+pub use boot::{
+    BootImageMatch, find_matching_boot_image, generate_boot_image, generate_boot_image_get_fs,
+};
 pub use boot::{boot_image, remove_boot_image};
 pub use composefs::generic_tree::{OciTransformOptions, XattrFiltering};
 pub use oci_image::{
@@ -923,7 +925,8 @@ fn ensure_oci_composefs_erofs_boot<ObjectID: FsVerityHashValue>(
     manifest_verity: Option<&ObjectID>,
     tag: Option<&str>,
     options: &composefs::generic_tree::OciTransformOptions,
-) -> Result<Option<(ObjectID, composefs::tree::FileSystem<ObjectID>)>> {
+    get_untransformed_filesystem: bool,
+) -> Result<Option<(ObjectID, Option<composefs::tree::FileSystem<ObjectID>>)>> {
     use composefs_boot::BootOps;
 
     let img = oci_image::OciImage::open(repo, manifest_digest, manifest_verity)?;
@@ -938,6 +941,15 @@ fn ensure_oci_composefs_erofs_boot<ObjectID: FsVerityHashValue>(
         Some(img.config_verity()),
         options,
     )?;
+
+    // We want the full filesystem to get boot entries
+    // [`transform_for_boot`] masks /boot which we don't want
+    let untransformed_fs = if get_untransformed_filesystem {
+        Some(fs.clone())
+    } else {
+        None
+    };
+
     fs.transform_for_boot(repo)?;
 
     // Commit as EROFS image(s) for all formats in the repository's default set.
@@ -1004,7 +1016,7 @@ fn ensure_oci_composefs_erofs_boot<ObjectID: FsVerityHashValue>(
         tag,
     )?;
 
-    Ok(Some((boot_erofs_id, fs)))
+    Ok(Some((boot_erofs_id, untransformed_fs)))
 }
 
 #[cfg(test)]

@@ -32,16 +32,35 @@ pub fn generate_boot_image<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     manifest_digest: &OciDigest,
     options: &OciTransformOptions,
+) -> Result<ObjectID> {
+    if let Some(existing) = boot_image_for_mode(repo, manifest_digest, options.xattrs)? {
+        return Ok(existing);
+    }
+
+    let (erofs_id, _) =
+        crate::ensure_oci_composefs_erofs_boot(repo, manifest_digest, None, None, options, false)?
+            .expect("container image should produce boot EROFS");
+
+    Ok(erofs_id)
+}
+
+/// Exactly the same as [`generate_boot_image`], but also returns the untransformed
+/// filesystem created from splitstreams
+#[cfg(feature = "boot")]
+pub fn generate_boot_image_get_fs<ObjectID: FsVerityHashValue>(
+    repo: &Arc<Repository<ObjectID>>,
+    manifest_digest: &OciDigest,
+    options: &OciTransformOptions,
 ) -> Result<(ObjectID, Option<composefs::tree::FileSystem<ObjectID>>)> {
     if let Some(existing) = boot_image_for_mode(repo, manifest_digest, options.xattrs)? {
         return Ok((existing, None));
     }
 
-    let (erofs_id, fs) =
-        crate::ensure_oci_composefs_erofs_boot(repo, manifest_digest, None, None, options)?
+    let (erofs_id, untransformed_fs) =
+        crate::ensure_oci_composefs_erofs_boot(repo, manifest_digest, None, None, options, true)?
             .expect("container image should produce boot EROFS");
 
-    Ok((erofs_id, Some(fs)))
+    Ok((erofs_id, untransformed_fs))
 }
 
 /// Result of [`find_matching_boot_image`].
@@ -356,7 +375,7 @@ mod test {
 
         let img = test_util::create_bootable_image(repo, Some("myapp:v1"), 1).await;
 
-        let (image_verity, _) =
+        let image_verity =
             generate_boot_image(repo, &img.manifest_digest, &OciTransformOptions::default())
                 .unwrap();
 
@@ -391,12 +410,10 @@ mod test {
 
         let img = test_util::create_bootable_image(repo, Some("myapp:v1"), 1).await;
 
-        let (v1, _) =
-            generate_boot_image(repo, &img.manifest_digest, &OciTransformOptions::default())
-                .unwrap();
-        let (v2, _) =
-            generate_boot_image(repo, &img.manifest_digest, &OciTransformOptions::default())
-                .unwrap();
+        let v1 = generate_boot_image(repo, &img.manifest_digest, &OciTransformOptions::default())
+            .unwrap();
+        let v2 = generate_boot_image(repo, &img.manifest_digest, &OciTransformOptions::default())
+            .unwrap();
         assert_eq!(v1, v2);
     }
 
@@ -416,7 +433,7 @@ mod test {
             .build_oci(repo, Some("myapp:v1"))
             .await;
 
-        let (allowlist_id, _) = generate_boot_image(
+        let allowlist_id = generate_boot_image(
             repo,
             &img.manifest_digest,
             &OciTransformOptions {
@@ -425,7 +442,7 @@ mod test {
         )
         .unwrap();
 
-        let (keep_user_id, _) = generate_boot_image(
+        let keep_user_id = generate_boot_image(
             repo,
             &img.manifest_digest,
             &OciTransformOptions {
@@ -454,11 +471,11 @@ mod test {
         );
 
         // Re-generating either mode is a cache hit, returning the same image.
-        let (allowlist_cached, _) =
+        let allowlist_cached =
             generate_boot_image(repo, &img.manifest_digest, &OciTransformOptions::default())
                 .unwrap();
         assert_eq!(allowlist_cached, allowlist_id);
-        let (keep_user_cached, _) = generate_boot_image(
+        let keep_user_cached = generate_boot_image(
             repo,
             &img.manifest_digest,
             &OciTransformOptions {
@@ -560,7 +577,7 @@ mod test {
             .build_oci(repo, Some("myapp:v1"))
             .await;
 
-        let (allowlist_id, _) = generate_boot_image(
+        let allowlist_id = generate_boot_image(
             repo,
             &img.manifest_digest,
             &OciTransformOptions {
@@ -568,7 +585,7 @@ mod test {
             },
         )
         .unwrap();
-        let (keep_user_id, _) = generate_boot_image(
+        let keep_user_id = generate_boot_image(
             repo,
             &img.manifest_digest,
             &OciTransformOptions {
@@ -609,7 +626,7 @@ mod test {
 
         let img = test_util::create_bootable_image(repo, Some("myapp:v1"), 1).await;
 
-        let (image_verity, _) =
+        let image_verity =
             generate_boot_image(repo, &img.manifest_digest, &OciTransformOptions::default())
                 .unwrap();
 
@@ -674,7 +691,7 @@ mod test {
 
         let img = test_util::create_bootable_image(repo, Some("myapp:v1"), 1).await;
 
-        let (allowlist_id, _) = generate_boot_image(
+        let allowlist_id = generate_boot_image(
             repo,
             &img.manifest_digest,
             &OciTransformOptions {
@@ -709,7 +726,7 @@ mod test {
             .build_oci(repo, Some("myapp:v1"))
             .await;
 
-        let (keep_user_id, _) = generate_boot_image(
+        let keep_user_id = generate_boot_image(
             repo,
             &img.manifest_digest,
             &OciTransformOptions {
@@ -785,7 +802,7 @@ mod test {
 
         // This repo is permanently locked to V2 -- simulating an old
         // repository whose `FormatConfig` predates a newer default.
-        let (v2_id, _) =
+        let v2_id =
             generate_boot_image(&repo, &img.manifest_digest, &OciTransformOptions::default())
                 .unwrap();
 
@@ -833,7 +850,7 @@ mod test {
 
             let img = test_util::create_bootable_image(repo, Some(tag), 1).await;
 
-            let (boot_verity, _) =
+            let boot_verity =
                 generate_boot_image(repo, &img.manifest_digest, &OciTransformOptions::default())
                     .unwrap();
 

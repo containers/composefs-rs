@@ -2576,7 +2576,7 @@ pub mod oci {
             } else {
                 let mode = xattrs.unwrap_or_default();
                 let transform_opts = composefs_oci::OciTransformOptions { xattrs: mode };
-                let (id, _) = composefs_oci::generate_boot_image(
+                let id = composefs_oci::generate_boot_image(
                     &repo,
                     &result.manifest_digest,
                     &transform_opts,
