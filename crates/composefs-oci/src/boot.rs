@@ -417,6 +417,52 @@ mod test {
         assert_eq!(v1, v2);
     }
 
+    /// Covers `ensure_oci_composefs_erofs(..., boot_options: Some(..))`:
+    /// requesting the boot variant alongside the untransformed one must
+    /// populate both refs from a single pass over the OCI layers (this is
+    /// the `commit_untransformed=true && generate_boot=true` combination of
+    /// `commit_oci_composefs_erofs` that no other test exercises).
+    #[tokio::test]
+    async fn test_ensure_oci_composefs_erofs_with_boot_options() {
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        let img = test_util::create_bootable_image(repo, Some("myapp:v1"), 1).await;
+
+        let erofs_id = crate::ensure_oci_composefs_erofs(
+            repo,
+            &img.manifest_digest,
+            Some(&img.manifest_verity),
+            Some("myapp:v1"),
+            Some(&OciTransformOptions::default()),
+        )
+        .unwrap()
+        .expect("container image should produce EROFS");
+
+        // The untransformed EROFS ref must be populated.
+        let oci = OciImage::open_ref(repo, "myapp:v1").unwrap();
+        assert_eq!(
+            oci.image_ref(repo.erofs_version()),
+            Some(&erofs_id),
+            "config should reference the untransformed EROFS image"
+        );
+
+        // The boot EROFS ref (default xattr mode) must *also* be populated,
+        // from the same call.
+        let boot_id = boot_image(repo, &img.manifest_digest)
+            .unwrap()
+            .expect("boot EROFS should have been generated in the same pass");
+        assert_ne!(
+            erofs_id, boot_id,
+            "boot-transformed image should differ from the untransformed one"
+        );
+        assert_eq!(
+            oci.boot_image_ref(repo.erofs_version()),
+            Some(&boot_id),
+            "config should reference the boot EROFS image"
+        );
+    }
+
     /// Each xattr filtering mode is cached under its own named ref: generating
     /// `KeepUserXattrs` produces a distinct image from the default
     /// `AllowlistOnly` mode (when a `user.*` xattr is present), and neither

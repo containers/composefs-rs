@@ -614,6 +614,7 @@ pub fn finalize_oci_image<ObjectID: FsVerityHashValue>(
             &manifest_digest,
             Some(&manifest_verity),
             name,
+            None,
         )?;
         if erofs.is_none() {
             // Not a container image (e.g. an artifact) — tag directly.

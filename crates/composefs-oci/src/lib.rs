@@ -497,8 +497,15 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
         });
     }
 
-    let (result, stats) =
-        skopeo::pull_image(repo, imgref, reference, opts.img_proxy_config, reporter).await?;
+    let (result, stats) = skopeo::pull_image(
+        repo,
+        imgref,
+        reference,
+        opts.img_proxy_config,
+        reporter,
+        None,
+    )
+    .await?;
     Ok(crate::PullResult {
         manifest_digest: result.manifest_digest,
         manifest_verity: result.manifest_verity,
@@ -737,6 +744,7 @@ pub fn upgrade_repo<ObjectID: FsVerityHashValue>(
             &manifest_digest,
             Some(img.manifest_verity()),
             Some(&tag),
+            None,
         )
         .with_context(|| format!("generating EROFS for image {tag}"))?;
 
@@ -845,9 +853,11 @@ fn transform_for_boot<ObjectID: FsVerityHashValue>(
     Ok(())
 }
 
-/// Stub used when the `boot` feature is disabled. Never actually reached:
-/// [`commit_oci_composefs_erofs`]'s only caller with `generate_boot: true`
-/// is [`ensure_oci_composefs_erofs_boot`], which is itself `#[cfg(feature = "boot")]`.
+/// Stub used when the `boot` feature is disabled. Reachable via
+/// [`ensure_oci_composefs_erofs`] when called with `boot_options: Some(..)`
+/// — that function is not itself feature-gated on `boot`, so on a build
+/// without the feature this surfaces the error below at runtime via the
+/// normal `?` propagation, which is the desired behavior.
 #[cfg(not(feature = "boot"))]
 fn transform_for_boot<ObjectID: FsVerityHashValue>(
     _repo: &Arc<Repository<ObjectID>>,
@@ -1043,12 +1053,20 @@ fn commit_oci_composefs_erofs<ObjectID: FsVerityHashValue>(
 /// splitstreams are rewritten. The old splitstream objects become unreferenced
 /// and are collected by the next GC.
 ///
-/// Returns the EROFS image's ObjectID (fs-verity digest).
+/// If `boot_options` is `Some`, the boot-transformed EROFS variant is also
+/// generated and linked in the same pass over the OCI layers (see
+/// [`commit_oci_composefs_erofs`]), avoiding the extra tar walk a separate
+/// `boot::generate_boot_image()` call would otherwise require. The boot
+/// image's ObjectID is not returned here — callers that need it can look
+/// it up afterward (e.g. via `boot::boot_image_for_mode`).
+///
+/// Returns the (untransformed) EROFS image's ObjectID (fs-verity digest).
 pub(crate) fn ensure_oci_composefs_erofs<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     manifest_digest: &OciDigest,
     manifest_verity: Option<&ObjectID>,
     tag: Option<&str>,
+    boot_options: Option<&composefs::generic_tree::OciTransformOptions>,
 ) -> Result<Option<ObjectID>> {
     let result = commit_oci_composefs_erofs(
         repo,
@@ -1056,8 +1074,8 @@ pub(crate) fn ensure_oci_composefs_erofs<ObjectID: FsVerityHashValue>(
         manifest_verity,
         tag,
         /* commit_untransformed */ true,
-        /* generate_boot */ false,
-        &composefs::generic_tree::OciTransformOptions::default(),
+        /* generate_boot */ boot_options.is_some(),
+        boot_options.unwrap_or(&Default::default()),
         /* get_untransformed_fs */ false,
     )?;
     Ok(result.map(|r| {
@@ -1564,6 +1582,7 @@ mod test {
             &img.manifest_digest,
             Some(&img.manifest_verity),
             Some("test:v1"),
+            None,
         )
         .unwrap()
         .expect("container image should produce EROFS");
@@ -1648,6 +1667,7 @@ mod test {
             &img.manifest_digest,
             Some(&img.manifest_verity),
             Some("dual:v1"),
+            None,
         )
         .unwrap()
         .expect("container image should produce EROFS");
@@ -1740,6 +1760,7 @@ mod test {
             &img.manifest_digest,
             Some(&img.manifest_verity),
             Some("gctest:v1"),
+            None,
         )
         .unwrap()
         .expect("container image should produce EROFS");
@@ -1887,6 +1908,7 @@ mod test {
             &new_manifest_digest,
             Some(&new_manifest_verity),
             Some("nc:v1"),
+            None,
         )
         .unwrap()
         .expect("should produce EROFS");
@@ -2183,6 +2205,7 @@ mod test {
             &manifest_digest,
             Some(&manifest_verity),
             Some("whiteout-test:v1"),
+            None,
         )
         .unwrap()
         .expect("container image should produce EROFS");
@@ -2284,6 +2307,7 @@ mod test {
             &img.manifest_digest,
             Some(&img.manifest_verity),
             Some("old:v1"),
+            None,
         )
         .unwrap()
         .expect("container image should produce EROFS");
@@ -2338,6 +2362,7 @@ mod test {
             &img.manifest_digest,
             Some(&img.manifest_verity),
             Some("upgrade:v1"),
+            None,
         )
         .unwrap()
         .expect("container image should produce EROFS");
