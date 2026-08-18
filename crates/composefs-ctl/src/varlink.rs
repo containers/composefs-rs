@@ -1868,6 +1868,10 @@ mod service_impl {
                         config_json.as_bytes(),
                         &layer_refs,
                         name.as_deref(),
+                        // This RPC backs repo-to-repo layer sync (`oci copy`),
+                        // not a bootable pull; boot EROFS generation is not
+                        // requested here.
+                        None,
                     )
                 })
                 .await
