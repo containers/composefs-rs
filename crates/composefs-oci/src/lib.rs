@@ -335,6 +335,16 @@ pub struct PullOptions<'a> {
     /// [`SharedReporter`] implementation (e.g. an `indicatif`-backed renderer)
     /// to receive [`ProgressEvent`]s as the pull proceeds.
     pub progress: Option<SharedReporter>,
+
+    /// When `true`, also generates and links the boot-transformed EROFS
+    /// variant in the same pass over the OCI layers, using
+    /// [`composefs::generic_tree::OciTransformOptions::default()`] for the
+    /// transform. Use [`crate::boot::generate_boot_image`] afterward instead
+    /// if you need a non-default xattr filtering mode.
+    ///
+    /// Supported uniformly across transports, including `containers-storage:`
+    /// imports (see [`LocalFetchOpt`]).
+    pub bootable: bool,
 }
 
 impl<'a> std::fmt::Debug for PullOptions<'a> {
@@ -352,6 +362,7 @@ impl<'a> std::fmt::Debug for PullOptions<'a> {
                     &"None"
                 },
             )
+            .field("bootable", &self.bootable)
             .finish()
     }
 }
@@ -472,6 +483,10 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
         .progress
         .unwrap_or_else(|| std::sync::Arc::new(NullReporter));
 
+    let boot_options = opts
+        .bootable
+        .then(composefs::generic_tree::OciTransformOptions::default);
+
     #[cfg(feature = "containers-storage")]
     if opts.local_fetch != LocalFetchOpt::Disabled
         && let Some(image_id) = cstor::parse_containers_storage_ref(imgref)
@@ -485,6 +500,7 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
                 zerocopy,
                 opts.storage_root,
                 opts.additional_image_stores,
+                boot_options.as_ref(),
                 reporter,
             )
             .await?;
@@ -503,7 +519,7 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
         reference,
         opts.img_proxy_config,
         reporter,
-        None,
+        boot_options.as_ref(),
     )
     .await?;
     Ok(crate::PullResult {
