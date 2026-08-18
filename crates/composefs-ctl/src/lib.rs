@@ -1979,7 +1979,7 @@ where
                     println!("No images found");
                 } else {
                     let mut table = Table::new();
-                    table.load_preset(UTF8_FULL);
+                    table.load_style(UTF8_FULL);
                     table.set_header(["NAME", "DIGEST", "ARCH", "LAYERS", "REFS"]);
 
                     for img in images {
@@ -2296,7 +2296,7 @@ where
                     println!("No ostree commits found");
                 } else {
                     let mut table = Table::new();
-                    table.load_preset(UTF8_FULL);
+                    table.load_style(UTF8_FULL);
                     table.set_header(["NAME", "COMMIT"]);
                     for c in commits {
                         table.add_row([c.name.as_str(), &c.commit_id]);
@@ -2328,7 +2328,7 @@ where
                     println!("No refs found");
                 } else {
                     let mut table = Table::new();
-                    table.load_preset(UTF8_FULL);
+                    table.load_style(UTF8_FULL);
                     table.set_header(["REF", "COMMIT"]);
                     for (name, checksum) in &refs {
                         table.add_row([name.as_str(), &hex::encode(checksum)]);
@@ -2371,7 +2371,7 @@ where
                 println!("No images found");
             } else {
                 let mut table = Table::new();
-                table.load_preset(UTF8_FULL);
+                table.load_style(UTF8_FULL);
                 table.set_header(["NAME", "DIGEST"]);
 
                 for entry in &reply.images {
