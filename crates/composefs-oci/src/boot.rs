@@ -37,30 +37,11 @@ pub fn generate_boot_image<ObjectID: FsVerityHashValue>(
         return Ok(existing);
     }
 
-    let (erofs_id, _) =
-        crate::ensure_oci_composefs_erofs_boot(repo, manifest_digest, None, None, options, false)?
+    let erofs_id =
+        crate::ensure_oci_composefs_erofs_boot(repo, manifest_digest, None, None, options)?
             .expect("container image should produce boot EROFS");
 
     Ok(erofs_id)
-}
-
-/// Exactly the same as [`generate_boot_image`], but also returns the untransformed
-/// filesystem created from splitstreams
-#[cfg(feature = "boot")]
-pub fn generate_boot_image_get_fs<ObjectID: FsVerityHashValue>(
-    repo: &Arc<Repository<ObjectID>>,
-    manifest_digest: &OciDigest,
-    options: &OciTransformOptions,
-) -> Result<(ObjectID, Option<composefs::tree::FileSystem<ObjectID>>)> {
-    if let Some(existing) = boot_image_for_mode(repo, manifest_digest, options.xattrs)? {
-        return Ok((existing, None));
-    }
-
-    let (erofs_id, untransformed_fs) =
-        crate::ensure_oci_composefs_erofs_boot(repo, manifest_digest, None, None, options, true)?
-            .expect("container image should produce boot EROFS");
-
-    Ok((erofs_id, untransformed_fs))
 }
 
 /// Result of [`find_matching_boot_image`].
