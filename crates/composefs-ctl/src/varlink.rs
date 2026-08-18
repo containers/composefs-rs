@@ -2451,10 +2451,11 @@ pub mod oci {
         }
     }
 
-    /// Whether the initial `pull()` call in [`pull_stream`] should request the
-    /// boot-transformed EROFS variant via `PullOptions::bootable`, so it's
-    /// produced in the same pass over the OCI layers instead of the
-    /// subsequent `generate_boot_image` call re-walking them.
+    /// Whether an initial `pull()` call (from [`pull_stream`] or `cfsctl`'s
+    /// `OciCommand::Pull` handler) should request the boot-transformed EROFS
+    /// variant via `PullOptions::bootable`, so it's produced in the same pass
+    /// over the OCI layers instead of a subsequent `generate_boot_image` call
+    /// re-walking them.
     ///
     /// `false` whenever that wouldn't actually save the second walk:
     /// - `bootable` is not requested at all.
@@ -2463,7 +2464,10 @@ pub mod oci {
     ///   its search over every mode/version combination stays meaningful.
     /// - `xattrs` requests a non-default mode: `PullOptions::bootable` only
     ///   supports [`composefs::generic_tree::OciTransformOptions::default()`].
-    fn want_bootable_pull(
+    ///
+    /// `pub(crate)` so `cfsctl`'s own `OciCommand::Pull` handler in `lib.rs`
+    /// can share this decision table instead of duplicating it.
+    pub(crate) fn want_bootable_pull(
         bootable: bool,
         has_expected_digest: bool,
         xattrs: Option<composefs_oci::XattrFiltering>,
