@@ -138,9 +138,7 @@ pub(crate) fn take_boot_image_refs<ObjectID>(
 
 // Re-export key types for convenience
 #[cfg(feature = "boot")]
-pub use boot::{
-    BootImageMatch, find_matching_boot_image, generate_boot_image, generate_boot_image_get_fs,
-};
+pub use boot::{BootImageMatch, find_matching_boot_image, generate_boot_image};
 pub use boot::{boot_image, remove_boot_image};
 pub use composefs::generic_tree::{OciTransformOptions, XattrFiltering};
 pub use oci_image::{
@@ -892,12 +890,6 @@ struct CommitResult<ObjectID: FsVerityHashValue> {
     /// `#[cfg(feature = "boot")]`.
     #[cfg_attr(not(feature = "boot"), allow(dead_code))]
     boot_id: Option<ObjectID>,
-    /// The untransformed `FileSystem`, if `get_untransformed_fs` was set.
-    ///
-    /// Only read by [`ensure_oci_composefs_erofs_boot`], which is
-    /// `#[cfg(feature = "boot")]`.
-    #[cfg_attr(not(feature = "boot"), allow(dead_code))]
-    untransformed_fs: Option<composefs::tree::FileSystem<ObjectID>>,
 }
 
 /// Core single-pass logic shared by [`ensure_oci_composefs_erofs`] and the
@@ -922,7 +914,6 @@ fn commit_oci_composefs_erofs<ObjectID: FsVerityHashValue>(
     commit_untransformed: bool,
     generate_boot: bool,
     transform_options: &composefs::generic_tree::OciTransformOptions,
-    get_untransformed_fs: bool,
 ) -> Result<Option<CommitResult<ObjectID>>> {
     let img = oci_image::OciImage::open(repo, manifest_digest, manifest_verity)?;
     if !img.is_container_image() {
@@ -960,11 +951,6 @@ fn commit_oci_composefs_erofs<ObjectID: FsVerityHashValue>(
             })?,
         );
     }
-
-    // The caller may want the full (untransformed) tree in addition to the
-    // boot image — [`transform_for_boot`] masks `/boot`, which we don't
-    // want in that copy — so clone it before the boot transform below.
-    let untransformed_fs = get_untransformed_fs.then(|| fs.clone());
 
     // Preserve all existing boot image refs; only the entries for
     // `transform_options.xattrs` are updated below if `generate_boot` is set.
@@ -1048,7 +1034,6 @@ fn commit_oci_composefs_erofs<ObjectID: FsVerityHashValue>(
     Ok(Some(CommitResult {
         untransformed_id,
         boot_id,
-        untransformed_fs,
     }))
 }
 
@@ -1092,7 +1077,6 @@ pub(crate) fn ensure_oci_composefs_erofs<ObjectID: FsVerityHashValue>(
         /* commit_untransformed */ true,
         /* generate_boot */ boot_options.is_some(),
         boot_options.unwrap_or(&Default::default()),
-        /* get_untransformed_fs */ false,
     )?;
     Ok(result.map(|r| {
         r.untransformed_id
@@ -1109,8 +1093,7 @@ fn ensure_oci_composefs_erofs_boot<ObjectID: FsVerityHashValue>(
     manifest_verity: Option<&ObjectID>,
     tag: Option<&str>,
     options: &composefs::generic_tree::OciTransformOptions,
-    get_untransformed_filesystem: bool,
-) -> Result<Option<(ObjectID, Option<composefs::tree::FileSystem<ObjectID>>)>> {
+) -> Result<Option<ObjectID>> {
     let result = commit_oci_composefs_erofs(
         repo,
         manifest_digest,
@@ -1119,14 +1102,10 @@ fn ensure_oci_composefs_erofs_boot<ObjectID: FsVerityHashValue>(
         /* commit_untransformed */ false,
         /* generate_boot */ true,
         options,
-        get_untransformed_filesystem,
     )?;
     Ok(result.map(|r| {
-        (
-            r.boot_id
-                .expect("generate_boot=true always produces boot_id"),
-            r.untransformed_fs,
-        )
+        r.boot_id
+            .expect("generate_boot=true always produces boot_id")
     }))
 }
 
