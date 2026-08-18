@@ -626,29 +626,28 @@ fn run_oci_mount<ObjectID: composefs::fsverity::FsVerityHashValue>(
         image: format!("{image}: {e:#}"),
     })?;
 
-    let erofs_id = if bootable {
-        img.boot_image_ref(repo.erofs_version())
-    } else {
-        img.image_ref(repo.erofs_version())
-    }
-    .ok_or_else(|| oci::OciError::InternalError {
-        message: if bootable {
-            "No boot EROFS image linked".into()
-        } else {
-            "No composefs EROFS image linked".into()
-        },
-    })?;
-
     let options = params
         .to_mount_options(fds)
         .map_err(|e| oci::OciError::InternalError {
             message: format!("{e:?}"),
         })?;
-    let mount_fd = repo
-        .mount_with_options(&erofs_id.to_hex(), &options)
-        .map_err(|e| oci::OciError::InternalError {
-            message: format!("{e:#}"),
-        })?;
+
+    let mount_fd = img.mount(repo, bootable, &options).map_err(|e| {
+        match e.downcast_ref::<composefs_oci::oci_image::OciErofsNotFound>() {
+            // Preserve the exact varlink-facing message from before this was
+            // deduplicated through `OciImage::mount`.
+            Some(_) => oci::OciError::InternalError {
+                message: if bootable {
+                    "No boot EROFS image linked".into()
+                } else {
+                    "No composefs EROFS image linked".into()
+                },
+            },
+            None => oci::OciError::InternalError {
+                message: format!("{e:#}"),
+            },
+        }
+    })?;
 
     Ok((MountReply { fd_index: 0 }, vec![mount_fd]))
 }
