@@ -13,7 +13,7 @@ use crate::{cfsctl, create_test_rootfs, integration_test};
 
 // Pinned composefs image ID for the deterministic OCI layout built by
 // create_oci_layout() (single layer with usr/ dir + hello.txt, mtime=1234567890).
-const OCI_LAYOUT_COMPOSEFS_ID: &str = "f7684c21050615c02cec250e0c7d4118fb0ff6340af5039e06f2f372a7614fff25dfd38cf7f28ad67\
+pub(crate) const OCI_LAYOUT_COMPOSEFS_ID: &str = "f7684c21050615c02cec250e0c7d4118fb0ff6340af5039e06f2f372a7614fff25dfd38cf7f28ad67\
      d8b86e86371b7deafa9ae4bf543630322aee6196417de92";
 // Pinned V1 composefs image ID for the same OCI layout (V1 writer: compact inodes, BFS).
 const OCI_LAYOUT_COMPOSEFS_V1_ID: &str = "d06f1f6a73f62ed48e05ce9442ff045cdf2a9f5ba1ec623795de3d6177a253d9\
