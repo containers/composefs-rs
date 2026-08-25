@@ -4097,4 +4097,115 @@ mod test {
             "boot-transformed /boot should have been emptied: {boot_entries:?}"
         );
     }
+
+    #[test]
+    fn test_erofs_counterparts() {
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        let (manifest_digest, manifest_verity, _) =
+            create_test_image(repo, Some("cparts:v1"), "amd64");
+
+        let img = OciImage::open(&repo, &manifest_digest, Some(&manifest_verity)).unwrap();
+
+        let fake_nonboot_v2: Sha256HashValue =
+            composefs::fsverity::compute_verity(b"fake-nonboot-v2");
+        let fake_nonboot_v1: Sha256HashValue =
+            composefs::fsverity::compute_verity(b"fake-nonboot-v1");
+        let fake_boot_v2: Sha256HashValue = composefs::fsverity::compute_verity(b"fake-boot-v2");
+        let fake_boot_v2_xattr: Sha256HashValue =
+            composefs::fsverity::compute_verity(b"fake-boot-v2-keepuser");
+        let fake_boot_v1: Sha256HashValue = composefs::fsverity::compute_verity(b"fake-boot-v1");
+
+        let mut boot_images = std::collections::HashMap::new();
+        boot_images.insert(Box::from(crate::BOOT_IMAGE_REF_KEY), fake_boot_v2.clone());
+        boot_images.insert(
+            Box::from(format!(
+                "{}.xattrs=keep-user-xattrs",
+                crate::BOOT_IMAGE_REF_KEY
+            )),
+            fake_boot_v2_xattr.clone(),
+        );
+        boot_images.insert(
+            Box::from(crate::BOOT_IMAGE_REF_KEY_V1),
+            fake_boot_v1.clone(),
+        );
+
+        let config_json = img.read_config_json(&repo).unwrap();
+        let (_, new_config_verity) = crate::write_config_raw(
+            repo,
+            &config_json,
+            img.layer_refs().clone(),
+            Some(&fake_nonboot_v2),
+            Some(&fake_nonboot_v1),
+            &boot_images,
+        )
+        .unwrap();
+
+        let manifest_json = img.read_manifest_json(&repo).unwrap();
+        let layer_verities: Vec<_> = img
+            .layer_refs()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        rewrite_manifest(
+            repo,
+            &manifest_json,
+            &manifest_digest,
+            &new_config_verity,
+            &layer_verities,
+            Some("cparts:v1"),
+        )
+        .unwrap();
+
+        let img2 = OciImage::open_ref(&repo, "cparts:v1").unwrap();
+
+        // Non-boot V2 → both V2 boot images
+        let mut v2_counterparts = img2.erofs_counterparts(&fake_nonboot_v2);
+        v2_counterparts.sort_by_key(|id| id.to_hex());
+        let mut expected_v2 = vec![&fake_boot_v2, &fake_boot_v2_xattr];
+        expected_v2.sort_by_key(|id| id.to_hex());
+        assert_eq!(v2_counterparts, expected_v2);
+
+        // Non-boot V1 → V1 boot image
+        assert_eq!(
+            img2.erofs_counterparts(&fake_nonboot_v1),
+            vec![&fake_boot_v1],
+        );
+
+        // Boot V2 → non-boot V2
+        assert_eq!(
+            img2.erofs_counterparts(&fake_boot_v2),
+            vec![&fake_nonboot_v2],
+        );
+
+        // Boot V2 (xattr variant) → non-boot V2
+        assert_eq!(
+            img2.erofs_counterparts(&fake_boot_v2_xattr),
+            vec![&fake_nonboot_v2],
+        );
+
+        // Boot V1 → non-boot V1
+        assert_eq!(
+            img2.erofs_counterparts(&fake_boot_v1),
+            vec![&fake_nonboot_v1],
+        );
+
+        // Unknown → empty
+        let unknown: Sha256HashValue = composefs::fsverity::compute_verity(b"unknown");
+        assert!(img2.erofs_counterparts(&unknown).is_empty());
+
+        // Repo-level extension trait: same results without loading OciImage
+        let mut repo_v2 = repo.erofs_counterparts(&fake_nonboot_v2).unwrap();
+        repo_v2.sort_by_key(|id| id.to_hex());
+        let mut expected_v2_owned = vec![fake_boot_v2.clone(), fake_boot_v2_xattr.clone()];
+        expected_v2_owned.sort_by_key(|id| id.to_hex());
+        assert_eq!(repo_v2, expected_v2_owned);
+
+        assert_eq!(
+            repo.erofs_counterparts(&fake_boot_v1).unwrap(),
+            vec![fake_nonboot_v1],
+        );
+        assert!(repo.erofs_counterparts(&unknown).is_err());
+    }
 }
