@@ -48,6 +48,8 @@ use rustix::fs::{AtFlags, Dir, Mode, OFlags, openat, readlinkat, unlinkat};
 use rustix::io::Errno;
 use serde::Serialize;
 
+use fn_error_context::context;
+
 use composefs::{
     erofs::format::{FormatEpoch, FormatVersion},
     fsverity::FsVerityHashValue,
@@ -381,6 +383,61 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
         })
     }
 
+    /// Given an EROFS image ObjectID (boot or non-boot), returns all
+    /// counterparts from the opposite category at the same epoch
+    ///
+    /// - Non-boot ref: returns the boot ref at the same epoch
+    /// - Boot ref: returns the non-boot ref at the same epoch
+    /// - Unknown `id`: returns an empty vec.
+    pub fn erofs_counterparts(&self, id: &ObjectID) -> Vec<&ObjectID> {
+        for (key, value) in &self.boot_image_refs {
+            if value != id {
+                continue;
+            }
+
+            let non_boot = if key.starts_with(crate::BOOT_IMAGE_REF_KEY_V1) {
+                self.image_ref_v1.as_ref()
+            } else {
+                self.image_ref.as_ref()
+            };
+
+            return non_boot.into_iter().collect();
+        }
+
+        // Non boot image passed in
+        if self.image_ref.as_ref() == Some(id) {
+            let mut v = vec![];
+
+            for (boot_img, id) in &self.boot_image_refs {
+                if boot_img.starts_with(crate::BOOT_IMAGE_REF_KEY_V1) {
+                    continue;
+                }
+
+                if !boot_img.starts_with(crate::BOOT_IMAGE_REF_KEY) {
+                    continue;
+                }
+
+                v.push(id);
+            }
+
+            return v;
+        }
+
+        if self.image_ref_v1.as_ref() == Some(id) {
+            let mut v = vec![];
+
+            for (boot_img, id) in &self.boot_image_refs {
+                if boot_img.starts_with(crate::BOOT_IMAGE_REF_KEY_V1) {
+                    v.push(id);
+                }
+            }
+
+            return v;
+        }
+
+        Vec::new()
+    }
+
     /// Reads the already-committed EROFS image for this OCI image back into a
     /// `FileSystem`, in-process — no kernel mount, and no re-walk of the OCI
     /// tar layers (this decodes the EROFS binary format directly via
@@ -590,6 +647,28 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
     }
 }
 
+/// Extension trait that adds OCI EROFS counterpart lookups to [`Repository`].
+pub trait RepositoryOciExt<ObjectID: FsVerityHashValue> {
+    /// Given an EROFS image ObjectID (boot or non-boot), scans all tagged OCI
+    /// images and returns every counterpart from the opposite category.
+    fn erofs_counterparts(&self, id: &ObjectID) -> Result<Vec<ObjectID>>;
+}
+
+impl<ObjectID: FsVerityHashValue> RepositoryOciExt<ObjectID> for Repository<ObjectID> {
+    fn erofs_counterparts(&self, id: &ObjectID) -> Result<Vec<ObjectID>> {
+        for (_, digest) in list_refs(self)? {
+            if let Ok(img) = OciImage::open(self, &digest, None) {
+                let counterparts = img.erofs_counterparts(id);
+                if !counterparts.is_empty() {
+                    return Ok(counterparts.into_iter().cloned().collect());
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!("No EORFS image found {}", id.to_hex()))
+    }
+}
+
 // =============================================================================
 // Reference Management (GC Roots)
 // =============================================================================
@@ -682,6 +761,7 @@ pub fn resolve_ref<ObjectID: FsVerityHashValue>(
 /// Lists all tagged OCI images.
 ///
 /// Returns (name, manifest_digest) pairs for each tag.
+#[context("Lising oci image refs")]
 pub fn list_refs<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
 ) -> Result<Vec<(String, OciDigest)>> {
