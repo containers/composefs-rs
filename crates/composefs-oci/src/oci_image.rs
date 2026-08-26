@@ -87,6 +87,57 @@ pub struct OciErofsNotFound {
     pub bootable: bool,
 }
 
+/// An EROFS image ref paired with metadata describing which variant it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkedErofsImage<ObjectID: FsVerityHashValue> {
+    /// The fs-verity hash of the EROFS image.
+    pub id: ObjectID,
+    /// Whether this is a boot-transformed image.
+    pub bootable: bool,
+    /// The EROFS format version.
+    pub version: FormatVersion,
+    /// The xattr filtering mode used to build this image.
+    /// `None` for non-boot images (xattr filtering only applies to
+    /// boot transforms).
+    pub xattr_mode: Option<XattrFiltering>,
+}
+
+impl<ObjectID: FsVerityHashValue> Serialize for LinkedErofsImage<ObjectID> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("LinkedErofsImage", 4)?;
+        st.serialize_field("id", &self.id.to_hex())?;
+        st.serialize_field("bootable", &self.bootable)?;
+        st.serialize_field("version", &self.version)?;
+        st.serialize_field(
+            "xattrMode",
+            &self.xattr_mode.as_ref().map(|m| m.to_string()),
+        )?;
+        st.end()
+    }
+}
+
+/// Parse a boot image ref key into (FormatVersion, XattrFiltering).
+///
+/// Keys look like:
+/// - `"composefs.image.boot"` -> (V2, AllowlistOnly)
+/// - `"composefs.image.boot.v1"` -> (V1, AllowlistOnly)
+/// - `"composefs.image.boot.xattrs=keep-user-xattrs"` -> (V2, KeepUserXattrs)
+/// - `"composefs.image.boot.v1.xattrs=keep-user-xattrs"` -> (V1, KeepUserXattrs)
+fn parse_boot_ref_key(key: &str) -> (FormatVersion, XattrFiltering) {
+    let is_v1 = key.starts_with(crate::BOOT_IMAGE_REF_KEY_V1);
+    let version = if is_v1 {
+        FormatVersion::V1
+    } else {
+        FormatVersion::V2
+    };
+    let mode = key
+        .split_once(".xattrs=")
+        .and_then(|(_, mode_str)| mode_str.parse().ok())
+        .unwrap_or(XattrFiltering::AllowlistOnly);
+    (version, mode)
+}
+
 /// Data and named refs from a splitstream with external object storage.
 type ExternalData<ObjectID> = (Vec<u8>, HashMap<Box<str>, ObjectID>);
 
@@ -383,59 +434,70 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
         })
     }
 
-    /// Given an EROFS image ObjectID (boot or non-boot), returns all
-    /// counterparts from the opposite category at the same epoch
+    /// Returns true if `id` matches any EROFS image ref (boot or non-boot)
+    /// stored in this OCI image.
+    pub fn has_erofs_id(&self, id: &ObjectID) -> bool {
+        if self.image_ref.as_ref() == Some(id) || self.image_ref_v1.as_ref() == Some(id) {
+            return true;
+        }
+        for value in self.boot_image_refs.values() {
+            if value == id {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns all EROFS image refs associated with this OCI image.
     ///
-    /// - Non-boot ref: returns the boot ref at the same epoch
-    /// - Boot ref: returns the non-boot ref at the same epoch
-    /// - Unknown `id`: returns an empty vec.
-    pub fn erofs_counterparts(&self, id: &ObjectID) -> Vec<&ObjectID> {
+    /// This includes both boot and non-boot variants across all format
+    /// versions and xattr filtering modes.
+    pub fn all_erofs_images(&self) -> Vec<LinkedErofsImage<ObjectID>> {
+        let mut result = Vec::new();
+
+        if let Some(id) = &self.image_ref {
+            result.push(LinkedErofsImage {
+                id: id.clone(),
+                bootable: false,
+                version: FormatVersion::V2,
+                // non-boot images aren't built with any xattr filtering
+                xattr_mode: None,
+            });
+        }
+
+        if let Some(id) = &self.image_ref_v1 {
+            result.push(LinkedErofsImage {
+                id: id.clone(),
+                bootable: false,
+                version: FormatVersion::V1,
+                // non-boot images aren't built with any xattr filtering
+                xattr_mode: None,
+            });
+        }
+
         for (key, value) in &self.boot_image_refs {
-            if value != id {
-                continue;
-            }
-
-            let non_boot = if key.starts_with(crate::BOOT_IMAGE_REF_KEY_V1) {
-                self.image_ref_v1.as_ref()
-            } else {
-                self.image_ref.as_ref()
-            };
-
-            return non_boot.into_iter().collect();
+            let (version, mode) = parse_boot_ref_key(key);
+            result.push(LinkedErofsImage {
+                id: value.clone(),
+                bootable: true,
+                version,
+                xattr_mode: Some(mode),
+            });
         }
 
-        // Non boot image passed in
-        if self.image_ref.as_ref() == Some(id) {
-            let mut v = vec![];
+        result
+    }
 
-            for (boot_img, id) in &self.boot_image_refs {
-                if boot_img.starts_with(crate::BOOT_IMAGE_REF_KEY_V1) {
-                    continue;
-                }
-
-                if !boot_img.starts_with(crate::BOOT_IMAGE_REF_KEY) {
-                    continue;
-                }
-
-                v.push(id);
-            }
-
-            return v;
+    /// Given an EROFS image ObjectID (boot or non-boot), returns all
+    /// EROFS image refs associated with the same OCI image
+    ///
+    /// Returns an empty vec if `id` does not match any known EROFS
+    /// image ref in this image
+    pub fn linked_erofs_images(&self, id: &ObjectID) -> Vec<LinkedErofsImage<ObjectID>> {
+        if !self.has_erofs_id(id) {
+            return Vec::new();
         }
-
-        if self.image_ref_v1.as_ref() == Some(id) {
-            let mut v = vec![];
-
-            for (boot_img, id) in &self.boot_image_refs {
-                if boot_img.starts_with(crate::BOOT_IMAGE_REF_KEY_V1) {
-                    v.push(id);
-                }
-            }
-
-            return v;
-        }
-
-        Vec::new()
+        self.all_erofs_images()
     }
 
     /// Reads the already-committed EROFS image for this OCI image back into a
@@ -651,21 +713,21 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
 pub trait RepositoryOciExt<ObjectID: FsVerityHashValue> {
     /// Given an EROFS image ObjectID (boot or non-boot), scans all tagged OCI
     /// images and returns every counterpart from the opposite category.
-    fn erofs_counterparts(&self, id: &ObjectID) -> Result<Vec<ObjectID>>;
+    fn linked_erofs_images(&self, id: &ObjectID) -> Result<Vec<LinkedErofsImage<ObjectID>>>;
 }
 
 impl<ObjectID: FsVerityHashValue> RepositoryOciExt<ObjectID> for Repository<ObjectID> {
-    fn erofs_counterparts(&self, id: &ObjectID) -> Result<Vec<ObjectID>> {
+    fn linked_erofs_images(&self, id: &ObjectID) -> Result<Vec<LinkedErofsImage<ObjectID>>> {
         for (_, digest) in list_refs(self)? {
             if let Ok(img) = OciImage::open(self, &digest, None) {
-                let counterparts = img.erofs_counterparts(id);
+                let counterparts = img.linked_erofs_images(id);
                 if !counterparts.is_empty() {
-                    return Ok(counterparts.into_iter().cloned().collect());
+                    return Ok(counterparts);
                 }
             }
         }
 
-        Err(anyhow::anyhow!("No EORFS image found {}", id.to_hex()))
+        Err(anyhow::anyhow!("No EROFS image found {}", id.to_hex()))
     }
 }
 
@@ -4099,7 +4161,7 @@ mod test {
     }
 
     #[test]
-    fn test_erofs_counterparts() {
+    fn test_linked_erofs_images() {
         let test_repo = TestRepo::<Sha256HashValue>::new();
         let repo = &test_repo.repo;
 
@@ -4159,53 +4221,71 @@ mod test {
         .unwrap();
 
         let img2 = OciImage::open_ref(&repo, "cparts:v1").unwrap();
+        use composefs::erofs::format::FormatVersion;
+        use composefs::generic_tree::XattrFiltering;
 
-        // Non-boot V2 → both V2 boot images
-        let mut v2_counterparts = img2.erofs_counterparts(&fake_nonboot_v2);
-        v2_counterparts.sort_by_key(|id| id.to_hex());
-        let mut expected_v2 = vec![&fake_boot_v2, &fake_boot_v2_xattr];
-        expected_v2.sort_by_key(|id| id.to_hex());
-        assert_eq!(v2_counterparts, expected_v2);
+        // Non-boot V2 -> both V2 boot images
+        let mut expected_all = vec![
+            LinkedErofsImage {
+                id: fake_nonboot_v2.clone(),
+                bootable: false,
+                version: FormatVersion::V2,
+                xattr_mode: None,
+            },
+            LinkedErofsImage {
+                id: fake_nonboot_v1.clone(),
+                bootable: false,
+                version: FormatVersion::V1,
+                xattr_mode: None,
+            },
+            LinkedErofsImage {
+                id: fake_boot_v2.clone(),
+                bootable: true,
+                version: FormatVersion::V2,
+                xattr_mode: Some(XattrFiltering::AllowlistOnly),
+            },
+            LinkedErofsImage {
+                id: fake_boot_v2_xattr.clone(),
+                bootable: true,
+                version: FormatVersion::V2,
+                xattr_mode: Some(XattrFiltering::KeepUserXattrs),
+            },
+            LinkedErofsImage {
+                id: fake_boot_v1.clone(),
+                bootable: true,
+                version: FormatVersion::V1,
+                xattr_mode: Some(XattrFiltering::AllowlistOnly),
+            },
+        ];
+        expected_all.sort_by_key(|c| c.id.to_hex());
 
-        // Non-boot V1 → V1 boot image
-        assert_eq!(
-            img2.erofs_counterparts(&fake_nonboot_v1),
-            vec![&fake_boot_v1],
-        );
+        // Any known ID returns the full set
+        for id in [
+            &fake_nonboot_v2,
+            &fake_nonboot_v1,
+            &fake_boot_v2,
+            &fake_boot_v2_xattr,
+            &fake_boot_v1,
+        ] {
+            let mut result = img2.linked_erofs_images(id);
+            result.sort_by_key(|c| c.id.to_hex());
+            assert_eq!(result, expected_all, "mismatch for id {}", id.to_hex());
+        }
 
-        // Boot V2 → non-boot V2
-        assert_eq!(
-            img2.erofs_counterparts(&fake_boot_v2),
-            vec![&fake_nonboot_v2],
-        );
-
-        // Boot V2 (xattr variant) → non-boot V2
-        assert_eq!(
-            img2.erofs_counterparts(&fake_boot_v2_xattr),
-            vec![&fake_nonboot_v2],
-        );
-
-        // Boot V1 → non-boot V1
-        assert_eq!(
-            img2.erofs_counterparts(&fake_boot_v1),
-            vec![&fake_nonboot_v1],
-        );
-
-        // Unknown → empty
+        // Unknown -> empty
         let unknown: Sha256HashValue = composefs::fsverity::compute_verity(b"unknown");
-        assert!(img2.erofs_counterparts(&unknown).is_empty());
+        assert!(img2.linked_erofs_images(&unknown).is_empty());
 
-        // Repo-level extension trait: same results without loading OciImage
-        let mut repo_v2 = repo.erofs_counterparts(&fake_nonboot_v2).unwrap();
-        repo_v2.sort_by_key(|id| id.to_hex());
-        let mut expected_v2_owned = vec![fake_boot_v2.clone(), fake_boot_v2_xattr.clone()];
-        expected_v2_owned.sort_by_key(|id| id.to_hex());
-        assert_eq!(repo_v2, expected_v2_owned);
+        // all_erofs_images returns the same set unconditionally
+        let mut all = img2.all_erofs_images();
+        all.sort_by_key(|c| c.id.to_hex());
+        assert_eq!(all, expected_all);
 
-        assert_eq!(
-            repo.erofs_counterparts(&fake_boot_v1).unwrap(),
-            vec![fake_nonboot_v1],
-        );
-        assert!(repo.erofs_counterparts(&unknown).is_err());
+        // Repo-level extension trait
+        let mut repo_result = repo.linked_erofs_images(&fake_boot_v2).unwrap();
+        repo_result.sort_by_key(|c| c.id.to_hex());
+        assert_eq!(repo_result, expected_all);
+
+        assert!(repo.linked_erofs_images(&unknown).is_err());
     }
 }

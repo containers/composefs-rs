@@ -554,9 +554,9 @@ enum OciCommand {
         #[clap(long, value_hint = clap::ValueHint::AnyPath)]
         address: Option<PathBuf>,
     },
-    /// Find boot/non-boot counterparts of an EROFS image
-    ErofsCounterparts {
-        /// Fsverity digest of an EROFS image
+    /// List all EROFS images linked to the same OCI image
+    LinkedErofsImages {
+        /// Hex fs-verity digest of an EROFS image
         verity: String,
     },
 }
@@ -2187,18 +2187,12 @@ where
             OciCommand::Varlink { .. } => {
                 unreachable!("oci varlink is handled before opening a repository");
             }
-            OciCommand::ErofsCounterparts { ref verity } => {
+            OciCommand::LinkedErofsImages { ref verity } => {
                 use composefs_oci::RepositoryOciExt;
                 let id = ObjectID::from_hex(verity)?;
-                let counterparts = repo.erofs_counterparts(&id)?;
-                if counterparts.is_empty() {
-                    println!("No counterparts found for {verity}");
-                    return Ok(());
-                }
-
-                for c in &counterparts {
-                    println!("{}", c.to_hex());
-                }
+                let images = repo.linked_erofs_images(&id)?;
+                serde_json::to_writer_pretty(std::io::stdout().lock(), &images)?;
+                println!();
             }
         },
         #[cfg(feature = "ostree")]
