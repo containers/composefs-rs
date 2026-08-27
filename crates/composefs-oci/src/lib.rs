@@ -143,8 +143,8 @@ pub use boot::{boot_image, remove_boot_image};
 pub use composefs::generic_tree::{OciTransformOptions, XattrFiltering};
 pub use oci_image::{
     ImageInfo, LayerInfo, LinkedErofsImage, OCI_REF_PREFIX, OciFsckError, OciFsckResult, OciImage,
-    OciImageNotFound, OciRefNotFound, RepositoryOciExt, SplitstreamInfo, add_referrer,
-    layer_dumpfile, layer_info, layer_tar, list_images, list_referrers, list_refs, oci_fsck,
+    OciImageNotFound, OciRefNotFound, SplitstreamInfo, add_referrer, layer_dumpfile, layer_info,
+    layer_tar, linked_erofs_images, list_images, list_referrers, list_refs, oci_fsck,
     oci_fsck_image, remove_referrer, remove_referrers_for_subject, resolve_ref, tag_image,
     untag_image,
 };
