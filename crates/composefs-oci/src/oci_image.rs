@@ -440,12 +440,7 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
         if self.image_ref.as_ref() == Some(id) || self.image_ref_v1.as_ref() == Some(id) {
             return true;
         }
-        for value in self.boot_image_refs.values() {
-            if value == id {
-                return true;
-            }
-        }
-        false
+        self.boot_image_refs.values().any(|v| v == id)
     }
 
     /// Returns all EROFS image refs associated with this OCI image.
@@ -709,26 +704,22 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
     }
 }
 
-/// Extension trait that adds OCI EROFS counterpart lookups to [`Repository`].
-pub trait RepositoryOciExt<ObjectID: FsVerityHashValue> {
-    /// Given an EROFS image ObjectID (boot or non-boot), scans all tagged OCI
-    /// images and returns every counterpart from the opposite category.
-    fn linked_erofs_images(&self, id: &ObjectID) -> Result<Vec<LinkedErofsImage<ObjectID>>>;
-}
-
-impl<ObjectID: FsVerityHashValue> RepositoryOciExt<ObjectID> for Repository<ObjectID> {
-    fn linked_erofs_images(&self, id: &ObjectID) -> Result<Vec<LinkedErofsImage<ObjectID>>> {
-        for (_, digest) in list_refs(self)? {
-            if let Ok(img) = OciImage::open(self, &digest, None) {
-                let counterparts = img.linked_erofs_images(id);
-                if !counterparts.is_empty() {
-                    return Ok(counterparts);
-                }
+/// Given an EROFS image ObjectID (boot or non-boot), scans all tagged OCI
+/// images and returns every counterpart from the opposite category.
+pub fn linked_erofs_images<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    id: &ObjectID,
+) -> Result<Vec<LinkedErofsImage<ObjectID>>> {
+    for (_, digest) in list_refs(repo)? {
+        if let Ok(img) = OciImage::open(repo, &digest, None) {
+            let counterparts = img.linked_erofs_images(id);
+            if !counterparts.is_empty() {
+                return Ok(counterparts);
             }
         }
-
-        Err(anyhow::anyhow!("No EROFS image found {}", id.to_hex()))
     }
+
+    Err(anyhow::anyhow!("No EROFS image found {}", id.to_hex()))
 }
 
 // =============================================================================
@@ -4282,10 +4273,10 @@ mod test {
         assert_eq!(all, expected_all);
 
         // Repo-level extension trait
-        let mut repo_result = repo.linked_erofs_images(&fake_boot_v2).unwrap();
+        let mut repo_result = linked_erofs_images(repo, &fake_boot_v2).unwrap();
         repo_result.sort_by_key(|c| c.id.to_hex());
         assert_eq!(repo_result, expected_all);
 
-        assert!(repo.linked_erofs_images(&unknown).is_err());
+        assert!(linked_erofs_images(repo, &unknown).is_err());
     }
 }

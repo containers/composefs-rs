@@ -2188,9 +2188,8 @@ where
                 unreachable!("oci varlink is handled before opening a repository");
             }
             OciCommand::LinkedErofsImages { ref verity } => {
-                use composefs_oci::RepositoryOciExt;
                 let id = ObjectID::from_hex(verity)?;
-                let images = repo.linked_erofs_images(&id)?;
+                let images = composefs_oci::linked_erofs_images(&repo, &id)?;
                 serde_json::to_writer_pretty(std::io::stdout().lock(), &images)?;
                 println!();
             }
