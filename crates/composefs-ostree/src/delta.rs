@@ -575,7 +575,9 @@ impl DeltaSuperblock {
                     obj_data.len()
                 );
                 let objects = obj_data
-                    .chunks_exact(OBJTYPE_CSUM_LEN)
+                    .as_chunks::<OBJTYPE_CSUM_LEN>()
+                    .0
+                    .iter()
                     .map(|chunk| {
                         let obj_type = ObjectType::from_byte(chunk[0])?;
                         let csum: Sha256Digest = chunk[1..33]
