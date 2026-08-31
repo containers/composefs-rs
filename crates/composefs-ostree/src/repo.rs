@@ -815,19 +815,27 @@ impl<ObjectID: FsVerityHashValue> OstreeRepo<ObjectID> for RemoteRepo<ObjectID> 
         let file_header: AlignedBuf = header_buf.into();
 
         let header = OstreeFileHeader::from_zlib_sized(&file_header)?;
+        let is_symlink = FileType::from_raw_mode(header.mode as rustix::fs::RawMode).is_symlink();
 
         let checksum = *checksum;
         let repo = self.repo.clone();
 
-        // Convert the async stream to a sync reader for decompression
-        let sync_reader = tokio_util::io::SyncIoBridge::new(reader);
-        let mut decompressor = DeflateDecoder::new(sync_reader);
+        if is_symlink {
+            tokio::task::spawn_blocking(move || {
+                hash_and_store_file(&repo, &header, file_header, &mut empty(), &checksum)
+            })
+            .await
+            .context("spawn_blocking failed")?
+        } else {
+            let sync_reader = tokio_util::io::SyncIoBridge::new(reader);
+            let mut decompressor = DeflateDecoder::new(sync_reader);
 
-        tokio::task::spawn_blocking(move || {
-            hash_and_store_file(&repo, &header, file_header, &mut decompressor, &checksum)
-        })
-        .await
-        .context("spawn_blocking failed")?
+            tokio::task::spawn_blocking(move || {
+                hash_and_store_file(&repo, &header, file_header, &mut decompressor, &checksum)
+            })
+            .await
+            .context("spawn_blocking failed")?
+        }
     }
 
     async fn try_pull_delta(
@@ -1214,8 +1222,17 @@ impl<ObjectID: FsVerityHashValue> LocalRepo<ObjectID> {
             file.read_exact(&mut v[header_size..])
         })?;
 
-        // Decompress rest
-        Ok((header_buf, Box::new(DeflateDecoder::new(file))))
+        // Symlink objects have no compressed content after the header.
+        // Wrapping an empty input in DeflateDecoder fails on some zlib
+        // implementations, so return an empty reader in that case.
+        let file_len = file.metadata()?.len();
+        let header_total = (header_size + variant_size) as u64;
+
+        if header_total >= file_len {
+            Ok((header_buf, Box::new(empty())))
+        } else {
+            Ok((header_buf, Box::new(DeflateDecoder::new(file))))
+        }
     }
 }
 
