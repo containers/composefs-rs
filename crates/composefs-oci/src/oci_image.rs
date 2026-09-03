@@ -710,7 +710,31 @@ pub fn linked_erofs_images<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     id: &ObjectID,
 ) -> Result<Vec<LinkedErofsImage<ObjectID>>> {
-    for (_, digest) in list_refs(repo)? {
+    // In bootc, we untag the image as a precursor to GC
+    // so we need to read the actual OCI manifests and not
+    // rely on refs
+    let streams_dir_fd = rustix::fs::openat(
+        repo.repo_fd(),
+        "streams",
+        OFlags::RDONLY | OFlags::DIRECTORY,
+        rustix::fs::Mode::empty(),
+    )?;
+
+    for stream in Dir::read_from(streams_dir_fd).context("Reading from streams directory")? {
+        let stream = stream.context("Reading stream entry")?;
+        let filename = stream
+            .file_name()
+            .to_str()
+            .context("Filename is not valid UTF-8")?;
+
+        let Some(img_sha) = filename.strip_prefix("oci-manifest-") else {
+            continue;
+        };
+
+        let digest: OciDigest = img_sha
+            .parse()
+            .with_context(|| format!("Parsing {img_sha} as OciDigest"))?;
+
         if let Ok(img) = OciImage::open(repo, &digest, None) {
             let counterparts = img.linked_erofs_images(id);
             if !counterparts.is_empty() {
