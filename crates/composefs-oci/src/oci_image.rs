@@ -716,7 +716,7 @@ pub fn linked_erofs_images<ObjectID: FsVerityHashValue>(
     let streams_dir_fd = rustix::fs::openat(
         repo.repo_fd(),
         "streams",
-        OFlags::RDONLY | OFlags::DIRECTORY,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::DIRECTORY,
         rustix::fs::Mode::empty(),
     )?;
 
