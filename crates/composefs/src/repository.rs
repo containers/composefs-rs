@@ -3033,7 +3033,10 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         mode: GCCategoryWalkMode,
     ) -> Result<Vec<(ObjectID, String)>> {
         let Some(category_fd) = self
-            .openat(category, OFlags::RDONLY | OFlags::DIRECTORY)
+            .openat(
+                category,
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::DIRECTORY,
+            )
             .filter_errno(Errno::NOENT)
             .context(format!("Opening {category} dir in repository"))?
         else {
@@ -3148,7 +3151,10 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     #[context("Cleaning up broken links in {category} category")]
     fn cleanup_gc_category(&self, category: &'static str, dry_run: bool) -> Result<u64> {
         let Some(category_fd) = self
-            .openat(category, OFlags::RDONLY | OFlags::DIRECTORY)
+            .openat(
+                category,
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::DIRECTORY,
+            )
             .filter_errno(Errno::NOENT)
             .context(format!("Opening {category} dir in repository"))?
         else {
@@ -3570,7 +3576,10 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         let is_streams = category == "streams";
 
         let Some(category_fd) = self
-            .openat(category, OFlags::RDONLY | OFlags::DIRECTORY)
+            .openat(
+                category,
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::DIRECTORY,
+            )
             .filter_errno(Errno::NOENT)
             .with_context(|| format!("Opening {category} directory"))?
         else {

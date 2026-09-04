@@ -165,7 +165,7 @@ fn resolve_commit_prefix<ObjectID: FsVerityHashValue>(
     let dir_fd = rustix::fs::openat(
         repo.repo_fd(),
         "streams",
-        OFlags::RDONLY | OFlags::DIRECTORY,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::DIRECTORY,
         rustix::fs::Mode::empty(),
     )?;
     let mut match_name: Option<String> = None;
@@ -275,7 +275,7 @@ fn list_local_commit_ids<ObjectID: FsVerityHashValue>(
     let dir_fd = rustix::fs::openat(
         repo.repo_fd(),
         "streams",
-        OFlags::RDONLY | OFlags::DIRECTORY,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::DIRECTORY,
         rustix::fs::Mode::empty(),
     )?;
     let mut ids = HashSet::new();
