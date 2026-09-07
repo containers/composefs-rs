@@ -1276,6 +1276,7 @@ mod tests {
     /// generate the boot EROFS variant, rather than skipping generation just
     /// because the plain EROFS is already present (see the comment above the
     /// `needs_generation` check in `finalize_oci_image`).
+    #[cfg(feature = "boot")]
     #[tokio::test]
     async fn test_finalize_oci_image_generates_boot_on_reimport() {
         let (repo, _tempdir) = create_test_repo();
