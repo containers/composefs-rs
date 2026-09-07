@@ -24,7 +24,9 @@ use std::thread::available_parallelism;
 
 use anyhow::{Context, Result};
 use cap_std_ext::cap_std;
-use containers_image_proxy::oci_spec::image::{Descriptor, Digest as OciDigest, MediaType};
+use containers_image_proxy::oci_spec::image::{
+    Descriptor, Digest as OciDigest, ImageManifest, MediaType,
+};
 use fn_error_context::context;
 use ocidir::{OciDir, OciRead, ResolvedManifest};
 use tokio::io::{AsyncRead, DuplexStream, ReadBuf};
@@ -95,6 +97,31 @@ impl AsyncRead for BlockingReader {
     }
 }
 
+/// Check if an OCI layout contains a single delta artifact manifest.
+///
+/// Anything that isn't a parseable image manifest is simply not a delta and
+/// will be handled by the regular codepath.
+fn detect_delta_manifest(oci: &impl OciRead) -> Result<Option<ImageManifest>> {
+    let index = oci.read_index()?;
+    let [desc] = index.manifests().as_slice() else {
+        return Ok(None);
+    };
+    if desc.media_type() != &MediaType::ImageManifest {
+        return Ok(None);
+    }
+
+    let mut manifest_data = Vec::new();
+    oci.read_blob(desc)?.read_to_end(&mut manifest_data)?;
+    match ImageManifest::from_reader(&manifest_data[..]) {
+        Ok(manifest) if crate::delta::is_delta_artifact(&manifest) => Ok(Some(manifest)),
+        Ok(_) => Ok(None),
+        Err(err) => {
+            debug!("Ignoring unparseable manifest {}: {err}", desc.digest());
+            Ok(None)
+        }
+    }
+}
+
 /// Parse an OCI layout reference like "/path/to/dir:tag" or "/path/to/dir".
 ///
 /// Returns (path, optional_tag).
@@ -145,24 +172,11 @@ pub async fn import_oci_layout<ObjectID: FsVerityHashValue>(
         .with_context(|| format!("Opening OCI layout directory {}", layout_path.display()))?;
     let ocidir = OciDir::open(dir).context("Opening OCI directory")?;
 
-    // Check for delta artifact before platform resolution (deltas lack
-    // platform info and would fail the platform filter). Only check
-    // single-manifest layouts since deltas are always single-manifest.
-    if let Ok(index) = ocidir.read_index()
-        && index.manifests().len() == 1
-    {
-        let desc = &index.manifests()[0];
-        let mut manifest_data = Vec::new();
-        ocidir.read_blob(desc)?.read_to_end(&mut manifest_data)?;
-        let manifest = containers_image_proxy::oci_spec::image::ImageManifest::from_reader(
-            &manifest_data[..],
-        )?;
-        if crate::delta::is_delta_artifact(&manifest) {
-            let blob_reader = Arc::new(OciDirBlobReader(ocidir));
-            let (result, stats) =
-                crate::delta::import_delta(repo, &manifest, blob_reader, &reporter, None).await?;
-            return Ok((result, stats));
-        }
+    if let Some(manifest) = detect_delta_manifest(&ocidir)? {
+        let blob_reader = Arc::new(OciDirBlobReader(ocidir));
+        let (result, stats) =
+            crate::delta::import_delta(repo, &manifest, blob_reader, &reporter, None).await?;
+        return Ok((result, stats));
     }
 
     // Resolve the manifest, with fallback for images lacking platform annotations
