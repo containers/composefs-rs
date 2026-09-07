@@ -19,6 +19,8 @@ use containers_image_proxy::{
 };
 use fn_error_context::context;
 
+use crate::oci_layout::OciLayoutKind;
+
 use rustix::process::geteuid;
 use tokio::{io::AsyncReadExt, sync::Semaphore, task::JoinSet};
 
@@ -589,11 +591,27 @@ pub async fn pull_image<ObjectID: FsVerityHashValue>(
     let image_ref =
         ImageReference::try_from(imgref).context("Parsing image reference transport")?;
 
-    // Fast path: read local OCI layout directories directly without skopeo
-    let (result, stats) = if image_ref.transport == Transport::OciDir {
+    // Fast path: read local OCI layout directories and archives directly without skopeo
+    let kind = match image_ref.transport {
+        Transport::OciDir => Some(OciLayoutKind::Directory),
+        Transport::OciArchive => Some(OciLayoutKind::Archive),
+        _ => None,
+    };
+    let oci_layout = kind.and_then(|kind| {
         let (path_str, layout_tag) = crate::oci_layout::parse_oci_layout_ref(&image_ref.name);
         let layout_path = std::path::Path::new(path_str);
-        crate::oci_layout::import_oci_layout(repo, layout_path, layout_tag, reporter).await?
+        // A compressed oci-archive is only readable via the proxy, which
+        // decompresses it for us.  A path that doesn't exist stays on the
+        // direct path so the error names the file, rather than surfacing as a
+        // skopeo failure.
+        let needs_proxy = kind == OciLayoutKind::Archive
+            && layout_path.exists()
+            && !crate::oci_layout::is_uncompressed_tar(layout_path);
+        (!needs_proxy).then_some((kind, layout_path, layout_tag))
+    });
+
+    let (result, stats) = if let Some((kind, layout_path, layout_tag)) = oci_layout {
+        crate::oci_layout::import_oci_layout(repo, kind, layout_path, layout_tag, reporter).await?
     } else {
         // Standard path: use skopeo proxy for other transports
         let op = Arc::new(ImageOp::new(repo, &image_ref, img_proxy_config, reporter).await?);
