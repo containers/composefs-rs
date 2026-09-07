@@ -1112,6 +1112,7 @@ fn ensure_oci_composefs_erofs_boot<ObjectID: FsVerityHashValue>(
 
 #[cfg(test)]
 mod test {
+    use crate::oci_layout::OciLayoutKind;
     use std::{fmt::Write, io::Read};
 
     use rustix::fs::CWD;
@@ -2555,6 +2556,55 @@ mod test {
         oci_dir
     }
 
+    /// A gzip-compressed `oci-archive:` is not readable by the direct
+    /// `OciArchive` fast path, but containers/image decompresses it
+    /// transparently, so the pull must fall back to the skopeo proxy.
+    #[tokio::test]
+    async fn test_compressed_oci_archive_falls_back_to_proxy() {
+        use composefs::fsverity::Sha256HashValue;
+        use composefs::test::TestRepo;
+
+        if std::process::Command::new("skopeo")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: skopeo not found in PATH");
+            return;
+        }
+
+        let layout = crate::test_util::build_oci_layout(&["\
+            /usr 0 40755 2 0 0 0 0.0 - - -\n\
+            /usr/bin 0 40755 2 0 0 0 0.0 - - -\n\
+            /usr/bin/hello 21 100755 1 0 0 0 0.0 - #!/bin/sh\\necho\\x20hello\\n -\n"]);
+        let layout_path = layout.path();
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let archive_path = tempdir.path().join("image.tar.gz");
+        let encoder = flate2::write::GzEncoder::new(
+            std::fs::File::create(&archive_path).unwrap(),
+            flate2::Compression::default(),
+        );
+        let mut builder = ::tar::Builder::new(encoder);
+        builder.append_dir_all(".", layout_path).unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+
+        assert!(!crate::oci_layout::is_uncompressed_tar(&archive_path));
+
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let reporter: crate::progress::SharedReporter = std::sync::Arc::new(crate::NullReporter);
+        skopeo::pull_image(
+            &test_repo.repo,
+            &format!("oci-archive:{}", archive_path.display()),
+            None,
+            None,
+            reporter,
+            None,
+        )
+        .await
+        .expect("pulling a gzipped oci-archive");
+    }
+
     /// Pulling a fresh OCI layout image (no prior cache) must emit at least one
     /// `Started` event per layer and a matching `Done` event, via the
     /// `import_oci_layout` fast path.
@@ -2579,7 +2629,7 @@ mod test {
         let reporter: crate::progress::SharedReporter =
             std::sync::Arc::clone(&recorder) as crate::progress::SharedReporter;
 
-        import_oci_layout(repo, &layout_path, None, reporter)
+        import_oci_layout(repo, OciLayoutKind::Directory, &layout_path, None, reporter)
             .await
             .expect("import_oci_layout should succeed");
 
@@ -2639,7 +2689,7 @@ mod test {
 
         // First import (populates cache)
         let null: crate::progress::SharedReporter = std::sync::Arc::new(NullReporter);
-        import_oci_layout(repo, &layout_path, None, null)
+        import_oci_layout(repo, OciLayoutKind::Directory, &layout_path, None, null)
             .await
             .expect("first import should succeed");
 
@@ -2647,7 +2697,7 @@ mod test {
         let recorder = std::sync::Arc::new(RecordingReporter::new());
         let reporter: crate::progress::SharedReporter =
             std::sync::Arc::clone(&recorder) as crate::progress::SharedReporter;
-        import_oci_layout(repo, &layout_path, None, reporter)
+        import_oci_layout(repo, OciLayoutKind::Directory, &layout_path, None, reporter)
             .await
             .expect("second import should succeed");
 
@@ -2691,7 +2741,7 @@ mod test {
 
         // NullReporter: zero overhead, no events collected
         let reporter: crate::progress::SharedReporter = std::sync::Arc::new(NullReporter);
-        import_oci_layout(repo, &layout_path, None, reporter)
+        import_oci_layout(repo, OciLayoutKind::Directory, &layout_path, None, reporter)
             .await
             .expect("import_oci_layout with NullReporter should not panic");
     }

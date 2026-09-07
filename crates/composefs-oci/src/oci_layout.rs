@@ -28,7 +28,8 @@ use containers_image_proxy::oci_spec::image::{
     Descriptor, Digest as OciDigest, ImageManifest, MediaType,
 };
 use fn_error_context::context;
-use ocidir::{OciDir, OciRead, ResolvedManifest};
+use ocidir::prelude::*;
+use ocidir::{OciArchive, OciDir, ResolvedManifest};
 use tokio::io::{AsyncRead, DuplexStream, ReadBuf};
 use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinSet;
@@ -145,22 +146,50 @@ pub(crate) fn parse_oci_layout_ref(imgref: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// The `ustar` magic of a POSIX or GNU tar header, and its offset in the header.
+const TAR_MAGIC: &[u8; 5] = b"ustar";
+const TAR_MAGIC_OFFSET: u64 = 257;
+
+/// Is `path` an uncompressed tar archive?
+pub(crate) fn is_uncompressed_tar(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = [0u8; TAR_MAGIC.len()];
+    std::os::unix::fs::FileExt::read_exact_at(&file, &mut buf, TAR_MAGIC_OFFSET).is_ok()
+        && &buf == TAR_MAGIC
+}
+
 /// Resolve a manifest from an OCI layout directory for the current platform.
-fn resolve_manifest(ocidir: &OciDir, tag: Option<&str>) -> Result<ResolvedManifest> {
-    ocidir
-        .open_image_this_platform(tag)
+fn resolve_manifest<T: OciRead + Send + Sync>(
+    oci: &T,
+    tag: Option<&str>,
+) -> Result<ResolvedManifest> {
+    oci.open_image_this_platform(tag)
         .context("Resolving manifest for platform")
 }
 
-/// Import an image from a local OCI layout directory.
+/// Whether a layout path is an `oci:` directory or an `oci-archive:` tarball.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OciLayoutKind {
+    /// An `oci:` layout directory.
+    Directory,
+    /// An `oci-archive:` tarball.
+    Archive,
+}
+
+/// Import an image from a local OCI layout directory or archive.
 ///
-/// This is the fast path for `oci:` transport references. It reads the OCI
-/// layout directly without going through skopeo. Progress events are emitted
+/// This is the fast path for `oci:` and uncompressed `oci-archive:` transport
+/// references. It reads the layout directly without going through skopeo.
+/// Progress events are emitted
 /// via `reporter` using the same `Started`/`Done`/`Skipped` lifecycle as the
 /// skopeo path.
 #[context("Importing OCI layout from {}", layout_path.display())]
 pub async fn import_oci_layout<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
+    kind: OciLayoutKind,
     layout_path: &Path,
     layout_tag: Option<&str>,
     reporter: SharedReporter,
@@ -169,20 +198,38 @@ pub async fn import_oci_layout<ObjectID: FsVerityHashValue>(
     // a clear "not writable" error rather than a misleading source-open error.
     repo.ensure_writable()?;
 
-    // Open the OCI layout directory
-    let dir = cap_std::fs::Dir::open_ambient_dir(layout_path, cap_std::ambient_authority())
-        .with_context(|| format!("Opening OCI layout directory {}", layout_path.display()))?;
-    let ocidir = OciDir::open(dir).context("Opening OCI directory")?;
+    match kind {
+        OciLayoutKind::Archive => {
+            let oci = OciArchive::open(layout_path)
+                .with_context(|| format!("Opening OCI archive {}", layout_path.display()))?;
+            import_opened_layout(repo, oci, layout_tag, reporter).await
+        }
+        OciLayoutKind::Directory => {
+            let dir = cap_std::fs::Dir::open_ambient_dir(layout_path, cap_std::ambient_authority())
+                .with_context(|| {
+                    format!("Opening OCI layout directory {}", layout_path.display())
+                })?;
+            let oci = OciDir::open(dir).context("Opening OCI directory")?;
+            import_opened_layout(repo, oci, layout_tag, reporter).await
+        }
+    }
+}
 
-    if let Some(manifest) = detect_delta_manifest(&ocidir)? {
-        let blob_reader = Arc::new(OciBlobReader(ocidir));
-        let (result, stats) =
-            crate::delta::import_delta(repo, &manifest, blob_reader, &reporter, None).await?;
-        return Ok((result, stats));
+/// Import from any opened [`OciRead`] backend, as either a delta artifact or a
+/// plain image.
+async fn import_opened_layout<ObjectID: FsVerityHashValue, T: OciRead + Send + Sync + 'static>(
+    repo: &Arc<Repository<ObjectID>>,
+    oci: T,
+    tag: Option<&str>,
+    reporter: SharedReporter,
+) -> Result<(PullResult<ObjectID>, ImportStats)> {
+    if let Some(manifest) = detect_delta_manifest(&oci)? {
+        let blob_reader = Arc::new(OciBlobReader(oci));
+        return crate::delta::import_delta(repo, &manifest, blob_reader, &reporter, None).await;
     }
 
     // Resolve the manifest, with fallback for images lacking platform annotations
-    let resolved = resolve_manifest(&ocidir, layout_tag)?;
+    let resolved = resolve_manifest(&oci, tag)?;
 
     let manifest = resolved.manifest;
     let manifest_descriptor = &resolved.manifest_descriptor;
@@ -196,7 +243,7 @@ pub async fn import_oci_layout<ObjectID: FsVerityHashValue>(
         layers.len()
     )));
     let (config_digest, config_verity, layer_refs, stats) =
-        import_config_and_layers(repo, &ocidir, layers, config_descriptor, &reporter)
+        import_config_and_layers(repo, &oci, layers, config_descriptor, &reporter)
             .await
             .with_context(|| format!("Failed to import config {}", config_descriptor.digest()))?;
 
@@ -221,8 +268,7 @@ pub async fn import_oci_layout<ObjectID: FsVerityHashValue>(
         }
 
         let mut raw_manifest = Vec::with_capacity(manifest_descriptor.size() as usize);
-        ocidir
-            .read_blob(manifest_descriptor)
+        oci.read_blob(manifest_descriptor)
             .context("Reading raw manifest bytes")?
             .read_to_end(&mut raw_manifest)?;
         splitstream.write_external(&raw_manifest)?;
@@ -245,9 +291,9 @@ pub async fn import_oci_layout<ObjectID: FsVerityHashValue>(
 /// Returns (config_digest, config_verity, layer_refs, stats).
 /// `layer_refs` is an ordered Vec of (diff_id, verity) pairs preserving the
 /// order from the config (or manifest for artifacts).
-async fn import_config_and_layers<ObjectID: FsVerityHashValue>(
+async fn import_config_and_layers<ObjectID: FsVerityHashValue, T: OciRead + Send + Sync>(
     repo: &Arc<Repository<ObjectID>>,
-    ocidir: &OciDir,
+    oci: &T,
     manifest_layers: &[Descriptor],
     config_descriptor: &Descriptor,
     reporter: &SharedReporter,
@@ -306,8 +352,7 @@ async fn import_config_and_layers<ObjectID: FsVerityHashValue>(
     // and parse diff_ids from the same buffer via as_slice().
     debug!("Reading config {config_digest}");
     let mut raw_config = Vec::with_capacity(config_descriptor.size() as usize);
-    ocidir
-        .read_blob(config_descriptor)
+    oci.read_blob(config_descriptor)
         .context("Reading config blob")?
         .read_to_end(&mut raw_config)?;
     let diff_ids = crate::extract_diff_ids(
@@ -330,7 +375,7 @@ async fn import_config_and_layers<ObjectID: FsVerityHashValue>(
         let permit = Arc::clone(&sem).acquire_owned().await?;
         let reporter = Arc::clone(reporter);
 
-        let layer_reader = ocidir
+        let layer_reader = oci
             .read_blob(descriptor)
             .with_context(|| format!("Opening layer blob {}", descriptor.digest()))?;
 
@@ -546,6 +591,33 @@ mod tests {
     }
 
     #[test]
+    fn test_is_uncompressed_tar() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tar = crate::test_util::dumpfile_to_tar(
+            "/ 0 40755 2 0 0 0 0.0 - - -\n\
+             /foo 0 100644 1 0 0 0 0.0 - - -\n",
+        );
+
+        let plain = dir.path().join("plain.tar");
+        std::fs::write(&plain, &tar).unwrap();
+        assert!(is_uncompressed_tar(&plain));
+
+        let gzipped = dir.path().join("compressed.tar.gz");
+        let mut encoder = flate2::write::GzEncoder::new(
+            std::fs::File::create(&gzipped).unwrap(),
+            flate2::Compression::default(),
+        );
+        encoder.write_all(&tar).unwrap();
+        encoder.finish().unwrap();
+        assert!(!is_uncompressed_tar(&gzipped));
+
+        assert!(!is_uncompressed_tar(&dir.path().join("does-not-exist.tar")));
+        assert!(!is_uncompressed_tar(dir.path()));
+    }
+
+    #[test]
     fn test_parse_oci_layout_ref() {
         let cases: &[(&str, (&str, Option<&str>))] = &[
             ("/path/to/oci", ("/path/to/oci", None)),
@@ -571,6 +643,35 @@ mod tests {
         ];
         for (input, expected) in cases {
             assert_eq!(parse_oci_layout_ref(input), *expected, "input: {input}");
+        }
+    }
+
+    /// A missing path must be reported as the kind the caller asked for,
+    /// rather than being silently treated as the other kind.
+    #[tokio::test]
+    async fn test_missing_path_reports_requested_kind() {
+        use composefs::fsverity::Sha256HashValue;
+        use composefs::test::TestRepo;
+
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let missing = std::path::Path::new("/does/not/exist");
+
+        let cases = [
+            (OciLayoutKind::Archive, "Opening OCI archive"),
+            (OciLayoutKind::Directory, "Opening OCI layout directory"),
+        ];
+        for (kind, expected) in cases {
+            let err = import_oci_layout(
+                &test_repo.repo,
+                kind,
+                missing,
+                None,
+                std::sync::Arc::new(NullReporter),
+            )
+            .await
+            .expect_err("should fail on a missing path");
+            let err = format!("{err:#}");
+            assert!(err.contains(expected), "{kind:?}: unexpected error: {err}");
         }
     }
 
@@ -631,7 +732,8 @@ mod tests {
         let repo = std::sync::Arc::new(repo);
 
         let reporter = std::sync::Arc::new(NullReporter);
-        let result = import_oci_layout(&repo, layout_path, None, reporter).await;
+        let result =
+            import_oci_layout(&repo, OciLayoutKind::Directory, layout_path, None, reporter).await;
         let err = result.expect_err("should fail with no matching platform");
         let err_msg = format!("{err:#}");
         assert!(

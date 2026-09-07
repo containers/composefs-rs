@@ -796,6 +796,7 @@ pub(crate) async fn import_delta<ObjectID: FsVerityHashValue>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oci_layout::OciLayoutKind;
     use composefs::fsverity::Sha256HashValue;
     use composefs::test::TestRepo;
     use std::path::PathBuf;
@@ -1082,10 +1083,15 @@ mod tests {
         layout_dir: &Path,
     ) -> (OciDigest, OciDigest) {
         let reporter: SharedReporter = Arc::new(crate::NullReporter);
-        let (pull_result, _stats) =
-            crate::oci_layout::import_oci_layout(repo, layout_dir, None, reporter)
-                .await
-                .expect("importing OCI layout");
+        let (pull_result, _stats) = crate::oci_layout::import_oci_layout(
+            repo,
+            OciLayoutKind::Directory,
+            layout_dir,
+            None,
+            reporter,
+        )
+        .await
+        .expect("importing OCI layout");
 
         crate::ensure_oci_composefs_erofs(
             repo,
@@ -1263,13 +1269,6 @@ mod tests {
         assert_eq!(delta_config, target_config, "config digest mismatch");
     }
 
-    fn have_skopeo() -> bool {
-        std::process::Command::new("skopeo")
-            .arg("--version")
-            .output()
-            .is_ok()
-    }
-
     fn tar_oci_layout(layout_dir: &Path) -> tempfile::NamedTempFile {
         let archive = tempfile::NamedTempFile::new().expect("creating archive tempfile");
         let status = std::process::Command::new("tar")
@@ -1289,17 +1288,13 @@ mod tests {
         let Some(oci_delta_bin) = have_oci_delta(OciDeltaFeatures::empty()) else {
             return;
         };
-        if !have_skopeo() {
-            eprintln!("skipping: skopeo not found in PATH");
-            return;
-        }
         let (source, target, delta) = build_test_fixtures(&oci_delta_bin);
 
         let test_repo = TestRepo::<Sha256HashValue>::new();
         let repo = &test_repo.repo;
         let reporter: SharedReporter = Arc::new(crate::NullReporter);
 
-        // Pull source via oci-archive: (through skopeo)
+        // Pull source via oci-archive:
         let source_archive = tar_oci_layout(source.path());
         let source_ref = format!("oci-archive:{}", source_archive.path().display());
         crate::pull(
