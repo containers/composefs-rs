@@ -614,14 +614,16 @@ pub(crate) async fn import_delta<ObjectID: FsVerityHashValue>(
         );
     }
 
-    let source_config = crate::open_config(repo, &parsed.source_config_digest, None)?;
-    let erofs_id = source_config.image_ref.with_context(|| {
-        format!(
-            "Source image (config {}) exists but has no EROFS image. \
+    let erofs_version = repo.erofs_version();
+    let erofs_id =
+        crate::composefs_erofs_for_config(repo, &parsed.source_config_digest, None, erofs_version)?
+            .with_context(|| {
+                format!(
+                    "Source image (config {}) exists but has no {erofs_version:?} EROFS image. \
              Try re-pulling the base image with a current version of cfsctl.",
-            parsed.source_config_digest,
-        )
-    })?;
+                    parsed.source_config_digest,
+                )
+            })?;
 
     // Build the shared file index from the source image's EROFS
     reporter.report(ProgressEvent::Message(
