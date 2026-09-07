@@ -32,7 +32,7 @@ jobs:
       options: "--privileged --pid=host -v /var/tmp:/var/tmp --tmpfs /tmp:rw,exec,nosuid,nodev -v /:/run/host"
 
     steps:
-    - run: dnf -y install cargo clippy composefs-devel e2fsprogs fsverity-utils just ostree rustfmt gcc-c++
+    - run: dnf -y install cargo clippy composefs-devel e2fsprogs fsverity-utils just oci-delta ostree rustfmt gcc-c++
     - name: Enable fs-verity on /
       run: tune2fs -O verity $(findmnt -vno SOURCE /run/host)
     - uses: actions/checkout@v7
