@@ -38,7 +38,9 @@ use tracing::debug;
 use composefs::fsverity::FsVerityHashValue;
 use composefs::repository::{ObjectStoreMethod, Repository};
 
-use crate::layer::{decompress_async, import_tar_async, is_tar_media_type, store_blob_async};
+use crate::layer::{
+    BlobStream, decompress_async, import_tar_async, is_tar_media_type, store_blob_async,
+};
 use crate::oci_image::manifest_identifier;
 use crate::progress::{ComponentId, ProgressEvent, ProgressRead, ProgressUnit, SharedReporter};
 use crate::skopeo::OCI_BLOB_CONTENT_TYPE;
@@ -173,7 +175,7 @@ pub async fn import_oci_layout<ObjectID: FsVerityHashValue>(
     let ocidir = OciDir::open(dir).context("Opening OCI directory")?;
 
     if let Some(manifest) = detect_delta_manifest(&ocidir)? {
-        let blob_reader = Arc::new(OciDirBlobReader(ocidir));
+        let blob_reader = Arc::new(OciBlobReader(ocidir));
         let (result, stats) =
             crate::delta::import_delta(repo, &manifest, blob_reader, &reporter, None).await?;
         return Ok((result, stats));
@@ -250,7 +252,7 @@ async fn import_config_and_layers<ObjectID: FsVerityHashValue>(
     config_descriptor: &Descriptor,
     reporter: &SharedReporter,
 ) -> Result<(OciDigest, ObjectID, Vec<(OciDigest, ObjectID)>, ImportStats)> {
-    let config_digest: OciDigest = config_descriptor.digest().clone();
+    let config_digest = config_descriptor.digest().clone();
     let content_id = config_identifier(&config_digest);
 
     if let Some(config_id) = repo.has_stream(&content_id)? {
@@ -328,7 +330,7 @@ async fn import_config_and_layers<ObjectID: FsVerityHashValue>(
         let permit = Arc::clone(&sem).acquire_owned().await?;
         let reporter = Arc::clone(reporter);
 
-        let layer_file = ocidir
+        let layer_reader = ocidir
             .read_blob(descriptor)
             .with_context(|| format!("Opening layer blob {}", descriptor.digest()))?;
 
@@ -337,10 +339,10 @@ async fn import_config_and_layers<ObjectID: FsVerityHashValue>(
 
         layer_tasks.spawn(async move {
             let _permit = permit;
-            let (verity, layer_stats) = import_layer_from_file(
+            let (verity, layer_stats) = import_layer_from_blob(
                 &repo,
                 &diff_id,
-                layer_file,
+                layer_reader,
                 &media_type,
                 layer_size,
                 &reporter,
@@ -388,13 +390,13 @@ async fn import_config_and_layers<ObjectID: FsVerityHashValue>(
     Ok((config_digest, config_id, layer_refs, stats))
 }
 
-/// Import a single layer by streaming from a file handle.
+/// Import a single layer by streaming from a blob reader.
 ///
 /// Emits `Started`/`Done` (or `Skipped`) progress events via `reporter`.
-async fn import_layer_from_file<ObjectID: FsVerityHashValue>(
+async fn import_layer_from_blob<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     diff_id: &OciDigest,
-    layer_file: std::fs::File,
+    layer_reader: impl BlobStream + 'static,
     media_type: &MediaType,
     layer_size: u64,
     reporter: &SharedReporter,
@@ -422,7 +424,7 @@ async fn import_layer_from_file<ObjectID: FsVerityHashValue>(
     // The watch channel provides backpressure: if the renderer is slow, intermediate
     // byte counts are coalesced rather than queued, keeping the I/O path non-blocking.
     let (async_file, progress_driver) = ProgressRead::new(
-        tokio::fs::File::from_std(layer_file),
+        BlockingReader::new(layer_reader),
         Arc::clone(reporter),
         id.clone(),
         Some(layer_size),
@@ -479,24 +481,17 @@ async fn import_layer_from_file<ObjectID: FsVerityHashValue>(
     Ok((object_id, layer_stats))
 }
 
-/// Blob reader backed by an OCI layout directory.
-struct OciDirBlobReader(OciDir);
+/// Blob reader that owns an [`OciRead`] backend, for use with delta imports.
+struct OciBlobReader<T: OciRead + Send + Sync>(T);
 
-impl crate::delta::DeltaBlobReader for OciDirBlobReader {
-    fn open_blob(
-        &self,
-        desc: &Descriptor,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<std::fs::File>> + Send + '_>>
-    {
-        let digest = desc.digest();
-        let blob_path = format!("blobs/{}/{}", digest.algorithm(), digest.digest());
-        Box::pin(std::future::ready(
-            self.0
-                .dir()
-                .open(&blob_path)
-                .map(|f| f.into_std())
-                .with_context(|| format!("Opening blob {digest} from OCI layout")),
-        ))
+impl<T: OciRead + Send + Sync> crate::delta::DeltaBlobReader for OciBlobReader<T> {
+    fn open_blob(&self, desc: &Descriptor) -> crate::delta::BlobStreamFuture<'_> {
+        let result = self
+            .0
+            .read_blob(desc)
+            .map(|r| Box::new(r) as Box<dyn BlobStream>)
+            .with_context(|| format!("Reading blob {}", desc.digest()));
+        Box::pin(std::future::ready(result))
     }
 }
 

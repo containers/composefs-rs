@@ -530,12 +530,7 @@ struct ProxyBlobReader<ObjectID: FsVerityHashValue> {
 }
 
 impl<ObjectID: FsVerityHashValue> crate::delta::DeltaBlobReader for ProxyBlobReader<ObjectID> {
-    fn open_blob(
-        &self,
-        desc: &Descriptor,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<std::fs::File>> + Send + '_>,
-    > {
+    fn open_blob(&self, desc: &Descriptor) -> crate::delta::BlobStreamFuture<'_> {
         let desc = desc.clone();
         Box::pin(async move {
             let (reader, driver) = self
@@ -556,7 +551,7 @@ impl<ObjectID: FsVerityHashValue> crate::delta::DeltaBlobReader for ProxyBlobRea
                 let mut std_file = async_dst.into_std().await;
                 use std::io::Seek;
                 std_file.seek(std::io::SeekFrom::Start(0))?;
-                anyhow::Ok(std_file)
+                anyhow::Ok(Box::new(std_file) as Box<dyn crate::layer::BlobStream>)
             };
             let (file_result, driver_result) = tokio::join!(copy_fut, driver);
             let _: () = driver_result?;
