@@ -41,7 +41,8 @@ const ANNOTATION_DELTA_SOURCE_CONFIG: &str = "io.github.containers.delta.source-
 const ANNOTATION_DELTA_TO: &str = "io.github.containers.delta.to";
 const ANNOTATION_DELTA_CONTENT: &str = "io.github.containers.delta.content";
 
-const TAR_DIFF_HEADER: &[u8; 8] = b"tardf1\n\0";
+const TAR_DIFF_HEADER_V1: &[u8; 8] = b"tardf1\n\0";
+const TAR_DIFF_HEADER_V2: &[u8; 8] = b"tardf2\n\0";
 
 // tar-diff opcodes
 const OP_DATA: u8 = 0;
@@ -49,10 +50,16 @@ const OP_OPEN: u8 = 1;
 const OP_COPY: u8 = 2;
 const OP_ADD_DATA: u8 = 3;
 const OP_SEEK: u8 = 4;
+const OP_ZSTD_DICT: u8 = 5;
 
 // DoS protection limits from the Go tar-patch reference implementation
 const MAX_FILENAME_SIZE: u64 = 4 * 1024;
 const MAX_ADD_DATA_SIZE: u64 = 100 * 1024 * 1024;
+
+/// Bump max dict size to the generator max so that we accept all generated ones
+/// but no more.
+const MAX_ZSTD_DICT_WINDOW_LOG: u32 = 29;
+const MAX_ZSTD_DICT_SIZE: u64 = 1 << MAX_ZSTD_DICT_WINDOW_LOG;
 
 // ─── Blob reader trait ──────────────────────────────────────────────────────
 
@@ -165,6 +172,23 @@ impl<ObjectID: FsVerityHashValue> ComposeFsDataSource<ObjectID> {
         Ok(current.seek(SeekFrom::Start(offset))?)
     }
 
+    /// Read the whole current file, leaving the cursor at end of file.
+    fn read_current_to_end(&mut self, max_size: u64) -> Result<Vec<u8>> {
+        let current = self
+            .current
+            .as_mut()
+            .context("No current file set in data source")?;
+        let size = current.seek(SeekFrom::End(0))?;
+        ensure!(
+            size <= max_size,
+            "Source file too large: {size} > {max_size}"
+        );
+        current.seek(SeekFrom::Start(0))?;
+        let mut data = Vec::with_capacity(size as usize);
+        current.read_to_end(&mut data)?;
+        Ok(data)
+    }
+
     fn copy_to(&mut self, dst: &mut impl Write, n: u64) -> Result<()> {
         let current = self
             .current
@@ -264,7 +288,13 @@ fn tar_patch_apply<ObjectID: FsVerityHashValue>(
     let mut header_buf = [0u8; 8];
     let mut reader = io::BufReader::new(delta);
     reader.read_exact(&mut header_buf)?;
-    ensure!(header_buf == *TAR_DIFF_HEADER, "Invalid tar-diff header");
+    let is_v2 = if header_buf == *TAR_DIFF_HEADER_V2 {
+        true
+    } else if header_buf == *TAR_DIFF_HEADER_V1 {
+        false
+    } else {
+        bail!("Invalid tar-diff header");
+    };
 
     let decoder =
         zstd::stream::read::Decoder::new(reader).context("Creating zstd decoder for tar-diff")?;
@@ -320,6 +350,28 @@ fn tar_patch_apply<ObjectID: FsVerityHashValue>(
             }
             OP_SEEK => {
                 data_source.seek_current(size)?;
+            }
+            OP_ZSTD_DICT => {
+                ensure!(is_v2, "ZstdDict op requires a tardf2 delta");
+                // The dictionary is the whole source file, read it all
+                let dict = data_source
+                    .read_current_to_end(MAX_ZSTD_DICT_SIZE)
+                    .context("Reading source file as zstd dictionary")?;
+                let mut frame = Read::by_ref(&mut r).take(size);
+                {
+                    let mut decoder =
+                        zstd::stream::read::Decoder::with_ref_prefix(&mut frame, &dict)
+                            .context("Creating zstd decoder for ZstdDict op")?
+                            .single_frame();
+                    decoder
+                        .window_log_max(MAX_ZSTD_DICT_WINDOW_LOG)
+                        .context("Setting zstd window limit for ZstdDict op")?;
+                    io::copy(&mut decoder, &mut dst).context("Applying ZstdDict op")?;
+                }
+                // Skip any unread data from the delta stream to ensure the underlying
+                // delta stream is at the end of the op.
+                io::copy(&mut frame, &mut io::sink())
+                    .context("Skipping trailing bytes after ZstdDict frame")?;
             }
             _ => bail!("Unexpected tar-diff op {op}"),
         }
@@ -763,6 +815,169 @@ mod tests {
         read_uvarint(&mut io::BufReader::new(bytes))
     }
 
+    fn write_uvarint(out: &mut Vec<u8>, mut value: u64) {
+        while value >= 0x80 {
+            out.push(value as u8 | 0x80);
+            value >>= 7;
+        }
+        out.push(value as u8);
+    }
+
+    /// Assemble a tar-diff stream from `(op, size, data)` triples. Ops without
+    /// a payload (Copy, Seek) carry their operand in `size` and empty `data`.
+    fn build_tar_diff(header: &[u8; 8], ops: &[(u8, u64, &[u8])]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (op, size, data) in ops {
+            body.push(*op);
+            write_uvarint(&mut body, *size);
+            body.extend_from_slice(data);
+        }
+        let mut out = header.to_vec();
+        out.extend_from_slice(&zstd::stream::encode_all(&body[..], 3).unwrap());
+        out
+    }
+
+    /// A zstd frame compressing `target` against `source` as a raw dictionary,
+    /// as `zstd --patch-from` and tar-diff's zstd backend produce.
+    fn zstd_patch_from(source: &[u8], target: &[u8]) -> Vec<u8> {
+        zstd_patch_from_with_window_log(source, target, None)
+    }
+
+    /// As [`zstd_patch_from`], but able to declare a window larger than the
+    /// libzstd encoder default. tar-diff's Go encoder sizes the window to the
+    /// source file, so real deltas of sources over 128 MiB only decode with a
+    /// raised `window_log_max`.
+    fn zstd_patch_from_with_window_log(
+        source: &[u8],
+        target: &[u8],
+        window_log: Option<u32>,
+    ) -> Vec<u8> {
+        let mut encoder =
+            zstd::stream::write::Encoder::with_ref_prefix(Vec::new(), 3, source).unwrap();
+        if let Some(window_log) = window_log {
+            encoder
+                .set_parameter(zstd::stream::raw::CParameter::WindowLog(window_log))
+                .unwrap();
+        }
+        encoder.write_all(target).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    const SOURCE_NAME: &str = "data/blob.bin";
+
+    /// A composefs data source with content from a tar file
+    async fn tar_to_compose(
+        repo: &Arc<Repository<Sha256HashValue>>,
+        tar: &[u8],
+    ) -> ComposeFsDataSource<Sha256HashValue> {
+        let (layer_id, _stats) = crate::layer::import_tar_async(Arc::clone(repo), tar)
+            .await
+            .expect("importing source layer");
+
+        let mut fs = composefs::tree::FileSystem::new(composefs::tree::Stat::uninitialized());
+        let mut stream = repo
+            .open_stream(
+                "",
+                Some(&layer_id),
+                Some(crate::skopeo::TAR_LAYER_CONTENT_TYPE),
+            )
+            .expect("opening source layer stream");
+        while let Some(entry) = crate::tar::get_entry(&mut stream).expect("reading tar entry") {
+            crate::image::process_entry(&mut fs, entry).expect("processing tar entry");
+        }
+
+        ComposeFsDataSource {
+            source: Arc::new(SourceImage {
+                fs,
+                repo: Arc::clone(repo),
+            }),
+            current: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tar_patch_zstd_dict() {
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let (source, target) = similar_blobs();
+        let patch = zstd_patch_from(&source, &target);
+        assert!(patch.len() < target.len() / 4, "patch should be small");
+
+        let delta = build_tar_diff(
+            TAR_DIFF_HEADER_V2,
+            &[
+                (OP_OPEN, SOURCE_NAME.len() as u64, SOURCE_NAME.as_bytes()),
+                (OP_ZSTD_DICT, patch.len() as u64, &patch),
+            ],
+        );
+
+        let mut data_source = tar_to_compose(&test_repo.repo, &blob_layer_tar(&source)).await;
+        let mut out = Vec::new();
+        tar_patch_apply(&delta[..], &mut data_source, &mut out).expect("applying zstd-dict delta");
+        assert_eq!(out, target);
+    }
+
+    /// libzstd refuses windows above 128 MiB by default, so a frame declaring
+    /// the 512 MiB window that tar-diff allows only decodes because
+    /// [`MAX_ZSTD_DICT_WINDOW_LOG`] raises the cap — and anything beyond it is
+    /// still refused.
+    #[tokio::test]
+    async fn test_tar_patch_zstd_dict_window_log() {
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let (source, target) = similar_blobs();
+
+        for (window_log, accepted) in [
+            (MAX_ZSTD_DICT_WINDOW_LOG, true),
+            (MAX_ZSTD_DICT_WINDOW_LOG + 1, false),
+        ] {
+            let patch = zstd_patch_from_with_window_log(&source, &target, Some(window_log));
+            let delta = build_tar_diff(
+                TAR_DIFF_HEADER_V2,
+                &[
+                    (OP_OPEN, SOURCE_NAME.len() as u64, SOURCE_NAME.as_bytes()),
+                    (OP_ZSTD_DICT, patch.len() as u64, &patch),
+                ],
+            );
+
+            let mut data_source = tar_to_compose(&test_repo.repo, &blob_layer_tar(&source)).await;
+            let mut out = Vec::new();
+            let result = tar_patch_apply(&delta[..], &mut data_source, &mut out);
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "windowLog {window_log}: {result:?}"
+            );
+            if accepted {
+                assert_eq!(out, target);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_current_to_end_size_limit() {
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let mut data_source = tar_to_compose(&test_repo.repo, &blob_layer_tar(b"0123456789")).await;
+        data_source.set_current_file(SOURCE_NAME).unwrap();
+
+        let err = data_source
+            .read_current_to_end(9)
+            .expect_err("a source over the limit must be refused");
+        assert!(
+            format!("{err:#}").contains("Source file too large"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(data_source.read_current_to_end(10).unwrap(), b"0123456789");
+    }
+
+    #[tokio::test]
+    async fn test_tar_patch_rejects_unknown_header() {
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let delta = build_tar_diff(b"tardf3\n\0", &[(OP_DATA, 5, b"hello")]);
+
+        let mut data_source = tar_to_compose(&test_repo.repo, &blob_layer_tar(b"")).await;
+        tar_patch_apply(&delta[..], &mut data_source, &mut Vec::new())
+            .expect_err("unknown tar-diff version must be rejected");
+    }
+
     #[test]
     fn test_read_uvarint() {
         assert_eq!(uvarint(&[0]).unwrap(), 0);
@@ -801,18 +1016,51 @@ mod tests {
         assert!(uvarint(&[]).is_err());
     }
 
-    fn have_oci_delta() -> Option<PathBuf> {
-        std::process::Command::new("oci-delta")
+    bitflags::bitflags! {
+        /// A set of oci-delta capabilities that only newer builds have.
+        #[derive(Clone, Copy)]
+        struct OciDeltaFeatures: u32 {
+            /// `--binary-diff` (and with it the tardf2 zstd-dict op) was added
+            /// in oci-delta 0.6; older builds only ever emit tardf1.
+            const BINARY_DIFF = 1 << 0;
+        }
+    }
+
+    /// The oci-delta binary, if it is installed and has all of `required`.
+    /// Reports why it is unavailable, for tests that then skip themselves.
+    fn have_oci_delta(required: OciDeltaFeatures) -> Option<PathBuf> {
+        let bin = PathBuf::from("oci-delta");
+        if std::process::Command::new(&bin)
             .arg("--help")
             .output()
-            .ok()
-            .map(|_| PathBuf::from("oci-delta"))
+            .is_err()
+        {
+            eprintln!("skipping: oci-delta not found in PATH");
+            return None;
+        }
+        if required.contains(OciDeltaFeatures::BINARY_DIFF)
+            && !delta_create_help(&bin).contains("--binary-diff")
+        {
+            eprintln!("skipping: oci-delta has no --binary-diff support");
+            return None;
+        }
+        Some(bin)
     }
 
     fn create_delta(oci_delta_bin: &Path, source: &Path, target: &Path) -> tempfile::TempDir {
+        create_delta_with(oci_delta_bin, source, target, &[])
+    }
+
+    fn create_delta_with(
+        oci_delta_bin: &Path,
+        source: &Path,
+        target: &Path,
+        extra_args: &[&str],
+    ) -> tempfile::TempDir {
         let delta_dir = tempfile::tempdir().expect("creating delta tempdir");
         let status = std::process::Command::new(oci_delta_bin)
             .arg("create")
+            .args(extra_args)
             .arg(format!("oci:{}", source.display()))
             .arg(format!("oci:{}", target.display()))
             .arg(format!("oci:{}", delta_dir.path().display()))
@@ -820,6 +1068,24 @@ mod tests {
             .expect("running oci-delta");
         assert!(status.success(), "oci-delta create failed: {status}");
         delta_dir
+    }
+
+    fn delta_create_help(oci_delta_bin: &Path) -> String {
+        let out = std::process::Command::new(oci_delta_bin)
+            .args(["create", "--help"])
+            .output()
+            .expect("running oci-delta create --help");
+        assert!(
+            out.status.success(),
+            "oci-delta create --help failed: {}",
+            out.status
+        );
+        let help = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            help.contains("--signature"),
+            "unrecognised oci-delta create --help output, the probes against it are stale:\n{help}"
+        );
+        help
     }
 
     async fn pull_from_layout(
@@ -879,7 +1145,8 @@ mod tests {
     }
 
     /// Incompressible source and target contents that differ only in the
-    /// middle, so tar-diff has something worth encoding as a binary diff.
+    /// middle, so tar-diff has something worth encoding as a binary diff and a
+    /// zstd-dict patch comes out much smaller than the target itself.
     fn similar_blobs() -> (Vec<u8>, Vec<u8>) {
         let source: Vec<u8> = (0..32768u32)
             .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
@@ -898,7 +1165,7 @@ mod tests {
     /// Source and target layouts sharing one layer, differing in a second one,
     /// with a third present only in the target.  The differing layer holds
     /// similar (not unrelated) blobs, so tar-diff encodes it with real
-    /// Copy/AddData ops rather than emitting it verbatim as Data.
+    /// Copy/AddData or ZstdDict ops rather than emitting it verbatim as Data.
     fn build_test_layouts() -> (tempfile::TempDir, tempfile::TempDir) {
         let (source_blob, target_blob) = similar_blobs();
         let source = crate::test_util::build_oci_layout_from_tars(&[
@@ -929,7 +1196,7 @@ mod tests {
         for entry in std::fs::read_dir(blobs).expect("reading delta blobs") {
             let blob =
                 std::fs::read(entry.expect("delta blob entry").path()).expect("reading delta blob");
-            if !blob.starts_with(TAR_DIFF_HEADER) {
+            if !blob.starts_with(TAR_DIFF_HEADER_V1) && !blob.starts_with(TAR_DIFF_HEADER_V2) {
                 continue;
             }
             let ops = zstd::stream::decode_all(&blob[8..]).expect("decompressing tar-diff");
@@ -949,15 +1216,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_pull_delta_end_to_end() {
-        let Some(oci_delta_bin) = have_oci_delta() else {
-            eprintln!("skipping: oci-delta not found in PATH");
+        let Some(oci_delta_bin) = have_oci_delta(OciDeltaFeatures::empty()) else {
             return;
         };
         let (source, target, delta) = build_test_fixtures(&oci_delta_bin);
         let ops = delta_ops(delta.path());
         assert!(
             ops.iter()
-                .any(|op| matches!(*op, OP_COPY | OP_ADD_DATA | OP_SEEK)),
+                .any(|op| matches!(*op, OP_COPY | OP_ADD_DATA | OP_SEEK | OP_ZSTD_DICT)),
             "delta only replays whole files ({ops:?}), so it exercises no diff op"
         );
 
@@ -974,6 +1240,36 @@ mod tests {
         let (target_manifest, target_config) = pull_from_layout(repo, target.path()).await;
 
         // Manifest and config digests must match
+        assert_eq!(delta_manifest, target_manifest, "manifest digest mismatch");
+        assert_eq!(delta_config, target_config, "config digest mismatch");
+    }
+
+    /// `--binary-diff zstd` makes oci-delta emit tardf2 deltas whose changed
+    /// layers use the ZstdDict op instead of bsdiff.
+    #[tokio::test]
+    async fn test_pull_delta_zstd_binary_diff() {
+        let Some(oci_delta_bin) = have_oci_delta(OciDeltaFeatures::BINARY_DIFF) else {
+            return;
+        };
+        let (source, target) = build_test_layouts();
+        let delta = create_delta_with(
+            &oci_delta_bin,
+            source.path(),
+            target.path(),
+            &["--binary-diff", "zstd"],
+        );
+        assert!(
+            delta_ops(delta.path()).contains(&OP_ZSTD_DICT),
+            "delta has no ZstdDict op, so it would not exercise the v2 path"
+        );
+
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        pull_from_layout(repo, source.path()).await;
+        let (delta_manifest, delta_config) = pull_from_layout(repo, delta.path()).await;
+        let (target_manifest, target_config) = pull_from_layout(repo, target.path()).await;
+
         assert_eq!(delta_manifest, target_manifest, "manifest digest mismatch");
         assert_eq!(delta_config, target_config, "config digest mismatch");
     }
@@ -1001,8 +1297,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pull_delta_oci_archive() {
-        let Some(oci_delta_bin) = have_oci_delta() else {
-            eprintln!("skipping: oci-delta not found in PATH");
+        let Some(oci_delta_bin) = have_oci_delta(OciDeltaFeatures::empty()) else {
             return;
         };
         if !have_skopeo() {
@@ -1060,8 +1355,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pull_delta_idempotent() {
-        let Some(oci_delta_bin) = have_oci_delta() else {
-            eprintln!("skipping: oci-delta not found in PATH");
+        let Some(oci_delta_bin) = have_oci_delta(OciDeltaFeatures::empty()) else {
             return;
         };
         let (source, _target, delta) = build_test_fixtures(&oci_delta_bin);

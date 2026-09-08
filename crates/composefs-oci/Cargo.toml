@@ -43,11 +43,12 @@ tar-core = "0.1.0"
 tokio = { version = "1.24.2", features = ["macros", "rt-multi-thread"] }
 tokio-util = { version = "0.7", default-features = false, features = ["io"] }
 tracing = { version = "0.1", default-features = false }
-zstd = { version = "0.13.0", default-features = false }
+zstd = { version = "0.13.2", default-features = false }
 cap-std-ext = { workspace = true }
 ocidir = { workspace = true }
 
 [dev-dependencies]
+bitflags = { version = "2.9.0", default-features = false }
 cap-std = { version = "4.0.0", default-features = false }
 cap-tempfile = { version = "4.0.0", default-features = false }
 similar-asserts = "2.0.0"
