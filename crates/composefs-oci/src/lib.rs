@@ -19,7 +19,7 @@
 pub mod boot;
 #[cfg(feature = "containers-storage")]
 pub mod cstor;
-pub(crate) mod delta;
+pub mod delta;
 pub mod image;
 pub mod layer;
 pub mod layer_sync;

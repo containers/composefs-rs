@@ -19,7 +19,7 @@ use crate::skopeo::TAR_LAYER_CONTENT_TYPE;
 use crate::tar::split_async;
 
 /// Sync blob streams accepted by [`crate::delta::DeltaBlobReader`].
-pub(crate) trait BlobStream: std::io::Read + Send {}
+pub trait BlobStream: std::io::Read + Send {}
 
 impl<T: std::io::Read + Send> BlobStream for T {}
 

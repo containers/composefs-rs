@@ -34,7 +34,9 @@ use crate::progress::{ComponentId, ProgressEvent, ProgressUnit, SharedReporter};
 use crate::skopeo::PullResult;
 use crate::{ImportStats, layer_identifier};
 
-pub(crate) const MEDIA_TYPE_DELTA: &str = "application/vnd.io.github.containers.oci-delta.v1";
+/// The `artifactType` value identifying an oci-delta artifact manifest.
+pub const MEDIA_TYPE_DELTA: &str = "application/vnd.io.github.containers.oci-delta.v1";
+
 fn media_type_tar_diff() -> MediaType {
     MediaType::Other("application/vnd.tar-diff".to_string())
 }
@@ -65,14 +67,14 @@ const MAX_ZSTD_DICT_SIZE: u64 = 1 << MAX_ZSTD_DICT_WINDOW_LOG;
 // ─── Blob reader trait ──────────────────────────────────────────────────────
 
 /// The future returned by [`DeltaBlobReader::open_blob`].
-pub(crate) type BlobStreamFuture<'a> =
+pub type BlobStreamFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Box<dyn BlobStream>>> + Send + 'a>>;
 
 /// Read blobs from a delta artifact by digest.
 ///
 /// Implemented for OCI layout directories and pre-fetched blob maps
 /// (used by the skopeo proxy path which fetches blobs asynchronously).
-pub(crate) trait DeltaBlobReader: Send + Sync {
+pub trait DeltaBlobReader: Send + Sync {
     /// Open a blob for reading by digest.
     /// For local storage this opens the file directly. For remote transports
     /// this fetches the blob to a local temp file first.
@@ -80,11 +82,39 @@ pub(crate) trait DeltaBlobReader: Send + Sync {
 }
 
 /// Check whether an OCI manifest is a delta artifact.
-pub(crate) fn is_delta_artifact(manifest: &ImageManifest) -> bool {
+pub fn is_delta_artifact(manifest: &ImageManifest) -> bool {
     manifest
         .artifact_type()
         .as_ref()
         .is_some_and(|t| t.to_string() == MEDIA_TYPE_DELTA)
+}
+
+// ─── Source image data ──────────────────────────────────────────────────────
+
+/// Supplies file data from the "old" image a tar-diff was created against.
+///
+/// A tar-diff refers to source files by their path in the old image's root
+/// filesystem, reading from one file at a time. Implementations resolve those
+/// paths against whatever local storage holds that image.
+pub trait DeltaDataSource {
+    /// Select `path` in the source image as the current file.
+    ///
+    /// Subsequent reads and seeks apply to it until the next call. Returns an
+    /// error if the path is absent: a delta cannot be applied without its
+    /// source data, and there is no meaningful way to continue.
+    fn set_current_file(&mut self, path: &str) -> Result<()>;
+
+    /// Fill `buf` from the current file, erroring on a short read.
+    fn read_exact_current(&mut self, buf: &mut [u8]) -> Result<()>;
+
+    /// Seek the current file to absolute `offset`.
+    fn seek_current(&mut self, offset: u64) -> Result<u64>;
+
+    /// Read the whole current file, leaving the cursor at end of file.
+    fn read_current_to_end(&mut self, max_size: u64) -> Result<Vec<u8>>;
+
+    /// Copy `n` bytes from the current file to `dst`, erroring on a short read.
+    fn copy_to(&mut self, dst: &mut dyn Write, n: u64) -> Result<()>;
 }
 
 // ─── Composefs-backed data source for tar-patch ─────────────────────────────
@@ -124,7 +154,7 @@ struct ComposeFsDataSource<ObjectID: FsVerityHashValue> {
     current: Option<CurrentFile>,
 }
 
-impl<ObjectID: FsVerityHashValue> ComposeFsDataSource<ObjectID> {
+impl<ObjectID: FsVerityHashValue> DeltaDataSource for ComposeFsDataSource<ObjectID> {
     fn set_current_file(&mut self, path: &str) -> Result<()> {
         let path = Path::new(path);
         let (dir, filename) = self
@@ -191,7 +221,7 @@ impl<ObjectID: FsVerityHashValue> ComposeFsDataSource<ObjectID> {
         Ok(data)
     }
 
-    fn copy_to(&mut self, dst: &mut impl Write, n: u64) -> Result<()> {
+    fn copy_to(&mut self, dst: &mut dyn Write, n: u64) -> Result<()> {
         let current = self
             .current
             .as_mut()
@@ -265,12 +295,12 @@ impl OciHasher {
     }
 }
 
-struct HashingWriter<'a, W: Write> {
+struct HashingWriter<'a, W: Write + ?Sized> {
     inner: &'a mut W,
     hasher: &'a mut OciHasher,
 }
 
-impl<W: Write> Write for HashingWriter<'_, W> {
+impl<W: Write + ?Sized> Write for HashingWriter<'_, W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let n = self.inner.write(buf)?;
         self.hasher.update(&buf[..n]);
@@ -282,9 +312,14 @@ impl<W: Write> Write for HashingWriter<'_, W> {
     }
 }
 
-fn tar_patch_apply<ObjectID: FsVerityHashValue>(
+/// Apply a tar-diff blob, writing the reconstructed uncompressed tar to `dst`.
+///
+/// `data_source` supplies file data from the source image the delta was built
+/// against. The result is not verified here; callers should check it against
+/// the expected diff_id, which [`reconstruct_layer_to`] does.
+pub fn tar_patch_apply(
     delta: impl Read,
-    data_source: &mut ComposeFsDataSource<ObjectID>,
+    data_source: &mut dyn DeltaDataSource,
     mut dst: impl Write,
 ) -> Result<()> {
     let mut header_buf = [0u8; 8];
@@ -384,9 +419,8 @@ fn tar_patch_apply<ObjectID: FsVerityHashValue>(
 
 // ─── Delta layer reconstruction ─────────────────────────────────────────────
 
-/// Reconstruct a single layer's uncompressed tar from a delta blob.
-/// Returns a seeked-to-start temp file with diff_id already verified.
-fn decompress_layer(
+/// Wrap a layer blob in the decompressor its `media_type` calls for.
+pub fn decompress_layer(
     reader: impl BlobStream + 'static,
     media_type: &MediaType,
 ) -> Result<Box<dyn BlobStream>> {
@@ -403,6 +437,43 @@ fn decompress_layer(
     }
 }
 
+/// Reconstruct one layer's uncompressed tar into `dst`, verifying its diff_id.
+///
+/// `blob` is a delta layer blob: either a tar-diff, applied against
+/// `data_source`, or the original compressed layer, simply decompressed —
+/// as indicated by `media_type`. Errors if the result does not hash to
+/// `expected_diff_id`, so callers must not publish `dst` until this returns
+/// successfully.
+pub fn reconstruct_layer_to(
+    blob: impl BlobStream + 'static,
+    media_type: &MediaType,
+    data_source: &mut dyn DeltaDataSource,
+    expected_diff_id: &OciDigest,
+    dst: &mut dyn Write,
+) -> Result<()> {
+    let mut hasher = OciHasher::new(expected_diff_id.algorithm())?;
+    let mut hashing_writer = HashingWriter {
+        inner: dst,
+        hasher: &mut hasher,
+    };
+
+    if *media_type == media_type_tar_diff() {
+        tar_patch_apply(blob, data_source, &mut hashing_writer)?;
+    } else {
+        let mut decoder = decompress_layer(blob, media_type)?;
+        io::copy(&mut decoder, &mut hashing_writer)?;
+    }
+
+    let computed_diff_id = hasher.finalize()?;
+    ensure!(
+        computed_diff_id == *expected_diff_id,
+        "Layer diff_id mismatch: expected {expected_diff_id}, got {computed_diff_id}",
+    );
+    Ok(())
+}
+
+/// Reconstruct a single layer's uncompressed tar from a delta blob.
+/// Returns a seeked-to-start temp file with diff_id already verified.
 fn reconstruct_layer<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     source_image: &Arc<SourceImage<ObjectID>>,
@@ -414,32 +485,18 @@ fn reconstruct_layer<ObjectID: FsVerityHashValue>(
         .create_object_tmpfile()
         .context("Creating temp file for layer reconstruction")?;
     let mut tmpfile = File::from(tmpfile_fd);
-    let mut hasher = OciHasher::new(expected_diff_id.algorithm())?;
+    let mut data_source = ComposeFsDataSource {
+        source: Arc::clone(source_image),
+        current: None,
+    };
 
-    if *media_type == media_type_tar_diff() {
-        let mut data_source = ComposeFsDataSource {
-            source: Arc::clone(source_image),
-            current: None,
-        };
-        let mut hashing_writer = HashingWriter {
-            inner: &mut tmpfile,
-            hasher: &mut hasher,
-        };
-        tar_patch_apply(blob_reader, &mut data_source, &mut hashing_writer)?;
-    } else {
-        let mut decoder = decompress_layer(blob_reader, media_type)?;
-        let mut hashing_writer = HashingWriter {
-            inner: &mut tmpfile,
-            hasher: &mut hasher,
-        };
-        io::copy(&mut decoder, &mut hashing_writer)?;
-    }
-
-    let computed_diff_id = hasher.finalize()?;
-    ensure!(
-        computed_diff_id == *expected_diff_id,
-        "Layer diff_id mismatch: expected {expected_diff_id}, got {computed_diff_id}",
-    );
+    reconstruct_layer_to(
+        blob_reader,
+        media_type,
+        &mut data_source,
+        expected_diff_id,
+        &mut tmpfile,
+    )?;
 
     tmpfile.seek(SeekFrom::Start(0))?;
     Ok(tmpfile)
@@ -447,19 +504,42 @@ fn reconstruct_layer<ObjectID: FsVerityHashValue>(
 
 // ─── Delta manifest parsing ─────────────────────────────────────────────────
 
-struct ParsedDelta {
-    target_manifest: ImageManifest,
-    target_manifest_descriptor: Descriptor,
-    target_manifest_raw: Vec<u8>,
-    target_config_descriptor: Descriptor,
-    target_config_raw: Vec<u8>,
-    source_config_digest: OciDigest,
-    delta_layer_by_to: HashMap<OciDigest, Descriptor>,
+/// Whether a delta layer blob is a tar-diff, which must be applied against the
+/// source image, rather than an original layer blob to decompress directly.
+pub fn is_tar_diff(media_type: &MediaType) -> bool {
+    *media_type == media_type_tar_diff()
+}
+
+/// A delta artifact's manifest, with the embedded target image manifest and
+/// config resolved.
+///
+/// Layers of the target image that are absent from `delta_layer_by_to` are
+/// unchanged from the source image and are expected to be present locally
+/// already, matched by diff_id.
+#[derive(Debug)]
+pub struct ParsedDelta {
+    /// The target image's manifest.
+    pub target_manifest: ImageManifest,
+    /// Descriptor of the target image's manifest, as carried in the delta.
+    pub target_manifest_descriptor: Descriptor,
+    /// Raw bytes of the target image's manifest. Preserved verbatim so that
+    /// the original digest is reproduced rather than a re-serialized one.
+    pub target_manifest_raw: Vec<u8>,
+    /// Descriptor of the target image's config, as carried in the delta.
+    pub target_config_descriptor: Descriptor,
+    /// Raw bytes of the target image's config.
+    pub target_config_raw: Vec<u8>,
+    /// Digest of the source image's config. The delta is only applicable on a
+    /// system that already has the image with this config.
+    pub source_config_digest: OciDigest,
+    /// Changed layers, keyed by the digest of the target layer each produces.
+    /// The value is the descriptor of the blob within the delta artifact.
+    pub delta_layer_by_to: HashMap<OciDigest, Descriptor>,
 }
 
 /// Parse a delta artifact's manifest and extract the embedded target image
 /// manifest, config, and layer mapping. Blobs are fetched via `blob_reader`.
-async fn parse_delta_manifest(
+pub async fn parse_delta_manifest(
     delta_manifest: &ImageManifest,
     blob_reader: &dyn DeltaBlobReader,
 ) -> Result<ParsedDelta> {
