@@ -28,7 +28,7 @@ tokio = { version = "1.40", default-features = false, features = ["rt", "net", "
 toml = { version = "1.0", default-features = false, features = ["parse", "serde"] }
 tracing = { version = "0.1", default-features = false, optional = true }
 zlink = { workspace = true, optional = true }
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.14", default-features = false }
 
 [features]
 default = []
