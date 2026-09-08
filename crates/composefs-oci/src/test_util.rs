@@ -1003,6 +1003,16 @@ pub fn ensure_erofs_for_image(
 /// `import_oci_layout`, or any OCI-aware tool.
 #[cfg(test)]
 pub fn build_oci_layout(layers: &[&str]) -> tempfile::TempDir {
+    let tars: Vec<Vec<u8>> = layers.iter().map(|l| dumpfile_to_tar(l)).collect();
+    build_oci_layout_from_tars(&tars)
+}
+
+/// Build an OCI layout directory from ready-made uncompressed layer tars.
+///
+/// Use this instead of [`build_oci_layout`] when a layer needs file contents
+/// that the dumpfile format can't express, such as multi-kilobyte blobs.
+#[cfg(test)]
+pub fn build_oci_layout_from_tars(layers: &[Vec<u8>]) -> tempfile::TempDir {
     use cap_std_ext::cap_std;
     use containers_image_proxy::oci_spec::image::{
         ConfigBuilder, ImageConfigurationBuilder, PlatformBuilder, RootFsBuilder,
@@ -1029,10 +1039,9 @@ pub fn build_oci_layout(layers: &[&str]) -> tempfile::TempDir {
         .build()
         .unwrap();
 
-    for dumpfile in layers {
-        let tar_data = dumpfile_to_tar(dumpfile);
+    for tar_data in layers {
         let mut layer_writer = ocidir.create_gzip_layer(None).unwrap();
-        layer_writer.write_all(&tar_data).unwrap();
+        layer_writer.write_all(tar_data).unwrap();
         let layer = layer_writer.complete().unwrap();
         ocidir.push_layer(&mut manifest, &mut config, layer, "layer", None);
     }

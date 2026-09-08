@@ -852,28 +852,99 @@ mod tests {
         /usr/bin 0 40755 2 0 0 0 0.0 - - -\n\
         /usr/bin/hello 21 100755 1 0 0 0 0.0 - #!/bin/sh\\necho\\x20hello\\n -\n";
 
-    // Layer with a 4KB file (source version)
-    const LAYER_BLOB_V1: &str = "\
-        /data 0 40755 2 0 0 0 0.0 - - -\n\
-        /data/blob.bin 4096 100644 1 0 0 0 0.0 / - -\n";
+    /// A layer tar holding a single file with exactly `content`. Built directly
+    /// rather than via a dumpfile because dumpfile lines are capped at 512
+    /// bytes and `Item::Regular` derives its content from the size alone, which
+    /// would leave the source and target blobs unrelated.
+    fn blob_layer_tar(content: &[u8]) -> Vec<u8> {
+        let mut builder = ::tar::Builder::new(Vec::new());
 
-    // Layer with same structure but different size (target — triggers tar-diff)
-    const LAYER_BLOB_V2: &str = "\
-        /data 0 40755 2 0 0 0 0.0 - - -\n\
-        /data/blob.bin 4000 100644 1 0 0 0 0.0 / - -\n";
+        let mut header = ::tar::Header::new_ustar();
+        header.set_entry_type(::tar::EntryType::Directory);
+        header.set_mode(0o755);
+        header.set_size(0);
+        builder
+            .append_data(&mut header, "data/", std::io::empty())
+            .unwrap();
+
+        let mut header = ::tar::Header::new_ustar();
+        header.set_entry_type(::tar::EntryType::Regular);
+        header.set_mode(0o644);
+        header.set_size(content.len() as u64);
+        builder
+            .append_data(&mut header, "data/blob.bin", content)
+            .unwrap();
+
+        builder.into_inner().unwrap()
+    }
+
+    /// Incompressible source and target contents that differ only in the
+    /// middle, so tar-diff has something worth encoding as a binary diff.
+    fn similar_blobs() -> (Vec<u8>, Vec<u8>) {
+        let source: Vec<u8> = (0..32768u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        let mut target = source.clone();
+        target[10000..10256].fill(0x5a);
+        target.extend_from_slice(b"appended target-only bytes");
+        (source, target)
+    }
 
     // Completely new layer (target only)
     const LAYER_NEW: &str = "\
         /opt 0 40755 2 0 0 0 0.0 - - -\n\
         /opt/newfile.bin 2048 100644 1 0 0 0 0.0 / - -\n";
 
+    /// Source and target layouts sharing one layer, differing in a second one,
+    /// with a third present only in the target.  The differing layer holds
+    /// similar (not unrelated) blobs, so tar-diff encodes it with real
+    /// Copy/AddData ops rather than emitting it verbatim as Data.
+    fn build_test_layouts() -> (tempfile::TempDir, tempfile::TempDir) {
+        let (source_blob, target_blob) = similar_blobs();
+        let source = crate::test_util::build_oci_layout_from_tars(&[
+            crate::test_util::dumpfile_to_tar(LAYER_SHARED),
+            blob_layer_tar(&source_blob),
+        ]);
+        let target = crate::test_util::build_oci_layout_from_tars(&[
+            crate::test_util::dumpfile_to_tar(LAYER_SHARED),
+            blob_layer_tar(&target_blob),
+            crate::test_util::dumpfile_to_tar(LAYER_NEW),
+        ]);
+        (source, target)
+    }
+
     fn build_test_fixtures(
         oci_delta_bin: &Path,
     ) -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir) {
-        let source = crate::test_util::build_oci_layout(&[LAYER_SHARED, LAYER_BLOB_V1]);
-        let target = crate::test_util::build_oci_layout(&[LAYER_SHARED, LAYER_BLOB_V2, LAYER_NEW]);
+        let (source, target) = build_test_layouts();
         let delta = create_delta(oci_delta_bin, source.path(), target.path());
         (source, target, delta)
+    }
+
+    /// The set of opcodes used across all tar-diff blobs in a delta layout, so
+    /// tests can fail loudly if oci-delta stops emitting the op they cover.
+    fn delta_ops(layout_dir: &Path) -> std::collections::HashSet<u8> {
+        let blobs = layout_dir.join("blobs/sha256");
+        let mut seen = std::collections::HashSet::new();
+        for entry in std::fs::read_dir(blobs).expect("reading delta blobs") {
+            let blob =
+                std::fs::read(entry.expect("delta blob entry").path()).expect("reading delta blob");
+            if !blob.starts_with(TAR_DIFF_HEADER) {
+                continue;
+            }
+            let ops = zstd::stream::decode_all(&blob[8..]).expect("decompressing tar-diff");
+            let mut r = io::BufReader::new(&ops[..]);
+            let mut op = [0u8; 1];
+            while r.read_exact(&mut op).is_ok() {
+                let size = read_uvarint(&mut r).expect("tar-diff op size");
+                seen.insert(op[0]);
+                if !matches!(op[0], OP_COPY | OP_SEEK) {
+                    io::copy(&mut Read::by_ref(&mut r).take(size), &mut io::sink())
+                        .expect("skipping tar-diff op data");
+                }
+            }
+        }
+        seen
     }
 
     #[tokio::test]
@@ -883,6 +954,12 @@ mod tests {
             return;
         };
         let (source, target, delta) = build_test_fixtures(&oci_delta_bin);
+        let ops = delta_ops(delta.path());
+        assert!(
+            ops.iter()
+                .any(|op| matches!(*op, OP_COPY | OP_ADD_DATA | OP_SEEK)),
+            "delta only replays whole files ({ops:?}), so it exercises no diff op"
+        );
 
         let test_repo = TestRepo::<Sha256HashValue>::new();
         let repo = &test_repo.repo;
